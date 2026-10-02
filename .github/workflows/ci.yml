@@ -178,7 +178,14 @@ jobs:
                   target=$(git cat-file blob "$commit:$path")
                   case "$target" in
                     /*) echo "::error file=$path::symlink to an absolute path: $target"; fail=1 ;;
-                    *..*) echo "::error file=$path::symlink leaving the repository: $target"; fail=1 ;;
+                    *)
+                      # Resolved from the link's own directory and without following other links:
+                      # a crate's LICENSE pointing at ../../LICENSE stays inside the tree.
+                      resolved=$(realpath -m -s --relative-to=. "$(dirname "$path")/$target")
+                      case "$resolved" in
+                        .. | ../*) echo "::error file=$path::symlink leaving the repository: $target"; fail=1 ;;
+                      esac
+                      ;;
                   esac
                   ;;
                 160000)
