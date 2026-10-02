@@ -1,7 +1,7 @@
 # lethewis-core
 
 Key derivation, hierarchy, lifecycle and destruction for a device that may be taken from its owner.
-Pure logic: no filesystem, no network, no clock, no platform API.
+Pure logic: no filesystem, no network, no clock, no platform API, no memory allocator.
 
 What is guaranteed, what is not, and which properties are proven:
 [the repository](https://github.com/wisper-dev/lethewis).

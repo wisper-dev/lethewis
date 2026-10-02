@@ -11,7 +11,8 @@ A Rust library for the lifecycle of encryption keys on a device that may be take
 It is for applications where seizure is part of the threat model: wallets, password managers, notes,
 tools for crossing a border, evidence collection. Properties that can be stated precisely are proven
 formally wherever that is possible; what cannot be proven is measured on real devices and described
-as measured. The core is platform-independent, and hardware binding is specific to Android.
+as measured. The core is platform-independent and builds without the standard library and without a
+memory allocator; hardware binding is a crate of its own for each platform, Android first.
 Suggestions for functionality not listed here are accepted as issues.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)

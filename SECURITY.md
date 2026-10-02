@@ -38,7 +38,7 @@ private report before publication.
 **In scope:** the crates in this repository.
 
 - A key that survives destruction.
-- A key that leaves the library through anything other than the call intended to hand it over.
+- A key that leaves the library in the clear.
 - A path that opens two-tier access from a single password.
 - A replacement key created without the caller being told.
 - A counterexample to any property listed as proven in [docs/proofs.md](docs/proofs.md).
