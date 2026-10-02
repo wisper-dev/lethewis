@@ -15,5 +15,10 @@ Nothing is published while the version is below 0.1.0.
 - Workspace with the `lethewis-core` crate.
 - Documents: licence, security policy, contribution rules, code of conduct, threat model, proof
   register.
+- `lethewis-core`: keys held in slots whose memory the caller provides (`Slot`, `Slots`) and
+  referred to by handles (`Handle`). No call returns a key. A key is wiped when it is released, and
+  every key is wiped when its `Slots` is created or dropped.
+- Dependency: `zeroize` 1.9.0, without default features.
+- Builds without the standard library and without a memory allocator.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

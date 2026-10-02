@@ -3,9 +3,9 @@
 This covers the library, not an application built on it: a screen, a network and a user each carry
 threats this document does not reach.
 
-**Lines marked "Intended" are design intentions, not working defences.** A line leaves that state
-when [proofs.md](proofs.md) records what was checked. Lines marked "Not defended" are true now and
-will stay true.
+**Lines marked "Intended" are design intentions, not working defences.** A line becomes "In place"
+when the defence works and is checked on every change; what is proven, rather than tested, is
+recorded in [proofs.md](proofs.md). Lines marked "Not defended" are true now and will stay true.
 
 ## What is protected
 
@@ -55,20 +55,24 @@ reach.
 
 **Capability.** Another application, possibly with elevated privileges.
 
-**Intended.** Wipe keys after use, size buffers in advance so that growth leaves no stale copies, and
-drop keys from memory when the device locks.
+**In place.** Keys are held only in fixed-size slots whose memory the caller provides, and no call
+returns a key. A key is wiped when it is released, and every key is wiped when its set of slots is
+dropped. Tested on every change, not proven.
+
+**Intended.** Drop keys from memory when the device locks.
 
 **Not defended.** Copies left by a value move, a buffer reallocation, a CPU register, swap, or a crash
-dump. A system component with elevated privileges is outside what process isolation provides.
+dump. A set of slots leaked instead of dropped keeps its keys in memory. A system component with
+elevated privileges is outside what process isolation provides.
 
 ### 5. The supply chain
 
 **Capability.** A compromised dependency, a stolen maintainer credential, a rewritten tag.
 
 **In place.** Licence and advisory gates, a committed lockfile, an exact compiler pin, tag rules that
-forbid moving or deleting a tag, and publication only from the build with a thirty-minute credential.
-
-**Intended** once there are dependencies: review of every build script and macro on each appearance.
+forbid moving or deleting a tag, publication only from the build with a thirty-minute credential,
+and review of every new dependency before it is added, including any build script or macro it
+brings.
 
 **Not defended.** An undiscovered vulnerability in a dependency. A compromise of the hosting
 platform or of a maintainer's account.

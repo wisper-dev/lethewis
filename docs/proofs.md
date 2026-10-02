@@ -21,7 +21,7 @@ All six must hold. A row missing any one of them is not written.
 | Property | Statement | Crate |
 |---|---|---|
 | Key destruction | after destruction no reachable state holds the real key, and no later call returns it | `lethewis-core` |
-| No key leak | a key is never written to a sink the library controls, and leaves only through the one call meant to hand it over | `lethewis-core` |
+| No key leak | a key leaves the library only wrapped: no call returns it in the clear, and it is never written to a sink the library controls | `lethewis-core` |
 | Two-tier access | the key for history past a caller-supplied cut-off is not derivable from one password | `lethewis-core` |
 | No silent substitution | when a key is lost the data either opens or is honestly marked unavailable; a replacement is never created silently | `lethewis-core` |
 
