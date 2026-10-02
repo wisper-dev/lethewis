@@ -7,4 +7,6 @@
 [toolchain]
 channel = "1.99.0"
 components = ["rustfmt", "clippy"]
+# A bare-metal target, to build the core where there is no standard library.
+targets = ["thumbv7em-none-eabihf"]
 profile = "minimal"

@@ -11,3 +11,29 @@
 
 #![deny(missing_docs, unused_crate_dependencies)]
 #![no_std]
+
+/// Fails to compile if `$type` implements any of the traits.
+#[cfg(test)]
+macro_rules! assert_not_impl {
+    ($type:ty: $($trait:path),+ $(,)?) => {
+        $(
+            const _: fn() = || {
+                trait Ambiguous<A> {
+                    fn check() {}
+                }
+                impl<T: ?Sized> Ambiguous<()> for T {}
+                struct Implemented;
+                impl<T: ?Sized + $trait> Ambiguous<Implemented> for T {}
+                let _ = <$type as Ambiguous<_>>::check;
+            };
+        )+
+    };
+}
+
+mod error;
+mod key;
+mod slots;
+
+pub use error::Error;
+pub use key::KEY_LEN;
+pub use slots::{Handle, Slot, Slots};

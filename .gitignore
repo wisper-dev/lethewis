@@ -4,8 +4,12 @@
 # Build outputs. Cargo.lock is deliberately NOT ignored: a binary that people rely on is built
 # from an exact dependency set, and the lockfile is what pins it.
 /target/
+/checks/*/target/
 **/*.rs.bk
 *.pdb
+
+# Mutation testing reports
+/mutants.out*/
 
 # Proof and fuzzing artefacts
 /fuzz/target/

@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# A program for a target with no operating system and no memory allocator. It builds only if nothing
+# in the core needs one.
+
+[package]
+name = "no-alloc"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+lethewis-core = { path = "../../crates/lethewis-core" }
+
+# A workspace of its own: it builds only for a bare-metal target, never with the rest.
+[workspace]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
