@@ -310,6 +310,9 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-features --locked
 
+      - name: Shell scripts
+        run: git ls-files -z '*.sh' | xargs -0 -r shellcheck -x
+
       - name: The core builds with no standard library and no memory allocator
         run: cargo build --manifest-path checks/no-alloc/Cargo.toml --locked --target thumbv7em-none-eabihf
 
@@ -362,6 +365,45 @@ jobs:
             echo "::error::no mutant was caught, so nothing was tested"
             exit 1
           fi
+
+  proofs:
+    name: Proofs hold
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        # rustup no longer installs the pinned toolchain on its own.
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install Kani
+        run: |
+          # The version and the bundle digest live in one file, which the proof script also checks.
+          source scripts/kani-pin.sh
+          cargo install kani-verifier --locked --version "$KANI_VERSION"
+          bundle="kani-${KANI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sSLo "$bundle" \
+            "https://github.com/model-checking/kani/releases/download/kani-${KANI_VERSION}/${bundle}"
+          echo "$KANI_BUNDLE_SHA256  $bundle" | sha256sum -c -
+          cargo kani setup --use-local-bundle "$bundle"
+
+      - name: Every proof holds and every cover property is reached
+        run: scripts/prove.sh
+
+      - name: Keep the results and the manifest
+        # Also after a failed proof, whose results explain it; a missing directory means Kani never
+        # ran, which the failed step above already reports.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: proofs
+          path: target/proofs/
+          if-no-files-found: warn
 
   reproducible:
     name: Builds the same twice

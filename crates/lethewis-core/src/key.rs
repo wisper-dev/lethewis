@@ -3,8 +3,6 @@
 
 use core::fmt;
 
-use zeroize::Zeroize;
-
 /// Length of a key, in bytes.
 pub const KEY_LEN: usize = 32;
 
@@ -24,16 +22,27 @@ impl Key {
     /// Takes the bytes of `source` and wipes `source`.
     pub(crate) fn load(&mut self, source: &mut [u8; KEY_LEN]) {
         self.bytes.copy_from_slice(source.as_slice());
-        source.zeroize();
+        wipe(source);
     }
 
     pub(crate) fn wipe(&mut self) {
-        self.bytes.zeroize();
+        wipe(&mut self.bytes);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, kani))]
     pub(crate) const fn bytes(&self) -> &[u8; KEY_LEN] {
         &self.bytes
+    }
+}
+
+fn wipe(bytes: &mut [u8; KEY_LEN]) {
+    #[cfg(not(kani))]
+    zeroize::Zeroize::zeroize(bytes);
+    // zeroize ends in inline assembly, which Kani cannot model. The proofs see plain stores; the
+    // tests run the real zeroize.
+    #[cfg(kani)]
+    {
+        *bytes = [0; KEY_LEN];
     }
 }
 

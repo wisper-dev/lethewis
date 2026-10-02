@@ -360,3 +360,243 @@ mod tests {
         assert_eq!(format!("{slots:?}"), "Slots { .. }");
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use core::marker::PhantomData;
+
+    use super::{Error, Handle, KEY_LEN, Slot, Slots, State};
+
+    /// The shortest sequence that reaches every outcome below, including a released handle refused
+    /// while its slot holds a new key; a cover property shows that case is reached.
+    const STEPS: usize = 4;
+
+    fn key(slot: &Slot) -> [u8; KEY_LEN] {
+        *slot.key.bytes()
+    }
+
+    fn snapshot(slot: &Slot) -> (State, u64, [u8; KEY_LEN]) {
+        (slot.state, slot.generation, key(slot))
+    }
+
+    /// Every slot but `changed` matches its snapshot. The slots are compared by concrete index:
+    /// Kani 0.68.0 reports a spurious failure when two equal snapshots are compared through a
+    /// symbolic index.
+    fn unchanged_except(
+        slots: &Slots<'_>,
+        before: &[(State, u64, [u8; KEY_LEN]); 2],
+        changed: usize,
+    ) -> bool {
+        (0..2).all(|index| index == changed || snapshot(&slots.slots[index]) == before[index])
+    }
+
+    /// A slot in any state and with any generation, holding a key only when loaded. This covers
+    /// every state the code can produce and more: a key outside a loaded slot cannot arise, because
+    /// every path out of the loaded state wipes the key first.
+    fn any_slot() -> Slot {
+        let mut slot = Slot::empty();
+        slot.generation = kani::any();
+        slot.state = match kani::any::<u8>() % 3 {
+            0 => State::Free,
+            1 => State::Loaded,
+            _ => State::Retired,
+        };
+        if slot.state == State::Loaded {
+            slot.key.load(&mut kani::any());
+        }
+        slot
+    }
+
+    /// From empty memory, any interleaving of four imports and releases over two slots, with any
+    /// keys. A live handle reaches exactly its own key, a released key is zero at once, and a
+    /// released handle is refused ever after, including while its slot holds a new key.
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn a_handle_reaches_only_its_own_key() {
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut slots = Slots::new(&mut memory);
+        let mut issued: [Option<(Handle<'_>, [u8; KEY_LEN])>; STEPS] = [None; STEPS];
+        let mut live = [false; STEPS];
+
+        for step in 0..STEPS {
+            if kani::any() {
+                let mut source: [u8; KEY_LEN] = kani::any();
+                let original = source;
+                match slots.import(&mut source) {
+                    Ok(handle) => {
+                        assert!(source == [0; KEY_LEN]);
+                        issued[step] = Some((handle, original));
+                        live[step] = true;
+                        kani::cover!(true, "a key is imported");
+                    }
+                    Err(error) => {
+                        assert!(error == Error::NoFreeSlot);
+                        assert!(source == original);
+                        kani::cover!(true, "an import finds no free slot");
+                    }
+                }
+            } else {
+                let pick: usize = kani::any();
+                kani::assume(pick < STEPS);
+                kani::cover!(issued[pick].is_some(), "a step releases an earlier handle");
+                if let Some((handle, _)) = issued[pick] {
+                    let reused = slots.slots[handle.index].state == State::Loaded;
+                    let result = slots.release(handle);
+                    if live[pick] {
+                        assert!(result == Ok(()));
+                        assert!(key(&slots.slots[handle.index]) == [0; KEY_LEN]);
+                        live[pick] = false;
+                        kani::cover!(true, "a live key is released");
+                    } else {
+                        assert!(result == Err(Error::StaleHandle));
+                        kani::cover!(
+                            reused,
+                            "a released handle is refused while its slot holds a new key"
+                        );
+                    }
+                }
+            }
+
+            for (entry, is_live) in issued.iter().zip(live) {
+                if let (Some((handle, original)), true) = (entry, is_live) {
+                    let slot = &slots.slots[handle.index];
+                    assert!(slot.state == State::Loaded && slot.generation == handle.generation);
+                    assert!(key(slot) == *original);
+                }
+            }
+        }
+    }
+
+    /// From any state of two slots, a handle whose set number is not this set's is refused,
+    /// whatever slot and generation it names, and no slot changes.
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn a_handle_from_other_slots_is_refused() {
+        let mut memory = [any_slot(), any_slot()];
+        let id = memory.as_ptr().addr();
+        let mut slots = Slots { slots: &mut memory };
+        let before = [snapshot(&slots.slots[0]), snapshot(&slots.slots[1])];
+
+        let foreign = Handle {
+            slots: kani::any(),
+            index: kani::any(),
+            generation: kani::any(),
+            memory: PhantomData,
+        };
+        kani::assume(foreign.slots != id);
+        kani::cover!(
+            before
+                .get(foreign.index)
+                .is_some_and(|&(state, generation, _)| {
+                    state == State::Loaded && generation == foreign.generation
+                }),
+            "the foreign handle names a loaded slot and its generation"
+        );
+
+        assert!(slots.release(foreign) == Err(Error::StaleHandle));
+        assert!(snapshot(&slots.slots[0]) == before[0]);
+        assert!(snapshot(&slots.slots[1]) == before[1]);
+    }
+
+    /// From any state of two slots, creating `Slots` wipes every loaded key and loads none.
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn creating_slots_wipes_every_key() {
+        let mut memory = [any_slot(), any_slot()];
+        kani::cover!(
+            memory.iter().all(|slot| slot.state == State::Loaded),
+            "both slots hold a key before"
+        );
+        let slots = Slots::new(&mut memory);
+        for slot in slots.slots.iter() {
+            assert!(slot.state != State::Loaded);
+            assert!(key(slot) == [0; KEY_LEN]);
+        }
+    }
+
+    /// From any state of two slots and any generation: an import takes the first free slot, issues
+    /// that slot's generation, keeps it in the slot and wipes its source; a handle of this set
+    /// naming any slot and generation releases a key only if that slot is loaded with that
+    /// generation, and otherwise is refused and changes nothing; a release wipes the key and
+    /// advances the generation by one, or retires the slot when the generation runs out; no call
+    /// panics or overflows.
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn a_handle_releases_only_a_matching_loaded_slot() {
+        let mut memory = [any_slot(), any_slot()];
+        let id = memory.as_ptr().addr();
+        let mut slots = Slots { slots: &mut memory };
+
+        if kani::any() {
+            let before = [snapshot(&slots.slots[0]), snapshot(&slots.slots[1])];
+            let first_free = before
+                .iter()
+                .position(|&(state, _, _)| state == State::Free);
+            let mut source: [u8; KEY_LEN] = kani::any();
+            let original = source;
+            match (slots.import(&mut source), first_free) {
+                (Ok(handle), Some(index)) => {
+                    assert!(handle.index == index && handle.generation == before[index].1);
+                    assert!(source == [0; KEY_LEN]);
+                    let slot = &slots.slots[index];
+                    assert!(slot.state == State::Loaded && slot.generation == before[index].1);
+                    assert!(key(slot) == original);
+                    assert!(unchanged_except(&slots, &before, index));
+                    kani::cover!(true, "a key is imported");
+                }
+                (Err(error), None) => {
+                    assert!(error == Error::NoFreeSlot && source == original);
+                    kani::cover!(true, "no slot is free");
+                }
+                _ => panic!("import disagrees with the free slots"),
+            }
+        }
+
+        let forged = Handle {
+            slots: id,
+            index: kani::any(),
+            generation: kani::any(),
+            memory: PhantomData,
+        };
+        let before = [snapshot(&slots.slots[0]), snapshot(&slots.slots[1])];
+        kani::cover!(
+            before.iter().all(|&(state, _, _)| state == State::Loaded),
+            "both slots hold a key when the handle arrives"
+        );
+        kani::cover!(
+            before[0].0 == State::Free,
+            "the first slot is free when the handle arrives"
+        );
+        let target = before.get(forged.index).filter(|&&(state, generation, _)| {
+            state == State::Loaded && generation == forged.generation
+        });
+        let result = slots.release(forged);
+        match target {
+            Some(&(_, generation, _)) => {
+                assert!(result == Ok(()));
+                let slot = &slots.slots[forged.index];
+                assert!(key(slot) == [0; KEY_LEN]);
+                if generation == u64::MAX {
+                    assert!(slot.state == State::Retired);
+                    kani::cover!(true, "a slot is retired when its generation runs out");
+                } else {
+                    assert!(
+                        slot.state == State::Free
+                            && Some(slot.generation) == generation.checked_add(1)
+                    );
+                    kani::cover!(true, "a release advances the generation by one");
+                }
+                assert!(unchanged_except(&slots, &before, forged.index));
+            }
+            None => {
+                assert!(result == Err(Error::StaleHandle));
+                assert!(snapshot(&slots.slots[0]) == before[0]);
+                assert!(snapshot(&slots.slots[1]) == before[1]);
+                kani::cover!(
+                    before.iter().any(|&(state, _, _)| state == State::Loaded),
+                    "a handle is refused while a key is loaded"
+                );
+            }
+        }
+    }
+}

@@ -30,6 +30,10 @@ macro_rules! assert_not_impl {
     };
 }
 
+// Under Kani the wipe is plain stores, so zeroize goes unused there.
+#[cfg(kani)]
+use zeroize as _;
+
 mod error;
 mod key;
 mod slots;

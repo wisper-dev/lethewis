@@ -26,6 +26,8 @@ categories = ["cryptography", "no-std"]
 # these lints and must declare its own, with a written reason in front of every block.
 unsafe_code = "forbid"
 unreachable_pub = "deny"
+# Kani sets cfg(kani) when it compiles the proofs.
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(kani)"] }
 unused_qualifications = "deny"
 # missing_docs and unused_crate_dependencies are declared in the crates themselves, not here: from
 # the workspace they also apply to tests, where no integration test can compile: a test is not

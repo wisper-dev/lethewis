@@ -20,5 +20,8 @@ Nothing is published while the version is below 0.1.0.
   every key is wiped when its `Slots` is created or dropped.
 - Dependency: `zeroize` 1.9.0, without default features.
 - Builds without the standard library and without a memory allocator.
+- Proofs with Kani 0.68.0 for the slots: a released key is wiped and its handle refused, creating a
+  set wipes the keys left in its memory, a handle from another set is refused, a release advances
+  the generation, no call panics. Run on every change; see `docs/proofs.md`.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

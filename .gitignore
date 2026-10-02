@@ -11,6 +11,9 @@
 # Mutation testing reports
 /mutants.out*/
 
+# Written by the proof listing before it is moved under target/
+/kani-list.json
+
 # Proof and fuzzing artefacts
 /fuzz/target/
 /fuzz/corpus/
