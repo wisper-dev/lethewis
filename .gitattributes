@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# One line ending everywhere, in the repository and in the working tree. Without this a clone on
+# Windows converts every file and the formatting check fails on work that is correct.
+* text=auto eol=lf
+
+# Two spaces at the end of a line are a line break in Markdown, not stray whitespace. Conflict
+# markers are still reported.
+*.md whitespace=-trailing-space

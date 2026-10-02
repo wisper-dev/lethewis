@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+name: Suggestion
+description: Functionality the library does not cover yet
+labels: ["suggestion"]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need
+      description: The problem you are solving, not the implementation you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: What you do now
+      description: How the problem is handled without this library, if at all.
+    validations:
+      required: false

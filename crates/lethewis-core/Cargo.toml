@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "lethewis-core"
+description = "Key derivation, hierarchy, lifecycle and destruction. Pure logic: no system, no network, no filesystem."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+# Nothing here is ready to be published. Removing this line is a deliberate act, not an oversight,
+# and it is done once per crate rather than left off by default.
+publish = false
+
+# The licence travels with the crate: a published AGPL crate without its licence text would be an
+# empty gesture. LICENSE here is a symlink to the one at the workspace root, so there is one source
+# of truth; cargo resolves it when packaging.
+# Only what belongs to the crate. The lint, dependency and toolchain settings live at the workspace
+# root, outside this directory, and are read from the repository rather than from the package.
+include = ["src/**/*", "README.md", "LICENSE"]
+
+[lints]
+workspace = true

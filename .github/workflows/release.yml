@@ -1,0 +1,225 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Publishing happens here and nowhere else, never from a personal machine: no long-lived publishing
+# credential exists. Triggered by a signed tag on a commit already in main, so the content has been
+# through the pull-request gate. Tag rules forbid moving or deleting that tag.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions: {}
+
+# An in-flight release is never cancelled: cargo publish is not atomic, and a published version
+# cannot be deleted, only yanked.
+# Without this, GitHub runs each step as `bash -e`, where a failing command in a pipeline is
+# reported as success. `shell: bash` means `bash --noprofile --norc -eo pipefail`.
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: The tag says what the code says
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: The tag matches the version in the manifest
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Every crate shares one version, and that is verified rather than assumed: taking the
+          # first package's version would silently accept a workspace that had drifted apart.
+          versions=$(cargo metadata --no-deps --format-version 1 --locked |
+            jq -r '.packages[].version' | sort -u)
+          if [ "$(printf '%s\n' "$versions" | wc -l)" -ne 1 ]; then
+            echo "::error::crates do not share one version: $(printf '%s ' "$versions")"
+            exit 1
+          fi
+          if [ "v$versions" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match version $versions in the manifests"
+            exit 1
+          fi
+
+      - name: The tag is annotated and signed
+        # Asked of GitHub, which holds the account's keys, rather than trusted from the tag as it
+        # arrived.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          kind=$(git cat-file -t "$TAG")
+          if [ "$kind" != tag ]; then
+            echo "::error::$TAG is a lightweight tag; a release needs an annotated, signed tag"
+            exit 1
+          fi
+          verified=$(gh api "repos/$REPO/git/refs/tags/$TAG" --jq '.object.sha' |
+            xargs -I{} gh api "repos/$REPO/git/tags/{}" --jq '.verification.verified')
+          if [ "$verified" != true ]; then
+            reason=$(gh api "repos/$REPO/git/refs/tags/$TAG" --jq '.object.sha' |
+              xargs -I{} gh api "repos/$REPO/git/tags/{}" --jq '.verification.reason')
+            echo "::error::the signature on $TAG is not verified ($reason)"
+            exit 1
+          fi
+
+      - name: Every crate is actually publishable
+        run: |
+          # cargo publish exits 0 when every package has publishing disabled, printing only a
+          # warning. Without this check the whole release would succeed (attestation, GitHub
+          # release, changelog) while nothing reached the registry.
+          blocked=$(cargo metadata --no-deps --format-version 1 --locked |
+            jq -r '.packages[] | select(.publish == []) | .name' | tr '\n' ' ')
+          if [ -n "${blocked// /}" ]; then
+            echo "::error::publishing is disabled for: $blocked. Remove publish = false first"
+            exit 1
+          fi
+
+      - name: The tag sits on a commit that is in main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          git fetch --quiet origin main
+          git merge-base --is-ancestor "$TAG^{commit}" origin/main ||
+            { echo "::error::the tagged commit is not in main; it never passed the gate"; exit 1; }
+
+      - name: The changelog has an entry for this version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#v}
+          grep -q "^## \[${version}\]" CHANGELOG.md ||
+            { echo "::error::CHANGELOG.md has no released section for ${version}"; exit 1; }
+
+      - name: Everything still passes
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --all-features --locked
+          cargo test --workspace --all-features --locked
+
+      - name: Software bill of materials
+        run: |
+          # Built here, in a job without id-token, rather than in the publishing job: installing a
+          # tool runs its build scripts, and in the publishing job that code could obtain a
+          # registry token. Pinned to an exact version for the same reason.
+          cargo install cargo-cyclonedx --locked --version 0.5.9
+          cargo cyclonedx --all --format json
+          mkdir -p sbom
+          find . -name '*.cdx.json' -not -path './sbom/*' -exec cp {} sbom/ \;
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: sbom
+          retention-days: 7
+
+      - name: The public API broke nothing it did not mean to
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A linter, not a proof: it misses changes to field types, generics and lifetimes, and
+          # says nothing about a raised minimum compiler version. The version is pinned because an
+          # older release cannot read the rustdoc format of a current compiler.
+          cargo install cargo-semver-checks --locked --version 0.50.0
+          # Nothing to compare against until something has been published.
+          if cargo semver-checks --workspace 2>&1 | tee semver.log; then
+            echo "no breaking change found"
+          elif grep -q 'not found in registry' semver.log; then
+            echo "::notice::no published baseline yet, so compatibility could not be compared"
+          else
+            echo "::error::a breaking change was found; either bump the version or undo it"
+            exit 1
+          fi
+
+  publish:
+    name: Publish
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write # writes the GitHub release and attaches the crate and its bill of materials
+      id-token: write # exchanges GitHub's identity for a 30-minute crates.io token; the whole point
+      attestations: write # records provenance, so anyone can check what built these files
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Package
+        run: cargo package --workspace --locked
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sbom
+          path: sbom
+
+      - name: Collect the artefacts
+        run: |
+          mkdir -p dist
+          cp target/package/*.crate dist/
+          cp sbom/*.cdx.json dist/
+
+      - name: Prove where these files came from
+        # crates.io carries no provenance of its own. This attestation is checkable with
+        # `gh attestation verify`.
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      - name: Get a short-lived publishing token
+        id: auth
+        # Thirty minutes, revoked when the job ends, issued to this workflow only.
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          # The attestation above describes the archive built by `cargo package`. `cargo publish`
+          # builds its own, so the two are compared afterwards: if they differ, the provenance
+          # describes a file nobody received.
+          before=$(cd dist && sha256sum ./*.crate | sort)
+          cargo publish --workspace --locked
+          after=$(cd target/package && sha256sum ./*.crate | sort)
+          if [ "$before" != "$after" ]; then
+            echo "::error::the published archive differs from the attested one"
+            printf 'attested:\n%s\npublished:\n%s\n' "$before" "$after"
+            exit 1
+          fi
+
+      - name: GitHub release, with the changelog section as its text
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#v}
+          # The section for this version only: from its heading to the next one.
+          # Stops at the link definitions too: for the oldest section, which is the first release,
+          # awk otherwise ran to the end of the file and pulled them into the release text.
+          notes=$(awk -v v="## [$version]" '
+            index($0, v) == 1 { on = 1; next }
+            on && (/^## \[/ || /^\[/) { exit }
+            on { print }
+          ' CHANGELOG.md)
+          printf '%s\n' "$notes" > notes.md
+          gh release create "$TAG" --title "$TAG" --notes-file notes.md --verify-tag dist/*

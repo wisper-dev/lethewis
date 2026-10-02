@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Build outputs. Cargo.lock is deliberately NOT ignored: a binary that people rely on is built
+# from an exact dependency set, and the lockfile is what pins it.
+/target/
+**/*.rs.bk
+*.pdb
+
+# Proof and fuzzing artefacts
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+
+# Editors and systems
+.vscode/
+.idea/
+*.swp
+.DS_Store

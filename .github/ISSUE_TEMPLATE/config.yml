@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Blank issues are off so that a vulnerability cannot be filed as one by accident.
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/wisper-dev/lethewis/security/advisories/new
+    about: Report privately here, never as a public issue. See SECURITY.md for the timings.
+  - name: Question about the boundaries
+    url: https://github.com/wisper-dev/lethewis/blob/main/docs/threat-model.md
+    about: What is and is not defended against.

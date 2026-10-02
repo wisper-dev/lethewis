@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Lints denied in the workspace manifest are right for library code and wrong for tests: a test
+# unwraps, indexes and panics to state an expectation.
+
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = false
+allow-print-in-tests = true
+
+# The arithmetic lints have no in-tests setting, so a test module doing plain arithmetic opens with
+# #[allow(clippy::arithmetic_side_effects, clippy::integer_division)] and a reason.

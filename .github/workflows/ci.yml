@@ -1,0 +1,433 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# The gate on a pull request. Every check here runs on a clean machine over the full history of
+# the request, so nothing depends on how a contributor's own machine is set up. Nothing runs on a
+# push to main: the gate has already approved that content.
+
+name: CI
+
+on:
+  # Pull requests, plus a weekly run for the dependency jobs: those re-check unchanged code against
+  # an advisory database that has changed. A merge queue would need its own event here, and the jobs
+  # below would have to stop relying on a pull-request number; there is no queue on this repository.
+  pull_request:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+# No permissions by default. A job that needs one asks for it by itself.
+permissions: {}
+
+# Supersede an outdated run of the same pull request. Nothing cancels on main, which never runs.
+concurrency:
+  # The event name is part of the group so that a scheduled run and a pull-request run cannot
+  # cancel each other.
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Without this, GitHub runs each step as `bash -e`, where a failing command in a pipeline is
+# reported as success. `shell: bash` means `bash --noprofile --norc -eo pipefail`.
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rules:
+    name: Project rules
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # lists the pull request's commits, which is how signatures are verified
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The whole range of the pull request, so every commit in it is seen, not just the tip.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Every commit of this pull request is signed
+        # Asked of GitHub rather than verified locally: a runner holds none of our keys. The
+        # synthetic merge commit of a pull-request checkout is not in this list and not signed.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # The endpoint returns at most 250 commits, so a larger pull request would be only
+          # partly checked. Say so rather than let it pass quietly.
+          total=$(gh api "repos/$REPO/pulls/$PR" --jq '.commits')
+          if [ "$total" -gt 250 ]; then
+            echo "::error::$total commits in this pull request; only 250 can be checked. Split it"
+            exit 1
+          fi
+          unverified=$(gh api --paginate "repos/$REPO/pulls/$PR/commits" \
+            --jq '.[] | select(.commit.verification.verified | not) | "\(.sha) \(.commit.verification.reason)"')
+          if [ -n "$unverified" ]; then
+            echo "$unverified" | while read -r sha reason; do
+              echo "::error::$sha carries no verified signature ($reason)"
+            done
+            exit 1
+          fi
+
+      - name: English only, and no AI attribution
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # Without an explicit encoding a search by code point fails, and that failure reads as
+          # "no match": the check would switch itself off silently.
+          export LC_ALL=C.UTF-8
+          base=$(git rev-parse "origin/$BASE_REF")
+          cyrillic='[\x{0400}-\x{04FF}]'
+          # Attribution, not names: a plain list of names would reject legitimate words.
+          # Names are split across two quoted strings and the emoji given by code point: written
+          # literally, this file would contain what it forbids and fail its own check.
+          ai_products='cla''ude code|cla''ude\.ai|chat''gpt|copi''lot|cur''sor ai|ai-gener''ated|\x{1F916}'
+          ai_attrib='(co-?authored?|assisted|gener''ated|written|produced|created)[ -](by|with)[ -:]*(an? )?(ai\b|llm\b|language model|assistant\b|bot\b|cla''ude|anthro''pic|open''ai|chat''gpt|copi''lot|gem''ini\b)'
+          ai="$ai_products|$ai_attrib"
+          fail=0
+          # Read out of each commit file by file, never from a diff: a diff is blind to invalid
+          # UTF-8, to NUL bytes, to lines starting with "++ ", and to files marked -diff.
+          # Fields of a person, where a model name does not occur, so a plain list is enough.
+          ai_identity='cla''ude|anthro''pic|open''ai|chat''gpt|copi''lot|gem''ini|cur''sor|\[bot\]|bot@'
+          for commit in $(git rev-list "$base..HEAD"); do
+            ident=$(git log -1 --format='%an <%ae>|%cn <%ce>' "$commit")
+            if printf '%s' "$ident" | grep -qiP "$ai_identity"; then
+              echo "::error::author or committer of $commit names an AI: $ident"; fail=1
+            fi
+            message=$(git log -1 --format=%B "$commit")
+            if printf '%s' "$message" | grep -qP "$cyrillic"; then
+              echo "::error::Cyrillic in the message of $commit"; fail=1
+            fi
+            if printf '%s' "$message" | grep -qiP "$ai"; then
+              echo "::error::AI attribution in the message of $commit"; fail=1
+            fi
+            while IFS= read -r -d '' path; do
+              [ -n "$path" ] || continue
+              blob="$commit:$path"
+              git cat-file -e "$blob" 2>/dev/null || continue
+              size=$(git cat-file -s "$blob")
+              # A larger blob is rejected rather than skipped: skipping meant its contents were
+              # never examined, which is the opposite of what this check is for.
+              if [ "$size" -gt 524288 ]; then
+                echo "::error file=$path::$path in $commit is $size bytes, over the 524288 limit"
+                fail=1
+                continue
+              fi
+              without_nul=$(git cat-file blob "$blob" | tr -d '\0' | wc -c)
+              if [ "$size" = "$without_nul" ] &&
+                ! git cat-file blob "$blob" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+                echo "::error file=$path::not valid UTF-8; text in a single-byte encoding is not accepted"
+                fail=1
+                continue
+              fi
+              if [ "$(git cat-file blob "$blob" | grep -a -c -P -- "$cyrillic" || true)" != 0 ]; then
+                echo "::error file=$path::Cyrillic in $path ($commit)"; fail=1
+              fi
+              # ASCII only. Typographic characters such as an em dash add nothing and render
+              # differently across terminals and editors.
+              if [ "$(git cat-file blob "$blob" | grep -a -c -P -- '[^\x00-\x7F]' || true)" != 0 ]; then
+                echo "::error file=$path::non-ASCII character in $path ($commit)"; fail=1
+              fi
+              if [ "$(git cat-file blob "$blob" | grep -a -c -i -P -- "$ai" || true)" != 0 ]; then
+                echo "::error file=$path::AI attribution in $path ($commit)"; fail=1
+              fi
+              # --diff-merges=first-parent is required: without it this list is empty for a merge
+              # commit, so the loop never runs and text introduced while resolving a conflict is
+              # never examined.
+            done < <(git diff-tree -z --no-commit-id --name-only -r --diff-filter=ACMRT \
+              --diff-merges=first-parent "$commit")
+            # Names never appear as added lines, so they are checked separately.
+            while IFS= read -r -d '' path; do
+              [ -n "$path" ] || continue
+              if printf '%s' "$path" | grep -qP "$cyrillic"; then
+                echo "::error::Cyrillic in the file name $path ($commit)"; fail=1
+              fi
+            done < <(git diff-tree -z --no-commit-id --name-only -r --diff-filter=ACMRT \
+              --diff-merges=first-parent "$commit")
+          done
+          exit "$fail"
+
+      - name: No key files, build outputs or symlinks
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          base=$(git rev-parse "origin/$BASE_REF")
+          secret_names='(^|/)(id_rsa|id_ecdsa|id_ed25519|\.netrc|\.pgpass)$|(^|/)\.env$|\.(key|pem|p12|pfx|jks|keystore|ppk)$'
+          build_outputs='^(target|build|\.gradle|\.idea|node_modules)/|\.(o|so|dylib|rlib|rmeta|apk|aab|dex|jar|class|pyc|orig|rej)$'
+          fail=0
+          for commit in $(git rev-list "$base..HEAD"); do
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              mode=${line%% *}
+              path=${line#* }
+              if printf '%s' "$path" | grep -qiE "$secret_names"; then
+                echo "::error file=$path::looks like a key or secret file ($commit)"; fail=1
+              fi
+              if printf '%s' "$path" | grep -qiE "$build_outputs"; then
+                echo "::error file=$path::build output committed ($commit)"; fail=1
+              fi
+              case "$mode" in
+                120000)
+                  target=$(git cat-file blob "$commit:$path")
+                  case "$target" in
+                    /*) echo "::error file=$path::symlink to an absolute path: $target"; fail=1 ;;
+                    *..*) echo "::error file=$path::symlink leaving the repository: $target"; fail=1 ;;
+                  esac
+                  ;;
+                160000)
+                  echo "::error file=$path::submodules are not used in this project"; fail=1
+                  ;;
+              esac
+            done <<< "$(git ls-tree -r --full-tree "$commit" |
+              awk '{print $1 " " substr($0, index($0, $4))}')"
+          done
+          exit "$fail"
+
+      - name: Every source file carries its licence header
+        run: |
+          fail=0
+          tracked=$(git ls-files '*.rs' '*.sh' '*.kt' '*.kts' '*.toml' '*.yml' '*.yaml')
+          if [ -z "$tracked" ]; then
+            # A green step that examined nothing is worse than a red one.
+            echo "::error::no source files found to check; the listing must have failed"
+            exit 1
+          fi
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            if ! head -5 "$file" | grep -q 'SPDX-FileCopyrightText:'; then
+              echo "::error file=$file::missing SPDX-FileCopyrightText in the first five lines"; fail=1
+            fi
+            if ! head -5 "$file" | grep -q 'SPDX-License-Identifier:'; then
+              echo "::error file=$file::missing SPDX-License-Identifier in the first five lines"; fail=1
+            fi
+          done <<< "$tracked"
+          exit "$fail"
+
+      - name: The workflow files themselves are sound
+        run: |
+          # Pinned by exact version and checked by hash.
+          actionlint_version=1.7.12
+          actionlint_sha=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          curl -sSLo actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${actionlint_version}/actionlint_${actionlint_version}_linux_amd64.tar.gz"
+          echo "$actionlint_sha  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -color
+
+      - name: No secret in the history of this pull request
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The digest is checked against the checksum file published with the release.
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          # The file keeps its published name: sha256sum -c looks the name up in the checksum list.
+          curl -sSLo "$archive" "$base/$archive"
+          curl -sSLo checksums.txt "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep "$archive" checksums.txt | sha256sum -c -
+          # The checksum file travels from the same release as the archive, so on its own it proves
+          # only internal consistency. Provenance is what ties the file to the build that made it.
+          gh attestation verify "$archive" --repo gitleaks/gitleaks ||
+            echo "::warning::gitleaks publishes no provenance; the digest above is the only check"
+          tar -xzf "$archive" gitleaks
+          ./gitleaks git --no-banner --redact --log-level warn .
+
+      - name: The workflow files hide no weakness
+        env:
+          # Pinned exactly. The download is checked twice: its digest against the value recorded
+          # here, and its provenance against the build that produced it, which is the stronger of
+          # the two, since a digest file travels from the same server as the binary it describes.
+          ZIZMOR_VERSION: 1.30.1
+          ZIZMOR_SHA: e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -sSLo zizmor.tar.gz \
+            "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "$ZIZMOR_SHA  zizmor.tar.gz" | sha256sum -c -
+          gh attestation verify zizmor.tar.gz --repo zizmorcore/zizmor
+          tar -xzf zizmor.tar.gz
+          # Catches an action pinned to a tag rather than a commit, and shell injection through
+          # values a fork controls.
+          # Online: the audit that catches a forged action pin needs network and a token.
+          GH_TOKEN="$GH_TOKEN" ./zizmor --persona=pedantic .github/workflows
+
+      - name: Every workflow sets a shell that reports pipeline failures
+        run: |
+          # The default shell reports a failing command in a pipeline as success. Checking the
+          # setting is exact; searching the text for pipelines is not, and rejected legitimate ones.
+          fail=0
+          for file in .github/workflows/*.yml; do
+            if ! grep -qzP 'defaults:\n  run:\n    shell: bash' "$file"; then
+              echo "::error file=$file::needs defaults.run.shell: bash at the top level"
+              fail=1
+            fi
+          done
+          exit "$fail"
+
+  build:
+    name: Build and lint
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml pins the version; rustup no longer installs it on its own.
+      - name: Install the pinned toolchain, and show what it is
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked
+
+      - name: Build
+        run: cargo build --workspace --all-features --locked
+
+      - name: Documentation builds, and its links resolve
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --all-features --locked
+
+  test:
+    name: Tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        # rustup no longer installs the pinned toolchain on its own.
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Tests
+        run: cargo test --workspace --all-features --locked
+
+  reproducible:
+    name: Builds the same twice
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        # rustup no longer installs the pinned toolchain on its own.
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # Two different directories catch a build path baked into the artefact. The compiler bakes
+      # one in unless remapped; `trim-paths` in the profile is not stabilised in 1.99.0.
+      - name: Build in two directories and compare
+        run: |
+          only_tracked() {
+            git -C "$GITHUB_WORKSPACE" ls-files -z | xargs -0 -I{} cp --parents {} "$1"/
+          }
+          for dir in /tmp/build-a /tmp/build-b; do
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            only_tracked "$dir"
+            (
+              cd "$dir"
+              RUSTFLAGS="-D warnings --remap-path-prefix=$dir=/build --remap-path-prefix=$HOME/.cargo=/cargo" \
+                cargo build --release --workspace --all-features --locked
+            )
+          done
+          list() {
+            find "$1/target/release" -maxdepth 1 -type f \
+              \( -name '*.rlib' -o -name '*.a' -o -name '*.so' -o -name '*.dylib' -o -executable \) \
+              -printf '%P\n' | sort
+          }
+          names_a=$(list /tmp/build-a)
+          names_b=$(list /tmp/build-b)
+          if [ -z "$names_a" ]; then
+            # Never pass quietly for lack of something to compare.
+            echo "::error::no artefact found in target/release, so reproducibility was not measured"
+            exit 1
+          fi
+          if [ "$names_a" != "$names_b" ]; then
+            echo "::error::the two builds produced different sets of artefacts"
+            exit 1
+          fi
+          mismatch=0
+          while IFS= read -r name; do
+            a=$(sha256sum "/tmp/build-a/target/release/$name" | cut -d' ' -f1)
+            b=$(sha256sum "/tmp/build-b/target/release/$name" | cut -d' ' -f1)
+            if [ "$a" != "$b" ]; then
+              echo "::error::$name differs between the two builds ($a vs $b)"
+              mismatch=1
+            fi
+          done <<< "$names_a"
+          exit "$mismatch"
+
+  dependencies:
+    name: Advisories, licences, sources
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # From source with the tool's own lockfile, to keep a third-party action out of the build.
+      - name: Install the tools
+        run: |
+          cargo install cargo-deny --locked --version 0.20.2
+          cargo install cargo-machete --locked --version 0.9.2
+
+      - name: Advisories, licences and sources
+        run: cargo deny --all-features check
+
+      - name: Unused dependencies
+        run: cargo machete
+
+  lockfile:
+    name: Lockfile is honest
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # --locked fails if the lockfile would have to change.
+      - name: The lockfile needs no change
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: The lockfile is committed
+        run: |
+          test -f Cargo.lock || { echo "::error::Cargo.lock is missing from the repository"; exit 1; }
+          if git check-ignore -q Cargo.lock; then
+            echo "::error::Cargo.lock is ignored; a binary people rely on needs an exact dependency set"
+            exit 1
+          fi

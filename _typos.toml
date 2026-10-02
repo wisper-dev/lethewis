@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Spell-check settings for the typos checker.
+
+[default.extend-words]
+# The author's surname, present in the copyright line of every source file.
+Wisper = "Wisper"
+# Part of the project name.
+Lethe = "Lethe"

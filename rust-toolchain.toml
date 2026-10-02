@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# The compiler is pinned to an exact version, never to a channel: a reproducible build and a
+# proof that holds both depend on the exact toolchain. Update as a separate, deliberate step,
+# together with the proof tools.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

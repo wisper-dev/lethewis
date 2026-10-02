@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Dependency gate, run on every change. Three jobs: keep known vulnerabilities out, keep the
+# licence set clean enough that a commercial licence can still be sold, and keep the dependency
+# set small and sourced only from the main registry.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# "workspace" rather than "all": one abandoned transitive dependency would otherwise block every
+# merge, although it is not ours to replace. What is checked is what was chosen here.
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive only. Our own code is AGPL, which is ours to relicense; a single GPL or AGPL
+# dependency would remove that freedom and with it the commercial licence.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "CC0-1.0",
+  "Unlicense",
+  # File-level copyleft: acceptable, since their own files are not modified here.
+  "MPL-2.0",
+]
+confidence-threshold = 0.95
+unused-allowed-license = "allow"
+
+# Our own crates are AGPL and are listed by name: adding AGPL to the allow list above would also
+# admit someone else's AGPL dependency, which must stay refused.
+[[licenses.exceptions]]
+name = "lethewis-core"
+allow = ["AGPL-3.0-only"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+external-default-features = "warn"
+# Nothing here yet. Crates that must never appear go in this list with a reason, for example a
+# library with an unfixed advisory or a reimplementation of a primitive we already depend on.
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The main registry only. A git dependency or a private registry would put code in the build that
+# no advisory database watches.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
