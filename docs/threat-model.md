@@ -56,15 +56,18 @@ reach.
 **Capability.** Another application, possibly with elevated privileges.
 
 **In place.** Keys are held only in fixed-size slots whose memory the caller provides, and no call
-returns a key. A key is wiped when it is released, and every key is wiped when its set of slots is
-dropped. The wipe on release and on creating a set, and the refusal of a released or foreign
-handle, are proven for two slots; the statements and their limits are in [proofs.md](proofs.md).
+returns a key. A new key is written straight into its slot from the platform's random source, and
+the library makes no copy of it; if the source fails or panics halfway, the slot is wiped. A key is
+wiped when it is released, and every key is wiped when its set of slots is dropped. The wipe on
+release and on creating a set, and the refusal of a released or foreign handle, are proven for two
+slots; the statements and their limits are in [proofs.md](proofs.md).
 
 **Intended.** Drop keys from memory when the device locks.
 
 **Not defended.** Copies left by a value move, a buffer reallocation, a CPU register, swap, or a crash
-dump. A set of slots leaked instead of dropped keeps its keys in memory. A system component with
-elevated privileges is outside what process isolation provides.
+dump. A set of slots leaked instead of dropped keeps its keys in memory. A copy of a new key kept by
+the platform's random source. A system component with elevated privileges is outside what process
+isolation provides.
 
 ### 5. The supply chain
 
@@ -93,6 +96,8 @@ reintroduce a leak after a check has passed.
 3. The owner's password is not known to the adversary and is not trivially guessable. Password
    strength is the application's responsibility; the library only makes guessing slow.
 4. The third-party cryptographic primitives are sound. They are not proven here.
+5. The platform's random source is cryptographically secure. The library does not test its
+   output.
 
 ## Known gaps
 

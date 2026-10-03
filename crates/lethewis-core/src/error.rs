@@ -11,6 +11,8 @@ pub enum Error {
     NoFreeSlot,
     /// The handle does not refer to a key held now.
     StaleHandle,
+    /// The source of random bytes failed.
+    EntropyFailed,
 }
 
 impl fmt::Display for Error {
@@ -18,6 +20,7 @@ impl fmt::Display for Error {
         f.write_str(match self {
             Self::NoFreeSlot => "no free slot",
             Self::StaleHandle => "stale handle",
+            Self::EntropyFailed => "random source failed",
         })
     }
 }
@@ -36,5 +39,6 @@ mod tests {
     fn display_names_the_failure() {
         assert_eq!(Error::NoFreeSlot.to_string(), "no free slot");
         assert_eq!(Error::StaleHandle.to_string(), "stale handle");
+        assert_eq!(Error::EntropyFailed.to_string(), "random source failed");
     }
 }

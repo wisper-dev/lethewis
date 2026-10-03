@@ -34,10 +34,12 @@ macro_rules! assert_not_impl {
 #[cfg(kani)]
 use zeroize as _;
 
+mod entropy;
 mod error;
 mod key;
 mod slots;
 
+pub use entropy::{Entropy, EntropyError};
 pub use error::Error;
-pub use key::KEY_LEN;
+pub use key::KeyLength;
 pub use slots::{Handle, Slot, Slots};
