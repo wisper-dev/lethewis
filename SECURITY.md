@@ -49,6 +49,7 @@ private report before publication.
 - Residue in flash memory readable only by desoldering the chip.
 - Any device whose keys are already in memory because it was unlocked after boot.
 - Copies of a secret left by a value move, a buffer reallocation, a register, swap or a crash dump.
+- A weak random source supplied by the caller, and copies of its output that the source keeps.
 - Weaknesses in third-party dependencies. Report those to their maintainers, and here as well, so
   the dependency can be pinned or replaced.
 
