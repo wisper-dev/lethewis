@@ -27,5 +27,8 @@ Nothing is published while the version is below 0.1.0.
   set wipes the keys left in its memory, a handle from another set is refused, a release advances
   the generation, no call panics unless the caller's random source does. Run on every change; see
   `docs/proofs.md`.
+- Proofs with Kani 0.68.0 for the plaintext layout of a key record: parsing accepts exactly the
+  bytes building can write, building puts every field at its offset, and each returns what the
+  other was given.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

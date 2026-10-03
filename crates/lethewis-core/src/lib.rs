@@ -37,6 +37,8 @@ use zeroize as _;
 mod entropy;
 mod error;
 mod key;
+#[cfg_attr(not(any(test, kani)), expect(dead_code))]
+mod record;
 mod slots;
 
 pub use entropy::{Entropy, EntropyError};

@@ -6,7 +6,7 @@ use core::fmt;
 use crate::entropy::{Entropy, EntropyError};
 
 /// The size of the buffer behind every key, in bytes: the longest key a slot holds.
-const CAPACITY: usize = 64;
+pub(crate) const CAPACITY: usize = 64;
 
 /// How long a key is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,10 +98,49 @@ impl Key {
     pub(crate) const fn bytes(&self) -> &[u8; CAPACITY] {
         &self.bytes
     }
+}
 
-    #[cfg(any(test, kani))]
+#[cfg_attr(not(any(test, kani)), expect(dead_code))]
+impl Key {
     pub(crate) const fn length(&self) -> KeyLength {
         self.length
+    }
+
+    /// Writes the key into `dest`, followed by zeros up to the capacity.
+    pub(crate) fn write_into(&self, dest: &mut [u8; CAPACITY]) {
+        dest.copy_from_slice(&self.bytes);
+    }
+}
+
+/// Key bytes borrowed from a buffer, with the length they hold. They can only be loaded into a
+/// [`Key`], and loading leaves the buffer as it is.
+#[cfg_attr(not(any(test, kani)), expect(dead_code))]
+pub(crate) struct KeyBytes<'a> {
+    bytes: &'a [u8; CAPACITY],
+    length: KeyLength,
+}
+
+#[cfg_attr(not(any(test, kani)), expect(dead_code))]
+impl<'a> KeyBytes<'a> {
+    pub(crate) const fn new(bytes: &'a [u8; CAPACITY], length: KeyLength) -> Self {
+        Self { bytes, length }
+    }
+
+    /// Loads as many of the bytes as the length into `key`; the rest of `key` is zero.
+    pub(crate) fn load_into(self, key: &mut Key) {
+        key.wipe();
+        match self.length {
+            KeyLength::Bytes32 => {
+                if let (Some((head, _)), Some((from, _))) = (
+                    key.bytes.split_first_chunk_mut::<32>(),
+                    self.bytes.split_first_chunk::<32>(),
+                ) {
+                    head.copy_from_slice(from);
+                }
+            }
+            KeyLength::Bytes64 => key.bytes.copy_from_slice(self.bytes),
+        }
+        key.length = self.length;
     }
 }
 
@@ -150,9 +189,10 @@ pub(crate) mod tests {
     use core::{fmt, hash::Hash};
     use std::format;
 
-    use super::{CAPACITY, Entropy, EntropyError, Key, KeyLength};
+    use super::{CAPACITY, Entropy, EntropyError, Key, KeyBytes, KeyLength};
 
     assert_not_impl!(Key: Clone, PartialEq, Hash, Default, fmt::Display);
+    assert_not_impl!(KeyBytes<'static>: Clone, PartialEq, Hash, fmt::Debug, fmt::Display);
 
     /// Writes 1, 2, 3, ... into every buffer it fills.
     pub(crate) struct Counting;
@@ -252,6 +292,33 @@ pub(crate) mod tests {
         assert_eq!(key.bytes(), &[5; 64]);
         assert_eq!(key.length(), KeyLength::Bytes64);
         assert_eq!(source, [0; 64]);
+    }
+
+    #[test]
+    fn write_into_writes_the_key_and_zeros() {
+        let mut key = Key::empty();
+        key.load32(&mut counted::<32>());
+        let mut dest = [9; CAPACITY];
+        key.write_into(&mut dest);
+        assert_eq!(dest, padded(&counted::<32>()));
+
+        key.load64(&mut counted::<64>());
+        key.write_into(&mut dest);
+        assert_eq!(dest, counted::<64>());
+    }
+
+    #[test]
+    fn loading_borrowed_bytes_takes_as_many_as_the_length() {
+        let source = counted::<64>();
+        let mut key = Key::empty();
+        key.load64(&mut [5; 64]);
+        KeyBytes::new(&source, KeyLength::Bytes32).load_into(&mut key);
+        assert_eq!(key.bytes(), &padded(&counted::<32>()));
+        assert_eq!(key.length(), KeyLength::Bytes32);
+
+        KeyBytes::new(&source, KeyLength::Bytes64).load_into(&mut key);
+        assert_eq!(key.bytes(), &counted::<64>());
+        assert_eq!(key.length(), KeyLength::Bytes64);
     }
 
     #[test]
