@@ -643,13 +643,19 @@ mod proofs {
             let result = slots.import32(&mut source);
             let mut bytes = [0; 64];
             bytes[..32].copy_from_slice(&original);
-            assert!(source == if result.is_ok() { [0; 32] } else { original });
+            kani::assert(
+                source == if result.is_ok() { [0; 32] } else { original },
+                "an import wipes its source exactly when it succeeds",
+            );
             (result, bytes, KeyLength::Bytes32)
         } else {
             let mut source: [u8; 64] = kani::any();
             let original = source;
             let result = slots.import64(&mut source);
-            assert!(source == if result.is_ok() { [0; 64] } else { original });
+            kani::assert(
+                source == if result.is_ok() { [0; 64] } else { original },
+                "an import wipes its source exactly when it succeeds",
+            );
             (result, original, KeyLength::Bytes64)
         };
         let result = result.map(|handle| Handle {
@@ -678,26 +684,41 @@ mod proofs {
             let result = slots.import32(&mut source);
             let mut bytes = [0; 64];
             bytes[..32].copy_from_slice(&original);
-            assert!(source == if result.is_ok() { [0; 32] } else { original });
+            kani::assert(
+                source == if result.is_ok() { [0; 32] } else { original },
+                "an import wipes its source exactly when it succeeds",
+            );
             (result, bytes, KeyLength::Bytes32)
         } else if way % 3 == 1 {
             let mut source: [u8; 64] = kani::any();
             let original = source;
             let result = slots.import64(&mut source);
-            assert!(source == if result.is_ok() { [0; 64] } else { original });
+            kani::assert(
+                source == if result.is_ok() { [0; 64] } else { original },
+                "an import wipes its source exactly when it succeeds",
+            );
             (result, original, KeyLength::Bytes64)
         } else {
             let length = any_length();
             let result = slots.generate(length, &mut entropy);
             if result == Err(Error::NoFreeSlot) {
-                assert!(entropy.calls == 0);
+                kani::assert(entropy.calls == 0, "a full set asks the source for nothing");
             } else {
-                assert!(entropy.calls == 1 && entropy.requested == length.bytes());
-                assert!(result.is_ok() == !entropy.failed);
+                kani::assert(
+                    entropy.calls == 1 && entropy.requested == length.bytes(),
+                    "the source is asked once, for the length of the key",
+                );
+                kani::assert(
+                    result.is_ok() == !entropy.failed,
+                    "a generation succeeds exactly when the source does",
+                );
             }
             if let Ok(handle) = result {
                 let buffer = slot_at(slots, handle.index).key.bytes().as_ptr().addr();
-                assert!(entropy.at == buffer);
+                kani::assert(
+                    entropy.at == buffer,
+                    "the source writes straight into the buffer of the slot",
+                );
             }
             if result == Err(Error::EntropyFailed) {
                 kani::cover!(true, "the platform source fails");
@@ -744,7 +765,10 @@ mod proofs {
                         kani::cover!(true, "a key is loaded");
                     }
                     Err(error) => {
-                        assert!(error == Error::NoFreeSlot);
+                        kani::assert(
+                            error == Error::NoFreeSlot,
+                            "an import fails only with NoFreeSlot",
+                        );
                         kani::cover!(true, "an import finds no free slot");
                     }
                 }
@@ -756,12 +780,18 @@ mod proofs {
                     let reused = slot_at(&slots, handle.index).state == State::Loaded;
                     let result = slots.release(handle);
                     if live[pick] {
-                        assert!(result == Ok(()));
-                        assert!(key(slot_at(&slots, handle.index)) == [0; 64]);
+                        kani::assert(result == Ok(()), "a live handle releases its key");
+                        kani::assert(
+                            key(slot_at(&slots, handle.index)) == [0; 64],
+                            "a released key is zero at once",
+                        );
                         live[pick] = false;
                         kani::cover!(true, "a live key is released");
                     } else {
-                        assert!(result == Err(Error::StaleHandle));
+                        kani::assert(
+                            result == Err(Error::StaleHandle),
+                            "a released handle is refused",
+                        );
                         kani::cover!(
                             reused,
                             "a released handle is refused while its slot holds a new key"
@@ -773,8 +803,14 @@ mod proofs {
             for (entry, is_live) in issued.iter().zip(live) {
                 if let (Some((handle, expected, length)), true) = (entry, is_live) {
                     let slot = slot_at(&slots, handle.index);
-                    assert!(slot.state == State::Loaded && slot.generation == handle.generation);
-                    assert!(key(slot) == *expected && slot.key.length() == *length);
+                    kani::assert(
+                        slot.state == State::Loaded && slot.generation == handle.generation,
+                        "the slot of a live handle is loaded with its generation",
+                    );
+                    kani::assert(
+                        key(slot) == *expected && slot.key.length() == *length,
+                        "a live handle reaches exactly its own key",
+                    );
                 }
             }
         }
@@ -805,9 +841,18 @@ mod proofs {
             "the foreign handle names a loaded slot and its generation"
         );
 
-        assert!(slots.release(foreign) == Err(Error::StaleHandle));
-        assert!(snapshot(&slots.slots[0]) == before[0]);
-        assert!(snapshot(&slots.slots[1]) == before[1]);
+        kani::assert(
+            slots.release(foreign) == Err(Error::StaleHandle),
+            "a handle from other slots is refused",
+        );
+        kani::assert(
+            snapshot(&slots.slots[0]) == before[0],
+            "the first slot is unchanged",
+        );
+        kani::assert(
+            snapshot(&slots.slots[1]) == before[1],
+            "the second slot is unchanged",
+        );
     }
 
     /// A slot in any state and with any generation whose buffer holds a key of any bytes and either
@@ -842,8 +887,11 @@ mod proofs {
         );
         let slots = Slots::new(&mut memory);
         for slot in slots.slots.iter() {
-            assert!(slot.state != State::Loaded);
-            assert!(key(slot) == [0; 64] && slot.key.length() == KeyLength::Bytes32);
+            kani::assert(slot.state != State::Loaded, "creating slots loads no slot");
+            kani::assert(
+                key(slot) == [0; 64] && slot.key.length() == KeyLength::Bytes32,
+                "creating slots wipes every buffer",
+            );
         }
     }
 
@@ -868,22 +916,41 @@ mod proofs {
                 .iter()
                 .position(|&(state, _, _, _)| state == State::Free);
             let (result, expected, length) = load_any(&mut slots);
-            match (result, first_free) {
-                (Ok(handle), Some(index)) => {
-                    let generation = snapshot_at(&before, index).1;
-                    assert!(handle.index == index && handle.generation == generation);
-                    let slot = slot_at(&slots, index);
-                    assert!(slot.state == State::Loaded && slot.generation == generation);
-                    assert!(key(slot) == expected && slot.key.length() == length);
-                    assert!(unchanged_except(&slots, &before, index));
-                    kani::cover!(length == KeyLength::Bytes32, "a short key is loaded");
-                    kani::cover!(length == KeyLength::Bytes64, "a long key is loaded");
-                }
-                (Err(Error::EntropyFailed), Some(_)) | (Err(Error::NoFreeSlot), None) => {
-                    assert!(unchanged_except(&slots, &before, 2));
-                    kani::cover!(first_free.is_none(), "no slot is free");
-                }
-                _ => panic!("the load disagrees with the free slots"),
+            kani::assert(
+                if first_free.is_some() {
+                    result.is_ok() || result == Err(Error::EntropyFailed)
+                } else {
+                    result == Err(Error::NoFreeSlot)
+                },
+                "no free slot gives NoFreeSlot, otherwise success or EntropyFailed",
+            );
+            if let (Ok(handle), Some(index)) = (result, first_free) {
+                let generation = snapshot_at(&before, index).1;
+                kani::assert(
+                    handle.index == index && handle.generation == generation,
+                    "a load takes the first free slot and issues its generation",
+                );
+                let slot = slot_at(&slots, index);
+                kani::assert(
+                    slot.state == State::Loaded && slot.generation == generation,
+                    "the slot is loaded and keeps its generation",
+                );
+                kani::assert(
+                    key(slot) == expected && slot.key.length() == length,
+                    "the slot holds exactly the key, zero past its length",
+                );
+                kani::assert(
+                    unchanged_except(&slots, &before, index),
+                    "a load changes no other slot",
+                );
+                kani::cover!(length == KeyLength::Bytes32, "a short key is loaded");
+                kani::cover!(length == KeyLength::Bytes64, "a long key is loaded");
+            } else {
+                kani::assert(
+                    unchanged_except(&slots, &before, 2),
+                    "a failed load changes no slot",
+                );
+                kani::cover!(first_free.is_none(), "no slot is free");
             }
         }
 
@@ -913,25 +980,44 @@ mod proofs {
         let result = slots.release(forged);
         match target {
             Some((_, generation, _, _)) => {
-                assert!(result == Ok(()));
+                kani::assert(result == Ok(()), "a matching handle releases its key");
                 let slot = slot_at(&slots, forged.index);
-                assert!(key(slot) == [0; 64] && slot.key.length() == KeyLength::Bytes32);
+                kani::assert(
+                    key(slot) == [0; 64] && slot.key.length() == KeyLength::Bytes32,
+                    "a release wipes the key",
+                );
                 if generation == u64::MAX {
-                    assert!(slot.state == State::Retired);
+                    kani::assert(
+                        slot.state == State::Retired,
+                        "a slot whose generation runs out is retired",
+                    );
                     kani::cover!(true, "a slot is retired when its generation runs out");
                 } else {
-                    assert!(
+                    kani::assert(
                         slot.state == State::Free
-                            && Some(slot.generation) == generation.checked_add(1)
+                            && Some(slot.generation) == generation.checked_add(1),
+                        "a release frees the slot and advances the generation by one",
                     );
                     kani::cover!(true, "a release advances the generation by one");
                 }
-                assert!(unchanged_except(&slots, &before, forged.index));
+                kani::assert(
+                    unchanged_except(&slots, &before, forged.index),
+                    "a release changes no other slot",
+                );
             }
             None => {
-                assert!(result == Err(Error::StaleHandle));
-                assert!(snapshot(&slots.slots[0]) == before[0]);
-                assert!(snapshot(&slots.slots[1]) == before[1]);
+                kani::assert(
+                    result == Err(Error::StaleHandle),
+                    "any other handle is refused",
+                );
+                kani::assert(
+                    snapshot(&slots.slots[0]) == before[0],
+                    "the first slot is unchanged",
+                );
+                kani::assert(
+                    snapshot(&slots.slots[1]) == before[1],
+                    "the second slot is unchanged",
+                );
                 kani::cover!(
                     before
                         .iter()

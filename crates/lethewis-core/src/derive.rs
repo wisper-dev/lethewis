@@ -326,11 +326,17 @@ mod proofs {
             (any_length(), any_branch(), kani::any());
         let a = label(Purpose::Wrap, length_a, branch_a, usize::from(out_a));
         let b = label(Purpose::Wrap, length_b, branch_b, usize::from(out_b));
-        let (Ok((bytes_a, used_a)), Ok((bytes_b, used_b))) = (a, b) else {
-            panic!("a label of a length that fits in two bytes is always built");
-        };
-        if (length_a, branch_a, out_a) != (length_b, branch_b, out_b) {
-            assert!(used_a != used_b || bytes_a[..used_a] != bytes_b[..used_b]);
+        kani::assert(
+            a.is_ok() && b.is_ok(),
+            "a label of an output length that fits in two bytes is always built",
+        );
+        if let (Ok((bytes_a, used_a)), Ok((bytes_b, used_b))) = (a, b)
+            && (length_a, branch_a, out_a) != (length_b, branch_b, out_b)
+        {
+            kani::assert(
+                used_a != used_b || bytes_a[..used_a] != bytes_b[..used_b],
+                "different derivations have different labels",
+            );
         }
         kani::cover!(branch_a != branch_b, "two branches");
         kani::cover!(

@@ -48,15 +48,19 @@ A proof covers one named statement under named assumptions. Keeping the claims a
 file is what keeps the distance between them visible.
 
 The build accepts a proof run only if the pinned Kani ran, every declared proof ran and succeeded,
-every proof has a cover property and reached all of them, every proof checks this repository's code,
-and Kani reported no check in that code as unreachable. Kani does not check whether an `assert!` is
-reachable in a crate without the standard library. Each check is judged by itself, and an unknown
-status is a failure. The build keeps the results and a manifest of the run with the tool versions.
+every proof lives in a module `proofs`, has a cover property and reached all of them, every proof
+checks this repository's code, every `kani::assert(` and `kani::cover!(` written out in the source
+is in the run, some proof reaches every region that Kani compiled of the code in the modules
+`proofs`, and Kani reported no check in this repository's code as unreachable. Each check is judged
+by itself, and an unknown status is a failure. The build keeps the results and a manifest of the run
+with the tool versions.
 
 ## Checked against deliberate errors
 
-Each error was introduced on purpose, and the proof run failed on an assertion or an unreached cover
-property, not on a compile error.
+Each error was introduced on purpose and was caught by the proof run or, where the table says so, by
+unit tests: on an assertion, an unreached cover property, an unreachable check, an assertion missing
+from the run, proof code that no proof reaches or a proof outside a module `proofs`, not on a
+compile error.
 
 | Error introduced | Caught by |
 |---|---|
@@ -109,3 +113,8 @@ property, not on a compile error.
 | a derivation label without the branch name, or without its length | no proof: the labels still differ while the two branch names differ in length; the unit tests that write the label out by hand catch it |
 | a bound of three calls instead of four | the run: a cover property in `a_handle_reaches_only_its_own_key` is not reached |
 | a cover property that cannot be reached | the run, although the tool itself reports success |
+| a `kani::assert` in a proof branch that is never reached | the run: Kani reports it unreachable, and no proof reaches the branch |
+| a `kani::assert` in a closure that never runs | the run: the assertion is not in it |
+| a proof outside a module `proofs` | the run, before Kani starts |
+| an `assert!` or an `unwrap` in a proof branch that is never reached | the run: no proof reaches the branch |
+| an `assert!` in a method of a type in a module `proofs`, in a branch that is never reached | the run: no proof reaches the branch |

@@ -358,7 +358,10 @@ mod proofs {
     fn parsing_accepts_exactly_what_building_can_write() {
         let bytes: [u8; PLAINTEXT_LEN] = kani::any();
         let accepted = parse(&bytes).is_ok();
-        assert!(accepted == writable(&bytes));
+        kani::assert(
+            accepted == writable(&bytes),
+            "parsing accepts exactly what the layout allows",
+        );
 
         let [version, purpose, length, status, ..] = bytes;
         let others_valid = version == 1 && purpose == 1 && status == 1;
@@ -422,16 +425,38 @@ mod proofs {
         } else {
             2
         };
-        assert!(out[..4] == [1, 1, length, status]);
-        assert!(out[4..20] == attributes.parent);
-        assert!(out[20..28] == attributes.epoch.to_le_bytes());
-        assert!(out[28..] == key.bytes()[..]);
+        kani::assert(
+            out[..4] == [1, 1, length, status],
+            "the control bytes are written as the layout says",
+        );
+        kani::assert(
+            out[4..20] == attributes.parent,
+            "the parent is written at its offset",
+        );
+        kani::assert(
+            out[20..28] == attributes.epoch.to_le_bytes(),
+            "the epoch is written at its offset, least significant byte first",
+        );
+        kani::assert(
+            out[28..] == key.bytes()[..],
+            "the key is written at its offset, zero past its length",
+        );
 
-        let (read_attributes, key_bytes) = parse(&out).unwrap();
-        let mut read_key = used_key();
-        key_bytes.load_into(&mut read_key);
-        assert!(read_attributes == attributes);
-        assert!(read_key.bytes() == key.bytes() && read_key.length() == key.length());
+        let parsed = parse(&out);
+        kani::assert(parsed.is_ok(), "what building writes parses");
+        // Not an `if let`: its failing path, ruled out above, would be proof code no proof reaches.
+        let _ = parsed.map(|(read_attributes, key_bytes)| {
+            let mut read_key = used_key();
+            key_bytes.load_into(&mut read_key);
+            kani::assert(
+                read_attributes == attributes,
+                "parsing gives back the attributes",
+            );
+            kani::assert(
+                read_key.bytes() == key.bytes() && read_key.length() == key.length(),
+                "parsing gives back the key and its length",
+            );
+        });
 
         kani::cover!(key.length() == KeyLength::Bytes32, "a short key");
         kani::cover!(key.length() == KeyLength::Bytes64, "a long key");
@@ -452,7 +477,10 @@ mod proofs {
         key_bytes.load_into(&mut key);
         let mut out: [u8; PLAINTEXT_LEN] = kani::any();
         build(&attributes, &key, &mut out);
-        assert!(out == bytes);
+        kani::assert(
+            out == bytes,
+            "a parsed record builds back to the same bytes",
+        );
 
         kani::cover!(key.length() == KeyLength::Bytes32, "a short key");
         kani::cover!(key.length() == KeyLength::Bytes64, "a long key");
