@@ -81,6 +81,9 @@ exactly 1.99.0, pinned in `rust-toolchain.toml`: a build that reproduces byte fo
 compiler rather than a channel. That pin is not part of the published package and does not constrain
 what a dependent builds with.
 
+How dependencies are reviewed, and which versions a dependent receives:
+[SECURITY.md](SECURITY.md#dependencies).
+
 ## Reporting and contributing
 
 - **Security:** report through the private advisory form, not as a public issue. Terms and

@@ -1,0 +1,51 @@
+
+# cargo-vet audits file
+
+[criteria.read-in-full]
+description = """
+Every file of the published archive that can be built into a dependent, namely the manifest, any
+build script, every source file and every file a source file includes with include_str! or
+include_bytes!, has been read in full, and the archive's checksum matches the lockfile. The review
+covered every unsafe block, build scripts, procedural macros, and access to the system, files and
+network, and, where the crate handles secrets, branches and memory accesses that depend on them.
+"""
+implies = "safe-to-deploy"
+
+[[audits.zeroize]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "1.9.0"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/barrier.rs, src/stack.rs, src/aarch64.rs, src/x86.rs.
+
+No build script (build = false). The optional dependencies serde and zeroize_derive, a procedural
+macro, are behind features this workspace leaves off. No access to the system, files or network.
+
+Path used here: Zeroize for [u8; N] (lib.rs:342) calls iter_mut().zeroize() (lib.rs:347); the impl
+for IterMut (lib.rs:354) then, for each byte, calls the DefaultIsZeroes impl (lib.rs:270):
+write_volatile of zero (lib.rs:736), then optimization_barrier on that byte. The loop covers every
+byte whatever its value; no branch and no memory access depends on the secret.
+
+Unsafe code, each use sound as read:
+- lib.rs:736: write_volatile through a &mut T.
+- lib.rs:748-764, volatile_set: dst.add(i) and write_volatile for i < count; every caller passes
+  count from the value's own length or size (lib.rs:387, 446, 472, 820).
+- lib.rs:387 and 403, Option<Z>: zeroes size_of::<Self>() bytes after take(), then writes None.
+- lib.rs:420 and 446, MaybeUninit: all-zero is a valid MaybeUninit.
+- lib.rs:481: str::as_bytes_mut; zero bytes are valid UTF-8.
+- lib.rs:568: String::as_mut_vec, behind the alloc feature, which is off here.
+- lib.rs:814, pub unsafe fn zeroize_flat_type: zeroes size_of::<F>() bytes at data, then passes
+  &data, the address of the pointer variable rather than the data, to the barrier. The volatile
+  writes are not removable regardless.
+- barrier.rs:68: an empty inline asm taking the value's address, options(readonly, preserves_flags,
+  nostack), on aarch64, arm, arm64ec, loongarch64, riscv32, riscv64, s390x, x86 and x86_64, except
+  under Miri.
+- barrier.rs:94: on other targets, wasm32 among them, core::hint::black_box of the reference plus
+  read_volatile of its first byte in an inline(never) function.
+- x86.rs:16 and aarch64.rs:13: core::mem::zeroed() for SIMD register types on those architectures;
+  all-zero is a valid value of each.
+
+README.md says the crate uses no inline assembly and relies on atomic fences; barrier.rs uses inline
+assembly on the architectures listed above, and no fence appears in the source.
+"""

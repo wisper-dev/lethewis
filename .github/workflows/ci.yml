@@ -200,7 +200,8 @@ jobs:
       - name: Every source file carries its licence header
         run: |
           fail=0
-          tracked=$(git ls-files '*.rs' '*.sh' '*.kt' '*.kts' '*.toml' '*.yml' '*.yaml')
+          tracked=$(git ls-files '*.rs' '*.sh' '*.py' '*.kt' '*.kts' '*.toml' '*.yml' '*.yaml' \
+            supply-chain/imports.lock)
           if [ -z "$tracked" ]; then
             # A green step that examined nothing is worse than a red one.
             echo "::error::no source files found to check; the listing must have failed"
@@ -208,10 +209,18 @@ jobs:
           fi
           while IFS= read -r file; do
             [ -n "$file" ] || continue
-            if ! head -5 "$file" | grep -q 'SPDX-FileCopyrightText:'; then
+            # The cargo-vet store rejects comments, so its three files carry the header in a sidecar
+            # named <file>.license, as the REUSE specification allows. Nowhere else.
+            header_file=$file
+            case "$file" in
+              supply-chain/audits.toml | supply-chain/config.toml | supply-chain/imports.lock)
+                header_file=$file.license
+                ;;
+            esac
+            if ! head -5 "$header_file" | grep -q 'SPDX-FileCopyrightText:'; then
               echo "::error file=$file::missing SPDX-FileCopyrightText in the first five lines"; fail=1
             fi
-            if ! head -5 "$file" | grep -q 'SPDX-License-Identifier:'; then
+            if ! head -5 "$header_file" | grep -q 'SPDX-License-Identifier:'; then
               echo "::error file=$file::missing SPDX-License-Identifier in the first five lines"; fail=1
             fi
           done <<< "$tracked"
@@ -281,6 +290,8 @@ jobs:
 
   build:
     name: Build and lint
+    # Nothing third-party is built before every version of it is known to be reviewed.
+    needs: lockfile
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -323,6 +334,7 @@ jobs:
 
   test:
     name: Tests
+    needs: lockfile
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -341,6 +353,7 @@ jobs:
 
   mutants:
     name: Every mutant is caught
+    needs: lockfile
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -368,6 +381,7 @@ jobs:
 
   proofs:
     name: Proofs hold
+    needs: lockfile
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -407,6 +421,7 @@ jobs:
 
   reproducible:
     name: Builds the same twice
+    needs: lockfile
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -482,9 +497,13 @@ jobs:
         run: |
           cargo install cargo-deny --locked --version 0.20.2
           cargo install cargo-machete --locked --version 0.9.2
+          cargo install cargo-vet --locked --version 0.10.2
 
       - name: Advisories, licences and sources
         run: cargo deny --all-features check
+
+      - name: The lower bounds in the manifests hold
+        run: scripts/minimal-versions.py
 
       - name: Unused dependencies
         run: cargo machete
@@ -514,3 +533,16 @@ jobs:
             echo "::error::Cargo.lock is ignored; a binary people rely on needs an exact dependency set"
             exit 1
           fi
+
+      - name: The lockfile of the no-allocator check matches the main one
+        run: scripts/lockfiles-agree.py
+
+      # From source with the tool's own lockfile, to keep a third-party action out of the build.
+      - name: Install cargo-vet
+        run: cargo install cargo-vet --locked --version 0.10.2
+
+      - name: Only our own reviews count, and every workspace crate asks for a reading in full
+        run: scripts/supply-chain-rules.py
+
+      - name: Every dependency is reviewed to the depth its use requires
+        run: cargo vet --locked --store-path supply-chain
