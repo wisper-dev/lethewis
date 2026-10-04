@@ -4,8 +4,9 @@
 
 # Runs every Kani proof and accepts the run only if the pinned Kani ran, every declared proof ran
 # and succeeded, every proof has a cover property and reached all of them, every proof checks code
-# in this repository, and no check in this repository's code was unreachable. Kani itself reports
-# success with an unreached cover property, so each check is judged here.
+# in this repository, and Kani reported no check in this repository's code as unreachable. Kani
+# does not check whether an `assert!` is reachable in a crate without the standard library, and it
+# reports success with an unreached cover property, so each check is judged here.
 # Writes the manifest of what was proven to target/proofs/manifest.json.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -15,7 +16,7 @@ source scripts/kani-pin.sh
 out=target/proofs
 results=$out/results.json
 mkdir -p "$out"
-rm -f "$out/declared.json" "$results" "$out/manifest.json"
+rm -f "$out/declared.json" "$results" "$out/manifest.json" "$out/files"
 
 cargo kani list --format json
 mv kani-list.json "$out/declared.json"
@@ -43,15 +44,17 @@ if [ "$declared" != "$ran" ]; then
 fi
 
 # Every check is judged by itself, not by a summary: a summary field that disappears in another Kani
-# version would read as zero and pass. A file is ours only if git tracks it: Kani also writes
-# relative paths for its own library and for built-in functions.
-tracked=$(git ls-files | jq -R . | jq -s .)
-problems=$(jq -r --argjson tracked "$tracked" '
+# version would read as zero and pass. A file is ours if git tracks it, or if it is new and neither
+# .gitignore nor .git/info/exclude ignores it: Kani also writes relative paths for its own library
+# and for built-in functions.
+git -c core.excludesFile=/dev/null ls-files -z --cached --others --exclude-standard >"$out/files"
+problems=$(jq -r --rawfile names "$out/files" '
   (.project.workspace_root // "") as $root
+  | ($names | split("\u0000") | map(select(. != ""))) as $files
   | def ours: (.location.file // "") as $file
       | (if $root != "" and ($file | startswith($root + "/"))
           then $file[($root | length) + 1:] else $file end) as $relative
-      | any($tracked[]; . == $relative);
+      | any($files[]; . == $relative);
   ["Success", "Failure", "Unreachable", "Satisfied", "Unsatisfiable", "Undetermined"] as $known
   | .verification_results.results[]
   | .harness_id as $proof

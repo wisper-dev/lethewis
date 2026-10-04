@@ -49,8 +49,9 @@ file is what keeps the distance between them visible.
 
 The build accepts a proof run only if the pinned Kani ran, every declared proof ran and succeeded,
 every proof has a cover property and reached all of them, every proof checks this repository's code,
-and no check in that code was unreachable. Each check is judged by itself, and an unknown status is a
-failure. The build keeps the results and a manifest of the run with the tool versions.
+and Kani reported no check in that code as unreachable. Kani does not check whether an `assert!` is
+reachable in a crate without the standard library. Each check is judged by itself, and an unknown
+status is a failure. The build keeps the results and a manifest of the run with the tool versions.
 
 ## Checked against deliberate errors
 
