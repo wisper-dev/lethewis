@@ -31,7 +31,9 @@ TESTS_ONLY = "safe-to-run"
 MEMBER_PREFIX = "lethewis-"
 TOOLCHAIN_KEYS = {"channel", "components", "targets", "profile"}
 # Crates that handle key material: every locked version read in full, never lowered in a policy.
-HANDLE_SECRETS = {"zeroize"}
+HANDLE_SECRETS = {
+    "block-buffer", "cmov", "ctutils", "digest", "hkdf", "hmac", "hybrid-array", "sha2", "zeroize",
+}
 
 
 def main() -> int:

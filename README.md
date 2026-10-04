@@ -47,7 +47,8 @@ password and the hardware secret at each unlock, and neither alone is enough.
   a file, and flash is not overwritten in place. A copy of the device made before the destruction is
   unaffected by it.
 - **Wiping a value from memory does not reach every copy.** A copy left by a value move, a buffer
-  reallocation, a CPU register, swap, or a crash dump is outside what this library can clear.
+  reallocation, a CPU register, swap, a crash dump, or by the hashing code on the stack is outside
+  what this library clears.
 - **Hardware-backed keys are not available everywhere.** A dedicated secure element is absent on a
   large share of Android devices, and our figure for that share is an estimate rather than a
   measurement. Where the element is missing, protection falls back and records the level actually

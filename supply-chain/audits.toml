@@ -11,6 +11,507 @@ network, and, where the crate handles secrets, branches and memory accesses that
 """
 implies = "safe-to-deploy"
 
+[[audits.block-buffer]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.12.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, src/lib.rs, src/read.rs, src/sealed.rs. README.md is not
+compiled in. The archive matches the repository at the commit in .cargo_vcs_info.json apart from
+the files cargo generates.
+
+No build script (build = false), no procedural macros, no include_str! or include_bytes!. No
+access to the system, files, network or environment. Dependencies: hybrid-array, and zeroize
+behind the zeroize feature, which is on here.
+
+What the buffer holds: the bytes of an incomplete block. Whole input blocks go to the compress
+closure straight from the caller's slice. Branches and offsets depend only on the position and
+input lengths, never on byte values, except in deserialize (lib.rs:348) and
+ReadBuffer::deserialize (read.rs:172), which test serialized bytes for zero with an early exit.
+
+Wiping: Drop (lib.rs:433) calls zeroize (lib.rs:425), one volatile write of the whole block, the
+Eager position byte included; the Lazy position is zeroed as well (lib.rs:429). reset
+(lib.rs:217) and ResetGuard (lib.rs:445) change only the position: buffered bytes stay until
+overwritten or dropped. pad_with_zeros (lib.rs:226), serialize (lib.rs:325) and Clone
+(lib.rs:109) return copies the crate does not wipe. Debug (lib.rs:118) prints the buffered bytes.
+
+Unsafe code, each use sound as read:
+- lib.rs:114, Clone: ptr::read of self. Both fields are plain bytes and own nothing, and each
+  copy wipes itself on drop. The SAFETY comment at lib.rs:112 says the type has no Drop;
+  lib.rs:433 has one.
+- lib.rs:151, try_new: set_data_unchecked after the length check at lib.rs:146.
+- lib.rs:177, digest_blocks: copies n bytes at pos; K::invariant(n, rem) keeps them inside the
+  block and, for Eager, below the position byte.
+- lib.rs:195: fills the block from pos to its end, then assume_init_ref; the bytes before pos are
+  initialized by the invariant. For Eager this overwrites the position byte; the ResetGuard made
+  at lib.rs:188 sets the position to 0 at the end of the scope, on unwind as well.
+- lib.rs:210: set_data_unchecked with the leftover, shorter than a block for Eager and at most a
+  block for Lazy.
+- lib.rs:219, reset: position 0.
+- lib.rs:241, get_pos: unreachable_unchecked if the position breaks the invariant; every writer
+  in the crate keeps it.
+- lib.rs:253, get_data: the first get_pos() bytes, initialized by the invariant.
+- lib.rs:266, set: after the assert at lib.rs:262 and a write of the whole block.
+- lib.rs:292 and 304, unsafe fns set_pos_unchecked and set_data_unchecked: the position first,
+  then buf.len() bytes from offset 0, below the Eager position byte. Every caller passes a value
+  within the kind invariant.
+- lib.rs:353, deserialize: after the invariant check at lib.rs:342.
+- lib.rs:386, digest_pad: writes delim and zeros to the end of the block, then assume_init_mut;
+  the ResetGuard made at lib.rs:382 restores the position on return and on unwind.
+- sealed.rs:41 and 53, Eager get_pos and set_pos: read and write byte N - 1 of the block.
+- read.rs:26, 88 and 125: set_pos_unchecked with 1 <= pos <= block size; read.rs:72 is an unsafe
+  fn whose body is safe indexing; read.rs:47, ReadBuffer::get_pos: unreachable_unchecked if the
+  cursor is 0 or above the block size; every writer keeps it in range.
+
+Unsound, not reached here: the sealed get_pos and set_pos (sealed.rs:39, 50) are safe functions
+over any ArraySize, and a dependent can call them through a K: BufferKind bound; given an
+uninitialized block, or N = U0 in a release build, they read uninitialized memory or go out of
+bounds. digest, hmac, sha2 and hkdf call only the public methods of BlockBuffer.
+"""
+
+[[audits.cfg-if]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "1.0.5"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, src/lib.rs. The archive matches the repository at the
+commit in .cargo_vcs_info.json apart from the files cargo generates.
+
+One macro_rules! macro, cfg_if, that expands to the given items under #[cfg] attributes. No
+runtime code, no unsafe code. No build script (build = false), no procedural macros; the optional
+dependency rustc-std-workspace-core is behind rustc-dep-of-std, off here. No access to the
+system, files or network.
+"""
+
+[[audits.cmov]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.5.4"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/macros.rs, src/array.rs, src/slice.rs, src/backends.rs,
+src/backends/x86.rs, src/backends/aarch64.rs, src/backends/soft.rs. The archive matches the
+repository at the commit in .cargo_vcs_info.json apart from the files cargo generates.
+
+No build script (build = false), no dependencies, no procedural macros, no #[target_feature]. No
+access to the system, files, network or environment.
+
+Backend by target (backends.rs): x86 and x86_64 use x86.rs, aarch64 uses aarch64.rs, every other
+target and Miri use soft.rs. soft.rs selects with (a & !mask) | (b & mask) (soft.rs:218). On arm
+the mask comes from inline assembly; on wasm32 it is arithmetic behind core::hint::black_box,
+which does not guarantee branch-free code.
+
+Inline assembly, each block sound as read; none touches memory or the stack, and none claims to
+preserve flags:
+- x86.rs:16, cmov!: an 8-bit TEST of the condition, then CMOVNZ or CMOVZ on 32- or 64-bit
+  registers; for u16 the upper bits are dropped on output.
+- x86.rs:33, cmov_eq!: XOR at the operand width, then CMOVZ or CMOVNZ moves the input condition
+  into the output, both widened to u16.
+- aarch64.rs:8, csel!: TST of the condition against 0xff, then CSEL dst, src, dst.
+- aarch64.rs:27, cseleq!: EOR into a scratch register, then TST against 0xffff for u16 or CMP
+  with 0 for u32 and u64, then CSEL; unspecified upper register bits of the u8 condition and of
+  u16 operands do not affect the result.
+- soft.rs:151, arm: RSBS and SBCS turn a u32 into 0 or all ones without a branch. masknz64
+  (soft.rs:202) ORs the masks of both halves.
+- soft.rs:167 and 189: riscv32 and riscv64 only.
+
+Other unsafe code:
+- lib.rs:280: NonZero::new_unchecked on the result of cmovnz between two non-zero values.
+- lib.rs:326: reads the i8 produced by cmovnz between two Ordering values as an Ordering.
+- slice.rs:170, 171, 270 and 271: cast_slice_mut and cast_slice (unsafe fns at slice.rs:311 and
+  331, blocks at 321 and 341) between signed, unsigned, NonZero and Ordering slices of equal size
+  and alignment, asserted at compile time. Through the mutable cast every element ends up equal
+  to one of two valid values, because each mask is all zeros or all ones.
+- slice.rs:425, 428, 446, 449, 462, 470, 482 and 490: as_chunks copied from core: a split at a
+  multiple of N, then a cast to [T; N] chunks.
+
+The default cmovz (lib.rs:47), used for isize, usize, NonZero, Ordering, slices and arrays,
+inverts the condition with the black_box macro and then calls cmovnz. The generated machine code
+was not inspected. The crate keeps no state and wipes nothing; secret words pass through
+registers and stack temporaries. CSEL timing is architecturally data independent only with
+PSTATE.DIT set, and the crate does not set it.
+"""
+
+[[audits.cpufeatures]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.3.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/aarch64.rs, src/x86.rs, src/loongarch64.rs, src/miri.rs. The
+archive matches the repository; it was built from a commit one after the release tag, and the
+two differ only in CI files.
+
+No build script (build = false), no procedural macros, no access to files or network. libc is a
+dependency only on aarch64 Linux, Android and Apple targets and on loongarch64 Linux. lib.rs:31
+stops the build on other architectures; sha2 depends on this crate only on aarch64, x86 and
+x86_64.
+
+The new! macro (lib.rs:35) caches the result in a static AtomicU8 with Relaxed ordering; a race
+only repeats detection. Results depend on the CPU, never on secret data.
+
+Unsafe code, expanded in the calling crate unless noted, each use sound as read:
+- x86.rs:41-51: CPUID leaves 1, 7/0 and 7/1 through core::arch; every x86_64 CPU has CPUID.
+- x86.rs:71: _xgetbv of XCR0, only when CPUID.1:ECX bits 26 and 27 (XSAVE, OSXSAVE) are set.
+- aarch64.rs:37, in this crate: getauxval(AT_HWCAP), on Linux and Android.
+- aarch64.rs:114, 122: calls of sysctlbyname for dit and sha3, on Apple targets.
+- aarch64.rs:141-173, in this crate: pub unsafe fn sysctlbyname: asserts NUL termination, reads
+  a u32 with newp null and newlen 0, then panics unless size == 4 and the return value is 0.
+- loongarch64.rs:30-40, 49: cpucfg inline assembly and getauxval, loongarch64 only.
+
+Path used here, sha2 SHA-256: on x86_64, CPUID only, with no system call; on aarch64 Linux and
+Android, getauxval(AT_HWCAP) tested for HWCAP_SHA2; on aarch64 Apple targets check!("sha2") is
+the constant true, so nothing is called. x86.rs:49-51 does not check the maximum CPUID leaf
+first. sysctlbyname panics instead of returning false when the name does not exist; it is
+reached only for dit and sha3.
+"""
+
+[[audits.crypto-common]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.2.2"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/hazmat.rs, src/generate.rs (behind the rand_core feature, off
+here). The archive matches the repository at the commit in .cargo_vcs_info.json apart from the
+files cargo generates.
+
+No unsafe code: lib.rs:8 is #![forbid(unsafe_code)]. No build script (build = false), no
+procedural macros. The optional dependencies getrandom and rand_core and the zeroize feature are
+off here. No access to the system, files or network.
+
+Traits and type aliases over hybrid-array. The default methods KeyInit::new_from_slice,
+KeyIvInit::new_from_slices, TryKeyInit::new_from_slice and InnerIvInit::inner_iv_slice_init
+(lib.rs:169, 202, 273, 301) borrow the slice as an &Array after a length check and branch only on
+the length. No branch or index depends on secret data. hazmat.rs:165 passes U8 as the size of
+u128, so SerializableState for [u128; N] panics (hazmat.rs:116, 130); not used here.
+"""
+
+[[audits.ctutils]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.4.2"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/choice.rs, src/ct_option.rs, src/traits.rs, and in src/traits/:
+ct_assign.rs, ct_eq.rs, ct_find.rs, ct_gt.rs, ct_lookup.rs, ct_lt.rs, ct_neg.rs, ct_select.rs.
+The archive matches the repository at the commit in .cargo_vcs_info.json apart from the files
+cargo generates.
+
+No build script (build = false), no procedural macros; map! and unwrap_or! are macro_rules. No
+access to the system, files, network or environment. The alloc and subtle features are off here.
+No unsafe code: lib.rs:7 forbids it, and the source has none.
+
+Choice is a u8 holding 0 or 1. CtAssign (ct_assign.rs:69, 85) passes it to cmovnz through to_u8
+(choice.rs:398), which applies core::hint::black_box; CtEq (ct_eq.rs:83, 101) gets it from
+cmoveq. The Choice constructors and bitwise operations are branch-free arithmetic with no
+barrier. CtGt and CtLt take the borrow of overflowing_sub and bypass cmov. Slice equality
+(ct_eq.rs:50, 99) visits every element; only the lengths steer the loop. to_bool and the
+conversions into bool and Option branch on the Choice, as documented. ct_neg on signed types
+panics in debug builds at MIN (ct_neg.rs:29, 35).
+
+Use here: digest calls <[u8]>::ct_eq to verify a MAC; hkdf and hmac do not call it. The crate
+holds no secrets of its own and wipes nothing. CtOption and Choice derive Debug.
+"""
+
+[[audits.digest]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.11.3"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/digest.rs, src/mac.rs, src/xof_fixed.rs, src/block_api.rs,
+src/block_api/ct_variable.rs, src/buffer_macros.rs, src/buffer_macros/fixed.rs,
+src/buffer_macros/variable.rs, src/buffer_macros/xof.rs, and, behind the dev feature, off here,
+src/dev.rs and src/dev/*.rs. The archive matches the repository at the commit in
+.cargo_vcs_info.json apart from the files cargo generates.
+
+No build script (build = false). No unsafe code in the crate (lib.rs:4 forbids it) or in what
+its exported macros buffer_fixed!, buffer_ct_variable! and buffer_xof! expand to. No procedural
+macros, no target-specific code, no access to the system, files or network.
+
+Features on here: block-api adds block-buffer and the block_api module; mac adds ctutils, Mac,
+CtOutput and MacMarker (lib.rs:56-73); zeroize clears CtOutput on drop (mac.rs:241-253), adds
+ZeroizeOnDrop markers for CtOutWrapper and XofFixedWrapper (ct_variable.rs:170,
+xof_fixed.rs:120), and turns on the zeroize feature of block-buffer. The cfg(feature = "zeroize")
+items inside buffer_fixed! (fixed.rs:472, 483) are evaluated against the features of the crate
+that invokes the macro.
+
+Path used here, through hmac: buffer_fixed! with MacTraits KeyInit generates a struct of a core
+and a block buffer with Debug, BlockSizeUser, OutputSizeUser, CoreProxy, Update, FixedOutput,
+MacMarker and KeyInit; Debug prints no state. CtOutWrapper::finalize_fixed_core
+(ct_variable.rs:103) truncates the full hash from a local array that is not cleared
+(ct_variable.rs:108). No branch or memory index depends on secret data.
+
+MAC comparison: CtOutput::eq (mac.rs:228), verify_slice and verify_truncated_* (mac.rs:139-180)
+use ctutils CtEq on byte slices; the only branches are on the public tag length and on the final
+result. verify_slice and verify_truncated_* leave the computed tag in a temporary that is not
+cleared. HKDF calls none of them.
+"""
+
+[[audits.hkdf]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.13.0"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/hmac_impl.rs, src/errors.rs. The archive matches the repository at
+the commit in .cargo_vcs_info.json apart from the files cargo generates.
+
+No build script (build = false). No unsafe code, no procedural macros, no target-specific code,
+no access to the system, files or network. The optional dependency kdf is behind a feature off
+here.
+
+Path used here, Hkdf<Sha256>: new (lib.rs:94) calls extract (lib.rs:117), which keys an Hmac with
+the salt (lib.rs:47-49), feeds the IKM (lib.rs:55), finalizes it into the PRK (lib.rs:62) and
+keys a second Hmac with the PRK through from_prk (lib.rs:104-111). expand (lib.rs:174) calls
+expand_multi_info (lib.rs:130), which rejects okm longer than 255 * HashLen (lib.rs:138), then
+for each block clones the keyed Hmac and feeds T(i-1), the info parts and the counter byte
+(lib.rs:143-155); the counter stays within 1..=255. Every branch and loop bound depends on
+lengths and the block index only.
+
+Not cleared: new drops the PRK returned by extract (lib.rs:95), and expand_multi_info keeps the
+last block T(n), including its bytes beyond okm, in prev (lib.rs:135, 162); both are plain
+arrays without Drop. The HMAC state held by the Hkdf, and each per-block clone, is cleared on
+drop by the hash core and the block buffer when the zeroize features of sha2 and digest are on,
+as they are here. README.md says the PRK remains hidden within the Hkdf object; the object holds
+only the HMAC state keyed with the PRK, and new leaves the PRK itself on the stack uncleared.
+"""
+
+[[audits.hmac]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.13.0"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/block_api.rs, src/simple.rs, src/simple_reset.rs, src/utils.rs.
+The archive matches the repository at the commit in .cargo_vcs_info.json apart from the files
+cargo generates.
+
+No build script (build = false). No unsafe code, no procedural macros, no target-specific code,
+no access to the system, files or network. Hmac and HmacReset are generated by the buffer_fixed!
+macro of digest (lib.rs:34-52), which expands to safe code only. The zeroize feature only turns
+on the zeroize feature of digest.
+
+Path used here: HmacCore::new_from_slice (block_api.rs:53) calls get_der_key (utils.rs:9), which
+copies a key of at most block size into a zeroed block and hashes a longer key first
+(utils.rs:15-30); the branch depends on the key length only. The block is XORed with ipad in
+place and compressed into the inner state, then XORed with ipad ^ opad and compressed into the
+outer state (block_api.rs:54-63). finalize_fixed_core (block_api.rs:81) finalizes the inner state
+into a local array, feeds it to the outer state through the block buffer and finalizes that. No
+branch or memory index depends on the key or the data.
+
+Not cleared: the local block buf still holds key ^ opad on return (block_api.rs:54, 60), the
+inner hash stays in a local array (block_api.rs:82), and get_der_key leaves the hash of a long
+key in a local (utils.rs:18). HmacCore and Hmac have no Drop; their state is cleared only by the
+Drop of the hash core and of the block buffer, which depend on the zeroize features of the hash
+crate and of digest. Not used here: SimpleHmac keeps key ^ opad (simple.rs:14) and
+SimpleHmacReset also key ^ ipad (simple_reset.rs:15-16) in arrays that are never cleared.
+"""
+
+[[audits.hybrid-array]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.4.15"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/flatten.rs, src/from_fn.rs, src/iter.rs, src/traits.rs,
+src/sizes.rs, src/serde.rs (behind the serde feature, off here). The archive matches the
+repository at the commit in .cargo_vcs_info.json apart from the files cargo generates.
+
+No build script (build = false), no procedural macros. The optional dependencies and the
+features alloc and extra-sizes are off here. No access to the system, files or network.
+
+Soundness rests on ArraySize (traits.rs:22), an unsafe trait: ArrayType<T> is [T; USIZE]. Its
+only impls come from the impl_array_sizes macro (sizes.rs:26); each default line maps N to
+typenum's UN with the same N. typenum seals Unsigned, so no other crate can add sizes. split,
+concat, Flatten and Unflatten also rely on typenum's Add, Sub, Mul, Div and Rem being exact.
+
+Unsafe code, each use sound as read:
+- lib.rs:180, 188: as_slice, as_mut_slice: a slice of U::USIZE elements over the array.
+- lib.rs:239: concat: assume_init after the two loops wrote all U + N slots.
+- lib.rs:252-257: split: ptr::read of the head at 0 and the tail at N from a ManuallyDrop of
+  self; each element moves once.
+- lib.rs:268-273, 284-289: split_ref, split_ref_mut: references to [0, N) and [N, U); the
+  mutable pair is disjoint.
+- lib.rs:302, 319: slice_as_array, slice_as_mut_array: cast after len == U::USIZE.
+- lib.rs:340-345, 363-368: slice_as_chunks and the mutable form: len / U whole chunks, then the
+  tail; the mutable pair is disjoint; U == 0 panics first.
+- lib.rs:384, 400: slice_as_flattened and the mutable form: length by checked_mul.
+- lib.rs:495, 502, 509, 516, 523, 530: casts between [T; N] and Array<T, U> where
+  U::ArrayType<T> = [T; N]; Array is repr(transparent).
+- lib.rs:550: uninit: assume_init of an array of MaybeUninit, which needs no initialization.
+- lib.rs:560-574: unsafe fn assume_init: transmute_copy to Array<T, U> of equal size; called
+  only at lib.rs:239 and from_fn.rs:32.
+- lib.rs:945, 949: Send and Sync when T is; the only field is [T; N].
+- lib.rs:963, 979: TryFrom<&[T]> for &Array and the mutable form: cast after
+  check_slice_length.
+- lib.rs:1106, 1115: bytemuck Pod and Zeroable, behind the bytemuck feature, off here.
+- flatten.rs:32: Flatten: ptr::read of the flat array from a ManuallyDrop of the nested array.
+- flatten.rs:62-65: Unflatten by value: ptr::read of part i at i * (N / M), with N % M == 0.
+- flatten.rs:83-87: Unflatten by reference: M shared references, N / M elements apart.
+- from_fn.rs:32: try_from_fn: assume_init after every slot was written.
+- from_fn.rs:53, 80-89: Guard::push_unchecked writes the next slot while initialized < len.
+- from_fn.rs:98-104: Guard drop: drop_in_place of the initialized prefix on error or panic; the
+  guard is forgotten on success (from_fn.rs:56).
+
+Secrets: no branch and no memory access in this crate depends on element values. PartialEq and
+Ord delegate to the slice and are not constant time; Hash and Debug pass the elements on. Array
+has no Drop and, with zeroize off, no Zeroize; Array<u8, U> is Copy (lib.rs:689). By-value paths
+leave copies that are never wiped: from_fn and try_from_fn, hence Default, Clone, FromIterator,
+map and TryFrom<&[T]> for Array, build in a MaybeUninit buffer and copy it out; concat does the
+same; split, Flatten and Unflatten copy out of the original. Reference paths make no copy. Here
+hmac takes a block from Default and copies the key in through IndexMut, so the from_fn buffer
+never holds key bytes.
+"""
+
+[[audits.libc]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "0.2.190"
+notes = """
+Not read in full. Read in full: Cargo.toml, build.rs, src/lib.rs, src/primitives.rs,
+src/types.rs. Read in part: src/macros.rs:1-170 (cfg_if, prelude); in the other files, only the
+definitions below, the module selection leading to them on these targets, and the link
+directives. All other source, its unsafe code included, was not read. The archive matches the
+repository at the commit in .cargo_vcs_info.json apart from the files cargo generates.
+
+Only cpufeatures depends on libc here, with default features off, on aarch64 Linux, Android and
+Apple targets.
+
+Definitions used, checked against the arm64 kernel uapi headers, glibc and bionic sys/auxv.h and
+the XNU sys/sysctl.h prototype:
+- getauxval(c_ulong) -> c_ulong: unix/linux_like/linux/gnu/mod.rs:973,
+  unix/linux_like/android/mod.rs:3844.
+- AT_HWCAP = 16: unix/linux_like/linux_l4re_shared.rs:864, unix/linux_like/android/mod.rs:3407.
+- HWCAP_AES 1 << 3, PMULL 1 << 4, SHA2 1 << 6, SHA3 1 << 17, SM3 1 << 18, SM4 1 << 19,
+  SHA512 1 << 21, DIT 1 << 24: unix/linux_like/linux/gnu/b64/aarch64/mod.rs:483-504,
+  unix/linux_like/android/b64/aarch64/mod.rs:108-129.
+- sysctlbyname(*const c_char, *mut c_void, *mut size_t, *mut c_void, size_t) -> c_int:
+  unix/bsd/apple/mod.rs:4742.
+- c_ulong and c_char re-export core::ffi (primitives.rs:10-24), c_void too (lib.rs:232); size_t
+  is usize (unix/mod.rs:11).
+The functions are plain extern "C" items without link_name. Each name has one definition per
+target.
+
+build.rs runs $RUSTC --version, through RUSTC_WRAPPER if set, to decide whether to print
+check-cfg lines; it runs freebsd-version or emcc only for FreeBSD or Emscripten targets. It reads
+RUSTC, RUSTC_WRAPPER, CARGO_CFG_*, LIBC_* and RUST_LIBC_* variables, plus two more on FreeBSD
+and VxWorks only, and prints cargo directives; no file or network access.
+
+No procedural macros, include!, asm!, global_asm!, no_mangle, export_name or link_section. With
+std off, link directives add c, m, rt and pthread on Linux GNU (unix/mod.rs:658-662), c and m on
+Android and Apple (unix/mod.rs:620-624), and iconv on Apple (unix/bsd/apple/mod.rs:5549).
+
+Unsafe code read: types.rs:123, from_raw_parts over a u8 slice as c_char of the same size,
+sound. No Rust function body of libc runs on these paths, only the extern functions above. At
+run time the SHA-256 path calls getauxval(AT_HWCAP) on first use on aarch64 Linux and Android,
+and no libc function on Apple targets. No libc code here handles secrets.
+
+Review again by 2027-04-01 or at the next version, whichever comes first.
+"""
+
+[[audits.sha2]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.11.0"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str! at lib.rs:2), src/lib.rs, src/block_api.rs, src/consts.rs, src/sha256.rs,
+src/sha512.rs, and every backend under src/sha256/ and src/sha512/: soft.rs, soft/unroll.rs,
+soft/compact.rs, wasm32_simd128.rs, loongarch64_asm.rs, riscv_zknh.rs, riscv_zknh/utils.rs,
+riscv_zknh/unroll.rs, riscv_zknh/compact.rs, plus sha256/x86_sha.rs, sha256/aarch64_sha2.rs,
+sha512/x86_avx2.rs and sha512/aarch64_sha3.rs. The archive matches the repository at the commit
+in .cargo_vcs_info.json apart from the files cargo generates.
+
+No build script (build = false), no procedural macro, no access to files, network or
+environment. CPU feature detection is delegated to cpufeatures::new! (sha256.rs:55, 58;
+sha512.rs:50, 53). Round constants and initial hash values in consts.rs match their derivation.
+
+Backend selection when no sha2_* cfg flag is set (sha256.rs:49-79, sha512.rs:44-74): the
+portable backend (soft.rs, soft/unroll.rs) is always compiled. On x86_64, x86_sha.rs and
+x86_avx2.rs are added and chosen at run time from CPUID. On aarch64, aarch64_sha2.rs and
+aarch64_sha3.rs are added and chosen from AT_HWCAP on Linux and Android; Apple aarch64 targets
+enable the sha2 target feature, so the SHA-256 check there is a constant true. On arm, thumbv7em
+and wasm32 without simd128 only the portable backend is compiled.
+
+Path used here: Sha256VarCore::update_blocks (block_api.rs:38) and finalize_variable_core
+(block_api.rs:64) call compress256 (sha256.rs:86), which dispatches at sha256.rs:62-78.
+
+Portable SHA-256 (soft/unroll.rs): repeat64! unrolls the 64 rounds with literal indices, so every
+array index, the i < 16 test and the round constant address (rk, unroll.rs:26) are compile-time
+constants. The data path is wrapping add, xor, and, not, and shifts and rotations by constants.
+No branch and no memory address depends on the message or the state. The hardware backends have
+no data-dependent branch or address either; on aarch64 PSTATE.DIT is not set.
+
+With the zeroize feature, Drop zeroizes state and block_len of Sha256VarCore (block_api.rs:89)
+and Sha512VarCore (block_api.rs:208). Not erased: copies made inside the compression functions
+(message schedule and working variables on the stack or in vector registers), the digest written
+to the caller's buffer (block_api.rs:69, 188), serialize() output (block_api.rs:106, 224), and
+stale bytes left where a core value was moved from.
+
+Unsafe code, each use sound as read unless stated otherwise:
+- sha256.rs:67, 72 and sha512.rs:62, 67: calls to the target_feature backends after the
+  cpufeatures check for the same features.
+- sha256.rs:16, 31, 41 and sha512.rs:16, 26, 36: the same calls when a sha2_*_backend cfg forces
+  a backend, behind compile_error! unless the features are enabled at compile time.
+- sha256/soft/unroll.rs:39 and sha512/soft/unroll.rs:33: rk reads K32 or K64 at index i through
+  a raw pointer; i is a literal below 64 or 80 from the unrolling macro.
+- x86_sha.rs:13 and 45, target_feature unsafe fns: unaligned 16-byte loads of the state (54, 55)
+  and the block (67-70) and stores of the state (100, 101), all in bounds.
+- aarch64_sha2.rs:12, target_feature unsafe fn: NEON loads of the state (17, 18) and the block
+  (27-30) and stores (92, 93), in bounds. Lines 33, 39, 45, 51, 59, 66, 73 and 80 load
+  K32[t..t+4], t <= 60, through a pointer derived from &K32[t], a reference to one u32. The read
+  stays inside K32 but exceeds that reference: Miri's stacked-borrows model rejects it, its
+  tree-borrows model accepts it. This backend serves SHA-256 on aarch64 whenever the CPU has the
+  SHA-256 instructions, and always on Apple aarch64 targets.
+- x86_avx2.rs:17, 47, 60, 82, 115, 136 and 243: block pointer arithmetic and loads (31, 66, 98,
+  99), two blocks at a time only once an odd count is made even (21-23, 30); K64 loads with
+  indices below 80; 330 and 335 view [__m128i; N] as [u64; 2N], same size, lower alignment.
+- aarch64_sha3.rs:10: NEON loads and stores of state and block, in bounds; K64[t..t+2] loads
+  through &K64[t], the same reference-range pattern as in aarch64_sha2.rs.
+- wasm32_simd128.rs, built only with the simd128 target feature: v128_load of the block and of
+  the round constants, in bounds.
+- riscv_zknh, nightly only: for an unaligned block the inline assembly reads the aligned words
+  around it, up to 7 bytes outside the block, and ptr::read(bp.add(..)) offsets a pointer that
+  may lie before the allocation; both are outside the Rust memory model. Not built here.
+- loongarch64_asm.rs: one asm! each with 64 or 128 bytes of stack scratch, not erased. Not built
+  here.
+
+README.md documents per-algorithm backend flags that sha512.rs does not follow: lines 2 and 5
+test sha2_256_backend. Forcing sha2_256_backend = "aarch64-sha2" (sha256.rs:39) or
+sha2_512_backend = "x86-avx2" (sha512.rs:24) fails to compile on a wrong compress signature. No
+sha2_* flag is set here.
+"""
+
+[[audits.typenum]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "1.20.1"
+notes = """
+Not read in full: the generated files were reproduced, not read line by line. Read in full:
+Cargo.toml, Cargo.toml.orig, src/lib.rs, src/gen.rs, src/bit.rs, src/int.rs, src/uint.rs,
+src/array.rs, src/marker_traits.rs, src/operator_aliases.rs, src/private.rs, src/tuple.rs,
+src/type_operators.rs. The archive matches the repository at the commit in .cargo_vcs_info.json
+apart from the files cargo generates and the unpublished generate package.
+
+Generated: src/gen/consts.rs, src/gen/op.rs and src/gen/generic_const_mappings.rs (behind
+const-generics, on here). The repository's generate package, which has no dependencies and only
+formats strings and writes files, was read and run at that commit; after rustfmt its output
+matched all three files and tests/generated.rs byte for byte. Each of the 1148 aliases UN in
+consts.rs is a canonical UInt chain whose value is N, and each ToUInt impl in
+generic_const_mappings.rs maps Const<N> to UN.
+
+No unsafe code: lib.rs:43 is #![forbid(unsafe_code)], which covers the generated modules. No
+build script (build = false); the consts.rs header calls the generator a build script, but none
+ships. No procedural macros; the optional scale-info derive is off here. No access to the
+system, files or network. All arithmetic is resolved at compile time.
+
+hybrid-array's unsafe code relies on UN::USIZE == N and on exact Add, Sub, Mul, Div and Rem on
+UInt (uint.rs:413, 547, 1090, 1789, 1817). As read, they are exact, and Sub has no impl when the
+result would be negative, so underflow fails to compile.
+"""
+
 [[audits.zeroize]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"

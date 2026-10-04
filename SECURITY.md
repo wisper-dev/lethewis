@@ -48,7 +48,8 @@ private report before publication.
 - Recovery of data from a copy of the device taken before a key was destroyed.
 - Residue in flash memory readable only by desoldering the chip.
 - Any device whose keys are already in memory because it was unlocked after boot.
-- Copies of a secret left by a value move, a buffer reallocation, a register, swap or a crash dump.
+- Copies of a secret left by a value move, a buffer reallocation, a register, swap or a crash dump,
+  or on the stack by the hashing code.
 - A weak random source supplied by the caller, and copies of its output that the source keeps.
 - Weaknesses in third-party dependencies. Report those to their maintainers, and here as well, so
   the dependency can be updated or replaced.

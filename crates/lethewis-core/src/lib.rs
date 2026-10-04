@@ -34,6 +34,8 @@ macro_rules! assert_not_impl {
 #[cfg(kani)]
 use zeroize as _;
 
+#[cfg_attr(not(test), expect(dead_code))]
+mod derive;
 mod entropy;
 mod error;
 mod key;

@@ -4,5 +4,11 @@
 [cargo-vet]
 version = "0.10"
 
+[policy.cpufeatures]
+dependency-criteria = { libc = "safe-to-deploy" }
+
+[policy.hybrid-array]
+dependency-criteria = { typenum = "safe-to-deploy" }
+
 [policy.lethewis-core]
 criteria = "read-in-full"

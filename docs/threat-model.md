@@ -64,10 +64,12 @@ slots; the statements and their limits are in [proofs.md](proofs.md).
 
 **Intended.** Drop keys from memory when the device locks.
 
-**Not defended.** Copies left by a value move, a buffer reallocation, a CPU register, swap, or a crash
-dump. A set of slots leaked instead of dropped keeps its keys in memory. A copy of a new key kept by
-the platform's random source. A system component with elevated privileges is outside what process
-isolation provides.
+**Not defended.** Copies left by a value move, a buffer reallocation, a CPU register, swap, or a
+crash dump. Temporary copies of a key and of values derived from it that the hashing code leaves on
+the stack: the HMAC key block, the inner hash, the extracted key and the last output block. A set of
+slots leaked instead of dropped keeps its keys in memory. A copy of a new key kept by the platform's
+random source. A system component with elevated privileges is outside what process isolation
+provides.
 
 ### 5. The supply chain
 

@@ -48,7 +48,7 @@ impl Status {
     }
 }
 
-const fn length_to_byte(length: KeyLength) -> u8 {
+pub(crate) const fn length_to_byte(length: KeyLength) -> u8 {
     match length {
         KeyLength::Bytes32 => 32,
         KeyLength::Bytes64 => 64,

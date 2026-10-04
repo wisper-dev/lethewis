@@ -100,7 +100,7 @@ impl Key {
     }
 }
 
-#[cfg_attr(not(any(test, kani)), expect(dead_code))]
+#[cfg_attr(not(test), expect(dead_code))]
 impl Key {
     pub(crate) const fn length(&self) -> KeyLength {
         self.length
@@ -109,6 +109,13 @@ impl Key {
     /// Writes the key into `dest`, followed by zeros up to the capacity.
     pub(crate) fn write_into(&self, dest: &mut [u8; CAPACITY]) {
         dest.copy_from_slice(&self.bytes);
+    }
+
+    /// The key itself: as many bytes as its length.
+    pub(crate) fn material(&self) -> Option<&[u8]> {
+        self.bytes
+            .split_at_checked(self.length.bytes())
+            .map(|(key, _)| key)
     }
 }
 
