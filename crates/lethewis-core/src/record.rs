@@ -11,11 +11,13 @@ const VERSION: u8 = 1;
 
 const _: () = assert!(4 + ID_LEN + 8 + CAPACITY == PLAINTEXT_LEN);
 
-/// What a key may be used for. The value is the byte a record holds.
+/// What a key may be used for: a class of operations together with its algorithm. It is given when
+/// the key is loaded and never changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 #[repr(u8)]
-pub(crate) enum Purpose {
-    /// Wraps other keys into records, and never leaves the library.
+pub enum Purpose {
+    /// Wraps other keys. Never leaves the library.
     Wrap = 1,
 }
 

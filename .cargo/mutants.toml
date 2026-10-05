@@ -8,10 +8,12 @@ all_features = true
 cap_lints = true
 
 # A wipe on drop can be observed only through the memory of a value already dropped, which takes
-# unsafe code, and unsafe code is forbidden here. The drop calls `Key::wipe`, which is tested.
-# Code under cfg(kani) is compiled only by Kani, which a mutant run does not invoke. The proofs are
-# checked against deliberate errors instead.
+# unsafe code, and unsafe code is forbidden here. The drops call `Key::wipe` and `KeyId::wipe`,
+# which are tested.
+# Code under cfg(kani), the modules `proofs` and `model`, is compiled only by Kani, which a mutant run
+# does not invoke. The proofs are checked against deliberate errors instead.
 exclude_re = [
   '^crates/lethewis-core/src/key\.rs:[0-9]+:[0-9]+: replace <impl Drop for Key>::drop with \(\)$',
-  '^crates/lethewis-core/src/[a-z_]+\.rs:[0-9]+:[0-9]+: .* proofs::',
+  '^crates/lethewis-core/src/derive\.rs:[0-9]+:[0-9]+: replace <impl Drop for KeyId>::drop with \(\)$',
+  '^crates/lethewis-core/src/[a-z_]+\.rs:[0-9]+:[0-9]+: .* (proofs|model)::',
 ]

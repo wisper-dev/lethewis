@@ -45,20 +45,32 @@ impl Key {
         }
     }
 
-    /// Takes the bytes of `source` and wipes `source`.
-    pub(crate) fn load32(&mut self, source: &mut [u8; 32]) {
+    /// Copies the bytes of `source` in; the rest of the buffer is zero. `source` is left as it is.
+    pub(crate) fn copy32(&mut self, source: &[u8; 32]) {
         self.wipe();
         if let Some((head, _)) = self.bytes.split_first_chunk_mut::<32>() {
             head.copy_from_slice(source.as_slice());
         }
         self.length = KeyLength::Bytes32;
+    }
+
+    /// Copies the bytes of `source` in. `source` is left as it is.
+    pub(crate) fn copy64(&mut self, source: &[u8; 64]) {
+        self.bytes.copy_from_slice(source.as_slice());
+        self.length = KeyLength::Bytes64;
+    }
+
+    /// Takes the bytes of `source` and wipes `source`.
+    #[cfg(any(test, kani))]
+    pub(crate) fn load32(&mut self, source: &mut [u8; 32]) {
+        self.copy32(source);
         wipe(source);
     }
 
     /// Takes the bytes of `source` and wipes `source`.
+    #[cfg(any(test, kani))]
     pub(crate) fn load64(&mut self, source: &mut [u8; 64]) {
-        self.bytes.copy_from_slice(source.as_slice());
-        self.length = KeyLength::Bytes64;
+        self.copy64(source);
         wipe(source);
     }
 
@@ -100,13 +112,13 @@ impl Key {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 impl Key {
     pub(crate) const fn length(&self) -> KeyLength {
         self.length
     }
 
     /// Writes the key into `dest`, followed by zeros up to the capacity.
+    #[cfg_attr(not(any(test, kani)), expect(dead_code))]
     pub(crate) fn write_into(&self, dest: &mut [u8; CAPACITY]) {
         dest.copy_from_slice(&self.bytes);
     }
@@ -166,7 +178,7 @@ impl Drop for WipeUnlessKept<'_> {
     }
 }
 
-fn wipe<const N: usize>(bytes: &mut [u8; N]) {
+pub(crate) fn wipe<const N: usize>(bytes: &mut [u8; N]) {
     #[cfg(not(kani))]
     zeroize::Zeroize::zeroize(bytes);
     // zeroize ends in inline assembly, which Kani cannot model. The proofs see plain stores; the

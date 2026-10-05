@@ -1,13 +1,16 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
+#[cfg(not(kani))]
 use hkdf::Hkdf;
+#[cfg(not(kani))]
 use sha2::Sha256;
 
-use crate::key::{Key, KeyLength};
-use crate::record::{Purpose, length_to_byte};
+use crate::key::{Key, KeyLength, wipe};
+use crate::record::{ID_LEN, Purpose, length_to_byte};
 
 /// The salt of every derivation.
+#[cfg(not(kani))]
 const SALT: &[u8] = b"lethewis derivation salt v1";
 /// The first bytes of every label.
 const PREFIX: &[u8; 8] = b"lethewis";
@@ -22,6 +25,7 @@ pub(crate) enum Branch {
     /// The identifier of a key.
     KeyId,
     /// The key that encrypts the records a wrapping key wraps.
+    #[cfg_attr(not(any(test, kani)), expect(dead_code))]
     WrapKey,
 }
 
@@ -39,6 +43,41 @@ impl Branch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DerivationFailed;
 
+/// The identifier of a key, derived from the key itself. It is wiped when dropped.
+#[cfg_attr(any(test, kani), derive(Debug, PartialEq, Eq))]
+pub(crate) struct KeyId([u8; ID_LEN]);
+
+impl KeyId {
+    pub(crate) const fn empty() -> Self {
+        Self([0; ID_LEN])
+    }
+
+    pub(crate) fn wipe(&mut self) {
+        wipe(&mut self.0);
+    }
+
+    /// Takes the identifier out of `source` and wipes `source`.
+    pub(crate) fn take(&mut self, source: &mut Self) {
+        self.0 = source.0;
+        source.wipe();
+    }
+}
+
+impl Drop for KeyId {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+/// Derives the identifier of `key`, which serves `purpose`, straight into `id`.
+pub(crate) fn derive_key_id(
+    key: &Key,
+    purpose: Purpose,
+    id: &mut KeyId,
+) -> Result<(), DerivationFailed> {
+    derive(key, purpose, Branch::KeyId, &mut id.0)
+}
+
 /// Fills `out` with the value of `branch` derived from `key`, which serves `purpose`. The key goes
 /// through HKDF-Extract with a fixed salt, and HKDF-Expand takes the label.
 pub(crate) fn derive(
@@ -50,9 +89,77 @@ pub(crate) fn derive(
     let (label, used) = label(purpose, key.length(), branch, out.len())?;
     let info = label.get(..used).ok_or(DerivationFailed)?;
     let material = key.material().ok_or(DerivationFailed)?;
+    hkdf(material, info, out)
+}
+
+#[cfg(not(kani))]
+fn hkdf(material: &[u8], info: &[u8], out: &mut [u8]) -> Result<(), DerivationFailed> {
     Hkdf::<Sha256>::new(Some(SALT), material)
         .expand(info, out)
         .map_err(|_| DerivationFailed)
+}
+
+#[cfg(kani)]
+use model::hkdf;
+
+/// What stands in for HKDF-SHA-256 under Kani, and how the proofs read an identifier.
+#[cfg(kani)]
+pub(crate) mod model {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{DerivationFailed, KeyId};
+    use crate::record::ID_LEN;
+
+    /// Whether the last derivation failed, so a proof can tell a failure of the derivation from one
+    /// the code makes up.
+    static FAILED: AtomicBool = AtomicBool::new(false);
+
+    /// HKDF-SHA-256 is beyond Kani. The model fails at will, after writing into `out`, and records
+    /// whether it failed; otherwise `out` takes the first bytes of the key with the key's length and
+    /// the label folded in, so equal inputs give equal outputs, and the output depends on those
+    /// bytes, that length and the label. Folding every byte of the key would be too slow for the
+    /// solver; that HKDF uses the whole key and the output length, the unit tests check.
+    pub(super) fn hkdf(
+        material: &[u8],
+        info: &[u8],
+        out: &mut [u8],
+    ) -> Result<(), DerivationFailed> {
+        let fail: bool = kani::any();
+        FAILED.store(fail, Ordering::Relaxed);
+        if fail {
+            out.fill(0xa5);
+            return Err(DerivationFailed);
+        }
+        fold(material, info, out);
+        Ok(())
+    }
+
+    /// Whether the last derivation failed.
+    pub(crate) fn failed() -> bool {
+        FAILED.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn fold(material: &[u8], info: &[u8], out: &mut [u8]) {
+        for (index, at) in out.iter_mut().enumerate() {
+            *at = material.get(index).copied().unwrap_or(0);
+        }
+        if let Some(first) = out.first_mut() {
+            *first ^= u8::try_from(material.len()).unwrap_or(u8::MAX);
+        }
+        for (index, byte) in info.iter().enumerate() {
+            if let Some(at) = index.checked_rem(out.len()).and_then(|at| out.get_mut(at)) {
+                *at ^= *byte;
+            }
+        }
+    }
+
+    pub(crate) const fn id_bytes(id: &KeyId) -> &[u8; ID_LEN] {
+        &id.0
+    }
+
+    pub(crate) const fn id_from_bytes(bytes: [u8; ID_LEN]) -> KeyId {
+        KeyId(bytes)
+    }
 }
 
 /// The label of one derivation, and how many of its bytes are used. Every field but the name has a
@@ -96,7 +203,7 @@ mod tests {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
-    use super::{Branch, DerivationFailed, derive, label};
+    use super::{Branch, DerivationFailed, KeyId, derive, derive_key_id, label};
     use crate::key::{Key, KeyLength};
     use crate::record::Purpose;
 
@@ -260,6 +367,20 @@ mod tests {
     }
 
     #[test]
+    fn take_moves_the_identifier_and_wipes_the_source() {
+        let key = counted_key(KeyLength::Bytes64);
+        let mut expected = KeyId::empty();
+        derive_key_id(&key, Purpose::Wrap, &mut expected).unwrap();
+        let mut source = KeyId::empty();
+        derive_key_id(&key, Purpose::Wrap, &mut source).unwrap();
+        let mut target = KeyId::empty();
+        target.take(&mut source);
+        assert_eq!(target, expected);
+        assert_eq!(source, KeyId::empty());
+        assert_ne!(target, KeyId::empty());
+    }
+
+    #[test]
     fn every_branch_has_a_label() {
         for branch in [Branch::KeyId, Branch::WrapKey] {
             let (_, used) = label(Purpose::Wrap, KeyLength::Bytes64, branch, 32).unwrap();
@@ -295,10 +416,24 @@ mod tests {
 }
 
 #[cfg(kani)]
-mod proofs {
-    use super::{Branch, label};
+pub(crate) mod proofs {
+    use super::{Branch, label, model::fold};
     use crate::key::KeyLength;
-    use crate::record::Purpose;
+    use crate::record::{ID_LEN, Purpose};
+
+    /// The identifier the model of HKDF gives for the first `length` bytes of `key`, worked out
+    /// from the label alone, without a `Key` and without `derive`.
+    pub(crate) fn expected_key_id(
+        key: &[u8; 64],
+        length: KeyLength,
+        purpose: Purpose,
+    ) -> [u8; ID_LEN] {
+        let mut id = [0; ID_LEN];
+        let _ = label(purpose, length, Branch::KeyId, ID_LEN).map(|(label, used)| {
+            fold(&key[..length.bytes()], &label[..used], &mut id);
+        });
+        id
+    }
 
     fn any_length() -> KeyLength {
         if kani::any() {

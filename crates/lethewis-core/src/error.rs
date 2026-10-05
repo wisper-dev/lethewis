@@ -13,6 +13,8 @@ pub enum Error {
     StaleHandle,
     /// The source of random bytes failed.
     EntropyFailed,
+    /// A value could not be derived from a key.
+    DerivationFailed,
 }
 
 impl fmt::Display for Error {
@@ -21,6 +23,7 @@ impl fmt::Display for Error {
             Self::NoFreeSlot => "no free slot",
             Self::StaleHandle => "stale handle",
             Self::EntropyFailed => "random source failed",
+            Self::DerivationFailed => "key derivation failed",
         })
     }
 }
@@ -40,5 +43,6 @@ mod tests {
         assert_eq!(Error::NoFreeSlot.to_string(), "no free slot");
         assert_eq!(Error::StaleHandle.to_string(), "stale handle");
         assert_eq!(Error::EntropyFailed.to_string(), "random source failed");
+        assert_eq!(Error::DerivationFailed.to_string(), "key derivation failed");
     }
 }

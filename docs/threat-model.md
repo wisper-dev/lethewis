@@ -57,10 +57,10 @@ reach.
 
 **In place.** Keys are held only in fixed-size slots whose memory the caller provides, and no call
 returns a key. A new key is written straight into its slot from the platform's random source, and
-the library makes no copy of it; if the source fails or panics halfway, the slot is wiped. A key is
-wiped when it is released, and every key is wiped when its set of slots is dropped. The wipe on
-release and on creating a set, and the refusal of a released or foreign handle, are proven for two
-slots; the statements and their limits are in [proofs.md](proofs.md).
+the library's own code makes no copy of it; if the source fails or panics halfway, the slot is
+wiped. A key is wiped when it is released, and every key is wiped when its set of slots is dropped.
+The wipe on release and on creating a set, and the refusal of a released or foreign handle, are
+proven for two slots; the statements and their limits are in [proofs.md](proofs.md).
 
 **Intended.** Drop keys from memory when the device locks.
 

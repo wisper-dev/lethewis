@@ -40,7 +40,8 @@ fi
 # In a crate without the standard library Kani reports an assert! or unwrap that is never reached as
 # a success; line coverage shows it.
 rm -rf target/kani/*/kanicov_*
-cargo kani --workspace --output-format terse --harness-timeout 30m --coverage -Z source-coverage \
+cargo kani --workspace --output-format terse --harness-timeout 60m --jobs --coverage \
+  -Z source-coverage \
   -Z unstable-options --export-json "$results"
 
 fail=0

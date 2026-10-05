@@ -4,9 +4,11 @@
 use core::{fmt, marker::PhantomData};
 
 use crate::{
+    derive::{KeyId, derive_key_id},
     entropy::{Entropy, EntropyError},
     error::Error,
-    key::{Key, KeyLength},
+    key::{Key, KeyLength, wipe},
+    record::Purpose,
 };
 
 /// Memory for one key, provided by the caller.
@@ -15,6 +17,8 @@ use crate::{
 /// alive, so moving the memory afterwards copies no key.
 pub struct Slot {
     key: Key,
+    id: KeyId,
+    purpose: Purpose,
     generation: u64,
     state: State,
 }
@@ -33,6 +37,8 @@ impl Slot {
     pub const fn empty() -> Self {
         Self {
             key: Key::empty(),
+            id: KeyId::empty(),
+            purpose: Purpose::Wrap,
             generation: 0,
             state: State::Free,
         }
@@ -40,6 +46,7 @@ impl Slot {
 
     fn unload(&mut self) {
         self.key.wipe();
+        self.id.wipe();
         match self.generation.checked_add(1) {
             Some(next) => {
                 self.generation = next;
@@ -62,13 +69,13 @@ impl fmt::Debug for Slot {
 /// and cannot outlive the memory of its slots. It may outlive the `Slots` itself:
 ///
 /// ```
-/// use lethewis_core::{Slot, Slots};
+/// use lethewis_core::{Purpose, Slot, Slots};
 ///
 /// let mut memory = [const { Slot::empty() }; 1];
 /// let handle;
 /// {
 ///     let mut slots = Slots::new(&mut memory);
-///     handle = slots.import32(&mut [7; 32])?;
+///     handle = slots.import32(Purpose::Wrap, &mut [7; 32])?;
 /// }
 /// let _ = handle;
 /// # Ok::<(), lethewis_core::Error>(())
@@ -77,13 +84,13 @@ impl fmt::Debug for Slot {
 /// The same code with the memory gone before the handle does not compile:
 ///
 /// ```compile_fail
-/// use lethewis_core::{Slot, Slots};
+/// use lethewis_core::{Purpose, Slot, Slots};
 ///
 /// let handle;
 /// {
 ///     let mut memory = [const { Slot::empty() }; 1];
 ///     let mut slots = Slots::new(&mut memory);
-///     handle = slots.import32(&mut [7; 32])?;
+///     handle = slots.import32(Purpose::Wrap, &mut [7; 32])?;
 /// }
 /// let _ = handle;
 /// # Ok::<(), lethewis_core::Error>(())
@@ -110,13 +117,13 @@ impl fmt::Debug for Handle<'_> {
 /// its keys stay in memory until the next `Slots` over the same memory.
 ///
 /// ```
-/// use lethewis_core::{Slot, Slots};
+/// use lethewis_core::{Purpose, Slot, Slots};
 ///
 /// let mut memory = [const { Slot::empty() }; 4];
 /// let mut slots = Slots::new(&mut memory);
 ///
 /// let mut secret = [7; 32];
-/// let handle = slots.import32(&mut secret)?;
+/// let handle = slots.import32(Purpose::Wrap, &mut secret)?;
 /// assert_eq!(secret, [0; 32]);
 ///
 /// slots.release(handle)?;
@@ -135,56 +142,76 @@ impl<'a> Slots<'a> {
         this
     }
 
-    /// Takes a 32-byte key from `source` into a free slot and wipes `source`.
+    /// Takes a 32-byte key for `purpose` from `source` into a free slot and wipes `source`.
     ///
     /// # Errors
     ///
-    /// [`Error::NoFreeSlot`] if no slot is free. `source` is then left as it was.
-    pub fn import32(&mut self, source: &mut [u8; 32]) -> Result<Handle<'a>, Error> {
-        self.load(|key| {
-            key.load32(source);
+    /// [`Error::NoFreeSlot`] if no slot is free, and [`Error::DerivationFailed`] if the identifier of
+    /// the key cannot be derived. `source` is then left as it was, and no slot changes.
+    pub fn import32(
+        &mut self,
+        purpose: Purpose,
+        source: &mut [u8; 32],
+    ) -> Result<Handle<'a>, Error> {
+        let handle = self.load(purpose, |key| {
+            key.copy32(source);
             Ok(())
-        })
+        })?;
+        wipe(source);
+        Ok(handle)
     }
 
-    /// Takes a 64-byte key from `source` into a free slot and wipes `source`.
+    /// Takes a 64-byte key for `purpose` from `source` into a free slot and wipes `source`.
     ///
     /// # Errors
     ///
-    /// [`Error::NoFreeSlot`] if no slot is free. `source` is then left as it was.
-    pub fn import64(&mut self, source: &mut [u8; 64]) -> Result<Handle<'a>, Error> {
-        self.load(|key| {
-            key.load64(source);
+    /// [`Error::NoFreeSlot`] if no slot is free, and [`Error::DerivationFailed`] if the identifier of
+    /// the key cannot be derived. `source` is then left as it was, and no slot changes.
+    pub fn import64(
+        &mut self,
+        purpose: Purpose,
+        source: &mut [u8; 64],
+    ) -> Result<Handle<'a>, Error> {
+        let handle = self.load(purpose, |key| {
+            key.copy64(source);
             Ok(())
-        })
+        })?;
+        wipe(source);
+        Ok(handle)
     }
 
-    /// Creates a key of `length` random bytes from `entropy` in a free slot. The bytes are written
-    /// straight into the slot, and the library makes no copy of them. `entropy` is asked once, and
-    /// only when a slot is free.
+    /// Creates a key for `purpose` of `length` random bytes from `entropy` in a free slot. The bytes
+    /// are written straight into the slot, and the library's own code makes no copy of them; the
+    /// hashing code that derives the key's identifier leaves copies on the stack. `entropy` is asked
+    /// once, and only when a slot is free.
     ///
     /// # Errors
     ///
-    /// [`Error::NoFreeSlot`] if no slot is free, and [`Error::EntropyFailed`] if `entropy` fails.
-    /// No slot changes then.
+    /// [`Error::NoFreeSlot`] if no slot is free, [`Error::EntropyFailed`] if `entropy` fails, and
+    /// [`Error::DerivationFailed`] if the identifier of the key cannot be derived. No slot changes
+    /// then.
     ///
     /// # Panics
     ///
     /// Only if `entropy` panics. The panic passes through, and the slot stays free and wiped.
     pub fn generate(
         &mut self,
+        purpose: Purpose,
         length: KeyLength,
         entropy: &mut (impl Entropy + ?Sized),
     ) -> Result<Handle<'a>, Error> {
-        self.load(|key| {
+        self.load(purpose, |key| {
             key.fill(length, entropy)
                 .map_err(|EntropyError| Error::EntropyFailed)
         })
     }
 
-    /// Puts a key into the first free slot with `fill` and issues a handle if `fill` succeeds.
+    /// Puts a key for `purpose` into the first free slot with `fill`, derives its identifier, and
+    /// issues a handle if both succeed. If the derivation fails, the key and what the derivation
+    /// wrote are wiped.
     fn load(
         &mut self,
+        purpose: Purpose,
         fill: impl FnOnce(&mut Key) -> Result<(), Error>,
     ) -> Result<Handle<'a>, Error> {
         let slots = self.id();
@@ -195,6 +222,15 @@ impl<'a> Slots<'a> {
             .find(|(_, slot)| slot.state == State::Free)
             .ok_or(Error::NoFreeSlot)?;
         fill(&mut slot.key)?;
+        // Derived in a local buffer and copied in at once: the derivation writes byte by byte, and
+        // each write through a reference to a slot chosen at run time multiplies the proofs' work.
+        let mut id = KeyId::empty();
+        if derive_key_id(&slot.key, purpose, &mut id).is_err() {
+            slot.key.wipe();
+            return Err(Error::DerivationFailed);
+        }
+        slot.id.take(&mut id);
+        slot.purpose = purpose;
         slot.state = State::Loaded;
         Ok(Handle {
             slots,
@@ -229,13 +265,14 @@ impl<'a> Slots<'a> {
         self.slots.as_ptr().addr()
     }
 
-    /// Wipes the key in every slot, loaded or not, and frees the loaded ones.
+    /// Wipes the key and its identifier in every slot, loaded or not, and frees the loaded ones.
     fn unload_all(&mut self) {
         for slot in self.slots.iter_mut() {
             if slot.state == State::Loaded {
                 slot.unload();
             } else {
                 slot.key.wipe();
+                slot.id.wipe();
             }
         }
     }
@@ -260,8 +297,12 @@ mod tests {
     use core::marker::PhantomData;
     use std::format;
 
-    use super::{Entropy, EntropyError, Error, Handle, KeyLength, Slot, Slots, State};
-    use crate::key::tests::{Counting, Failing, Panicking, Recording, counted, padded};
+    use super::{Entropy, EntropyError, Error, Handle, KeyLength, Purpose, Slot, Slots, State};
+    use crate::derive::{KeyId, derive_key_id};
+    use crate::key::{
+        Key,
+        tests::{Counting, Failing, Panicking, Recording, counted, padded},
+    };
 
     assert_not_impl!(Slot: Clone, PartialEq, Default);
 
@@ -283,7 +324,7 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 2];
         let mut slots = Slots::new(&mut memory);
         let mut source = secret();
-        let handle = slots.import32(&mut source).unwrap();
+        let handle = slots.import32(Purpose::Wrap, &mut source).unwrap();
         assert_eq!((handle.index, handle.generation), (0, 0));
         assert_eq!(slots.slots[0].key.bytes(), &padded(&secret()));
         assert_eq!(slots.slots[0].key.length(), KeyLength::Bytes32);
@@ -296,7 +337,7 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut slots = Slots::new(&mut memory);
         let mut source = [5; 64];
-        slots.import64(&mut source).unwrap();
+        slots.import64(Purpose::Wrap, &mut source).unwrap();
         assert_eq!(slots.slots[0].key.bytes(), &[5; 64]);
         assert_eq!(slots.slots[0].key.length(), KeyLength::Bytes64);
         assert_eq!(slots.slots[0].state, State::Loaded);
@@ -307,8 +348,12 @@ mod tests {
     fn generate_writes_random_bytes_into_the_slot() {
         let mut memory = [const { Slot::empty() }; 2];
         let mut slots = Slots::new(&mut memory);
-        let short = slots.generate(KeyLength::Bytes32, &mut Counting).unwrap();
-        let long = slots.generate(KeyLength::Bytes64, &mut Counting).unwrap();
+        let short = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let long = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting)
+            .unwrap();
         assert_eq!((short.index, long.index), (0, 1));
         assert_eq!(slots.slots[0].key.bytes(), &padded(&counted::<32>()));
         assert_eq!(slots.slots[0].key.length(), KeyLength::Bytes32);
@@ -322,7 +367,7 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut slots = Slots::new(&mut memory);
         assert_eq!(
-            slots.generate(KeyLength::Bytes64, &mut Failing),
+            slots.generate(Purpose::Wrap, KeyLength::Bytes64, &mut Failing),
             Err(Error::EntropyFailed)
         );
         assert_eq!(slots.slots[0].state, State::Free);
@@ -335,7 +380,9 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 2];
         let mut slots = Slots::new(&mut memory);
         let mut source = Recording::default();
-        slots.generate(KeyLength::Bytes64, &mut source).unwrap();
+        slots
+            .generate(Purpose::Wrap, KeyLength::Bytes64, &mut source)
+            .unwrap();
         assert_eq!((source.calls, source.asked), (1, 64));
         assert_eq!(source.at, slots.slots[0].key.bytes().as_ptr().addr());
     }
@@ -345,7 +392,9 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut slots = Slots::new(&mut memory);
         let source: &mut dyn Entropy = &mut Counting;
-        slots.generate(KeyLength::Bytes32, source).unwrap();
+        slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, source)
+            .unwrap();
         assert_eq!(slots.slots[0].key.bytes(), &padded(&counted::<32>()));
     }
 
@@ -354,23 +403,72 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut slots = Slots::new(&mut memory);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = slots.generate(KeyLength::Bytes64, &mut Panicking);
+            let _ = slots.generate(Purpose::Wrap, KeyLength::Bytes64, &mut Panicking);
         }));
         assert!(outcome.is_err());
         assert_eq!(slots.slots[0].state, State::Free);
         assert_eq!(slots.slots[0].key.bytes(), &padded(&[]));
-        assert!(slots.generate(KeyLength::Bytes32, &mut Counting).is_ok());
+        assert!(
+            slots
+                .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+                .is_ok()
+        );
     }
 
     #[test]
     fn generate_without_a_free_slot_asks_for_no_bytes() {
         let mut memory = [const { Slot::empty() }; 1];
         let mut slots = Slots::new(&mut memory);
-        slots.import32(&mut secret()).unwrap();
+        slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         assert_eq!(
-            slots.generate(KeyLength::Bytes32, &mut Untouched),
+            slots.generate(Purpose::Wrap, KeyLength::Bytes32, &mut Untouched),
             Err(Error::NoFreeSlot)
         );
+    }
+
+    fn id_of(key: &Key) -> KeyId {
+        let mut id = KeyId::empty();
+        derive_key_id(key, Purpose::Wrap, &mut id).unwrap();
+        id
+    }
+
+    #[test]
+    fn a_load_keeps_the_purpose_and_the_identifier_of_the_key() {
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut slots = Slots::new(&mut memory);
+        slots.import32(Purpose::Wrap, &mut secret()).unwrap();
+        slots
+            .generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting)
+            .unwrap();
+        let mut short = Key::empty();
+        short.load32(&mut secret());
+        let mut long = Key::empty();
+        long.load64(&mut counted::<64>());
+        assert_eq!(slots.slots[0].purpose, Purpose::Wrap);
+        assert_eq!(slots.slots[1].purpose, Purpose::Wrap);
+        assert_eq!(slots.slots[0].id, id_of(&short));
+        assert_eq!(slots.slots[1].id, id_of(&long));
+        assert_ne!(slots.slots[0].id, slots.slots[1].id);
+    }
+
+    #[test]
+    fn release_wipes_the_identifier() {
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut slots = Slots::new(&mut memory);
+        let handle = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
+        assert_ne!(slots.slots[0].id, KeyId::empty());
+        slots.release(handle).unwrap();
+        assert_eq!(slots.slots[0].id, KeyId::empty());
+    }
+
+    #[test]
+    fn new_slots_wipe_an_identifier_left_behind() {
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut key = Key::empty();
+        key.load32(&mut secret());
+        memory[0].id = id_of(&key);
+        let slots = Slots::new(&mut memory);
+        assert_eq!(slots.slots[0].id, KeyId::empty());
     }
 
     #[test]
@@ -378,8 +476,8 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 3];
         memory[1].state = State::Retired;
         let mut slots = Slots::new(&mut memory);
-        slots.import32(&mut secret()).unwrap();
-        let handle = slots.import64(&mut [5; 64]).unwrap();
+        slots.import32(Purpose::Wrap, &mut secret()).unwrap();
+        let handle = slots.import64(Purpose::Wrap, &mut [5; 64]).unwrap();
         assert_eq!(handle.index, 2);
     }
 
@@ -387,12 +485,18 @@ mod tests {
     fn import_without_a_free_slot_keeps_the_source() {
         let mut memory = [const { Slot::empty() }; 1];
         let mut slots = Slots::new(&mut memory);
-        slots.import32(&mut secret()).unwrap();
+        slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         let mut short = secret();
-        assert_eq!(slots.import32(&mut short), Err(Error::NoFreeSlot));
+        assert_eq!(
+            slots.import32(Purpose::Wrap, &mut short),
+            Err(Error::NoFreeSlot)
+        );
         assert_eq!(short, secret());
         let mut long = [5; 64];
-        assert_eq!(slots.import64(&mut long), Err(Error::NoFreeSlot));
+        assert_eq!(
+            slots.import64(Purpose::Wrap, &mut long),
+            Err(Error::NoFreeSlot)
+        );
         assert_eq!(long, [5; 64]);
     }
 
@@ -400,8 +504,8 @@ mod tests {
     fn release_wipes_only_its_own_key() {
         let mut memory = [const { Slot::empty() }; 2];
         let mut slots = Slots::new(&mut memory);
-        slots.import32(&mut secret()).unwrap();
-        let second = slots.import64(&mut [5; 64]).unwrap();
+        slots.import32(Purpose::Wrap, &mut secret()).unwrap();
+        let second = slots.import64(Purpose::Wrap, &mut [5; 64]).unwrap();
         slots.release(second).unwrap();
         assert_eq!(slots.slots[1].key.bytes(), &padded(&[]));
         assert_eq!(slots.slots[1].key.length(), KeyLength::Bytes32);
@@ -415,7 +519,7 @@ mod tests {
     fn a_released_handle_is_stale() {
         let mut memory = [const { Slot::empty() }; 1];
         let mut slots = Slots::new(&mut memory);
-        let handle = slots.import32(&mut secret()).unwrap();
+        let handle = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         slots.release(handle).unwrap();
         assert_eq!(slots.release(handle), Err(Error::StaleHandle));
     }
@@ -424,9 +528,11 @@ mod tests {
     fn an_old_handle_does_not_reach_a_new_key_in_the_same_slot() {
         let mut memory = [const { Slot::empty() }; 1];
         let mut slots = Slots::new(&mut memory);
-        let old = slots.import32(&mut secret()).unwrap();
+        let old = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         slots.release(old).unwrap();
-        let new = slots.generate(KeyLength::Bytes64, &mut Counting).unwrap();
+        let new = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting)
+            .unwrap();
         assert_eq!(new.index, old.index);
         assert_eq!(slots.release(old), Err(Error::StaleHandle));
         assert_eq!(slots.release(new), Ok(()));
@@ -438,8 +544,8 @@ mod tests {
         let mut second_memory = [const { Slot::empty() }; 1];
         let mut first = Slots::new(&mut first_memory);
         let mut second = Slots::new(&mut second_memory);
-        let handle = first.import32(&mut secret()).unwrap();
-        second.import32(&mut secret()).unwrap();
+        let handle = first.import32(Purpose::Wrap, &mut secret()).unwrap();
+        second.import32(Purpose::Wrap, &mut secret()).unwrap();
         assert_eq!(second.release(handle), Err(Error::StaleHandle));
         assert_eq!(second.slots[0].key.bytes(), &padded(&secret()));
     }
@@ -449,7 +555,7 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let id = memory.as_ptr().addr();
         let mut slots = Slots::new(&mut memory);
-        slots.import32(&mut secret()).unwrap();
+        slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         let outside = Handle {
             slots: id,
             index: 1,
@@ -465,9 +571,12 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         memory[0].generation = u64::MAX;
         let mut slots = Slots::new(&mut memory);
-        let handle = slots.import32(&mut secret()).unwrap();
+        let handle = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         slots.release(handle).unwrap();
-        assert_eq!(slots.import32(&mut secret()), Err(Error::NoFreeSlot));
+        assert_eq!(
+            slots.import32(Purpose::Wrap, &mut secret()),
+            Err(Error::NoFreeSlot)
+        );
         assert_eq!(slots.release(handle), Err(Error::StaleHandle));
         assert_eq!(slots.slots[0].state, State::Retired);
         assert_eq!(slots.slots[0].key.bytes(), &padded(&[]));
@@ -478,8 +587,8 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 2];
         {
             let mut slots = Slots::new(&mut memory);
-            slots.import32(&mut secret()).unwrap();
-            slots.import64(&mut [5; 64]).unwrap();
+            slots.import32(Purpose::Wrap, &mut secret()).unwrap();
+            slots.import64(Purpose::Wrap, &mut [5; 64]).unwrap();
         }
         for slot in &memory {
             assert_eq!(slot.key.bytes(), &padded(&[]));
@@ -514,7 +623,7 @@ mod tests {
     fn debug_shows_no_state() {
         let mut memory = [const { Slot::empty() }; 1];
         let mut slots = Slots::new(&mut memory);
-        let handle = slots.import32(&mut secret()).unwrap();
+        let handle = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         assert_eq!(format!("{handle:?}"), "Handle { .. }");
         assert_eq!(format!("{:?}", slots.slots[0]), "Slot { .. }");
         assert_eq!(format!("{slots:?}"), "Slots { .. }");
@@ -525,21 +634,33 @@ mod tests {
 mod proofs {
     use core::marker::PhantomData;
 
-    use super::{Entropy, EntropyError, Error, Handle, KeyLength, Slot, Slots, State};
+    use super::{Entropy, EntropyError, Error, Handle, KeyLength, Purpose, Slot, Slots, State};
+    use crate::derive::{
+        model::{failed, id_bytes, id_from_bytes},
+        proofs::expected_key_id,
+    };
+    use crate::record::ID_LEN;
 
     /// The shortest sequence that reaches every outcome below, including a released handle refused
     /// while its slot holds a new key; a cover property shows that case is reached.
     const STEPS: usize = 4;
 
     type Bytes = [u8; 64];
-    type Snapshot = (State, u64, KeyLength, Bytes);
+    type Snapshot = (State, u64, KeyLength, Bytes, Purpose, [u8; ID_LEN]);
 
     fn key(slot: &Slot) -> Bytes {
         *slot.key.bytes()
     }
 
     fn snapshot(slot: &Slot) -> Snapshot {
-        (slot.state, slot.generation, slot.key.length(), key(slot))
+        (
+            slot.state,
+            slot.generation,
+            slot.key.length(),
+            key(slot),
+            slot.purpose,
+            *id_bytes(&slot.id),
+        )
     }
 
     // Kani 0.68.0 reports spurious failures when a key buffer is read through a symbolic index,
@@ -579,10 +700,11 @@ mod proofs {
         out
     }
 
-    /// A slot in any state and with any generation, holding a key of either length only when
-    /// loaded. This covers every state the code can produce and more: a key outside a loaded slot
-    /// cannot arise, because every path out of the loaded state wipes the key first, and bytes a
-    /// generation writes into a free slot are wiped when it fails, which the last proof checks, or
+    /// A slot in any state and with any generation, holding a key of either length and any
+    /// identifier only when loaded. This covers every state the code can produce and more: a key or
+    /// an identifier outside a loaded slot cannot arise, because every path out of the loaded state
+    /// wipes both first, and what a failed load writes into a free slot is wiped, which
+    /// `a_load_takes_the_first_free_slot` checks, as is what a generation writes before its source
     /// panics, which a unit test checks.
     fn any_slot() -> Slot {
         let mut slot = Slot::empty();
@@ -598,6 +720,7 @@ mod proofs {
             } else {
                 slot.key.load64(&mut kani::any());
             }
+            slot.id = id_from_bytes(kani::any());
         }
         slot
     }
@@ -640,7 +763,7 @@ mod proofs {
         let (result, expected, length) = if kani::any() {
             let mut source: [u8; 32] = kani::any();
             let original = source;
-            let result = slots.import32(&mut source);
+            let result = slots.import32(Purpose::Wrap, &mut source);
             let mut bytes = [0; 64];
             bytes[..32].copy_from_slice(&original);
             kani::assert(
@@ -651,7 +774,7 @@ mod proofs {
         } else {
             let mut source: [u8; 64] = kani::any();
             let original = source;
-            let result = slots.import64(&mut source);
+            let result = slots.import64(Purpose::Wrap, &mut source);
             kani::assert(
                 source == if result.is_ok() { [0; 64] } else { original },
                 "an import wipes its source exactly when it succeeds",
@@ -667,9 +790,10 @@ mod proofs {
         (result, expected, length)
     }
 
-    /// Loads one key by any of the three ways, with any key and length. Returns the outcome and,
-    /// on success, the bytes and length the slot must now hold.
-    fn load_any(slots: &mut Slots<'_>) -> (Result<Handle<'static>, Error>, Bytes, KeyLength) {
+    /// Loads one key by any of the three ways, with any key and length. Returns the outcome, the
+    /// bytes and length the slot must hold on success, and whether a platform source was asked and
+    /// failed.
+    fn load_any(slots: &mut Slots<'_>) -> (Result<Handle<'static>, Error>, Bytes, KeyLength, bool) {
         let mut entropy = AnyEntropy {
             written: [0; 64],
             calls: 0,
@@ -681,7 +805,7 @@ mod proofs {
         let (result, expected, length) = if way % 3 == 0 {
             let mut source: [u8; 32] = kani::any();
             let original = source;
-            let result = slots.import32(&mut source);
+            let result = slots.import32(Purpose::Wrap, &mut source);
             let mut bytes = [0; 64];
             bytes[..32].copy_from_slice(&original);
             kani::assert(
@@ -692,7 +816,7 @@ mod proofs {
         } else if way % 3 == 1 {
             let mut source: [u8; 64] = kani::any();
             let original = source;
-            let result = slots.import64(&mut source);
+            let result = slots.import64(Purpose::Wrap, &mut source);
             kani::assert(
                 source == if result.is_ok() { [0; 64] } else { original },
                 "an import wipes its source exactly when it succeeds",
@@ -700,7 +824,7 @@ mod proofs {
             (result, original, KeyLength::Bytes64)
         } else {
             let length = any_length();
-            let result = slots.generate(length, &mut entropy);
+            let result = slots.generate(Purpose::Wrap, length, &mut entropy);
             if result == Err(Error::NoFreeSlot) {
                 kani::assert(entropy.calls == 0, "a full set asks the source for nothing");
             } else {
@@ -709,8 +833,8 @@ mod proofs {
                     "the source is asked once, for the length of the key",
                 );
                 kani::assert(
-                    result.is_ok() == !entropy.failed,
-                    "a generation succeeds exactly when the source does",
+                    (result == Err(Error::EntropyFailed)) == entropy.failed,
+                    "a generation fails with EntropyFailed exactly when the source fails",
                 );
             }
             if let Ok(handle) = result {
@@ -739,14 +863,15 @@ mod proofs {
             generation: handle.generation,
             memory: PhantomData,
         });
-        (result, expected, length)
+        (result, expected, length, entropy.failed)
     }
 
     /// From empty memory, any interleaving of four imports and releases over two slots, with any
-    /// keys of either length. A live handle reaches exactly its own key, a released key is zero at
-    /// once, and a released handle is refused ever after, including while its slot holds a new
-    /// key. Every load goes through the same code, so generated keys are covered by the last proof,
-    /// which checks each way of loading from any state.
+    /// keys of either length. A live handle reaches exactly its own key, a released key and its
+    /// identifier are zero at once, and a released handle is refused ever after, including while
+    /// its slot holds a new key. Every load goes through the same code, so generated keys, and the
+    /// identifier a load derives, are covered by `a_load_takes_the_first_free_slot`, which checks
+    /// each way of loading from any state.
     #[kani::proof]
     #[kani::unwind(65)]
     fn a_handle_reaches_only_its_own_key() {
@@ -766,10 +891,14 @@ mod proofs {
                     }
                     Err(error) => {
                         kani::assert(
-                            error == Error::NoFreeSlot,
-                            "an import fails only with NoFreeSlot",
+                            error == Error::NoFreeSlot || error == Error::DerivationFailed,
+                            "an import fails only with NoFreeSlot or DerivationFailed",
                         );
-                        kani::cover!(true, "an import finds no free slot");
+                        kani::cover!(error == Error::NoFreeSlot, "an import finds no free slot");
+                        kani::cover!(
+                            error == Error::DerivationFailed,
+                            "an import fails to derive the identifier"
+                        );
                     }
                 }
             } else {
@@ -781,9 +910,10 @@ mod proofs {
                     let result = slots.release(handle);
                     if live[pick] {
                         kani::assert(result == Ok(()), "a live handle releases its key");
+                        let slot = slot_at(&slots, handle.index);
                         kani::assert(
-                            key(slot_at(&slots, handle.index)) == [0; 64],
-                            "a released key is zero at once",
+                            key(slot) == [0; 64] && *id_bytes(&slot.id) == [0; ID_LEN],
+                            "a released key and its identifier are zero at once",
                         );
                         live[pick] = false;
                         kani::cover!(true, "a live key is released");
@@ -835,7 +965,7 @@ mod proofs {
         kani::assume(foreign.slots != id);
         kani::cover!(
             foreign.index < 2 && {
-                let (state, generation, _, _) = snapshot_at(&before, foreign.index);
+                let (state, generation, ..) = snapshot_at(&before, foreign.index);
                 state == State::Loaded && generation == foreign.generation
             },
             "the foreign handle names a loaded slot and its generation"
@@ -864,11 +994,12 @@ mod proofs {
         } else {
             slot.key.load64(&mut kani::any());
         }
+        slot.id = id_from_bytes(kani::any());
         slot
     }
 
     /// From any state of two slots, with any bytes left in any buffer, creating `Slots` wipes every
-    /// buffer and loads no slot.
+    /// key and identifier and loads no slot.
     #[kani::proof]
     #[kani::unwind(65)]
     fn creating_slots_wipes_every_key() {
@@ -889,70 +1020,91 @@ mod proofs {
         for slot in slots.slots.iter() {
             kani::assert(slot.state != State::Loaded, "creating slots loads no slot");
             kani::assert(
-                key(slot) == [0; 64] && slot.key.length() == KeyLength::Bytes32,
-                "creating slots wipes every buffer",
+                key(slot) == [0; 64]
+                    && slot.key.length() == KeyLength::Bytes32
+                    && *id_bytes(&slot.id) == [0; ID_LEN],
+                "creating slots wipes every key and identifier",
             );
         }
     }
 
     /// From any state of two slots and any generation: a load by import or from the platform
     /// source takes the first free slot, issues that slot's generation, keeps it in the slot and
-    /// leaves exactly the expected bytes there, zero past the key's length; a failed source or a
-    /// full set changes no slot, and a full set asks the source for nothing. A handle of this set
-    /// naming any slot and generation releases a key only if that slot is loaded with that
-    /// generation, and otherwise is refused and changes nothing; a release wipes the key and
-    /// advances the generation by one, or retires the slot when the generation runs out; no call
-    /// panics or overflows.
+    /// leaves exactly the expected bytes there, zero past the key's length, with the purpose given
+    /// and the identifier derived from those bytes; a load fails to derive the identifier exactly
+    /// when the derivation fails; a failed source, a failed derivation or a full set changes no
+    /// slot, and a full set asks the source for nothing; no load panics or overflows.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_load_takes_the_first_free_slot() {
+        let mut memory = [any_slot(), any_slot()];
+        let mut slots = Slots { slots: &mut memory };
+
+        let before = [snapshot(&slots.slots[0]), snapshot(&slots.slots[1])];
+        let first_free = before.iter().position(|&(state, ..)| state == State::Free);
+        let (result, expected, length, source_failed) = load_any(&mut slots);
+        kani::assert(
+            if first_free.is_none() {
+                result == Err(Error::NoFreeSlot)
+            } else if source_failed {
+                result == Err(Error::EntropyFailed)
+            } else {
+                (result == Err(Error::DerivationFailed)) == failed()
+                    && (result.is_ok() || result == Err(Error::DerivationFailed))
+            },
+            "a load fails with NoFreeSlot without a free slot, with EntropyFailed when the source \
+             fails, with DerivationFailed when the derivation fails, and otherwise succeeds",
+        );
+        kani::cover!(
+            result == Err(Error::DerivationFailed),
+            "a load fails to derive the identifier"
+        );
+        if let (Ok(handle), Some(index)) = (result, first_free) {
+            let generation = snapshot_at(&before, index).1;
+            kani::assert(
+                handle.index == index && handle.generation == generation,
+                "a load takes the first free slot and issues its generation",
+            );
+            let slot = slot_at(&slots, index);
+            kani::assert(
+                slot.state == State::Loaded && slot.generation == generation,
+                "the slot is loaded and keeps its generation",
+            );
+            kani::assert(
+                key(slot) == expected && slot.key.length() == length,
+                "the slot holds exactly the key, zero past its length",
+            );
+            kani::assert(
+                *id_bytes(&slot.id) == expected_key_id(&expected, length, Purpose::Wrap)
+                    && slot.purpose == Purpose::Wrap,
+                "the slot keeps the purpose and the identifier derived from its key",
+            );
+            kani::assert(
+                unchanged_except(&slots, &before, index),
+                "a load changes no other slot",
+            );
+            kani::cover!(length == KeyLength::Bytes32, "a short key is loaded");
+            kani::cover!(length == KeyLength::Bytes64, "a long key is loaded");
+        } else {
+            kani::assert(
+                unchanged_except(&slots, &before, 2),
+                "a failed load changes no slot",
+            );
+            kani::cover!(first_free.is_none(), "no slot is free");
+        }
+    }
+
+    /// From any state of two slots and any generation, which includes every state a load leaves: a
+    /// handle of this set naming any slot and generation releases a key only if that slot is loaded
+    /// with that generation, and otherwise is refused and changes nothing; a release wipes the key
+    /// and its identifier and advances the generation by one, or retires the slot when the
+    /// generation runs out; no release panics or overflows.
     #[kani::proof]
     #[kani::unwind(65)]
     fn a_handle_releases_only_a_matching_loaded_slot() {
         let mut memory = [any_slot(), any_slot()];
         let id = memory.as_ptr().addr();
         let mut slots = Slots { slots: &mut memory };
-
-        if kani::any() {
-            let before = [snapshot(&slots.slots[0]), snapshot(&slots.slots[1])];
-            let first_free = before
-                .iter()
-                .position(|&(state, _, _, _)| state == State::Free);
-            let (result, expected, length) = load_any(&mut slots);
-            kani::assert(
-                if first_free.is_some() {
-                    result.is_ok() || result == Err(Error::EntropyFailed)
-                } else {
-                    result == Err(Error::NoFreeSlot)
-                },
-                "no free slot gives NoFreeSlot, otherwise success or EntropyFailed",
-            );
-            if let (Ok(handle), Some(index)) = (result, first_free) {
-                let generation = snapshot_at(&before, index).1;
-                kani::assert(
-                    handle.index == index && handle.generation == generation,
-                    "a load takes the first free slot and issues its generation",
-                );
-                let slot = slot_at(&slots, index);
-                kani::assert(
-                    slot.state == State::Loaded && slot.generation == generation,
-                    "the slot is loaded and keeps its generation",
-                );
-                kani::assert(
-                    key(slot) == expected && slot.key.length() == length,
-                    "the slot holds exactly the key, zero past its length",
-                );
-                kani::assert(
-                    unchanged_except(&slots, &before, index),
-                    "a load changes no other slot",
-                );
-                kani::cover!(length == KeyLength::Bytes32, "a short key is loaded");
-                kani::cover!(length == KeyLength::Bytes64, "a long key is loaded");
-            } else {
-                kani::assert(
-                    unchanged_except(&slots, &before, 2),
-                    "a failed load changes no slot",
-                );
-                kani::cover!(first_free.is_none(), "no slot is free");
-            }
-        }
 
         let forged = Handle {
             slots: id,
@@ -962,9 +1114,7 @@ mod proofs {
         };
         let before = [snapshot(&slots.slots[0]), snapshot(&slots.slots[1])];
         kani::cover!(
-            before
-                .iter()
-                .all(|&(state, _, _, _)| state == State::Loaded),
+            before.iter().all(|&(state, ..)| state == State::Loaded),
             "both slots hold a key when the handle arrives"
         );
         kani::cover!(
@@ -974,17 +1124,19 @@ mod proofs {
         let target = Some(forged.index)
             .filter(|&index| index < 2)
             .map(|index| snapshot_at(&before, index))
-            .filter(|&(state, generation, _, _)| {
+            .filter(|&(state, generation, ..)| {
                 state == State::Loaded && generation == forged.generation
             });
         let result = slots.release(forged);
         match target {
-            Some((_, generation, _, _)) => {
+            Some((_, generation, ..)) => {
                 kani::assert(result == Ok(()), "a matching handle releases its key");
                 let slot = slot_at(&slots, forged.index);
                 kani::assert(
-                    key(slot) == [0; 64] && slot.key.length() == KeyLength::Bytes32,
-                    "a release wipes the key",
+                    key(slot) == [0; 64]
+                        && slot.key.length() == KeyLength::Bytes32
+                        && *id_bytes(&slot.id) == [0; ID_LEN],
+                    "a release wipes the key and its identifier",
                 );
                 if generation == u64::MAX {
                     kani::assert(
@@ -1019,9 +1171,7 @@ mod proofs {
                     "the second slot is unchanged",
                 );
                 kani::cover!(
-                    before
-                        .iter()
-                        .any(|&(state, _, _, _)| state == State::Loaded),
+                    before.iter().any(|&(state, ..)| state == State::Loaded),
                     "a handle is refused while a key is loaded"
                 );
             }

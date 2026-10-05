@@ -24,7 +24,7 @@ Nothing is published while the version is below 0.1.0.
 - Builds without the standard library and without a memory allocator.
 - Keys of 32 or 64 bytes: `Slots::import32`, `Slots::import64`, and `Slots::generate`, which
   writes a key straight into its slot from the platform's random source, given through the
-  `Entropy` trait; the library makes no copy of it. `KeyLength` names the two lengths.
+  `Entropy` trait; the library's own code makes no copy of it. `KeyLength` names the two lengths.
 - Proofs with Kani 0.68.0 for the slots: a released key is wiped and its handle refused, creating a
   set wipes the keys left in its memory, a handle from another set is refused, a release advances
   the generation, no call panics unless the caller's random source does. Run on every change; see
@@ -34,6 +34,12 @@ Nothing is published while the version is below 0.1.0.
   other was given.
 - Proof with Kani 0.68.0 that the labels built for two key derivations which differ in key
   length, branch or output length are different.
+- `Purpose`: what a key may be used for, given when the key is loaded and never changed. One purpose
+  so far, wrapping other keys. `Slots::import32`, `Slots::import64` and `Slots::generate` take it.
+- The identifier of a key is derived from the key when it is loaded and kept in its slot; it is
+  wiped with the key. `Error::DerivationFailed` when it cannot be derived.
+- A failed import leaves its source as it was.
+- The proofs on slots cover the identifier, with a model of the derivation.
 - Dependency review recorded with cargo-vet in `supply-chain/`: a crate that handles key material is
   read in full, and the continuous integration check fails on a version without a record. See
   `SECURITY.md`.

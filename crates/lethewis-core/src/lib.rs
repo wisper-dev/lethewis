@@ -30,11 +30,10 @@ macro_rules! assert_not_impl {
     };
 }
 
-// Under Kani the wipe is plain stores, so zeroize goes unused there.
+// Under Kani the wipe is plain stores and the derivation a model, so these go unused there.
 #[cfg(kani)]
-use zeroize as _;
+use {hkdf as _, sha2 as _, zeroize as _};
 
-#[cfg_attr(not(test), expect(dead_code))]
 mod derive;
 mod entropy;
 mod error;
@@ -46,4 +45,5 @@ mod slots;
 pub use entropy::{Entropy, EntropyError};
 pub use error::Error;
 pub use key::KeyLength;
+pub use record::Purpose;
 pub use slots::{Handle, Slot, Slots};
