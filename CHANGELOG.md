@@ -40,6 +40,13 @@ Nothing is published while the version is below 0.1.0.
   wiped with the key. `Error::DerivationFailed` when it cannot be derived.
 - A failed import leaves its source as it was.
 - The proofs on slots cover the identifier, with a model of the derivation.
+- The stack a key derivation used is wiped after it, also when it fails. Loading a key now needs
+  8 KiB of stack for that, or 64 KiB when this crate is built without optimisation or with
+  `--cfg lethewis_unoptimised`, which a build that optimises this crate but not the hash code it
+  calls has to set. Tests read the memory of their own process back, with and without optimisation
+  and with the hardware and the software SHA-256, to check that the wipe reaches that depth and that
+  no piece of the key, of the extracted key or of the HMAC and SHA-256 states, blocks and message
+  schedules is left there.
 - Dependency review recorded with cargo-vet in `supply-chain/`: a crate that handles key material is
   read in full, and the continuous integration check fails on a version without a record. See
   `SECURITY.md`.

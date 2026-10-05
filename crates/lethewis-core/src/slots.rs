@@ -144,6 +144,11 @@ impl<'a> Slots<'a> {
 
     /// Takes a 32-byte key for `purpose` from `source` into a free slot and wipes `source`.
     ///
+    /// Needs 8 KiB of stack, or 64 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier is followed by a wipe of
+    /// that much. A build that optimises this crate but not the hash code it calls has to set that
+    /// flag.
+    ///
     /// # Errors
     ///
     /// [`Error::NoFreeSlot`] if no slot is free, and [`Error::DerivationFailed`] if the identifier of
@@ -162,6 +167,11 @@ impl<'a> Slots<'a> {
     }
 
     /// Takes a 64-byte key for `purpose` from `source` into a free slot and wipes `source`.
+    ///
+    /// Needs 8 KiB of stack, or 64 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier is followed by a wipe of
+    /// that much. A build that optimises this crate but not the hash code it calls has to set that
+    /// flag.
     ///
     /// # Errors
     ///
@@ -182,8 +192,12 @@ impl<'a> Slots<'a> {
 
     /// Creates a key for `purpose` of `length` random bytes from `entropy` in a free slot. The bytes
     /// are written straight into the slot, and the library's own code makes no copy of them; the
-    /// hashing code that derives the key's identifier leaves copies on the stack. `entropy` is asked
+    /// stack the derivation of the key's identifier used is wiped after it. `entropy` is asked
     /// once, and only when a slot is free.
+    ///
+    /// Like an import, this needs 8 KiB of stack, or 64 KiB when this crate is built without
+    /// optimisation or with `--cfg lethewis_unoptimised`, for that wipe; a build that optimises this
+    /// crate but not the hash code it calls has to set that flag.
     ///
     /// # Errors
     ///

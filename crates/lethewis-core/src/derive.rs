@@ -18,6 +18,13 @@ const VERSION: u8 = 1;
 /// Prefix (8), version, purpose, key length, output length (2), name length, and a name of up to
 /// 16 bytes.
 const LABEL_CAPACITY: usize = 30;
+/// How many bytes of stack a derivation is followed by a wipe of: at least twice what it uses, as a
+/// test measures in each build and with each SHA-256 back end. Without optimisation it uses far
+/// more.
+#[cfg(all(not(kani), not(lethewis_unoptimised)))]
+const STACK_WIPE: usize = 8192;
+#[cfg(all(not(kani), lethewis_unoptimised))]
+const STACK_WIPE: usize = 65_536;
 
 /// What a derived value is for. Each branch has a name of its own in the label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,8 +86,25 @@ pub(crate) fn derive_key_id(
 }
 
 /// Fills `out` with the value of `branch` derived from `key`, which serves `purpose`. The key goes
-/// through HKDF-Extract with a fixed salt, and HKDF-Expand takes the label.
+/// through HKDF-Extract with a fixed salt, and HKDF-Expand takes the label. Then the stack the
+/// derivation used is wiped, whether it succeeded or not.
 pub(crate) fn derive(
+    key: &Key,
+    purpose: Purpose,
+    branch: Branch,
+    out: &mut [u8],
+) -> Result<(), DerivationFailed> {
+    let derived = derive_on_stack(key, purpose, branch, out);
+    // The wipe ends in inline assembly, which Kani cannot model.
+    #[cfg(not(kani))]
+    zeroize::zeroize_stack::<STACK_WIPE>();
+    derived
+}
+
+/// The derivation itself, in a frame of its own: the wipe that follows starts where this frame
+/// starts.
+#[inline(never)]
+fn derive_on_stack(
     key: &Key,
     purpose: Purpose,
     branch: Branch,
@@ -97,6 +121,463 @@ fn hkdf(material: &[u8], info: &[u8], out: &mut [u8]) -> Result<(), DerivationFa
     Hkdf::<Sha256>::new(Some(SALT), material)
         .expand(info, out)
         .map_err(|_| DerivationFailed)
+}
+
+#[cfg(test)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "a test computes offsets and the SHA-256 message schedule"
+)]
+mod stack {
+    //! What a derivation leaves on the stack, read back from the memory of this process.
+
+    extern crate std;
+
+    use core::hint::black_box;
+    use core::ops::Range;
+    use std::collections::HashSet;
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::vec::Vec;
+
+    use hkdf::Hkdf;
+    use sha2::{Digest, Sha256, block_api::compress256};
+
+    use super::{Branch, SALT, STACK_WIPE, derive, derive_on_stack, label};
+    use crate::key::{
+        Key, KeyLength,
+        tests::{Counting, counted},
+    };
+    use crate::record::Purpose;
+    use crate::slots::{Slot, Slots};
+
+    /// Room between the test's frame and the code under test, so that reading the memory back,
+    /// which runs at the test's depth, does not reach the stack that code used.
+    const PAD: usize = 64 * 1024;
+    /// How far below the pad the stack is read: deeper than the deepest wipe.
+    const SCAN: usize = 128 * 1024;
+    const PAINT: u8 = 0xa7;
+
+    /// Runs `code` below the pad, after painting the stack it is about to use when asked to, and
+    /// returns the addresses under the pad.
+    #[inline(never)]
+    #[expect(
+        clippy::large_stack_arrays,
+        reason = "the pad is a large array on the stack"
+    )]
+    fn below_pad(paint: bool, code: impl FnOnce()) -> Range<usize> {
+        let pad = black_box([0x11_u8; PAD]);
+        let low = black_box(&pad).as_ptr().addr();
+        if paint {
+            paint_stack();
+        }
+        code();
+        black_box(&pad);
+        low.saturating_sub(SCAN)..low
+    }
+
+    #[inline(never)]
+    #[expect(
+        clippy::large_stack_arrays,
+        reason = "the paint is a large array on the stack"
+    )]
+    fn paint_stack() {
+        black_box([PAINT; SCAN]);
+    }
+
+    fn read(range: Range<usize>) -> Vec<u8> {
+        let mut memory = File::open("/proc/self/mem").unwrap();
+        memory.seek(SeekFrom::Start(range.start as u64)).unwrap();
+        let mut bytes = std::vec![0; range.len()];
+        memory.read_exact(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// A 64-byte key whose bytes appear nowhere else.
+    fn key_bytes() -> [u8; 64] {
+        core::array::from_fn(|i| u8::try_from(i).unwrap().wrapping_mul(37).wrapping_add(11))
+    }
+
+    /// The initial state of SHA-256, FIPS 180-4, section 5.3.3.
+    const IV: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+
+    /// The round constants of SHA-256, FIPS 180-4, section 4.2.2.
+    const K: [u32; 64] = [
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
+    ];
+
+    /// An HMAC key block: `key` padded with zeros to 64 bytes, each byte combined with `pad` by
+    /// exclusive or.
+    fn key_block(key: &[u8], pad: u8) -> [u8; 64] {
+        core::array::from_fn(|i| key.get(i).copied().unwrap_or(0) ^ pad)
+    }
+
+    /// The last block SHA-256 compresses for a 96-byte message whose last 32 bytes are `tail`: the
+    /// tail, the end mark and the length in bits.
+    fn final_block(tail: &[u8]) -> [u8; 64] {
+        let mut block = [0; 64];
+        block[..32].copy_from_slice(tail);
+        block[32] = 0x80;
+        block[56..].copy_from_slice(&768_u64.to_be_bytes());
+        block
+    }
+
+    /// The SHA-256 state after `blocks`, from the initial state.
+    fn state_after(blocks: &[[u8; 64]]) -> [u32; 8] {
+        let mut state = IV;
+        compress256(&mut state, blocks);
+        state
+    }
+
+    /// The message schedule SHA-256 computes for `block`, FIPS 180-4, section 6.2.2.
+    fn schedule(block: &[u8; 64]) -> [u32; 64] {
+        let mut w = [0_u32; 64];
+        for (word, bytes) in w.iter_mut().zip(block.chunks(4)) {
+            *word = u32::from_be_bytes(bytes.try_into().unwrap());
+        }
+        for i in 16..64 {
+            let (a, b) = (w[i - 15], w[i - 2]);
+            let s0 = a.rotate_right(7) ^ a.rotate_right(18) ^ a.wrapping_shr(3);
+            let s1 = b.rotate_right(17) ^ b.rotate_right(19) ^ b.wrapping_shr(10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        w
+    }
+
+    /// Words as they sit in memory on either byte order.
+    fn words_forms(words: &[u32]) -> [Vec<u8>; 2] {
+        [
+            words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+            words.iter().flat_map(|word| word.to_be_bytes()).collect(),
+        ]
+    }
+
+    /// A state as it sits in memory: as eight words, and as the halves the SHA instructions of
+    /// x86-64 keep it in on the way in, during the rounds and on the way out.
+    fn state_forms(state: [u32; 8]) -> Vec<Vec<u8>> {
+        let mut forms = Vec::from(words_forms(&state));
+        for half in [
+            [5, 4, 1, 0],
+            [7, 6, 3, 2],
+            [1, 0, 3, 2],
+            [7, 6, 5, 4],
+            [0, 1, 4, 5],
+            [6, 7, 2, 3],
+        ] {
+            forms.extend(words_forms(&half.map(|word| state[word])));
+        }
+        forms
+    }
+
+    /// A hash output as bytes and as the words of the state it came from.
+    fn hash_forms(hash: &[u8]) -> Vec<Vec<u8>> {
+        let words: Vec<u32> = hash
+            .chunks(4)
+            .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
+            .collect();
+        let mut forms = std::vec![hash.to_vec()];
+        forms.extend(state_forms(words.try_into().unwrap()));
+        forms
+    }
+
+    /// A block a hash compresses, with its message schedule and the schedule plus the round
+    /// constants, as they sit in memory.
+    fn block_forms(block: &[u8; 64]) -> Vec<Vec<u8>> {
+        let w = schedule(block);
+        let with_constants: Vec<u32> = w.iter().zip(K).map(|(w, k)| w.wrapping_add(k)).collect();
+        let mut forms = std::vec![block.to_vec()];
+        forms.extend(words_forms(&w));
+        forms.extend(words_forms(&with_constants));
+        forms
+    }
+
+    /// The secrets a derivation of the identifier of the first `length` bytes of `key` handles:
+    /// the key; in Extract, the state after the key and the inner hash; the extracted key, the
+    /// HMAC key blocks made from it and the states after each, from which any value could be
+    /// derived; in Expand, the inner hash; the message schedules of every secret block; and the
+    /// first output block, in plain bytes past its first byte, so that the identifier itself,
+    /// which the caller asked for, is not counted.
+    fn secrets(key: &[u8], length: KeyLength) -> Vec<Vec<u8>> {
+        let key = &key[..length.bytes()];
+        let (label, used) = label(Purpose::Wrap, length, Branch::KeyId, 16).unwrap();
+        let info = &label[..used];
+        let (prk, expander) = Hkdf::<Sha256>::extract(Some(SALT), key);
+        let mut output = [0; 32];
+        expander.expand(info, &mut output).unwrap();
+
+        let salt_inner = key_block(SALT, 0x36);
+        let key_block_of_message: [u8; 64] = match length {
+            KeyLength::Bytes32 => final_block(key),
+            _ => key.try_into().unwrap(),
+        };
+        let extract_inner = Sha256::new()
+            .chain_update(salt_inner)
+            .chain_update(key)
+            .finalize();
+        let inner_block = key_block(&prk, 0x36);
+        let outer_block = key_block(&prk, 0x5c);
+        let expand_inner = Sha256::new()
+            .chain_update(inner_block)
+            .chain_update(info)
+            .chain_update([1])
+            .finalize();
+
+        let mut secrets = std::vec![key.to_vec(), output[1..].to_vec()];
+        secrets.extend(hash_forms(&prk));
+        // Every form of the output but the plain one, whose first 16 bytes are the identifier.
+        secrets.extend(
+            hash_forms(&output)
+                .into_iter()
+                .enumerate()
+                .filter(|&(form, _)| form != 0 && form != 2)
+                .map(|(_, bytes)| bytes),
+        );
+        secrets.extend(state_forms(state_after(&[
+            salt_inner,
+            key_block_of_message,
+        ])));
+        secrets.extend(hash_forms(&extract_inner));
+        secrets.extend(state_forms(state_after(&[inner_block])));
+        secrets.extend(state_forms(state_after(&[outer_block])));
+        secrets.extend(hash_forms(&expand_inner));
+        for block in [
+            key_block_of_message,
+            inner_block,
+            outer_block,
+            final_block(&extract_inner),
+            final_block(&expand_inner),
+        ] {
+            secrets.extend(block_forms(&block));
+        }
+        secrets
+    }
+
+    /// Whether a 16-byte piece looks like data rather than a pattern: the zeros and the padding in
+    /// a hash block would match the wiped stack itself.
+    fn varied(piece: &[u8]) -> bool {
+        let mut bytes = piece.to_vec();
+        bytes.sort_unstable();
+        bytes.dedup();
+        bytes.len() >= 10
+    }
+
+    /// The 16-byte pieces of the secrets of the first `length` bytes of `key` that depend on the
+    /// key: varied, and absent from the secrets of another key, so that round constants and
+    /// padding are not counted.
+    fn pieces(key: &[u8], length: KeyLength) -> Vec<Vec<u8>> {
+        let other: [u8; 64] = core::array::from_fn(|i| key[i] ^ 0xff);
+        let public: HashSet<Vec<u8>> = secrets(&other, length)
+            .iter()
+            .flat_map(|secret| secret.windows(16).map(<[u8]>::to_vec))
+            .collect();
+        secrets(key, length)
+            .iter()
+            .flat_map(|secret| secret.windows(16).map(<[u8]>::to_vec))
+            .filter(|piece| varied(piece) && !public.contains(piece))
+            .collect()
+    }
+
+    /// How many of `pieces` the stack under the pad still holds.
+    fn residue(range: Range<usize>, pieces: &[Vec<u8>]) -> usize {
+        let stack = read(range);
+        let windows: HashSet<&[u8]> = stack.windows(16).collect();
+        pieces
+            .iter()
+            .filter(|piece| windows.contains(piece.as_slice()))
+            .count()
+    }
+
+    fn loaded_key() -> Key {
+        let mut key = Key::empty();
+        key.load64(&mut key_bytes());
+        key
+    }
+
+    /// Runs `code` below the pad and asserts that it leaves none of `pieces` there.
+    fn assert_clean(pieces: &[Vec<u8>], code: impl FnOnce()) {
+        let range = below_pad(false, code);
+        assert_eq!(residue(range, pieces), 0);
+    }
+
+    /// The test can see residue: the derivation without the wipe leaves some.
+    #[test]
+    fn a_derivation_without_the_wipe_leaves_residue() {
+        let pieces = pieces(&key_bytes(), KeyLength::Bytes64);
+        let key = loaded_key();
+        let range = below_pad(false, || {
+            let mut id = [0; 16];
+            derive_on_stack(&key, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
+            black_box(&id);
+        });
+        assert!(residue(range, &pieces) > 0);
+    }
+
+    #[test]
+    fn a_derivation_leaves_no_residue() {
+        let key = loaded_key();
+        assert_clean(&pieces(&key_bytes(), KeyLength::Bytes64), || {
+            let mut id = [0; 16];
+            derive(&key, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
+            black_box(&id);
+        });
+    }
+
+    /// An output longer than HKDF gives fails after Extract, with the extracted key on the stack.
+    #[test]
+    fn a_failed_derivation_leaves_no_residue() {
+        let pieces = pieces(&key_bytes(), KeyLength::Bytes64);
+        let key = loaded_key();
+        let unwiped = below_pad(false, || {
+            let mut out = [0; 8161];
+            assert!(derive_on_stack(&key, Purpose::Wrap, Branch::KeyId, &mut out).is_err());
+            black_box(&out);
+        });
+        assert!(residue(unwiped, &pieces) > 0);
+        assert_clean(&pieces, || {
+            let mut out = [0; 8161];
+            assert!(derive(&key, Purpose::Wrap, Branch::KeyId, &mut out).is_err());
+            black_box(&out);
+        });
+    }
+
+    #[test]
+    fn importing_a_key_leaves_no_residue() {
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut slots = Slots::new(&mut memory);
+        let mut long = key_bytes();
+        assert_clean(&pieces(&key_bytes(), KeyLength::Bytes64), || {
+            slots.import64(Purpose::Wrap, &mut long).unwrap();
+        });
+        let mut short: [u8; 32] = key_bytes()[..32].try_into().unwrap();
+        assert_clean(&pieces(&key_bytes(), KeyLength::Bytes32), || {
+            slots.import32(Purpose::Wrap, &mut short).unwrap();
+        });
+    }
+
+    #[test]
+    fn generating_a_key_leaves_no_residue() {
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut slots = Slots::new(&mut memory);
+        let counted = counted::<64>();
+        for length in [KeyLength::Bytes64, KeyLength::Bytes32] {
+            assert_clean(&pieces(&counted, length), || {
+                slots
+                    .generate(Purpose::Wrap, length, &mut Counting)
+                    .unwrap();
+            });
+        }
+    }
+
+    /// How deep below the pad `code` changed the painted stack.
+    fn depth_changed(code: impl FnOnce()) -> usize {
+        let range = below_pad(true, code);
+        let stack = read(range);
+        let lowest = stack.iter().position(|&byte| byte != PAINT).unwrap();
+        stack.len() - lowest
+    }
+
+    /// The wipe that follows a derivation reaches as deep as it is meant to.
+    #[test]
+    fn the_wipe_reaches_its_depth() {
+        let key = loaded_key();
+        let wiped = depth_changed(|| {
+            let mut id = [0; 16];
+            derive(&key, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
+            black_box(&id);
+        });
+        assert!(wiped >= STACK_WIPE, "{wiped} bytes wiped");
+    }
+
+    /// The wipe covers more than the derivation uses.
+    #[test]
+    fn the_wipe_is_deeper_than_the_derivation() {
+        let key = loaded_key();
+        let used = depth_changed(|| {
+            let mut id = [0; 16];
+            derive_on_stack(&key, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
+            black_box(&id);
+        });
+        std::println!("a derivation uses {used} bytes of stack");
+        assert!(used.saturating_mul(2) <= STACK_WIPE, "{used} bytes used");
+        // Not needlessly deep either: a thread that cannot spare the stack would be corrupted.
+        assert!(used.saturating_mul(8) >= STACK_WIPE, "{used} bytes used");
+    }
 }
 
 #[cfg(kani)]

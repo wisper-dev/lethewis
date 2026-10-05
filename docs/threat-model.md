@@ -59,14 +59,23 @@ reach.
 returns a key. A new key is written straight into its slot from the platform's random source, and
 the library's own code makes no copy of it; if the source fails or panics halfway, the slot is
 wiped. A key is wiped when it is released, and every key is wiped when its set of slots is dropped.
-The wipe on release and on creating a set, and the refusal of a released or foreign handle, are
-proven for two slots; the statements and their limits are in [proofs.md](proofs.md).
+After each key derivation, whether it succeeded or not, the stack below the caller is wiped: 8 KiB,
+or 64 KiB in a build without optimisation. Tests read the memory of their own process back, with and
+without optimisation and with the hardware and the software SHA-256, and check that the wipe reaches
+that depth, that the derivation uses less than half of it and more than an eighth, and that no
+16-byte piece is left of the key, the extracted key, the HMAC key blocks, the SHA-256 states, inner
+hashes and message schedules, or the output beyond the identifier, in the byte orders and
+arrangements the two SHA-256 paths use. The wipe on release and on creating a set, and the refusal
+of a released or foreign handle, are proven for two slots; the statements and their limits are in
+[proofs.md](proofs.md).
 
 **Intended.** Drop keys from memory when the device locks.
 
 **Not defended.** Copies left by a value move, a buffer reallocation, a CPU register, swap, or a
-crash dump. Temporary copies of a key and of values derived from it that the hashing code leaves on
-the stack: the HMAC key block, the inner hash, the extracted key and the last output block. A set of
+crash dump. The stack wipe is best effort: it does not reach registers, it relies on the compiler
+keeping the derivation out of its caller's frame, its depth follows the optimisation of this crate,
+so a build that optimises this crate but not the hash code it calls has to set `--cfg
+lethewis_unoptimised`, and it is measured only where the tests run, so far x86-64 Linux. A set of
 slots leaked instead of dropped keeps its keys in memory. A copy of a new key kept by the platform's
 random source. A system component with elevated privileges is outside what process isolation
 provides.

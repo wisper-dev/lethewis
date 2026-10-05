@@ -23,7 +23,7 @@ publish = false
 # of truth; cargo resolves it when packaging.
 # Only what belongs to the crate. The lint, dependency and toolchain settings live at the workspace
 # root, outside this directory, and are read from the repository rather than from the package.
-include = ["src/**/*", "README.md", "LICENSE"]
+include = ["src/**/*", "build.rs", "README.md", "LICENSE"]
 
 [dependencies]
 # Default features bring in `alloc`.
