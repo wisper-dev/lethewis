@@ -4,7 +4,7 @@
 use core::{fmt, marker::PhantomData};
 
 use crate::{
-    derive::{KeyId, derive_key_id, derive_wrap_key},
+    derive::{KeyId, derive_key_id, derive_wrap_key, wipe_cipher_stack},
     entropy::{Entropy, EntropyError},
     error::Error,
     key::{Key, KeyLength, wipe},
@@ -147,9 +147,10 @@ impl<'a> Slots<'a> {
 
     /// Takes a 32-byte key for `purpose` from `source` into a free slot and wipes `source`.
     ///
-    /// Needs 8 KiB of stack, or 64 KiB when this crate is built without optimisation or with `--cfg
-    /// lethewis_unoptimised`: the derivation of the key's identifier is followed by a wipe of that
-    /// much. A build that optimises this crate but not the hash code it calls has to set that flag.
+    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier is followed by a wipe
+    /// of 8 KiB, or 64 KiB, below it. A build that optimises this crate but not the hash code it
+    /// calls has to set that flag.
     ///
     /// # Errors
     ///
@@ -170,9 +171,10 @@ impl<'a> Slots<'a> {
 
     /// Takes a 64-byte key for `purpose` from `source` into a free slot and wipes `source`.
     ///
-    /// Needs 8 KiB of stack, or 64 KiB when this crate is built without optimisation or with `--cfg
-    /// lethewis_unoptimised`: the derivation of the key's identifier is followed by a wipe of that
-    /// much. A build that optimises this crate but not the hash code it calls has to set that flag.
+    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier is followed by a wipe
+    /// of 8 KiB, or 64 KiB, below it. A build that optimises this crate but not the hash code it
+    /// calls has to set that flag.
     ///
     /// # Errors
     ///
@@ -196,9 +198,10 @@ impl<'a> Slots<'a> {
     /// the stack the derivation of the key's identifier used is wiped after it. `entropy` is asked
     /// once, and only when a slot is free.
     ///
-    /// Like an import, this needs 8 KiB of stack, or 64 KiB when this crate is built without
-    /// optimisation or with `--cfg lethewis_unoptimised`, for that wipe; a build that optimises
-    /// this crate but not the hash code it calls has to set that flag.
+    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier is followed by a wipe
+    /// of 8 KiB, or 64 KiB, below it. A build that optimises this crate but not the hash code it
+    /// calls has to set that flag.
     ///
     /// # Errors
     ///
@@ -225,9 +228,10 @@ impl<'a> Slots<'a> {
     /// record into `record`. The record opens only with that parent and the same `context`, which
     /// names the place the record is kept, from 1 to 255 bytes. The nonce comes from `entropy`.
     ///
-    /// Needs 8 KiB of stack, or 64 KiB when this crate is built without optimisation or with `--cfg
-    /// lethewis_unoptimised`, for the wipe that follows each derivation from a key. A build that
-    /// optimises this crate but not the hash code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
+    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
+    /// code it calls has to set that flag.
     ///
     /// # Errors
     ///
@@ -239,6 +243,22 @@ impl<'a> Slots<'a> {
     /// and [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or fails.
     /// `record` is then left as it was.
     pub fn wrap(
+        &mut self,
+        key: Handle<'a>,
+        parent: Handle<'a>,
+        context: &[u8],
+        entropy: &mut (impl Entropy + ?Sized),
+        record: &mut [u8; RECORD_LEN],
+    ) -> Result<(), Error> {
+        let wrapped = self.wrap_on_stack(key, parent, context, entropy, record);
+        wipe_cipher_stack();
+        wrapped
+    }
+
+    /// The wrap itself, in a frame of its own: the wipe that follows starts where this frame
+    /// starts.
+    #[inline(never)]
+    fn wrap_on_stack(
         &mut self,
         key: Handle<'a>,
         parent: Handle<'a>,
@@ -285,9 +305,10 @@ impl<'a> Slots<'a> {
     /// Unwraps `record` with the key that `parent` refers to and the `context` it was wrapped for,
     /// into a free slot. The key comes out with the purpose and the status the record holds.
     ///
-    /// Needs 8 KiB of stack, or 64 KiB when this crate is built without optimisation or with `--cfg
-    /// lethewis_unoptimised`, for the wipe that follows each derivation from a key. A build that
-    /// optimises this crate but not the hash code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
+    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
+    /// code it calls has to set that flag.
     ///
     /// # Errors
     ///
@@ -299,6 +320,20 @@ impl<'a> Slots<'a> {
     /// plaintext this version of the library cannot read, or names another key as its parent. No
     /// slot changes then.
     pub fn unwrap(
+        &mut self,
+        parent: Handle<'a>,
+        context: &[u8],
+        record: &[u8; RECORD_LEN],
+    ) -> Result<Handle<'a>, Error> {
+        let unwrapped = self.unwrap_on_stack(parent, context, record);
+        wipe_cipher_stack();
+        unwrapped
+    }
+
+    /// The unwrap itself, in a frame of its own: the wipe that follows starts where this frame
+    /// starts.
+    #[inline(never)]
+    fn unwrap_on_stack(
         &mut self,
         parent: Handle<'a>,
         context: &[u8],
@@ -490,6 +525,7 @@ mod tests {
 
     use core::marker::PhantomData;
     use std::format;
+    use std::string::String;
     use std::vec::Vec;
 
     use super::{
@@ -497,13 +533,60 @@ mod tests {
         KeyLength, Occupancy, PLAINTEXT_LEN, Purpose, RECORD_LEN, Slot, Slots, Status,
         derive_wrap_key, record, seal, write_record,
     };
-    use crate::derive::{KeyId, derive_key_id};
+    use crate::derive::{CIPHER_STACK_WIPE, KeyId, STACK_WIPE, derive_key_id};
     use crate::key::{
         Key,
         tests::{Counting, Failing, Panicking, Recording, counted, padded},
     };
 
     assert_not_impl!(Slot: Clone, PartialEq, Default);
+
+    /// The stack, in KiB, that a load and that a wrap or an unwrap need, and the depth of the wipes
+    /// that follow them, in an optimised build and in one without optimisation.
+    pub(super) const LOAD_NEEDS: [usize; 2] = [9, 68];
+    pub(super) const WRAP_NEEDS: [usize; 2] = [25, 72];
+    const LOAD_WIPES: [usize; 2] = [8, 64];
+    const WRAP_WIPES: [usize; 2] = [24, 64];
+
+    /// The documentation of the public call `name` in this file, its lines joined.
+    fn documentation(name: &str) -> String {
+        let source = include_str!("slots.rs");
+        let at = source.find(&format!("    pub fn {name}(")).unwrap();
+        let mut lines: Vec<&str> = source[..at]
+            .lines()
+            .rev()
+            .take_while(|line| line.trim_start().starts_with("///"))
+            .map(|line| line.trim().trim_start_matches("///").trim())
+            .collect();
+        lines.reverse();
+        lines.join(" ")
+    }
+
+    /// The documentation of each import, generation, wrap and unwrap states the stack it needs and
+    /// the depth of the wipe after it, and those depths are the library's.
+    #[test]
+    fn the_documentation_states_the_stack_calls_need() {
+        let build = usize::from(cfg!(lethewis_unoptimised));
+        assert_eq!(LOAD_WIPES[build] * 1024, STACK_WIPE);
+        assert_eq!(WRAP_WIPES[build] * 1024, CIPHER_STACK_WIPE);
+        let loads = (LOAD_NEEDS, LOAD_WIPES);
+        let wraps = (WRAP_NEEDS, WRAP_WIPES);
+        for (call, (needs, wipes)) in [
+            ("import32", loads),
+            ("import64", loads),
+            ("generate", loads),
+            ("wrap", wraps),
+            ("unwrap", wraps),
+        ] {
+            let text = documentation(call);
+            for stated in [
+                format!("Needs {} KiB of stack, or {} KiB when", needs[0], needs[1]),
+                format!(" {} KiB, or {} KiB, ", wipes[0], wipes[1]),
+            ] {
+                assert!(text.contains(&stated), "{call}: {stated}");
+            }
+        }
+    }
 
     /// Fails the test if it is ever asked for bytes.
     struct Untouched;
@@ -1180,6 +1263,388 @@ mod tests {
         assert_eq!(format!("{handle:?}"), "Handle { .. }");
         assert_eq!(format!("{:?}", slots.slots[0]), "Slot { .. }");
         assert_eq!(format!("{slots:?}"), "Slots { .. }");
+    }
+}
+
+#[cfg(test)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "a test expands an AES key and builds counter blocks"
+)]
+mod stack {
+    //! What wrapping and unwrapping leave on the stack, read back from the memory of this process.
+
+    extern crate std;
+
+    use core::hint::black_box;
+    use std::vec::Vec;
+
+    use aes::Aes256;
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
+
+    use super::tests::{LOAD_NEEDS, WRAP_NEEDS};
+    use super::{Entropy, EntropyError, Error, Handle, Purpose, RECORD_LEN, Slot, Slots};
+    use crate::derive::{Branch, CIPHER_STACK_WIPE, derive_wrap_key, stack::secrets};
+    use crate::key::{
+        Key, KeyLength,
+        tests::{Counting, Failing},
+    };
+    use crate::record::{AssociatedData, PLAINTEXT_LEN};
+    use crate::residue::{assert_clean, below_pad, depth_changed, key_dependent, residue};
+    use crate::seal;
+
+    const CONTEXT: &[u8] = b"chat 7";
+    const NONCE: [u8; 12] = [
+        0x31, 0x9c, 0x07, 0xe2, 0x5d, 0xa8, 0x14, 0x6f, 0xc3, 0x2b, 0x90, 0x4e,
+    ];
+
+    /// Writes the same nonce every time.
+    struct Fixed;
+
+    impl Entropy for Fixed {
+        fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
+            dest.copy_from_slice(&NONCE);
+            Ok(())
+        }
+    }
+
+    fn parent_bytes(flip: u8) -> [u8; 32] {
+        core::array::from_fn(|i| u8::try_from(i).unwrap().wrapping_mul(41).wrapping_add(7) ^ flip)
+    }
+
+    fn key_bytes(flip: u8) -> [u8; 64] {
+        core::array::from_fn(|i| u8::try_from(i).unwrap().wrapping_mul(29).wrapping_add(101) ^ flip)
+    }
+
+    /// The S-box of AES, FIPS 197, section 5.1.1: the inverse in GF(2^8), zero for zero, then the
+    /// affine transformation.
+    fn sbox(byte: u8) -> u8 {
+        let inverse = (1..=255)
+            .find(|&other| multiply(byte, other) == 1)
+            .unwrap_or(0);
+        (1..5).fold(inverse ^ 0x63, |out, shift| {
+            out ^ inverse.rotate_left(shift)
+        })
+    }
+
+    fn multiply(mut a: u8, mut b: u8) -> u8 {
+        let mut product = 0;
+        while b != 0 {
+            if b & 1 != 0 {
+                product ^= a;
+            }
+            a = xtime(a);
+            b >>= 1;
+        }
+        product
+    }
+
+    fn xtime(byte: u8) -> u8 {
+        (byte << 1) ^ if byte & 0x80 == 0 { 0 } else { 0x1b }
+    }
+
+    /// The fifteen round keys of AES-256, FIPS 197, section 5.2.
+    fn round_keys(key: &[u8; 32]) -> Vec<Vec<u8>> {
+        let sub = |word: [u8; 4]| word.map(sbox);
+        let mut words: Vec<[u8; 4]> = key.chunks(4).map(|word| word.try_into().unwrap()).collect();
+        let mut rcon = 1;
+        for i in 8..60 {
+            let mut word = words[i - 1];
+            if i % 8 == 0 {
+                word = sub([word[1], word[2], word[3], word[0]]);
+                word[0] ^= rcon;
+                rcon = xtime(rcon);
+            } else if i % 8 == 4 {
+                word = sub(word);
+            }
+            words.push(core::array::from_fn(|j| words[i - 8][j] ^ word[j]));
+        }
+        words.chunks(4).map(<[[u8; 4]]>::concat).collect()
+    }
+
+    /// The S-box at zero and at the example of FIPS 197, section 5.1.1, and the key expansion of
+    /// its appendix A.3.
+    #[test]
+    fn the_s_box_and_the_round_keys_are_those_of_fips_197() {
+        let bytes = |text: &str| -> Vec<u8> {
+            (0..text.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+                .collect()
+        };
+        let key = bytes("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+        let keys = round_keys(&key.try_into().unwrap());
+        assert_eq!((sbox(0), sbox(0x53)), (0x63, 0xed));
+        assert_eq!(keys.len(), 15);
+        assert_eq!(keys[2], bytes("9ba354118e6925afa51a8b5f2067fcde"));
+        assert_eq!(keys[14], bytes("fe4890d1e6188d0b046df344706c631e"));
+    }
+
+    fn encrypt(key: &[u8; 32], block: [u8; 16]) -> [u8; 16] {
+        let mut block = block.into();
+        Aes256::new(key.into()).encrypt_block(&mut block);
+        block.into()
+    }
+
+    /// The keys AES-256-GCM-SIV derives for one message, RFC 8452, section 4: the POLYVAL key and
+    /// the encryption key.
+    fn message_keys(key: &[u8; 32], nonce: &[u8; 12]) -> ([u8; 16], [u8; 32]) {
+        let halves: Vec<u8> = (0_u32..6)
+            .flat_map(|counter| {
+                let mut block = [0; 16];
+                block[..4].copy_from_slice(&counter.to_le_bytes());
+                block[4..].copy_from_slice(nonce);
+                encrypt(key, block)[..8].to_vec()
+            })
+            .collect();
+        (
+            halves[..16].try_into().unwrap(),
+            halves[16..].try_into().unwrap(),
+        )
+    }
+
+    /// The keystream of a record whose tag is `tag`: counter blocks from the tag with its top bit
+    /// set, the first word counting up, RFC 8452, section 4.
+    fn keystream(enc_key: &[u8; 32], tag: &[u8; 16]) -> Vec<u8> {
+        let mut block = *tag;
+        block[15] |= 0x80;
+        let first = u32::from_le_bytes(block[..4].try_into().unwrap());
+        (0_u32..6)
+            .flat_map(|step| {
+                block[..4].copy_from_slice(&first.wrapping_add(step).to_le_bytes());
+                encrypt(enc_key, block)
+            })
+            .collect()
+    }
+
+    /// Two slots holding the parent and the key, made from `flip`ped patterns.
+    fn loaded(slots: &mut Slots<'_>, flip: u8) -> (Handle<'static>, Handle<'static>) {
+        let parent = slots
+            .import32(Purpose::Wrap, &mut parent_bytes(flip))
+            .unwrap();
+        let key = slots.import64(Purpose::Wrap, &mut key_bytes(flip)).unwrap();
+        let shorten = |handle: Handle<'_>| Handle {
+            slots: handle.slots,
+            index: handle.index,
+            generation: handle.generation,
+            memory: core::marker::PhantomData,
+        };
+        (shorten(parent), shorten(key))
+    }
+
+    /// The secrets a wrap of the key under the parent made from `flip`ped patterns handles, and
+    /// an unwrap of that record too when asked: the derivation of the cipher key, the cipher key,
+    /// the message keys, the round keys of the cipher key and of the message encryption key in the
+    /// layout of FIPS 197, the keystream and the record's plaintext; and for an unwrap the
+    /// derivation of the key's identifier.
+    fn handled(flip: u8, unwrap: bool) -> Vec<Vec<u8>> {
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut slots = Slots::new(&mut memory);
+        let (parent, key) = loaded(&mut slots, flip);
+        let mut record = [0; RECORD_LEN];
+        slots
+            .wrap(key, parent, CONTEXT, &mut Fixed, &mut record)
+            .unwrap();
+        let mut parent_key = Key::empty();
+        parent_key.load32(&mut parent_bytes(flip));
+        let mut cipher_key = [0; 32];
+        derive_wrap_key(&parent_key, Purpose::Wrap, &mut cipher_key).unwrap();
+        let tag: [u8; 16] = record[NONCE.len() + PLAINTEXT_LEN..].try_into().unwrap();
+        let mut plaintext: [u8; PLAINTEXT_LEN] = record[NONCE.len()..NONCE.len() + PLAINTEXT_LEN]
+            .try_into()
+            .unwrap();
+        let associated = AssociatedData::new(CONTEXT).unwrap();
+        seal::open(
+            &cipher_key,
+            &NONCE,
+            associated.bytes(),
+            &mut plaintext,
+            &tag,
+        )
+        .unwrap();
+        let (mac_key, enc_key) = message_keys(&cipher_key, &NONCE);
+
+        let mut handled = secrets(&parent_bytes(flip), KeyLength::Bytes32, Branch::WrapKey);
+        handled.extend([
+            cipher_key.to_vec(),
+            mac_key.to_vec(),
+            enc_key.to_vec(),
+            keystream(&enc_key, &tag),
+            plaintext.to_vec(),
+        ]);
+        handled.extend(round_keys(&cipher_key));
+        handled.extend(round_keys(&enc_key));
+        if unwrap {
+            handled.extend(secrets(&key_bytes(flip), KeyLength::Bytes64, Branch::KeyId));
+        }
+        handled
+    }
+
+    fn pieces(unwrap: bool) -> Vec<Vec<u8>> {
+        key_dependent(&handled(0, unwrap), &handled(0xff, unwrap))
+    }
+
+    #[test]
+    fn a_wrap_without_the_wipe_leaves_residue() {
+        let pieces = pieces(false);
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut slots = Slots::new(&mut memory);
+        let (parent, key) = loaded(&mut slots, 0);
+        let mut record = [0; RECORD_LEN];
+        let range = below_pad(false, || {
+            slots
+                .wrap_on_stack(key, parent, CONTEXT, &mut Fixed, &mut record)
+                .unwrap();
+            black_box(&record);
+        });
+        assert!(residue(range, &pieces) > 0);
+    }
+
+    #[test]
+    fn a_wrap_leaves_no_residue() {
+        let pieces = pieces(false);
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut slots = Slots::new(&mut memory);
+        let (parent, key) = loaded(&mut slots, 0);
+        let mut record = [0; RECORD_LEN];
+        assert_clean(&pieces, || {
+            slots
+                .wrap(key, parent, CONTEXT, &mut Fixed, &mut record)
+                .unwrap();
+            black_box(&record);
+        });
+    }
+
+    /// A parent loaded in one slot, the other free, and the record of the key under the parent.
+    fn wrapped(slots: &mut Slots<'_>) -> (Handle<'static>, [u8; RECORD_LEN]) {
+        let (parent, key) = loaded(slots, 0);
+        let mut record = [0; RECORD_LEN];
+        slots
+            .wrap(key, parent, CONTEXT, &mut Fixed, &mut record)
+            .unwrap();
+        slots.release(key).unwrap();
+        (parent, record)
+    }
+
+    #[test]
+    fn an_unwrap_leaves_no_residue() {
+        let pieces = pieces(true);
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut slots = Slots::new(&mut memory);
+        let (parent, record) = wrapped(&mut slots);
+        assert_clean(&pieces, || {
+            black_box(slots.unwrap(parent, CONTEXT, &record).unwrap());
+        });
+    }
+
+    /// A record whose ciphertext was changed is decrypted before its tag fails. This is also the
+    /// unwrap that shows the test sees residue: after a successful one, the wipe that follows the
+    /// derivation of the new key's identifier already covers the frames the cipher used, and no
+    /// key material is left even without the wipe after the unwrap.
+    #[test]
+    fn a_rejected_unwrap_leaves_no_residue() {
+        let pieces = pieces(false);
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut slots = Slots::new(&mut memory);
+        let (parent, mut record) = wrapped(&mut slots);
+        record[40] ^= 1;
+        let range = below_pad(false, || {
+            let refused = slots.unwrap_on_stack(parent, CONTEXT, &record);
+            assert_eq!(black_box(refused), Err(Error::RecordRejected));
+        });
+        assert!(residue(range, &pieces) > 0);
+        assert_clean(&pieces, || {
+            let refused = slots.unwrap(parent, CONTEXT, &record);
+            assert_eq!(black_box(refused), Err(Error::RecordRejected));
+        });
+    }
+
+    /// The wipe that follows covers more than the cipher uses; the derivations a wrap and an
+    /// unwrap run are measured with the derivation, and wiped after it besides.
+    #[test]
+    fn the_wipe_is_deeper_than_the_cipher() {
+        let key = [7; 32];
+        let associated = AssociatedData::new(CONTEXT).unwrap();
+        let mut sealed = [9; PLAINTEXT_LEN];
+        let mut tag = [0; 16];
+        let sealing = depth_changed(|| {
+            tag = seal::seal(&key, &NONCE, associated.bytes(), &mut sealed).unwrap();
+            black_box(&sealed);
+        });
+        let opening = depth_changed(|| {
+            seal::open(&key, &NONCE, associated.bytes(), &mut sealed, &tag).unwrap();
+            black_box(&sealed);
+        });
+        std::println!("sealing uses {sealing} bytes of stack, opening {opening}");
+        for used in [sealing, opening] {
+            assert!(
+                used.saturating_mul(2) <= CIPHER_STACK_WIPE,
+                "{used} bytes used"
+            );
+            // Not needlessly deep either: a thread that cannot spare the stack would be corrupted.
+            assert!(
+                used.saturating_mul(8) >= CIPHER_STACK_WIPE,
+                "{used} bytes used"
+            );
+        }
+    }
+
+    /// The stack a wrap or an unwrap and a load need in this build, in bytes.
+    const WRAP_STACK: usize = 1024 * WRAP_NEEDS[if cfg!(lethewis_unoptimised) { 1 } else { 0 }];
+    const LOAD_STACK: usize = 1024 * LOAD_NEEDS[if cfg!(lethewis_unoptimised) { 1 } else { 0 }];
+
+    /// The wipes that follow a wrap and an unwrap reach as deep as they are meant to, also when
+    /// the call fails, and no call reaches deeper than its documentation says it needs.
+    #[test]
+    fn wraps_unwraps_and_loads_wipe_and_need_the_stack_documented() {
+        let mut memory = [const { Slot::empty() }; 6];
+        let mut slots = Slots::new(&mut memory);
+        let (parent, record) = wrapped(&mut slots);
+        let mut changed = record;
+        changed[40] ^= 1;
+        let mut wraps = Vec::new();
+        wraps.push(depth_changed(|| {
+            black_box(slots.unwrap(parent, CONTEXT, &record).unwrap());
+        }));
+        wraps.push(depth_changed(|| {
+            assert_eq!(
+                black_box(slots.unwrap(parent, CONTEXT, &changed)),
+                Err(Error::RecordRejected)
+            );
+        }));
+        let key = slots.import64(Purpose::Wrap, &mut key_bytes(5)).unwrap();
+        let mut out = [0; RECORD_LEN];
+        wraps.push(depth_changed(|| {
+            slots
+                .wrap(key, parent, CONTEXT, &mut Fixed, &mut out)
+                .unwrap();
+            black_box(&out);
+        }));
+        wraps.push(depth_changed(|| {
+            let failed = slots.wrap(key, parent, CONTEXT, &mut Failing, &mut out);
+            assert_eq!(black_box(failed), Err(Error::EntropyFailed));
+        }));
+        for depth in wraps {
+            assert!(depth >= CIPHER_STACK_WIPE, "{depth} bytes wiped");
+            assert!(depth <= WRAP_STACK, "{depth} bytes reached");
+        }
+        let mut short: [u8; 32] = key_bytes(7)[..32].try_into().unwrap();
+        let loads = [
+            depth_changed(|| {
+                black_box(slots.import32(Purpose::Wrap, &mut short).unwrap());
+            }),
+            depth_changed(|| {
+                black_box(slots.import64(Purpose::Wrap, &mut key_bytes(9)).unwrap());
+            }),
+            depth_changed(|| {
+                let generated = slots.generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting);
+                black_box(generated.unwrap());
+            }),
+        ];
+        for depth in loads {
+            assert!(depth <= LOAD_STACK, "{depth} bytes reached");
+        }
     }
 }
 

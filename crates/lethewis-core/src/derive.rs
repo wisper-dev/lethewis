@@ -23,9 +23,15 @@ const LABEL_CAPACITY: usize = 30;
 /// test measures in each build and with each SHA-256 back end. Without optimisation it uses far
 /// more.
 #[cfg(all(not(kani), not(lethewis_unoptimised)))]
-const STACK_WIPE: usize = 8192;
+pub(crate) const STACK_WIPE: usize = 8192;
 #[cfg(all(not(kani), lethewis_unoptimised))]
-const STACK_WIPE: usize = 65_536;
+pub(crate) const STACK_WIPE: usize = 65_536;
+/// How many bytes of stack a wrap or an unwrap is followed by a wipe of: at least twice what the
+/// cipher uses at any level of optimisation, as a test measures in the same way.
+#[cfg(all(not(kani), not(lethewis_unoptimised)))]
+pub(crate) const CIPHER_STACK_WIPE: usize = 24_576;
+#[cfg(all(not(kani), lethewis_unoptimised))]
+pub(crate) const CIPHER_STACK_WIPE: usize = 65_536;
 
 /// What a derived value is for. Each branch has a name of its own in the label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,7 +84,9 @@ impl KeyId {
         self.is(&other.0)
     }
 
-    /// Whether the identifier is `bytes`, compared in constant time.
+    /// Whether the identifier is `bytes`, compared in constant time. Kept out of line, so that the
+    /// check of its machine code finds it.
+    #[inline(never)]
     pub(crate) fn is(&self, bytes: &[u8; ID_LEN]) -> bool {
         #[cfg(not(kani))]
         {
@@ -127,10 +135,21 @@ pub(crate) fn derive(
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
     let derived = derive_on_stack(key, purpose, branch, out);
+    wipe_stack();
+    derived
+}
+
+/// Wipes the stack below the caller's frame, as deep as a derivation reaches.
+pub(crate) fn wipe_stack() {
     // The wipe ends in inline assembly, which Kani cannot model.
     #[cfg(not(kani))]
     zeroize::zeroize_stack::<STACK_WIPE>();
-    derived
+}
+
+/// Wipes the stack below the caller's frame, as deep as the cipher reaches.
+pub(crate) fn wipe_cipher_stack() {
+    #[cfg(not(kani))]
+    zeroize::zeroize_stack::<CIPHER_STACK_WIPE>();
 }
 
 /// The derivation itself, in a frame of its own: the wipe that follows starts where this frame
@@ -161,16 +180,12 @@ fn hkdf(material: &[u8], info: &[u8], out: &mut [u8]) -> Result<(), DerivationFa
     clippy::arithmetic_side_effects,
     reason = "a test computes offsets and the SHA-256 message schedule"
 )]
-mod stack {
+pub(crate) mod stack {
     //! What a derivation leaves on the stack, read back from the memory of this process.
 
     extern crate std;
 
     use core::hint::black_box;
-    use core::ops::Range;
-    use std::collections::HashSet;
-    use std::fs::File;
-    use std::io::{Read, Seek, SeekFrom};
     use std::vec::Vec;
 
     use hkdf::Hkdf;
@@ -182,49 +197,8 @@ mod stack {
         tests::{Counting, counted},
     };
     use crate::record::Purpose;
+    use crate::residue::{assert_clean, below_pad, depth_changed, key_dependent, residue};
     use crate::slots::{Slot, Slots};
-
-    /// Room between the test's frame and the code under test, so that reading the memory back,
-    /// which runs at the test's depth, does not reach the stack that code used.
-    const PAD: usize = 64 * 1024;
-    /// How far below the pad the stack is read: deeper than the deepest wipe.
-    const SCAN: usize = 128 * 1024;
-    const PAINT: u8 = 0xa7;
-
-    /// Runs `code` below the pad, after painting the stack it is about to use when asked to, and
-    /// returns the addresses under the pad.
-    #[inline(never)]
-    #[expect(
-        clippy::large_stack_arrays,
-        reason = "the pad is a large array on the stack"
-    )]
-    fn below_pad(paint: bool, code: impl FnOnce()) -> Range<usize> {
-        let pad = black_box([0x11_u8; PAD]);
-        let low = black_box(&pad).as_ptr().addr();
-        if paint {
-            paint_stack();
-        }
-        code();
-        black_box(&pad);
-        low.saturating_sub(SCAN)..low
-    }
-
-    #[inline(never)]
-    #[expect(
-        clippy::large_stack_arrays,
-        reason = "the paint is a large array on the stack"
-    )]
-    fn paint_stack() {
-        black_box([PAINT; SCAN]);
-    }
-
-    fn read(range: Range<usize>) -> Vec<u8> {
-        let mut memory = File::open("/proc/self/mem").unwrap();
-        memory.seek(SeekFrom::Start(range.start as u64)).unwrap();
-        let mut bytes = std::vec![0; range.len()];
-        memory.read_exact(&mut bytes).unwrap();
-        bytes
-    }
 
     /// A 64-byte key whose bytes appear nowhere else.
     fn key_bytes() -> [u8; 64] {
@@ -399,15 +373,16 @@ mod stack {
         forms
     }
 
-    /// The secrets a derivation of the identifier of the first `length` bytes of `key` handles:
-    /// the key; in Extract, the state after the key and the inner hash; the extracted key, the
-    /// HMAC key blocks made from it and the states after each, from which any value could be
-    /// derived; in Expand, the inner hash; the message schedules of every secret block; and the
-    /// first output block, in plain bytes past its first byte, so that the identifier itself,
-    /// which the caller asked for, is not counted.
-    fn secrets(key: &[u8], length: KeyLength) -> Vec<Vec<u8>> {
+    /// The secrets a derivation of `branch` from the first `length` bytes of `key` handles: the
+    /// key; in Extract, the state after the key and the inner hash; the extracted key, the HMAC key
+    /// blocks made from it and the states after each, from which any value could be derived; in
+    /// Expand, the inner hash; the message schedules of every secret block; and the first output
+    /// block. Of an identifier, which the caller asks for, the plain bytes past its first byte only
+    /// are counted, so that the identifier itself is not.
+    pub(crate) fn secrets(key: &[u8], length: KeyLength, branch: Branch) -> Vec<Vec<u8>> {
         let key = &key[..length.bytes()];
-        let (label, used) = label(Purpose::Wrap, length, Branch::KeyId, 16).unwrap();
+        let out_len = if branch == Branch::KeyId { 16 } else { 32 };
+        let (label, used) = label(Purpose::Wrap, length, branch, out_len).unwrap();
         let info = &label[..used];
         let (prk, expander) = Hkdf::<Sha256>::extract(Some(SALT), key);
         let mut output = [0; 32];
@@ -432,12 +407,13 @@ mod stack {
 
         let mut secrets = std::vec![key.to_vec(), output[1..].to_vec()];
         secrets.extend(hash_forms(&prk));
-        // Every form of the output but the plain one, whose first 16 bytes are the identifier.
+        // Every form of the output but, for an identifier, the plain one, whose first 16 bytes are
+        // the identifier.
         secrets.extend(
             hash_forms(&output)
                 .into_iter()
                 .enumerate()
-                .filter(|&(form, _)| form != 0 && form != 2)
+                .filter(|&(form, _)| branch != Branch::KeyId || (form != 0 && form != 2))
                 .map(|(_, bytes)| bytes),
         );
         secrets.extend(state_forms(state_after(&[
@@ -460,51 +436,20 @@ mod stack {
         secrets
     }
 
-    /// Whether a 16-byte piece looks like data rather than a pattern: the zeros and the padding in
-    /// a hash block would match the wiped stack itself.
-    fn varied(piece: &[u8]) -> bool {
-        let mut bytes = piece.to_vec();
-        bytes.sort_unstable();
-        bytes.dedup();
-        bytes.len() >= 10
-    }
-
-    /// The 16-byte pieces of the secrets of the first `length` bytes of `key` that depend on the
-    /// key: varied, and absent from the secrets of another key, so that round constants and
-    /// padding are not counted.
+    /// The pieces of the secrets of a derivation from the first `length` bytes of `key` that depend
+    /// on the key.
     fn pieces(key: &[u8], length: KeyLength) -> Vec<Vec<u8>> {
         let other: [u8; 64] = core::array::from_fn(|i| key[i] ^ 0xff);
-        let public: HashSet<Vec<u8>> = secrets(&other, length)
-            .iter()
-            .flat_map(|secret| secret.windows(16).map(<[u8]>::to_vec))
-            .collect();
-        secrets(key, length)
-            .iter()
-            .flat_map(|secret| secret.windows(16).map(<[u8]>::to_vec))
-            .filter(|piece| varied(piece) && !public.contains(piece))
-            .collect()
-    }
-
-    /// How many of `pieces` the stack under the pad still holds.
-    fn residue(range: Range<usize>, pieces: &[Vec<u8>]) -> usize {
-        let stack = read(range);
-        let windows: HashSet<&[u8]> = stack.windows(16).collect();
-        pieces
-            .iter()
-            .filter(|piece| windows.contains(piece.as_slice()))
-            .count()
+        key_dependent(
+            &secrets(key, length, Branch::KeyId),
+            &secrets(&other, length, Branch::KeyId),
+        )
     }
 
     fn loaded_key() -> Key {
         let mut key = Key::empty();
         key.load64(&mut key_bytes());
         key
-    }
-
-    /// Runs `code` below the pad and asserts that it leaves none of `pieces` there.
-    fn assert_clean(pieces: &[Vec<u8>], code: impl FnOnce()) {
-        let range = below_pad(false, code);
-        assert_eq!(residue(range, pieces), 0);
     }
 
     /// The test can see residue: the derivation without the wipe leaves some.
@@ -576,14 +521,6 @@ mod stack {
         }
     }
 
-    /// How deep below the pad `code` changed the painted stack.
-    fn depth_changed(code: impl FnOnce()) -> usize {
-        let range = below_pad(true, code);
-        let stack = read(range);
-        let lowest = stack.iter().position(|&byte| byte != PAINT).unwrap();
-        stack.len() - lowest
-    }
-
     /// The wipe that follows a derivation reaches as deep as it is meant to.
     #[test]
     fn the_wipe_reaches_its_depth() {
@@ -628,8 +565,8 @@ pub(crate) mod model {
     static FAILED: AtomicBool = AtomicBool::new(false);
 
     /// HKDF-SHA-256 is beyond Kani. The model fails at will, after writing into `out`, and records
-    /// whether it failed; otherwise `out` takes the first bytes of the key with the key's length and
-    /// the label folded in, so equal inputs give equal outputs, and the output depends on those
+    /// whether it failed; otherwise `out` takes the first bytes of the key with the key's length
+    /// and the label folded in, so equal inputs give equal outputs, and the output depends on those
     /// bytes, that length and the label. Folding every byte of the key would be too slow for the
     /// solver; that HKDF uses the whole key and the output length, the unit tests check.
     pub(super) fn hkdf(
@@ -745,7 +682,8 @@ mod tests {
                 &ikm22,
                 Some(&salt13),
                 &info10,
-                "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
+                "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf\
+                 34007208d5b887185865",
             ),
             (
                 &ikm80,
@@ -759,7 +697,8 @@ mod tests {
                 &ikm22,
                 Some(&[]),
                 &[],
-                "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8",
+                "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d\
+                 9d201395faa4b61a96c8",
             ),
         ];
         for (ikm, salt, info, expected) in cases {
@@ -867,8 +806,8 @@ mod tests {
     }
 
     /// The label states the key length, and Extract takes the key as a message rather than as an
-    /// HMAC key, which would pad a short key with zeros: either keeps a key and its zero-padded long
-    /// form apart.
+    /// HMAC key, which would pad a short key with zeros: either keeps a key and its zero-padded
+    /// long form apart.
     #[test]
     fn a_short_key_and_its_zero_padded_long_form_differ() {
         let mut short = Key::empty();

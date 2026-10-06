@@ -42,6 +42,9 @@ mod entropy;
 mod error;
 mod key;
 mod record;
+#[cfg(test)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod residue;
 mod seal;
 mod slots;
 

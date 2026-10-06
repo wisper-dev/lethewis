@@ -72,26 +72,31 @@ without optimisation and with the hardware and the software SHA-256, and check t
 that depth, that the derivation uses less than half of it and more than an eighth, and that no
 16-byte piece is left of the key, the extracted key, the HMAC key blocks, the SHA-256 states, inner
 hashes and message schedules, or the output beyond the identifier, in the byte orders and
-arrangements the two SHA-256 paths use. The wipe on release and on creating a set, and the refusal
-of a released or foreign handle, are proven for two slots; the statements and their limits are in
-[proofs.md](proofs.md).
+arrangements the two SHA-256 paths use. After a wrap and an unwrap the stack below the caller is
+wiped as well: 24 KiB, or 64 KiB without optimisation, at least twice what the cipher uses at every
+level of optimisation by the same measurement; tests read the stack back after a wrap, an unwrap and
+an unwrap whose record fails its tag, and look for pieces of both keys, the derived cipher key, the
+message keys, the AES round keys of the derived key and of the message encryption key as laid out by
+the instructions, the keystream and the record's plaintext. The wipe on release and on creating a
+set, and the refusal of a released or foreign handle, are proven for two slots; the statements and
+their limits are in [proofs.md](proofs.md).
 
 **Intended.** Drop keys from memory when the device locks.
 
 **Not defended.** Copies left by a value move, a buffer reallocation, a CPU register, swap, or a
 crash dump. The stack wipe is best effort: it does not reach registers, it relies on the compiler
-keeping the derivation out of its caller's frame, its depth follows the optimisation of this crate,
-so a build that optimises this crate but not the hash code it calls has to set `--cfg
-lethewis_unoptimised`, and it is measured only where the tests run, so far x86-64 Linux. A set of
-slots leaked instead of dropped keeps its keys in memory. A copy of a new key kept by the platform's
-random source. A system component with elevated privileges is outside what process isolation
-provides. Copies the cipher leaves on the stack when a key is wrapped or unwrapped. A record is not
-bound to one key in the strict sense: whoever chooses two keys can cheaply build bytes the cipher
-accepts under both. For such bytes to unwrap under both keys they must also name each key's
-identifier, which raises the work to no less than about 2^64 by estimate; this is not proven. A key
-wrapped under itself is refused, also when it is loaded twice. Longer cycles, such as one key
-wrapped under another that is wrapped under the first, and a key whose bytes begin with the bytes of
-the key it is wrapped under, are not detected.
+keeping the derivation, the wrap and the unwrap out of their caller's frame, its depth follows the
+optimisation of this crate, so a build that optimises this crate but not the hash and cipher code it
+calls has to set `--cfg lethewis_unoptimised`, and it is measured only where the tests run, so far
+x86-64 Linux. A set of slots leaked instead of dropped keeps its keys in memory. A copy of a new key
+kept by the platform's random source. A system component with elevated privileges is outside what
+process isolation provides. The AES round keys of the software AES are bitsliced and are not looked
+for in that form. A record is not bound to one key in the strict sense: whoever chooses two keys can
+cheaply build bytes the cipher accepts under both. For such bytes to unwrap under both keys they
+must also name each key's identifier, which raises the work to no less than about 2^64 by estimate;
+this is not proven. A key wrapped under itself is refused, also when it is loaded twice. Longer
+cycles, such as one key wrapped under another that is wrapped under the first, and a key whose bytes
+begin with the bytes of the key it is wrapped under, are not detected.
 
 ### 5. The supply chain
 
@@ -116,14 +121,18 @@ what stands against an attack is the reading of every changed file before it is 
 
 **Not measured.** The cipher compares its tag, and the library compares the identifier of the
 wrapping key a record names, through a comparison written for constant time: inline assembly on
-x86-64 and aarch64, best effort on other targets. AES and POLYVAL run on the processor's
-instructions where present and on bitsliced portable code elsewhere. Whether those instructions take
-the same time for all data is up to the processor: on recent Intel processors only in a mode the
-operating system sets, on aarch64 only in a mode this library does not set, on Cortex-M3 the
-portable multiplication varies with its operands, and WebAssembly makes no promise. When timing is
-measured, the tool, its version, the compiler version and the coverage will be stated in
-[proofs.md](proofs.md). The available tools are statistical and detect only pronounced leaks, and
-compiler optimisation can reintroduce a leak after a check has passed.
+x86-64 and aarch64, best effort on other targets. A build step compiles that comparison for x86-64,
+aarch64, Cortex-M4 and WebAssembly and fails unless its machine code runs straight through: no
+branch, no call and no write of the program counter but the final return. This shows how the pinned
+compiler laid the code out, before link-time optimisation, not how long each instruction takes. AES
+and POLYVAL run on the processor's instructions where present and on bitsliced portable code
+elsewhere. Whether those instructions take the same time for all data is up to the processor: on
+recent Intel processors only in a mode the operating system sets, on aarch64 only in a mode this
+library does not set, on Cortex-M3 the portable multiplication varies with its operands, and
+WebAssembly makes no promise. When timing is measured, the tool, its version, the compiler version
+and the coverage will be stated in [proofs.md](proofs.md). The available tools are statistical and
+detect only pronounced leaks, and compiler optimisation can reintroduce a leak after a check has
+passed.
 
 ## Assumptions
 

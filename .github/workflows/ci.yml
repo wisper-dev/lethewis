@@ -327,6 +327,9 @@ jobs:
       - name: The core builds with no standard library and no memory allocator
         run: cargo build --manifest-path checks/no-alloc/Cargo.toml --locked --target thumbv7em-none-eabihf
 
+      - name: The comparison of key identifiers runs straight through on four targets
+        run: scripts/constant-time.py
+
       - name: Documentation builds, and its links resolve
         env:
           RUSTDOCFLAGS: -D warnings
@@ -359,18 +362,31 @@ jobs:
         run: cargo test --workspace --all-features --locked
 
       - name: Tests, optimised build
-        # The stack a derivation leaves behind differs between the two builds.
+        # The stack the hash and the cipher leave behind differs between the two builds.
         run: cargo test --workspace --all-features --locked --release
 
       - name: Tests, software SHA-256, AES and POLYVAL
         # The runners have the instructions these use; the portable code is a path of its own, and
-        # without them a derivation uses more stack.
+        # without them the hash and the cipher use a different amount of stack.
         env:
           RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
           LETHEWIS_BACK_ENDS: portable
         run: |
           cargo test --workspace --all-features --locked
           cargo test --workspace --all-features --locked --release
+
+      - name: Core tests at the other levels of optimisation
+        # The stack the hash and the cipher use, and so the depth the wipes have to reach, changes
+        # with the level.
+        env:
+          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+        run: |
+          for level in 1 2 s z; do
+            export CARGO_PROFILE_RELEASE_OPT_LEVEL=$level
+            cargo test -p lethewis-core --lib --locked --release
+            RUSTFLAGS="-D warnings $SOFTWARE" LETHEWIS_BACK_ENDS=portable \
+              cargo test -p lethewis-core --lib --locked --release
+          done
 
   mutants:
     name: Every mutant is caught

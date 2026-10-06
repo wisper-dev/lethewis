@@ -40,10 +40,10 @@ Nothing is published while the version is below 0.1.0.
   wiped with the key. `Error::DerivationFailed` when it cannot be derived.
 - A failed import leaves its source as it was.
 - The proofs on slots cover the identifier, with a model of the derivation.
-- The stack a key derivation used is wiped after it, also when it fails. Loading a key now needs
-  8 KiB of stack for that, or 64 KiB when this crate is built without optimisation or with
-  `--cfg lethewis_unoptimised`, which a build that optimises this crate but not the hash code it
-  calls has to set. Tests read the memory of their own process back, with and without optimisation
+- The stack a key derivation used is wiped after it, also when it fails: 8 KiB, or 64 KiB when this
+  crate is built without optimisation or with `--cfg lethewis_unoptimised`, which a build that
+  optimises this crate but not the hash code it calls has to set. Loading a key now needs 9 KiB of
+  stack, or 68 KiB. Tests read the memory of their own process back, with and without optimisation
   and with the hardware and the software SHA-256, to check that the wipe reaches that depth and that
   no piece of the key, of the extracted key or of the HMAC and SHA-256 states, blocks and message
   schedules is left there.
@@ -56,6 +56,15 @@ Nothing is published while the version is below 0.1.0.
   parse or name its parent, `KeyDisabled`, `SameKey`, `InvalidContext`, `CipherFailed`.
 - Dependency: `ctutils` 0.4.2 or a later compatible version, without default features, to compare
   a record's parent identifier in constant time.
+- The stack a wrap or an unwrap used is wiped after it, also when it fails: 24 KiB, or 64 KiB when
+  this crate is built without optimisation or with `--cfg lethewis_unoptimised`, which a build that
+  optimises this crate but not the hash and cipher code it calls has to set. Wrapping and unwrapping
+  need 25 KiB of stack, or 72 KiB. Tests read the memory of their own process back after a wrap and
+  an unwrap, with and without optimisation and with the hardware and the software AES, POLYVAL and
+  SHA-256, and check the wipe and the stack needed at every level of optimisation.
+- A build step checks that the machine code of the comparison of key identifiers runs straight
+  through on x86-64, aarch64, Cortex-M4 and WebAssembly: no branch, no call and no write of the
+  program counter but the final return.
 - Proofs with Kani 0.68.0 for wrapping and unwrapping, with a model of the cipher: a wrap changes no
   slot and writes the record only when it succeeds; a refused unwrap changes no slot; a decrypted
   record loads exactly the key it holds, only when it names the parent.
