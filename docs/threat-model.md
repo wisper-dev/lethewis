@@ -92,11 +92,12 @@ without one, and nothing from a dependency is built before that check passes. Th
 Cargo configuration file, no manifest patches or replaces a dependency, no toolchain file names a
 compiler by path, and every dependency comes from crates.io; the same check enforces it.
 
-**Not defended.** An undiscovered vulnerability in a dependency. A compromise of the hosting
+**Not defended.** An undiscovered vulnerability in a dependency. An advisory published outside the
+RustSec database, which is the only one the advisory gate reads. A compromise of the hosting
 platform or of a maintainer's account. A dependent that resolves a newer version of a dependency
-than the one reviewed here receives code this project has not read. A hostile change that also
-edits these checks: they run from the change under review, so they catch a mistake, not an attack,
-and what stands against an attack is the reading of every changed file before it is merged.
+than the one reviewed here receives code this project has not read. A hostile change that also edits
+these checks: they run from the change under review, so they catch a mistake, not an attack, and
+what stands against an attack is the reading of every changed file before it is merged.
 
 ### 6. Timing and other side channels
 

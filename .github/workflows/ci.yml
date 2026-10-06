@@ -348,9 +348,12 @@ jobs:
         # rustup no longer installs the pinned toolchain on its own.
         run: rustup show active-toolchain || rustup toolchain install
 
-      - name: The runner has SHA instructions
-        # Otherwise the hardware SHA-256 path would go untested.
-        run: grep -qw sha_ni /proc/cpuinfo
+      - name: The runner has the instructions of the hardware paths
+        # Otherwise the hardware paths of SHA-256, AES and POLYVAL would go untested.
+        run: |
+          for feature in sha_ni aes pclmulqdq avx; do
+            grep -qw "$feature" /proc/cpuinfo || { echo "::error::no $feature on this runner"; exit 1; }
+          done
 
       - name: Tests
         run: cargo test --workspace --all-features --locked
@@ -359,10 +362,12 @@ jobs:
         # The stack a derivation leaves behind differs between the two builds.
         run: cargo test --workspace --all-features --locked --release
 
-      - name: Tests, software SHA-256
-        # The runners have SHA instructions; without them a derivation uses more stack.
+      - name: Tests, software SHA-256, AES and POLYVAL
+        # The runners have the instructions these use; the portable code is a path of its own, and
+        # without them a derivation uses more stack.
         env:
-          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft"'
+          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+          LETHEWIS_BACK_ENDS: portable
         run: |
           cargo test --workspace --all-features --locked
           cargo test --workspace --all-features --locked --release

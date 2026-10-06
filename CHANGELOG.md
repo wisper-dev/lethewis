@@ -47,6 +47,11 @@ Nothing is published while the version is below 0.1.0.
   and with the hardware and the software SHA-256, to check that the wipe reaches that depth and that
   no piece of the key, of the extracted key or of the HMAC and SHA-256 states, blocks and message
   schedules is left there.
+- Dependencies: `aes-gcm-siv` 0.12.1, `aes` 0.9.3 and `polyval` 0.7.3 or later compatible versions,
+  without default features and with their `zeroize` features.
+- Proofs with Kani 0.68.0 for the code around the cipher of the key records: a seal that fails, and
+  a record that does not open, leave the buffer zero, and a record is refused exactly when the
+  cipher rejects it.
 - Dependency review recorded with cargo-vet in `supply-chain/`: a crate that handles key material is
   read in full, and the continuous integration check fails on a version without a record. See
   `SECURITY.md`.

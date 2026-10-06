@@ -31,6 +31,16 @@ zeroize = { version = "1.9.0", default-features = false }
 hkdf = { version = "0.13.0", default-features = false }
 # Default features bring in `alloc` and `oid`. `zeroize` also wipes the HMAC state inside HKDF.
 sha2 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+# Default features bring in `alloc` and `getrandom`. Its `zeroize` wipes only its own temporaries.
+aes-gcm-siv = { version = "0.12.1", default-features = false, features = [
+  "aes",
+  "zeroize",
+] }
+# Direct only for `zeroize`: without it the key schedule and the POLYVAL state are not wiped on drop.
+aes = { version = "0.9.3", default-features = false, features = ["zeroize"] }
+polyval = { version = "0.7.3", default-features = false, features = [
+  "zeroize",
+] }
 
 [lints]
 workspace = true

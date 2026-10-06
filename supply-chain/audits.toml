@@ -11,6 +11,215 @@ network, and, where the crate handles secrets, branches and memory accesses that
 """
 implies = "safe-to-deploy"
 
+[[audits.aead]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.6.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, and src/dev.rs behind the dev feature, off here. The archive matches
+the repository at the commit in .cargo_vcs_info.json apart from the files cargo generates.
+
+No unsafe code: lib.rs:8 is #![forbid(unsafe_code)]. No build script (build = false), no
+procedural macros; new_pass_test! and new_fail_test! in dev.rs are macro_rules that expand in
+the calling test crate with include_bytes!. No access to the system, files, network or
+environment. Dependencies: crypto-common and inout; arrayvec, blobby and bytes are optional. All
+features are off here, the default rand_core included, so Aead, the Buffer impls for Vec,
+BytesMut and ArrayVec, Generate and dev are not built.
+
+Traits and types only; the crate holds no secret state. Nonce<A>, Tag<A> and the re-exported Key
+are Array<u8, N>: Copy, without Drop, and without Zeroize while the zeroize feature of
+hybrid-array is off, so every by-value copy stays uncleared. Error is a unit struct.
+
+AeadInOut (lib.rs:220): the implementation supplies encrypt_inout_detached and
+decrypt_inout_detached, and the trait states nothing about the buffer contents after an error.
+encrypt_in_place and decrypt_in_place (lib.rs:258, 292) work through the dyn Buffer trait. For a
+postfix tag, encrypt_in_place encrypts the buffer and only then appends the tag (lib.rs:276-278);
+if the buffer cannot grow, it returns an error with the ciphertext in place and the tag dropped,
+leaving neither the plaintext nor a ciphertext the trait can decrypt. The prefix branch grows the
+buffer first. decrypt_in_place leaves the buffer untruncated on error; for a prefix tag it moves
+the plaintext down and truncates (lib.rs:306, 314), which leaves the last TagSize bytes of the
+plaintext past the new length.
+
+AeadInPlace (lib.rs:324) is deprecated since 0.6.0 but implemented for every AeadInOut
+(lib.rs:373), so encrypt_in_place, encrypt_in_place_detached, decrypt_in_place and
+decrypt_in_place_detached remain callable with a deprecation warning. The detached forms pass the
+&mut [u8] as an in-place InOutBuf to the AeadInOut methods (lib.rs:389, 408) and leave the
+buffer on error as the implementation leaves it.
+
+Payload (lib.rs:420) is built without features and derives Debug, which prints the message and
+the associated data. The documentation of TagSize (lib.rs:122) calls it the maximum tag length;
+the crate uses it as the exact length. No branch depends on data; the in-place methods branch on
+TAG_POSITION and on lengths only.
+"""
+
+[[audits.aes]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.9.3"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, src/lib.rs, src/backends.rs, src/backends/soft.rs, in
+src/backends/fixslice/: mod.rs, word.rs, utils.rs, sbox.rs, mix_columns.rs, aes128.rs, aes192.rs,
+aes256.rs; src/backends/x86_aes.rs with x86_aes/encdec.rs, expand.rs, utils.rs;
+src/backends/x86_vaes256.rs with x86_vaes256/encdec.rs; src/backends/x86_vaes512.rs with
+x86_vaes512/encdec.rs; src/backends/aarch64_aes.rs with aarch64_aes/encdec.rs, expand.rs, utils.rs;
+and, behind the hazmat feature, off here, src/hazmat.rs, fixslice/hazmat.rs, x86_aes/hazmat.rs,
+aarch64_aes/hazmat.rs. README.md is not compiled in. The archive matches the repository at the
+commit in .cargo_vcs_info.json, tagged aes-v0.9.3, apart from the files cargo generates.
+
+No build script (build = false), no procedural macros, no include_str! or include_bytes!, no
+inline assembly. No access to files, network or environment. CPU features come from
+cpufeatures::new! (lib.rs:152-154, 174): CPUID and XGETBV on x86, getauxval(AT_HWCAP) on aarch64
+Linux and Android, a constant on Apple targets. Dependencies: cipher; cpubits, macro_rules only;
+zeroize behind the zeroize feature, which is on here; cpufeatures on aarch64, x86 and x86_64 only.
+
+Backends. On x86_64, encrypt and decrypt (lib.rs:262-302, 312-352) try in turn VAES-512 (avx512f
+and vaes), VAES-256 (vaes), AES-NI (aes), then the portable fixsliced backend. cpufeatures 0.3.1
+checks vaes together with the ZMM state in XCR0, so CPUs with VAES but without AVX-512 state take
+AES-NI. On aarch64: ARMv8 AES, else portable. On thumbv7em and wasm32: portable only. cpubits
+chooses 64-bit words on 64-bit targets and on wasm32, and 32-bit words on thumbv7em with the
+stable compiler, which reports no arm target features. --cfg aes_backend = "soft" removes every
+hardware backend; no cfg removes VAES alone.
+
+Timing. The portable backend uses only bitwise operations and rotations by constant amounts; every
+array index and loop bound is a constant or a counter; the only multiplications (word.rs:71, 81,
+178, 191) take constant arguments at every call site. The hardware paths use the AES
+instructions, AESKEYGENASSIST on x86 and AESE with a zero key for SubWord on aarch64
+(aarch64_aes/expand.rs:82); their branches depend on round indices only. No branch and no memory
+address depends on the key or the data in any path. lib.rs:19-23 and README.md claim constant time
+on this basis; there are no optimization barriers, and the generated code was not inspected. On
+aarch64 PSTATE.DIT is not set.
+
+Secrets. Each public type holds a union (lib.rs:452-485) of the hardware and the portable schedule
+plus a zero-sized Token. For AES-256 the portable schedule is [u64; 120], 960 bytes, or [u32; 120]
+on 32-bit words; the x86 and aarch64 schedules are 15 round keys of 16 bytes for encryption, in
+Aes256 and Aes256Enc, and for decryption, in Aes256 and Aes256Dec. Aes256 is 960 bytes on
+x86_64, aarch64 and wasm32 and 480 on thumbv7em. With the zeroize feature, Drop
+(lib.rs:424-432) passes the whole struct to zeroize_flat_type, so the union is wiped whichever
+variant is live; the volatile writes cover it, and the barrier receives the address of the
+pointer variable. All nine types are marked ZeroizeOnDrop; Debug prints no key material. Not
+wiped:
+- key expansion temporaries: the portable rkeys, broadcast key blocks and bitslice words
+  (aes256.rs:8-11, utils.rs:9, word.rs:100, 222), the x86 key halves copied into a Block
+  (x86_aes/expand.rs:204), the local schedule arrays (x86_aes/expand.rs:172, 192;
+  aarch64_aes/expand.rs:21, 65); each schedule is returned by value and moved into the union and
+  then into the struct;
+- the schedule copies made by From<&Aes256Enc> for Aes256 and for Aes256Dec (lib.rs:391,
+  x86_aes.rs:101, aarch64_aes.rs:100);
+- on VAES, every encrypt and decrypt call builds rk4 or rk2 (x86_vaes512.rs:25, 33;
+  x86_vaes256.rs:25, 33): the whole schedule broadcast to 64- or 32-byte lanes, 960 or 480 bytes
+  for AES-256, whose first two round keys are the key; it stays in the stack frame;
+- portable single-block calls (soft.rs:48-53, 64-69) process a full batch with the other slots
+  zero, so the frame keeps E_K(0) or D_K(0) next to the result;
+- bitsliced state, register spills and vector registers on every path, and copies left by moves
+  of the cipher value.
+
+Unsafe code, each use sound as read unless stated otherwise:
+- lib.rs:236, 243: target_feature constructors after token.aes.get() at lib.rs:234, 241.
+- lib.rs:284-286, 292-294, 334-336, 342-344: read of inner.aes and call of the target_feature
+  method after token.aes.get(); new stores the aes variant exactly when that check passed.
+- lib.rs:372-374, 381-383: as_encdec and as_dec after token.aes.get().
+- lib.rs:301, 351, 391: read of inner.soft, reached only when aes is not detected or no hardware
+  backend is compiled.
+- lib.rs:268-270, 276-278, 318-320, 326-328: not sound. The VAES branches test only vaes512 or
+  vaes256, not aes, then read inner.aes and call functions compiled with target_feature vaes,
+  which in rustc implies aes and avx2. If CPUID reports VAES (with AVX512F and ZMM state) but not
+  AES-NI, the union holds the portable schedule: its words are used as AES round keys (no
+  uninitialized read in this version, since the portable variant is never smaller), and AES-NI
+  code runs unchecked (x86_vaes512.rs:58, 74; x86_vaes256.rs:56, 72). The result is output that
+  is not AES, or an illegal instruction.
+- lib.rs:428: zeroize_flat_type(self) in Drop; the union fields are Copy arrays, Token is
+  zero-sized, and all-zero is valid for each.
+- x86_aes.rs:65, 72, 81, 88, 133, 140, 170, 177 and aarch64_aes.rs:64, 71, 80, 87, 132, 139,
+  169, 176: target_feature calls from backend trait methods; values of these types are made only
+  by target_feature constructors after the aes check, or copied from such values.
+- x86_vaes256.rs:63, 79 and x86_vaes512.rs:65, 81: batch calls on a backend that exists only
+  inside the VAES target_feature functions.
+- x86_aes/utils.rs:13, 20 and aarch64_aes/utils.rs:7, 13: unaligned 16-byte load and store of a
+  Block.
+- x86_vaes256/encdec.rs:94, 109 and x86_vaes512/encdec.rs:94, 109: unaligned 32- and 64-byte
+  loads and stores at index i below N/2 or N/4; N % 2 == 0 and N % 4 == 0 are asserted at compile
+  time.
+- aarch64_aes/expand.rs:27: [uint8x16_t; RK] viewed as RK * 4 u32 words, alignment asserted at
+  expand.rs:24; the array is not touched while the slice is live.
+- hazmat.rs:39, behind hazmat: round intrinsics after features_aes::get().
+
+cpufeatures 0.3.1 reads CPUID leaf 7 without checking the maximum basic leaf. The aes bit comes
+from leaf 1; vaes and avx512f also require the ZMM bits of XCR0, which an operating system sets
+only after enumerating leaf 0xD, so a stale leaf 7 is not expected to select VAES; not verified
+for every operating system and hypervisor.
+
+lib.rs:48-49 and 107-108 document aes_backend = "avx256" and "avx512", which this version
+removed; VAES is detected at run time by default. lib.rs:25 names an aes_compact flag; the cfg is
+aes_backend_soft = "compact".
+"""
+
+[[audits.aes-gcm-siv]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.12.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs. The archive matches the repository at the commit in
+.cargo_vcs_info.json, tagged aes-gcm-siv-v0.12.1, apart from the files cargo generates. Also read,
+not built into dependents: tests/aes128gcmsiv.rs, tests/aes256gcmsiv.rs, tests/ctr_wrap.rs,
+tests/common/mod.rs.
+
+No build script (build = false), no procedural macros, no unsafe code, no access to the system,
+files, network or environment. Dependencies: aead and polyval with default features off, cipher,
+ctr, ctutils; aes and zeroize are optional and both on here. alloc, getrandom, rand_core,
+arrayvec and bytes only pass through to aead and are off here.
+
+Path used here: Aes256GcmSiv in place, through AeadInOut::encrypt_inout_detached and
+decrypt_inout_detached (lib.rs:177, 187). Nonce is Array<u8, U12> and Tag is Array<u8, U16>
+(lib.rs:114, 117), Copy arrays without Drop. AesGcmSiv holds the AES schedule of the
+key-generating key by value (lib.rs:132). Each call builds a Cipher (lib.rs:229): six AES blocks
+of a little-endian 32-bit counter 0 to 5 followed by the nonce, the first 8 bytes of each kept,
+counters 0 and 1 giving the POLYVAL key and 2 to 5 the encryption key (lib.rs:250-260), as in
+RFC 8452 section 4. finish_tag (lib.rs:332) hashes the length block, the bit lengths of AAD and
+data as LE64, XORs the nonce into the first 12 bytes of the POLYVAL output, clears the top bit of
+byte 15 and encrypts the block with the encryption key. init_ctr (lib.rs:363) sets the top bit of
+byte 15 of the tag and starts ctr's Ctr32LE core over a reference to the encryption key, so the
+schedule is not copied.
+
+Order: encrypt (lib.rs:282) checks lengths, hashes AAD and plaintext, computes the tag, then
+applies the keystream. decrypt (lib.rs:302) checks lengths, hashes AAD, applies the keystream,
+hashes the result and compares the computed tag with the given one through ctutils CtEq for
+[u8], reached through Deref (lib.rs:320-321); with hybrid-array's ctutils feature on, the Array
+impl compares the same 16 bytes. Besides the length checks, the comparison result is the only
+branch. On mismatch the keystream is applied to the buffer again (lib.rs:326). In place, the
+buffer returns to the given ciphertext. With separate input and output buffers the output keeps
+the decrypted, unauthenticated data: a ciphertext altered with its tag kept leaves the true
+plaintext with the same bits flipped. Both were observed in a test run.
+
+Length checks: AAD up to A_MAX and plaintext up to P_MAX, both 2^36 bytes (lib.rs:287). decrypt
+checks the detached ciphertext against C_MAX = 2^36 + 16 (lib.rs:308), which counts a tag the
+buffer does not contain. cipher's apply_keystream_partial panics at 2^36 bytes and above with
+ctr's 32-bit counter, so encrypting exactly P_MAX bytes, and decrypting 2^36 to 2^36 + 16 bytes,
+panic instead of returning an error; the decrypt panic was observed. Empty plaintext and empty
+AAD need no special case and round-trip.
+
+Secrets and wiping: the zeroize feature clears only the local mac_key, enc_key and block arrays
+after the Cipher is built (lib.rs:270-276). It does not turn on the zeroize features of aes,
+polyval or ctr, so the key-generating key schedule in AesGcmSiv, the per-message AES schedule and
+POLYVAL state in Cipher (lib.rs:209), and the POLYVAL clone made by finalize_reset (lib.rs:341)
+are cleared on drop only when those features are enabled elsewhere. AesGcmSiv derives Clone
+(lib.rs:131); Debug prints no state (lib.rs:202). Not cleared in any configuration: the computed
+tag on decrypt (lib.rs:318), copies of key material left on the stack by moves and by key
+expansion in aes and polyval, and keystream and plaintext in the stack temporaries of cipher and
+universal-hash. A stack scan after one in-place call on 92 bytes, in a release build on x86_64
+with the hardware and the portable backends, found the POLYVAL key, the encryption key and the
+plaintext or keystream of the final partial block within 4 KiB below the caller's stack pointer,
+with and without the zeroize features of aes and polyval; building AesGcmSiv left copies of the
+key-generating key. No branch or memory index depends on keys, data or tag bytes.
+
+Tests: RFC 8452 C.1, C.2 and C.3 through the allocating API, which calls the in-place inout
+methods; Wycheproof subsets (AES-256: 45 valid vectors with plaintexts up to 64 bytes, 35
+invalid) through the allocating API and, for valid vectors, out-of-place inout calls. Not tested:
+the buffer contents after a failed decryption. All pass on x86_64 with the hardware and the
+portable backends.
+"""
+
 [[audits.block-buffer]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -83,6 +292,57 @@ dependency rustc-std-workspace-core is behind rustc-dep-of-std, off here. No acc
 system, files or network.
 """
 
+[[audits.cipher]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.5.2"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/block.rs, src/block/backends.rs, src/block/ctx.rs, src/stream.rs,
+src/stream/core_api.rs, src/stream/errors.rs, src/stream/wrapper.rs, src/tweak.rs,
+src/tweak/ctx.rs, src/tweak/zero.rs, and, behind the dev feature, off here, src/dev.rs and
+src/dev/*.rs. The archive matches the repository at the commit in .cargo_vcs_info.json apart
+from the files cargo generates.
+
+No unsafe code: lib.rs:8 is #![forbid(unsafe_code)]. No build script (build = false), no
+procedural macros; impl_seek_num and impl_counter are macro_rules. No target-specific code, no
+access to the system, files, network or environment.
+
+Features: stream-wrapper is on here, through ctr, and adds block-buffer and
+StreamCipherCoreWrapper. alloc, block-padding, dev, getrandom, rand_core and zeroize are off.
+The zeroize feature adds only a re-export and ZeroizeOnDrop marker impls (wrapper.rs:213-228);
+the crate has no wiping code of its own.
+
+Path used here, through aes-gcm-siv and ctr: BlockCipherEncrypt::encrypt_block (block.rs:52) and
+its impl for &Alg (block.rs:141); StreamCipherCore::apply_keystream_partial (core_api.rs:144),
+which calls try_apply_keystream_partial (core_api.rs:102) and then process_with_backend with
+ApplyBlocksCtx (core_api.rs:266) and the default gen_tail_blocks. StreamCipherCoreWrapper is built
+but not used on this path.
+
+try_apply_keystream_partial compares buf.len() / block size with remaining_blocks and returns an
+error before it touches the buffer. Read with the meaning given at core_api.rs:107, the check
+never accepts more blocks than remain, and it rejects a buffer that ends exactly at the end of the
+last keystream block. Whole blocks are processed in place through the InOutBuf; a partial tail is
+copied into a local block (core_api.rs:127), processed there, and copied back.
+
+Secrets and copies, none cleared: the local tail block keeps the tail output and the rest of its
+keystream block (core_api.rs:127-131); keystream blocks stay in locals at core_api.rs:252, 273,
+278 and 286, the one at 278 a ParBlocksSize array even for a single block; xor_in2out in inout
+adds a copy of each input block and of each output block. Keystream XOR ciphertext gives the
+plaintext. StreamCipherCoreWrapper keeps unused keystream in a block-buffer ReadBuffer, which is
+cleared on drop only through the zeroize feature of block-buffer; its Clone copies that buffer,
+its Debug prints nothing. ZeroTweak derives Debug and Clone from the wrapped cipher.
+
+No branch or memory index depends on data or keystream; branches use lengths, ParBlocksSize and
+counter positions only. Panics: apply_keystream_partial when the check fails, the panicking
+StreamCipher methods at the end of the keystream, and gen_tail_blocks and the tail-block backend
+methods on a tail of ParBlocksSize blocks or more, which no caller in this crate passes.
+
+Not used here: SeekNum::into_block_byte for i32 (stream.rs:310) panics on a negative position,
+so try_seek with a negative i32 panics instead of returning an error. block_mode_test!
+(dev/block_mode.rs:100) ignores its test function and expands to block_cipher_test!.
+"""
+
 [[audits.cmov]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -132,6 +392,32 @@ registers and stack temporaries. CSEL timing is architecturally data independent
 PSTATE.DIT set, and the crate does not set it.
 """
 
+[[audits.cpubits]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.1.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs. The archive matches the repository at the commit in
+.cargo_vcs_info.json, tagged cpubits-v0.1.1, apart from the files cargo generates.
+
+No build script (build = false), no dependencies, no procedural macros, no unsafe code, no access
+to the system, files, network or environment. The crate is two macro_rules! macros and one
+constant, CPUBITS (lib.rs:391); nothing runs at run time.
+
+cpubits! (lib.rs:153) picks a word size of 16, 32 or 64 bits at compile time and keeps only the
+matching arm. Predicates in order (lib.rs:285-312): a cpubits cfg of "16", "32" or "64" set by
+the builder, for example through RUSTFLAGS; target_pointer_width 16; 32, unless the target is arm
+with target_feature v7 or wasm32, which are promoted to 64; 64; otherwise compile_error!. cfg_if!
+(lib.rs:323) is a vendored copy of cfg-if that gives each clause the negation of all earlier
+ones, so exactly one arm is kept. Here aes picks its fixslice word and polyval its portable
+multiplication with it; on x86_64 and aarch64 both get 64. The crate handles no secrets.
+
+The single-arm form cpubits! { 16 => { ... } } expands with a comma that no rule accepts
+(lib.rs:158) and fails to compile; aes and polyval use the 16 | 32 and 64 forms, which expand
+correctly.
+"""
+
 [[audits.cpufeatures]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -164,6 +450,13 @@ Android, getauxval(AT_HWCAP) tested for HWCAP_SHA2; on aarch64 Apple targets che
 the constant true, so nothing is called. x86.rs:49-51 does not check the maximum CPUID leaf
 first. sysctlbyname panics instead of returning false when the name does not exist; it is
 reached only for dit and sha3.
+
+Path used by aes and polyval: on x86_64, CPUID leaf 1 for aes and pclmulqdq, leaf 7 for vaes and
+avx512f together with the ZMM state in XCR0, and the YMM state for avx; on aarch64 Linux and
+Android, getauxval(AT_HWCAP); on aarch64 Apple targets, the constant true. The aes check on
+aarch64 Linux and Android passes when either HWCAP_AES or HWCAP_PMULL is set (aarch64.rs:59,
+(hwcaps & (AES | PMULL)) != 0), while polyval takes it to mean PMULL as well; a CPU with AES but
+without PMULL would execute PMULL and fault. The kernel reports PMULL only together with AES.
 """
 
 [[audits.crypto-common]]
@@ -185,6 +478,53 @@ KeyIvInit::new_from_slices, TryKeyInit::new_from_slice and InnerIvInit::inner_iv
 (lib.rs:169, 202, 273, 301) borrow the slice as an &Array after a length check and branch only on
 the length. No branch or index depends on secret data. hazmat.rs:165 passes U8 as the size of
 u128, so SerializableState for [u128; N] panics (hazmat.rs:116, 130); not used here.
+"""
+
+[[audits.ctr]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.10.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, src/lib.rs, src/ctr_core.rs, src/flavors.rs,
+src/flavors/ctr32.rs, src/flavors/ctr64.rs, src/flavors/ctr128.rs. README.md is not compiled in.
+The archive matches the repository named in the manifest at the commit in .cargo_vcs_info.json,
+tagged ctr-v0.10.1, apart from the files cargo generates.
+
+No unsafe code: lib.rs:66 is #![forbid(unsafe_code)]. No build script (build = false), no
+procedural macros, no include_str! or include_bytes!, no access to the system, files, network or
+environment. One dependency, cipher, with stream-wrapper on, which adds block-buffer. The alloc,
+block-padding and zeroize features pass through to cipher; zeroize also compiles the Drop bodies
+below. All three are off here.
+
+Path used here, from aes-gcm-siv: CtrCore<&Aes256, Ctr32LE>, made by inner_iv_init
+(ctr_core.rs:121) and consumed by cipher's StreamCipherCore::apply_keystream_partial; the
+StreamCipherCoreWrapper aliases (lib.rs:80-90) are not used. The cipher field holds a reference,
+so the key schedule is not copied. Ctr32LE::from_nonce (ctr32.rs:147) reads bytes 0..4 of the
+initial block as a little-endian u32 and keeps bytes 4..16 as native-endian words, emitted
+unchanged; ctr starts at 0. current_block (ctr32.rs:126) writes (nonce[0] + ctr) mod 2^32,
+little-endian, into bytes 0..4 only, and next_block (ctr32.rs:140) advances ctr with
+wrapping_add, so the counter wraps from 0xffffffff to 0 without a carry into byte 4, as RFC 8452
+requires. The wrap is covered by the crate's counter_wrap test and by the RFC 8452 C.3 vectors.
+
+remaining (ctr32.rs:121) returns u32::MAX - ctr, the blocks left after the next one, as cipher
+documents. cipher 0.5.2 try_apply_keystream_partial compares floor(len / 16) with it, so a buffer
+of exactly 2^32 blocks, the whole counter space, is refused and apply_keystream_partial panics;
+2^36 - 1 bytes are accepted.
+
+Keystream: gen_ks_block (ctr_core.rs:219) and gen_par_ks_blocks (ctr_core.rs:225) build counter
+blocks in locals and encrypt them into blocks owned by cipher's closures, which keep the
+keystream in stack temporaries that are not cleared. This crate stores no keystream; its locals
+hold counter blocks derived from the IV, which for AES-GCM-SIV is the public tag.
+
+Wiping: CtrNonce32, CtrNonce64 and CtrNonce128 implement Drop, which zeroizes ctr and the nonce
+words only with the zeroize feature (ctr32.rs:26-35, same lines in ctr64.rs and ctr128.rs); off
+here, and on this path they hold no secret. CtrCore has no Drop; with zeroize it gets a
+ZeroizeOnDrop marker when the cipher and the nonce type have one (ctr_core.rs:179-186). The nonce
+types derive Clone. Debug prints no state (ctr_core.rs:165, ctr32.rs:19).
+
+No branch or memory index depends on the key, the counter or the data: loops run over the
+compile-time number of words, and the only conditions test the loop index. The expect in
+from_nonce (ctr32.rs:152) cannot fire; the slice is exactly one word long.
 """
 
 [[audits.ctutils]]
@@ -365,6 +705,75 @@ hmac takes a block from Default and copies the key in through IndexMut, so the f
 never holds key bytes.
 """
 
+[[audits.inout]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.2.2"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, src/lib.rs, src/errors.rs, src/inout.rs,
+src/inout_buf.rs, src/reserved.rs. README.md is not compiled in. The archive matches the
+repository at the commit in .cargo_vcs_info.json apart from the files cargo generates.
+
+No build script (build = false), no procedural macros, no include_str! or include_bytes!, no
+target-specific code. No access to the system, files, network or environment. Dependencies:
+hybrid-array, and block-padding behind the block-padding feature, which is off here, so PadError,
+InOutBufReserved::into_padded_blocks and PaddedInOutBuf (errors.rs:29-41, reserved.rs:152-248)
+are not built.
+
+InOut and InOutBuf hold a raw input pointer, a raw output pointer and, for InOutBuf, a length;
+input and output are either equal or disjoint. The safe constructors take one &mut, giving equal
+pointers, or a & and a &mut of equal length. The types are not Clone, Copy, Send or Sync and have
+no Debug; they are covariant in both lifetimes and invariant in T.
+
+Path used here, an in-place InOutBuf<u8> built from one &mut [u8] (inout_buf.rs:18): into_chunks,
+get, get_in, get_out, iteration, xor_in2out on blocks and on arrays of blocks, and from_mut on a
+local block. Every pointer on this path derives from the raw pointer taken at inout_buf.rs:21, so
+reads through the input and writes through the output carry the same tag; the references from
+get_in and get_out are tied to &self and &mut self, and the borrow checker keeps them apart. As
+read, the path is sound under both the stacked-borrows and the tree-borrows models.
+
+Secrets: the crate keeps no state. xor_in2out on an array (inout.rs:184, 208) copies the whole
+input into a local with ptr::read and builds the result in a second local before ptr::write; for
+in-place encryption the first holds plaintext, for decryption the second does. Neither is
+cleared. The byte form (inout_buf.rs:262) works byte by byte without a local copy. No branch or
+index depends on data; ptr::eq at inout.rs:46 and inout_buf.rs:134 compares addresses only.
+
+Unsafe code, each use sound as read unless stated otherwise:
+- inout.rs:27, 33, 51, 57, 98: get_in, get_out, into_out_with_copied_in, into_out, clone_in:
+  references from the stored pointers; the shared one lives as long as &self, the mutable ones
+  as long as &mut self, or 'out with self consumed.
+- inout.rs:47: ptr::copy of one T when the pointers differ.
+- inout.rs:85, unsafe fn from_raw: the documented contract matches what the safe constructors
+  provide.
+- inout.rs:133: get: add(pos) after the assert pos < N.
+- inout.rs:166: Array<InOut<Array<T, N>>, M> from InOut<Array<T, N * M>>: M disjoint
+  sub-arrays at i < M; Array is repr(transparent) over [T; N].
+- inout.rs:185, 209: xor_in2out: ptr::read of a Copy array and ptr::write of the result.
+- inout_buf.rs:103: get: add(pos) after the assert pos < len.
+- inout_buf.rs:115, 121, 139, 145: get_in, get_out, into_out_with_copied_in, into_out: slices of
+  len elements over the stored pointers.
+- inout_buf.rs:135: ptr::copy of len elements when the pointers differ.
+- inout_buf.rs:186, unsafe fn from_raw: the contract of InOut::from_raw plus the isize::MAX
+  bound.
+- inout_buf.rs:211: split_at: add(mid) after the assert mid <= len; the halves are disjoint.
+- inout_buf.rs:236: into_chunks: len / N whole chunks cast to Array<T, N>, aligned as T; the tail
+  starts at N * (len / N) <= len. N = 0 panics on the division first.
+- inout_buf.rs:264: xor_in2out: a read and a write at each i < len after the length assert.
+- inout_buf.rs:308: iteration: add(pos) for pos < len; the items are disjoint.
+- reserved.rs:136, 142, 148: get_in, get_out, into_out: slices of in_len and out_len elements.
+- reserved.rs:64, unsafe fn from_raw: the contract omits in_len <= out_len. split_reserved
+  relies on it (reserved.rs:106): a call that breaks it underflows there, which panics in debug
+  builds and yields an out-of-bounds slice in release builds.
+- reserved.rs:107, split_reserved: unsound for an in-place buffer. The input pointer is taken
+  from the shared slice returned by get_in (reserved.rs:102); the mutable slice from get_out
+  (reserved.rs:103) is derived from the same original pointer and, under stacked borrows,
+  removes the tag of that shared slice, so any later read of the returned body's input is
+  undefined behaviour. Under tree borrows, a read through the input of a byte already written
+  through the output is. Found by reading, not run under Miri; no test covers the method. Not
+  reached here: aead, cipher, ctr and aes-gcm-siv do not call it.
+- reserved.rs:176, 195, 246: behind block-padding, off here.
+"""
+
 [[audits.libc]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "safe-to-deploy"
@@ -409,6 +818,85 @@ run time the SHA-256 path calls getauxval(AT_HWCAP) on first use on aarch64 Linu
 and no libc function on Apple targets. No libc code here handles secrets.
 
 Review again by 2027-04-01 or at the next version, whichever comes first.
+"""
+
+[[audits.polyval]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.7.3"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/hazmat.rs (behind the hazmat feature, off here), src/backend.rs,
+src/backend/soft.rs, src/backend/intrinsics.rs, src/backend/intrinsics/x86.rs,
+src/backend/intrinsics/armv8.rs, src/field_element.rs, src/field_element/mul32.rs,
+src/field_element/mul64.rs, src/field_element/mulx.rs. The archive matches the repository at the
+commit in .cargo_vcs_info.json, tagged polyval-v0.7.3, apart from the files cargo generates; it
+was published by trusted publishing from that commit.
+
+No build script (build = false), no procedural macros; cfg_if! and cpubits! are macro_rules from
+cpubits. No access to the system, files, network or environment. Dependencies: cpubits,
+universal-hash, cpufeatures on aarch64, x86 and x86_64, and zeroize behind the zeroize feature,
+which is on here. The cfg flags polyval_backend = "soft" and cpubits = "16" | "32" | "64" change
+the backend; none is set here.
+
+Backend by target (backend.rs:1-13, field_element.rs:22-31): x86 and x86_64 use
+intrinsics/x86.rs when CPUID reports AVX and PCLMULQDQ and XCR0 enables YMM state (x86.rs:34);
+aarch64 uses intrinsics/armv8.rs when the cpufeatures aes check passes (armv8.rs:31), a constant
+true on Apple targets. Otherwise, and on every other target, field multiplication is portable:
+mul64.rs on 64-bit targets and wasm32, mul32.rs on other 32-bit targets. cpubits would also move
+arm with target_feature = "v7" to mul64.rs, but a stable compiler does not expose that unstable
+feature to cfg: thumbv7em builds mul32.rs on stable and mul64.rs on nightly.
+
+Correctness: the R/F multiplication, the expansion to H^1..H^4 and D^1..D^4, the four-block
+aggregated reduction and both portable multipliers were modelled bit for bit and agreed with a
+direct GF(2^128) computation of POLYVAL, the specification's test vector included, on 300 random
+and edge-case inputs.
+
+Secrets. Polyval holds a State. On x86, x86_64 and aarch64 it is an ExpandedKey of H^1..H^4 and
+D^1..D^4 (intrinsics.rs:92-109, 128 bytes, each value enough to recover the key; only h1 is filled
+when the CPU check fails), the accumulator acc and a zero-sized InitToken. The portable State
+(soft.rs:11-20) holds h and the accumulator y. Data blocks are read through references and copied
+into FieldElement and u128 temporaries, SIMD registers and, in mul32.rs, the 18-word arrays a
+(key words), b (acc ^ block words) and c (products) (mul32.rs:51-96).
+
+Wiping: Drop (lib.rs:111) calls zeroize_flat_type on the whole Polyval: a volatile write of every
+byte of the key powers, the D values and the accumulator, then the barrier, which receives the
+address of the pointer variable rather than the data. The fields are byte arrays with no Drop and
+no padding, and all zeros is valid for them, so the safety conditions of zeroize_flat_type hold.
+Clone (lib.rs:45) yields a Polyval that wipes itself on drop. Not wiped: the Tag returned by
+finalize (lib.rs:84), a copy of the accumulator; the key copy made by FieldElement::from(*h)
+(intrinsics.rs:37, soft.rs:25); the local buffers of from_m128i and from_uint64x2_t (x86.rs:44,
+armv8.rs:41) and the ExpandedKey value built by expand_key before it is moved into the State; the
+mul32.rs arrays and every other stack and register temporary of a multiplication; and the bytes
+left behind when a Polyval is moved. reset (lib.rs:100) clears only the accumulator, by a plain
+store. Debug for Polyval prints no state (lib.rs:105). FieldElement, public only behind hazmat,
+is Copy, implements Zeroize (field_element.rs:168) and prints its bytes in Debug
+(field_element.rs:73).
+
+Timing: no branch and no memory index depends on the key, the accumulator or the data; branches
+test only the cached CPU check and block counts. The intrinsic paths use PCLMULQDQ or PMULL, XOR,
+shuffles and shifts by constants. The portable paths use AND, OR, XOR, shifts by constants,
+reverse_bits and integer multiplication truncated to the word (field_element.rs:203-206, called
+from mul32.rs:95 and mul64.rs:34-36), so they are constant time only where the multiplier is. On
+Cortex-M4, 32-bit MUL is single cycle; the 64-bit multiply of mul64.rs lowers to UMULL and MLA,
+fixed time on Cortex-M4 but early-terminating UMULL on Cortex-M3. On wasm32 the timing of i64.mul
+depends on the engine. The generated machine code was not inspected.
+
+Unsafe code, each use sound as read:
+- lib.rs:115-117, Drop: zeroize_flat_type(self), see Wiping.
+- intrinsics.rs:32, 54, 63-65: calls of the target_feature functions expand_key, proc_block and
+  proc_par_blocks after the cpufeatures check for the same features (intrinsics.rs:28, 83).
+- x86.rs:21 and armv8.rs:21 allow unsafe operations in unsafe fns, so every function body in both
+  files is an unsafe context. Memory is touched only by unaligned 16-byte loads from a &[u8; 16]
+  (x86.rs:63, armv8.rs:60) and stores into a local [u8; 16] (x86.rs:45, armv8.rs:42), in bounds;
+  every other intrinsic works on registers. The sse2 helpers are reached only from functions that
+  require avx.
+
+The aes check of cpufeatures on Linux and Android passes when either HWCAP_AES or HWCAP_PMULL is
+set ((hwcaps & (AES | PMULL)) != 0); the kernel sets PMULL only together with AES, so a CPU with
+AES but without PMULL would execute PMULL here and fault. README.md says the hardware path needs
+AVX2 on x86 and the crypto target feature on other aarch64 platforms; the code checks AVX with
+PCLMULQDQ, and the aes target feature.
 """
 
 [[audits.sha2]]
@@ -512,6 +1000,35 @@ UInt (uint.rs:413, 547, 1090, 1789, 1817). As read, they are exact, and Sub has 
 result would be negative, so underflow fails to compile.
 """
 
+[[audits.universal-hash]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.6.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs. The archive matches the repository at the commit in
+.cargo_vcs_info.json, tagged universal-hash-v0.6.1, apart from the files cargo generates; it was
+published by trusted publishing from that commit.
+
+No unsafe code: lib.rs:8 is #![forbid(unsafe_code)]. No build script (build = false), no
+procedural macros, no features, no target-specific code. No access to the system, files, network
+or environment. Dependencies: crypto-common and ctutils.
+
+Traits only: UhfBackend, UhfClosure, UniversalHash, and the Error type. update (lib.rs:61) splits
+the blocks into chunks of ParBlocksSize with slice_as_chunks of hybrid-array, passes each chunk to
+proc_par_blocks and the rest to proc_block; update_padded (lib.rs:100) does the same for the whole
+blocks of a byte slice. Branches and loop bounds depend on lengths only; no branch and no memory
+index depends on data.
+
+Copies made by the provided methods, none of them wiped: update_padded copies the last, partial
+block of the data into padded_block, a zero-padded Array<u8, BlockSize> on the stack
+(lib.rs:106-108); finalize_reset (lib.rs:118) finalizes a clone, so the clone is wiped only if the
+implementing type wipes itself on drop, and returns the output, then calls reset; verify
+(lib.rs:136) compares the finalized output with ctutils CtEq, branching only on the result, and
+leaves the computed value in a temporary. Array<u8, U16> has no Drop. polyval, the implementor
+used here, wipes itself on drop.
+"""
+
 [[audits.zeroize]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -543,7 +1060,11 @@ Unsafe code, each use sound as read:
   nostack), on aarch64, arm, arm64ec, loongarch64, riscv32, riscv64, s390x, x86 and x86_64, except
   under Miri.
 - barrier.rs:94: on other targets, wasm32 among them, core::hint::black_box of the reference plus
-  read_volatile of its first byte in an inline(never) function.
+  read_volatile of its first byte in an inline(never) function. optimization_barrier is a public
+  safe function, so a caller can pass memory whose first byte is uninitialized, a bare
+  MaybeUninit or padding, and that read is then undefined behaviour. The Zeroize impl for
+  Option<Z> writes None over the zeroed value, which can leave its first byte uninitialized before
+  the barrier. The wipes of byte arrays and zeroize_stack pass initialized bytes.
 - x86.rs:16 and aarch64.rs:13: core::mem::zeroed() for SIMD register types on those architectures;
   all-zero is a valid value of each.
 
