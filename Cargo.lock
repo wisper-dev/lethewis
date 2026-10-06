@@ -168,6 +168,7 @@ version = "0.0.0"
 dependencies = [
  "aes",
  "aes-gcm-siv",
+ "ctutils",
  "hkdf",
  "polyval",
  "sha2",

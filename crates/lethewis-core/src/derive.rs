@@ -8,6 +8,7 @@ use sha2::Sha256;
 
 use crate::key::{Key, KeyLength, wipe};
 use crate::record::{ID_LEN, Purpose, length_to_byte};
+use crate::seal::KEY_LEN as CIPHER_KEY_LEN;
 
 /// The salt of every derivation.
 #[cfg(not(kani))]
@@ -32,7 +33,6 @@ pub(crate) enum Branch {
     /// The identifier of a key.
     KeyId,
     /// The key that encrypts the records a wrapping key wraps.
-    #[cfg_attr(not(any(test, kani)), expect(dead_code))]
     WrapKey,
 }
 
@@ -68,6 +68,29 @@ impl KeyId {
         self.0 = source.0;
         source.wipe();
     }
+
+    pub(crate) const fn bytes(&self) -> [u8; ID_LEN] {
+        self.0
+    }
+
+    /// Whether both are the identifier of one key, compared in constant time.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        self.is(&other.0)
+    }
+
+    /// Whether the identifier is `bytes`, compared in constant time.
+    pub(crate) fn is(&self, bytes: &[u8; ID_LEN]) -> bool {
+        #[cfg(not(kani))]
+        {
+            use ctutils::CtEq;
+            self.0.ct_eq(bytes).to_bool()
+        }
+        // The comparison ends in inline assembly, which Kani cannot model.
+        #[cfg(kani)]
+        {
+            model::same_id(&self.0, bytes)
+        }
+    }
 }
 
 impl Drop for KeyId {
@@ -83,6 +106,15 @@ pub(crate) fn derive_key_id(
     id: &mut KeyId,
 ) -> Result<(), DerivationFailed> {
     derive(key, purpose, Branch::KeyId, &mut id.0)
+}
+
+/// Derives the key that encrypts the records `key`, which serves `purpose`, wraps.
+pub(crate) fn derive_wrap_key(
+    key: &Key,
+    purpose: Purpose,
+    out: &mut [u8; CIPHER_KEY_LEN],
+) -> Result<(), DerivationFailed> {
+    derive(key, purpose, Branch::WrapKey, out)
 }
 
 /// Fills `out` with the value of `branch` derived from `key`, which serves `purpose`. The key goes
@@ -632,6 +664,11 @@ pub(crate) mod model {
                 *at ^= *byte;
             }
         }
+    }
+
+    /// What stands in for the constant-time comparison of identifiers.
+    pub(crate) fn same_id(a: &[u8; ID_LEN], b: &[u8; ID_LEN]) -> bool {
+        a == b
     }
 
     pub(crate) const fn id_bytes(id: &KeyId) -> &[u8; ID_LEN] {

@@ -34,8 +34,8 @@ struct Known {
     tag: [u8; TAG_LEN],
 }
 
-/// Computed by an implementation of RFC 8452 that shares no code with this one and gives the vectors
-/// of its appendices C.2 and C.3.
+/// Computed by an implementation of RFC 8452 that shares no code with this one and gives the
+/// vectors of its appendices C.2 and C.3.
 #[rustfmt::skip]
 const KNOWN: Known = Known {
     key: [
@@ -229,8 +229,8 @@ mod tests {
         seal_checked,
     };
 
-    /// RFC 8452, appendices C.2 and C.3: key, nonce, associated data, plaintext, and the result, the
-    /// ciphertext followed by the tag.
+    /// RFC 8452, appendices C.2 and C.3: key, nonce, associated data, plaintext, and the result,
+    /// the ciphertext followed by the tag.
     const RFC_8452: [[&str; 5]; 26] = [
         [
             "0100000000000000000000000000000000000000000000000000000000000000",
@@ -469,8 +469,8 @@ mod tests {
         ],
     ];
 
-    /// Records sealed under other keys, nonces and associated data, computed by the same independent
-    /// implementation as the known answer.
+    /// Records sealed under other keys, nonces and associated data, computed by the same
+    /// independent implementation as the known answer.
     #[rustfmt::skip]
     const OTHERS: [Known; 2] = [
         Known {

@@ -25,9 +25,11 @@ device. After destruction, no call returns the key.
 
 **Not defended.** A device unlocked at least once since boot holds keys in memory, and a lock screen
 does not change that. On a large share of Android devices there is no dedicated secure element, and
-the password can then be attacked off the device on fast hardware, where a short secret falls quickly.
-Our figure for that share is an estimate rather than a measurement. The library is intended to record
-which level was actually reached rather than assume the better one.
+the password can then be attacked off the device on fast hardware, where a short secret falls
+quickly. Our figure for that share is an estimate rather than a measurement. A record replaced by an
+older record of the same place opens: the epoch a record holds is written as zero and not checked.
+The library is intended to record which level was actually reached rather than assume the better
+one.
 
 ### 2. Someone who compels the password
 
@@ -59,8 +61,13 @@ reach.
 returns a key. A new key is written straight into its slot from the platform's random source, and
 the library's own code makes no copy of it; if the source fails or panics halfway, the slot is
 wiped. A key is wiped when it is released, and every key is wiped when its set of slots is dropped.
-After each key derivation, whether it succeeded or not, the stack below the caller is wiped: 8 KiB,
-or 64 KiB in a build without optimisation. Tests read the memory of their own process back, with and
+A key leaves its slot only as a record encrypted with AES-256-GCM-SIV under a key derived from the
+key that wraps it, bound to a context the caller names; before every wrap the cipher encrypts a
+known input of the shape of a record and must give the answer an independent implementation gives,
+or nothing is written. A record is unwrapped into a slot only after its tag, its layout and the
+identifier of the key that wraps it are checked, and every such failure is the same error. After
+each key derivation, whether it succeeded or not, the stack below the caller is wiped: 8 KiB, or 64
+KiB in a build without optimisation. Tests read the memory of their own process back, with and
 without optimisation and with the hardware and the software SHA-256, and check that the wipe reaches
 that depth, that the derivation uses less than half of it and more than an eighth, and that no
 16-byte piece is left of the key, the extracted key, the HMAC key blocks, the SHA-256 states, inner
@@ -78,7 +85,13 @@ so a build that optimises this crate but not the hash code it calls has to set `
 lethewis_unoptimised`, and it is measured only where the tests run, so far x86-64 Linux. A set of
 slots leaked instead of dropped keeps its keys in memory. A copy of a new key kept by the platform's
 random source. A system component with elevated privileges is outside what process isolation
-provides.
+provides. Copies the cipher leaves on the stack when a key is wrapped or unwrapped. A record is not
+bound to one key in the strict sense: whoever chooses two keys can cheaply build bytes the cipher
+accepts under both. For such bytes to unwrap under both keys they must also name each key's
+identifier, which raises the work to no less than about 2^64 by estimate; this is not proven. A key
+wrapped under itself is refused, also when it is loaded twice. Longer cycles, such as one key
+wrapped under another that is wrapped under the first, and a key whose bytes begin with the bytes of
+the key it is wrapped under, are not detected.
 
 ### 5. The supply chain
 
@@ -101,10 +114,16 @@ what stands against an attack is the reading of every changed file before it is 
 
 ### 6. Timing and other side channels
 
-**Not claimed either way.** Constant-time behaviour is not measured. When it is, the tool, its
-version, the compiler version and the coverage will be stated in [proofs.md](proofs.md). The
-available tools are statistical and detect only pronounced leaks, and compiler optimisation can
-reintroduce a leak after a check has passed.
+**Not measured.** The cipher compares its tag, and the library compares the identifier of the
+wrapping key a record names, through a comparison written for constant time: inline assembly on
+x86-64 and aarch64, best effort on other targets. AES and POLYVAL run on the processor's
+instructions where present and on bitsliced portable code elsewhere. Whether those instructions take
+the same time for all data is up to the processor: on recent Intel processors only in a mode the
+operating system sets, on aarch64 only in a mode this library does not set, on Cortex-M3 the
+portable multiplication varies with its operands, and WebAssembly makes no promise. When timing is
+measured, the tool, its version, the compiler version and the coverage will be stated in
+[proofs.md](proofs.md). The available tools are statistical and detect only pronounced leaks, and
+compiler optimisation can reintroduce a leak after a check has passed.
 
 ## Assumptions
 

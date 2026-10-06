@@ -15,6 +15,17 @@ pub enum Error {
     EntropyFailed,
     /// A value could not be derived from a key.
     DerivationFailed,
+    /// The record does not open with this key and context, holds a plaintext this version of the
+    /// library cannot read, or names another key as the one it is wrapped with.
+    RecordRejected,
+    /// The key is disabled and cannot wrap or unwrap.
+    KeyDisabled,
+    /// A key cannot wrap itself.
+    SameKey,
+    /// The context is empty or longer than 255 bytes.
+    InvalidContext,
+    /// The cipher gave a known input a wrong answer or refused the input, so nothing was written.
+    CipherFailed,
 }
 
 impl fmt::Display for Error {
@@ -24,6 +35,11 @@ impl fmt::Display for Error {
             Self::StaleHandle => "stale handle",
             Self::EntropyFailed => "random source failed",
             Self::DerivationFailed => "key derivation failed",
+            Self::RecordRejected => "record rejected",
+            Self::KeyDisabled => "key disabled",
+            Self::SameKey => "a key cannot wrap itself",
+            Self::InvalidContext => "invalid context",
+            Self::CipherFailed => "cipher failed",
         })
     }
 }
@@ -44,5 +60,10 @@ mod tests {
         assert_eq!(Error::StaleHandle.to_string(), "stale handle");
         assert_eq!(Error::EntropyFailed.to_string(), "random source failed");
         assert_eq!(Error::DerivationFailed.to_string(), "key derivation failed");
+        assert_eq!(Error::RecordRejected.to_string(), "record rejected");
+        assert_eq!(Error::KeyDisabled.to_string(), "key disabled");
+        assert_eq!(Error::SameKey.to_string(), "a key cannot wrap itself");
+        assert_eq!(Error::InvalidContext.to_string(), "invalid context");
+        assert_eq!(Error::CipherFailed.to_string(), "cipher failed");
     }
 }

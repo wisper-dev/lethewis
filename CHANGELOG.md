@@ -49,6 +49,16 @@ Nothing is published while the version is below 0.1.0.
   schedules is left there.
 - Dependencies: `aes-gcm-siv` 0.12.1, `aes` 0.9.3 and `polyval` 0.7.3 or later compatible versions,
   without default features and with their `zeroize` features.
+- `Slots::wrap` writes the key a handle refers to as a record of `RECORD_LEN` bytes, encrypted with
+  AES-256-GCM-SIV under a key derived from the parent key, bound to a context of 1 to 255 bytes;
+  `Slots::unwrap` loads it back into a free slot. A record holds the key's purpose and status and
+  the identifier of its parent. New errors: `RecordRejected` for any record that does not open,
+  parse or name its parent, `KeyDisabled`, `SameKey`, `InvalidContext`, `CipherFailed`.
+- Dependency: `ctutils` 0.4.2 or a later compatible version, without default features, to compare
+  a record's parent identifier in constant time.
+- Proofs with Kani 0.68.0 for wrapping and unwrapping, with a model of the cipher: a wrap changes no
+  slot and writes the record only when it succeeds; a refused unwrap changes no slot; a decrypted
+  record loads exactly the key it holds, only when it names the parent.
 - Proofs with Kani 0.68.0 for the code around the cipher of the key records: a seal that fails, and
   a record that does not open, leave the buffer zero, and a record is refused exactly when the
   cipher rejects it.

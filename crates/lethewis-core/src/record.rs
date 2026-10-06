@@ -2,14 +2,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use crate::key::{CAPACITY, Key, KeyBytes, KeyLength};
+use crate::seal::{NONCE_LEN, TAG_LEN};
 
 /// The size of a record's plaintext in bytes.
 pub(crate) const PLAINTEXT_LEN: usize = 92;
+/// The size of a record of a wrapped key in bytes: the nonce, the encrypted plaintext and the tag.
+pub const RECORD_LEN: usize = 120;
+/// The longest context a record can be bound to, in bytes.
+pub(crate) const MAX_CONTEXT: usize = 255;
+const AAD_LABEL: &[u8; 19] = b"lethewis key record";
+/// The label, the version, the length of the context and the longest context.
+const AAD_CAPACITY: usize = 276;
 /// The size of a key identifier in bytes.
 pub(crate) const ID_LEN: usize = 16;
 const VERSION: u8 = 1;
 
 const _: () = assert!(4 + ID_LEN + 8 + CAPACITY == PLAINTEXT_LEN);
+const _: () = assert!(NONCE_LEN + PLAINTEXT_LEN + TAG_LEN == RECORD_LEN);
+const _: () = assert!(AAD_LABEL.len() + 2 + MAX_CONTEXT == AAD_CAPACITY);
 
 /// What a key may be used for: a class of operations together with its algorithm. It is given when
 /// the key is loaded and never changes.
@@ -17,7 +27,7 @@ const _: () = assert!(4 + ID_LEN + 8 + CAPACITY == PLAINTEXT_LEN);
 #[non_exhaustive]
 #[repr(u8)]
 pub enum Purpose {
-    /// Wraps other keys. Never leaves the library.
+    /// Wraps other keys. Leaves the library only as a record wrapped by another key.
     Wrap = 1,
 }
 
@@ -79,6 +89,41 @@ pub(crate) struct Attributes {
 /// The bytes are not a plaintext this version of the library writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Malformed;
+
+/// The context is empty or longer than [`MAX_CONTEXT`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InvalidContext;
+
+/// The associated data of a record: a label of the format and its version, the length of the
+/// context, and the context, which names the place the record belongs to.
+pub(crate) struct AssociatedData {
+    bytes: [u8; AAD_CAPACITY],
+    len: usize,
+}
+
+impl AssociatedData {
+    pub(crate) fn new(context: &[u8]) -> Result<Self, InvalidContext> {
+        let context_len = u8::try_from(context.len())
+            .ok()
+            .filter(|&len| len != 0)
+            .ok_or(InvalidContext)?;
+        let mut bytes = [0; AAD_CAPACITY];
+        let mut len: usize = 0;
+        for part in [&AAD_LABEL[..], &[VERSION, context_len], context] {
+            let end = len.checked_add(part.len()).ok_or(InvalidContext)?;
+            bytes
+                .get_mut(len..end)
+                .ok_or(InvalidContext)?
+                .copy_from_slice(part);
+            len = end;
+        }
+        Ok(Self { bytes, len })
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.bytes.split_at(self.len.min(AAD_CAPACITY)).0
+    }
+}
 
 /// Writes the plaintext of a record holding `key`. Every byte of `out` is written.
 pub(crate) fn build(attributes: &Attributes, key: &Key, out: &mut [u8; PLAINTEXT_LEN]) {
@@ -154,7 +199,10 @@ fn tail_is_zero(key: &[u8; CAPACITY], length: KeyLength) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Attributes, Malformed, PLAINTEXT_LEN, Purpose, Status, build, parse};
+    use super::{
+        AssociatedData, Attributes, InvalidContext, Malformed, PLAINTEXT_LEN, Purpose, Status,
+        build, parse,
+    };
     use crate::key::{Key, KeyLength, tests::padded};
 
     /// A record holding a 32-byte key, written out from the layout by hand.
@@ -320,6 +368,19 @@ mod tests {
     }
 
     #[test]
+    fn associated_data_are_the_label_the_version_the_length_and_the_context() {
+        let associated = AssociatedData::new(b"ab").unwrap();
+        assert_eq!(associated.bytes(), b"lethewis key record\x01\x02ab");
+        let longest = [7; 255];
+        let associated = AssociatedData::new(&longest).unwrap();
+        assert_eq!(associated.bytes().len(), 19 + 2 + 255);
+        assert_eq!(associated.bytes()[20], 255);
+        assert!(associated.bytes().ends_with(&longest));
+        assert_eq!(AssociatedData::new(b"").err(), Some(InvalidContext));
+        assert_eq!(AssociatedData::new(&[7; 256]).err(), Some(InvalidContext));
+    }
+
+    #[test]
     fn building_overwrites_every_byte() {
         let mut key = Key::empty();
         key.load32(&mut short_key());
@@ -393,8 +454,8 @@ mod proofs {
     }
 
     /// For any attributes and any key of either length, building puts every field where the layout
-    /// says, and parsing gives back the same attributes and the same key. The offsets and values are
-    /// written from the layout, independently of the builder and the parser.
+    /// says, and parsing gives back the same attributes and the same key. The offsets and values
+    /// are written from the layout, independently of the builder and the parser.
     #[kani::proof]
     #[kani::unwind(93)]
     fn building_then_parsing_gives_back_the_record() {

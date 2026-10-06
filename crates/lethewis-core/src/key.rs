@@ -118,7 +118,6 @@ impl Key {
     }
 
     /// Writes the key into `dest`, followed by zeros up to the capacity.
-    #[cfg_attr(not(any(test, kani)), expect(dead_code))]
     pub(crate) fn write_into(&self, dest: &mut [u8; CAPACITY]) {
         dest.copy_from_slice(&self.bytes);
     }
@@ -133,13 +132,11 @@ impl Key {
 
 /// Key bytes borrowed from a buffer, with the length they hold. They can only be loaded into a
 /// [`Key`], and loading leaves the buffer as it is.
-#[cfg_attr(not(any(test, kani)), expect(dead_code))]
 pub(crate) struct KeyBytes<'a> {
     bytes: &'a [u8; CAPACITY],
     length: KeyLength,
 }
 
-#[cfg_attr(not(any(test, kani)), expect(dead_code))]
 impl<'a> KeyBytes<'a> {
     pub(crate) const fn new(bytes: &'a [u8; CAPACITY], length: KeyLength) -> Self {
         Self { bytes, length }
