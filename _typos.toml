@@ -8,3 +8,5 @@
 Wisper = "Wisper"
 # Part of the project name.
 Lethe = "Lethe"
+# An instruction of aarch64, AND that sets the flags.
+ands = "ands"

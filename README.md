@@ -47,7 +47,9 @@ password and the hardware secret at each unlock, and neither alone is enough.
   a file, and flash is not overwritten in place. A copy of the device made before the destruction is
   unaffected by it.
 - **Wiping a value from memory does not reach every copy.** A copy left by a value move, a buffer
-  reallocation, a CPU register, swap, or a crash dump is outside what this library can clear.
+  reallocation, a CPU register, swap, or a crash dump is outside what this library clears. The stack
+  a key derivation, a wrap or an unwrap used is wiped after it, as far as that can go without
+  touching registers, and so far this is measured on x86-64 Linux only.
 - **Hardware-backed keys are not available everywhere.** A dedicated secure element is absent on a
   large share of Android devices, and our figure for that share is an estimate rather than a
   measurement. Where the element is missing, protection falls back and records the level actually
@@ -80,6 +82,9 @@ raise of this minimum is recorded in [CHANGELOG.md](CHANGELOG.md). Building this
 exactly 1.99.0, pinned in `rust-toolchain.toml`: a build that reproduces byte for byte needs one exact
 compiler rather than a channel. That pin is not part of the published package and does not constrain
 what a dependent builds with.
+
+How dependencies are reviewed, and which versions a dependent receives:
+[SECURITY.md](SECURITY.md#dependencies).
 
 ## Reporting and contributing
 

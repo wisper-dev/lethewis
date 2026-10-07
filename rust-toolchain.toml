@@ -7,6 +7,12 @@
 [toolchain]
 channel = "1.99.0"
 components = ["rustfmt", "clippy"]
-# A bare-metal target, to build the core where there is no standard library.
-targets = ["thumbv7em-none-eabihf"]
+# The targets whose machine code is checked; the bare-metal one also builds the core where there is
+# no standard library.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "thumbv7em-none-eabihf",
+  "wasm32-unknown-unknown",
+]
 profile = "minimal"

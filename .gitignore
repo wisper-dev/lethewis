@@ -3,13 +3,16 @@
 
 # Build outputs. Cargo.lock is deliberately NOT ignored: a binary that people rely on is built
 # from an exact dependency set, and the lockfile is what pins it.
-/target/
-/checks/*/target/
+/target
+/checks/*/target
 **/*.rs.bk
 *.pdb
 
 # Mutation testing reports
 /mutants.out*/
+
+# Python bytecode of the check scripts
+__pycache__/
 
 # Written by the proof listing before it is moved under target/
 /kani-list.json

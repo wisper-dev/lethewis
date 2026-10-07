@@ -200,7 +200,8 @@ jobs:
       - name: Every source file carries its licence header
         run: |
           fail=0
-          tracked=$(git ls-files '*.rs' '*.sh' '*.kt' '*.kts' '*.toml' '*.yml' '*.yaml')
+          tracked=$(git ls-files '*.rs' '*.sh' '*.py' '*.kt' '*.kts' '*.toml' '*.yml' '*.yaml' \
+            supply-chain/imports.lock)
           if [ -z "$tracked" ]; then
             # A green step that examined nothing is worse than a red one.
             echo "::error::no source files found to check; the listing must have failed"
@@ -208,10 +209,18 @@ jobs:
           fi
           while IFS= read -r file; do
             [ -n "$file" ] || continue
-            if ! head -5 "$file" | grep -q 'SPDX-FileCopyrightText:'; then
+            # The cargo-vet store rejects comments, so its three files carry the header in a sidecar
+            # named <file>.license, as the REUSE specification allows. Nowhere else.
+            header_file=$file
+            case "$file" in
+              supply-chain/audits.toml | supply-chain/config.toml | supply-chain/imports.lock)
+                header_file=$file.license
+                ;;
+            esac
+            if ! head -5 "$header_file" | grep -q 'SPDX-FileCopyrightText:'; then
               echo "::error file=$file::missing SPDX-FileCopyrightText in the first five lines"; fail=1
             fi
-            if ! head -5 "$file" | grep -q 'SPDX-License-Identifier:'; then
+            if ! head -5 "$header_file" | grep -q 'SPDX-License-Identifier:'; then
               echo "::error file=$file::missing SPDX-License-Identifier in the first five lines"; fail=1
             fi
           done <<< "$tracked"
@@ -281,6 +290,8 @@ jobs:
 
   build:
     name: Build and lint
+    # Nothing third-party is built before every version of it is known to be reviewed.
+    needs: lockfile
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -316,6 +327,9 @@ jobs:
       - name: The core builds with no standard library and no memory allocator
         run: cargo build --manifest-path checks/no-alloc/Cargo.toml --locked --target thumbv7em-none-eabihf
 
+      - name: The comparison of key identifiers runs straight through on four targets
+        run: scripts/constant-time.py
+
       - name: Documentation builds, and its links resolve
         env:
           RUSTDOCFLAGS: -D warnings
@@ -323,6 +337,7 @@ jobs:
 
   test:
     name: Tests
+    needs: lockfile
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -336,11 +351,46 @@ jobs:
         # rustup no longer installs the pinned toolchain on its own.
         run: rustup show active-toolchain || rustup toolchain install
 
+      - name: The runner has the instructions of the hardware paths
+        # Otherwise the hardware paths of SHA-256, AES and POLYVAL would go untested.
+        run: |
+          for feature in sha_ni aes pclmulqdq avx; do
+            grep -qw "$feature" /proc/cpuinfo || { echo "::error::no $feature on this runner"; exit 1; }
+          done
+
       - name: Tests
         run: cargo test --workspace --all-features --locked
 
+      - name: Tests, optimised build
+        # The stack the hash and the cipher leave behind differs between the two builds.
+        run: cargo test --workspace --all-features --locked --release
+
+      - name: Tests, software SHA-256, AES and POLYVAL
+        # The runners have the instructions these use; the portable code is a path of its own, and
+        # without them the hash and the cipher use a different amount of stack.
+        env:
+          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+          LETHEWIS_BACK_ENDS: portable
+        run: |
+          cargo test --workspace --all-features --locked
+          cargo test --workspace --all-features --locked --release
+
+      - name: Core tests at the other levels of optimisation
+        # The stack the hash and the cipher use, and so the depth the wipes have to reach, changes
+        # with the level.
+        env:
+          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+        run: |
+          for level in 1 2 s z; do
+            export CARGO_PROFILE_RELEASE_OPT_LEVEL=$level
+            cargo test -p lethewis-core --lib --locked --release
+            RUSTFLAGS="-D warnings $SOFTWARE" LETHEWIS_BACK_ENDS=portable \
+              cargo test -p lethewis-core --lib --locked --release
+          done
+
   mutants:
     name: Every mutant is caught
+    needs: lockfile
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -366,12 +416,15 @@ jobs:
             exit 1
           fi
 
-  proofs:
-    name: Proofs hold
+  proof-list:
+    name: Proofs to run
+    needs: lockfile
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      proofs: ${{ steps.list.outputs.proofs }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -382,22 +435,113 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Install Kani
+        run: scripts/install-kani.sh
+
+      - name: List the proofs
+        id: list
         run: |
-          # The version and the bundle digest live in one file, which the proof script also checks.
-          source scripts/kani-pin.sh
-          cargo install kani-verifier --locked --version "$KANI_VERSION"
-          bundle="kani-${KANI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-          curl -sSLo "$bundle" \
-            "https://github.com/model-checking/kani/releases/download/kani-${KANI_VERSION}/${bundle}"
-          echo "$KANI_BUNDLE_SHA256  $bundle" | sha256sum -c -
-          cargo kani setup --use-local-bundle "$bundle"
+          proofs=$(scripts/prove.sh list)
+          printf 'proofs=%s\n' "$proofs" >>"$GITHUB_OUTPUT"
+
+      - name: Keep the list
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: declared-proofs
+          path: target/proofs/declared.json
+          if-no-files-found: error
+
+  proof:
+    # Each proof on a machine of its own: with line coverage, Kani holds the solver's whole output
+    # in memory, more than one machine has for all the proofs together.
+    name: Proof ${{ matrix.proof }}
+    needs: proof-list
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        proof: ${{ fromJSON(needs.proof-list.outputs.proofs) }}
+    steps:
+      - name: Add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo fallocate -l 16G /proof.swap
+          sudo chmod 600 /proof.swap
+          sudo mkswap /proof.swap
+          sudo swapon /proof.swap
+          swapon --show
+          free -h
+          df -h /
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install Kani
+        run: scripts/install-kani.sh
+
+      - name: The proof holds
+        env:
+          PROOF: ${{ matrix.proof }}
+        run: scripts/prove.sh run "$PROOF"
+
+      - name: Keep its results
+        # Also after a failed proof, whose results explain it.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: proof-${{ strategy.job-index }}
+          path: target/proofs/runs/
+          if-no-files-found: error
+
+  proofs:
+    name: Proofs hold
+    needs: [proof-list, proof]
+    # GitHub counts a required check whose job was skipped as passed, so this job runs whatever
+    # happened before it and fails by itself.
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: The list and every proof job succeeded
+        env:
+          LISTED: ${{ needs.proof-list.result }}
+          PROVEN: ${{ needs.proof.result }}
+        run: |
+          echo "list: $LISTED, proofs: $PROVEN"
+          [ "$LISTED" = success ] && [ "$PROVEN" = success ]
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          persist-credentials: false
+
+      - name: Take the list
+        if: ${{ !cancelled() }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: declared-proofs
+          path: target/proofs/
+
+      - name: Take the results of every proof
+        if: ${{ !cancelled() }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: proof-*
+          merge-multiple: true
+          path: target/proofs/runs/
 
       - name: Every proof holds and every cover property is reached
-        run: scripts/prove.sh
+        if: ${{ !cancelled() }}
+        run: scripts/prove.sh judge
 
       - name: Keep the results and the manifest
-        # Also after a failed proof, whose results explain it; a missing directory means Kani never
-        # ran, which the failed step above already reports.
+        # Also after a failed judgement, whose results explain it.
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -407,6 +551,7 @@ jobs:
 
   reproducible:
     name: Builds the same twice
+    needs: lockfile
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -482,9 +627,13 @@ jobs:
         run: |
           cargo install cargo-deny --locked --version 0.20.2
           cargo install cargo-machete --locked --version 0.9.2
+          cargo install cargo-vet --locked --version 0.10.2
 
       - name: Advisories, licences and sources
         run: cargo deny --all-features check
+
+      - name: The lower bounds in the manifests hold
+        run: scripts/minimal-versions.py
 
       - name: Unused dependencies
         run: cargo machete
@@ -514,3 +663,16 @@ jobs:
             echo "::error::Cargo.lock is ignored; a binary people rely on needs an exact dependency set"
             exit 1
           fi
+
+      - name: The lockfile of the no-allocator check matches the main one
+        run: scripts/lockfiles-agree.py
+
+      # From source with the tool's own lockfile, to keep a third-party action out of the build.
+      - name: Install cargo-vet
+        run: cargo install cargo-vet --locked --version 0.10.2
+
+      - name: Only our own reviews count, and every workspace crate asks for a reading in full
+        run: scripts/supply-chain-rules.py
+
+      - name: Every dependency is reviewed to the depth its use requires
+        run: cargo vet --locked --store-path supply-chain
