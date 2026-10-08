@@ -41,7 +41,7 @@ jobs:
   rules:
     name: Project rules
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: read # lists the pull request's commits, which is how signatures are verified
@@ -293,7 +293,7 @@ jobs:
     # Nothing third-party is built before every version of it is known to be reviewed.
     needs: lockfile
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -339,7 +339,7 @@ jobs:
     name: Tests
     needs: lockfile
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -392,7 +392,7 @@ jobs:
     name: Every mutant is caught
     needs: lockfile
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -416,15 +416,13 @@ jobs:
             exit 1
           fi
 
-  proof-list:
-    name: Proofs to run
+  proofs:
+    name: Proofs hold
     needs: lockfile
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
-    outputs:
-      proofs: ${{ steps.list.outputs.proofs }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -437,123 +435,26 @@ jobs:
       - name: Install Kani
         run: scripts/install-kani.sh
 
-      - name: List the proofs
-        id: list
-        run: |
-          proofs=$(scripts/prove.sh list)
-          printf 'proofs=%s\n' "$proofs" >>"$GITHUB_OUTPUT"
-
-      - name: Keep the list
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: declared-proofs
-          path: target/proofs/declared.json
-          if-no-files-found: error
-
-  proof:
-    # Each proof on a machine of its own: with line coverage, Kani holds the solver's whole output
-    # in memory, more than one machine has for all the proofs together.
-    name: Proof ${{ matrix.proof }}
-    needs: proof-list
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        proof: ${{ fromJSON(needs.proof-list.outputs.proofs) }}
-    steps:
-      - name: Add swap
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo fallocate -l 16G /proof.swap
-          sudo chmod 600 /proof.swap
-          sudo mkswap /proof.swap
-          sudo swapon /proof.swap
-          swapon --show
-          free -h
-          df -h /
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install the pinned toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-
-      - name: Install Kani
-        run: scripts/install-kani.sh
-
-      - name: The proof holds
-        env:
-          PROOF: ${{ matrix.proof }}
-        run: scripts/prove.sh run "$PROOF"
-
-      - name: Keep its results
-        # Also after a failed proof, whose results explain it.
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: proof-${{ strategy.job-index }}
-          path: target/proofs/runs/
-          if-no-files-found: error
-
-  proofs:
-    name: Proofs hold
-    needs: [proof-list, proof]
-    # GitHub counts a required check whose job was skipped as passed, so this job runs whatever
-    # happened before it and fails by itself.
-    if: ${{ always() && github.event_name == 'pull_request' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: The list and every proof job succeeded
-        env:
-          LISTED: ${{ needs.proof-list.result }}
-          PROVEN: ${{ needs.proof.result }}
-        run: |
-          echo "list: $LISTED, proofs: $PROVEN"
-          [ "$LISTED" = success ] && [ "$PROVEN" = success ]
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ !cancelled() }}
-        with:
-          persist-credentials: false
-
-      - name: Take the list
-        if: ${{ !cancelled() }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: declared-proofs
-          path: target/proofs/
-
-      - name: Take the results of every proof
-        if: ${{ !cancelled() }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: proof-*
-          merge-multiple: true
-          path: target/proofs/runs/
-
       - name: Every proof holds and every cover property is reached
-        if: ${{ !cancelled() }}
-        run: scripts/prove.sh judge
+        run: scripts/prove.sh
 
       - name: Keep the results and the manifest
-        # Also after a failed judgement, whose results explain it.
+        # Also after a failed proof, whose results explain it; a missing directory means Kani never
+        # ran, which the failed step above already reports.
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: proofs
-          path: target/proofs/
+          path: |
+            target/proofs/
+            !target/proofs/slot-*/
           if-no-files-found: warn
 
   reproducible:
     name: Builds the same twice
     needs: lockfile
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -611,7 +512,7 @@ jobs:
 
   dependencies:
     name: Advisories, licences, sources
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -641,7 +542,7 @@ jobs:
   lockfile:
     name: Lockfile is honest
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:

@@ -589,17 +589,18 @@ pub(crate) mod model {
         FAILED.load(Ordering::Relaxed)
     }
 
+    // Slices are copied whole and indexed directly: a loop over an iterator chain unrolls into
+    // many times the steps under Kani.
     pub(crate) fn fold(material: &[u8], info: &[u8], out: &mut [u8]) {
-        for (index, at) in out.iter_mut().enumerate() {
-            *at = material.get(index).copied().unwrap_or(0);
+        if out.is_empty() {
+            return;
         }
-        if let Some(first) = out.first_mut() {
-            *first ^= u8::try_from(material.len()).unwrap_or(u8::MAX);
-        }
-        for (index, byte) in info.iter().enumerate() {
-            if let Some(at) = index.checked_rem(out.len()).and_then(|at| out.get_mut(at)) {
-                *at ^= *byte;
-            }
+        let taken = material.len().min(out.len());
+        out[..taken].copy_from_slice(&material[..taken]);
+        out[taken..].fill(0);
+        out[0] ^= u8::try_from(material.len()).unwrap_or(u8::MAX);
+        for index in 0..info.len() {
+            out[index % out.len()] ^= info[index];
         }
     }
 
@@ -873,6 +874,7 @@ mod tests {
 }
 
 #[cfg(kani)]
+#[coverage(on)]
 pub(crate) mod proofs {
     use super::{Branch, label, model::fold};
     use crate::key::KeyLength;

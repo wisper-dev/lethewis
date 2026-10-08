@@ -29,7 +29,7 @@ concurrency:
 jobs:
   verify:
     name: The tag says what the code says
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -151,7 +151,7 @@ jobs:
   publish:
     name: Publish
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: release
     permissions:
       contents: write # writes the GitHub release and attaches the crate and its bill of materials

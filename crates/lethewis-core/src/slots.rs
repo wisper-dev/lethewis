@@ -1649,6 +1649,7 @@ mod stack {
 }
 
 #[cfg(kani)]
+#[coverage(on)]
 mod proofs {
     use core::marker::PhantomData;
 
@@ -1662,10 +1663,6 @@ mod proofs {
     };
     use crate::record::ID_LEN;
     use crate::seal::model::rejected;
-
-    /// The shortest sequence that reaches every outcome below, including a released handle refused
-    /// while its slot holds a new key; a cover property shows that case is reached.
-    const STEPS: usize = 4;
 
     type Bytes = [u8; 64];
     type Snapshot = (
@@ -1777,10 +1774,9 @@ mod proofs {
             self.calls = self.calls.saturating_add(1);
             self.requested = dest.len();
             self.at = dest.as_ptr().addr();
-            for (index, byte) in dest.iter_mut().enumerate() {
-                *byte = kani::any();
-                self.written[index] = *byte;
-            }
+            let bytes: Bytes = kani::any();
+            dest.copy_from_slice(&bytes[..dest.len()]);
+            self.written[..dest.len()].copy_from_slice(dest);
             self.failed = kani::any();
             if self.failed {
                 kani::cover!(
@@ -1902,84 +1898,119 @@ mod proofs {
         (result, expected, length, entropy.failed)
     }
 
-    /// From empty memory, any interleaving of four imports and releases over two slots, with any
-    /// keys of either length. A live handle reaches exactly its own key, a released key and its
-    /// identifier are zero at once, and a released handle is refused ever after, including while
-    /// its slot holds a new key. Every load goes through the same code, so generated keys, and the
-    /// identifier a load derives, are covered by `a_load_takes_the_first_free_slot`, which checks
-    /// each way of loading from any state.
+    /// Whether `handle`, issued for the key `expected` of `length`, either still reaches exactly
+    /// that key in a slot loaded with its generation, or can never be live again: its slot is
+    /// retired or has moved past its generation, which no call ever moves back.
+    fn own_key_or_never_again(
+        slots: &Slots<'_>,
+        handle: &Handle<'_>,
+        expected: &Bytes,
+        length: KeyLength,
+    ) -> bool {
+        let slot = slot_at(slots, handle.index);
+        (slot.occupancy == Occupancy::Loaded
+            && slot.generation == handle.generation
+            && key(slot) == *expected
+            && slot.key.length() == length)
+            || slot.occupancy == Occupancy::Retired
+            || slot.generation > handle.generation
+    }
+
+    /// One step of any sequence of imports and releases. From any state of two slots, for any
+    /// handle of this set that reaches exactly its own key or can never be live again, one import
+    /// of any key of either length or one release of that or any other handle of this set keeps it
+    /// so, and a live handle stays live unless it is the one released; a handle the import issues
+    /// is a live handle of this set that reaches exactly its own key; a release of a live handle
+    /// wipes the key and its identifier at once, and any other is refused. By induction over the
+    /// steps, from the moment a handle is issued it reaches exactly its own key until it is
+    /// released, and after that every call refuses it, also while its slot holds a new key.
     #[kani::proof]
     #[kani::unwind(65)]
-    fn a_handle_reaches_only_its_own_key() {
-        let mut memory = [const { Slot::empty() }; 2];
-        let mut slots = Slots::new(&mut memory);
-        let mut issued: [Option<(Handle<'_>, Bytes, KeyLength)>; STEPS] = [None; STEPS];
-        let mut live = [false; STEPS];
+    fn a_step_keeps_every_handle_to_its_own_key() {
+        let mut memory = [any_slot(), any_slot()];
+        let id = memory.as_ptr().addr();
+        let mut slots = Slots { slots: &mut memory };
+        let tracked = Handle {
+            slots: id,
+            index: if kani::any() { 0 } else { 1 },
+            generation: kani::any(),
+            memory: PhantomData,
+        };
+        let expected: Bytes = kani::any();
+        let length = any_length();
+        kani::assume(own_key_or_never_again(&slots, &tracked, &expected, length));
+        let live = |slots: &Slots<'_>, handle: &Handle<'_>| {
+            handle.slots == id && handle.index < 2 && {
+                let slot = slot_at(slots, handle.index);
+                slot.occupancy == Occupancy::Loaded && slot.generation == handle.generation
+            }
+        };
+        let tracked_live = live(&slots, &tracked);
+        let mut tracked_released = false;
 
-        for step in 0..STEPS {
-            if kani::any() {
-                let (result, expected, length) = import_any(&mut slots);
-                match result {
-                    Ok(handle) => {
-                        issued[step] = Some((handle, expected, length));
-                        live[step] = true;
-                        kani::cover!(true, "a key is loaded");
-                    }
-                    Err(error) => {
-                        kani::assert(
-                            error == Error::NoFreeSlot || error == Error::DerivationFailed,
-                            "an import fails only with NoFreeSlot or DerivationFailed",
-                        );
-                        kani::cover!(error == Error::NoFreeSlot, "an import finds no free slot");
-                        kani::cover!(
-                            error == Error::DerivationFailed,
-                            "an import fails to derive the identifier"
-                        );
-                    }
+        if kani::any() {
+            let (result, issued, issued_length) = import_any(&mut slots);
+            match result {
+                Ok(handle) => {
+                    kani::assert(
+                        live(&slots, &handle)
+                            && own_key_or_never_again(&slots, &handle, &issued, issued_length),
+                        "a new handle reaches exactly its own key",
+                    );
+                    kani::cover!(!tracked_live, "a key is loaded beside a released handle");
+                    kani::cover!(tracked_live, "a key is loaded beside a live handle");
                 }
-            } else {
-                let pick: usize = kani::any();
-                kani::assume(pick < STEPS);
-                kani::cover!(issued[pick].is_some(), "a step releases an earlier handle");
-                if let Some((handle, _, _)) = issued[pick] {
-                    let reused = slot_at(&slots, handle.index).occupancy == Occupancy::Loaded;
-                    let result = slots.release(handle);
-                    if live[pick] {
-                        kani::assert(result == Ok(()), "a live handle releases its key");
-                        let slot = slot_at(&slots, handle.index);
-                        kani::assert(
-                            key(slot) == [0; 64] && *id_bytes(&slot.id) == [0; ID_LEN],
-                            "a released key and its identifier are zero at once",
-                        );
-                        live[pick] = false;
-                        kani::cover!(true, "a live key is released");
-                    } else {
-                        kani::assert(
-                            result == Err(Error::StaleHandle),
-                            "a released handle is refused",
-                        );
-                        kani::cover!(
-                            reused,
-                            "a released handle is refused while its slot holds a new key"
-                        );
-                    }
+                Err(error) => {
+                    kani::assert(
+                        error == Error::NoFreeSlot || error == Error::DerivationFailed,
+                        "an import fails only with NoFreeSlot or DerivationFailed",
+                    );
+                    kani::cover!(error == Error::NoFreeSlot, "an import finds no free slot");
+                    kani::cover!(
+                        error == Error::DerivationFailed,
+                        "an import fails to derive the identifier"
+                    );
                 }
             }
-
-            for (entry, is_live) in issued.iter().zip(live) {
-                if let (Some((handle, expected, length)), true) = (entry, is_live) {
-                    let slot = slot_at(&slots, handle.index);
-                    kani::assert(
-                        slot.occupancy == Occupancy::Loaded && slot.generation == handle.generation,
-                        "the slot of a live handle is loaded with its generation",
-                    );
-                    kani::assert(
-                        key(slot) == *expected && slot.key.length() == *length,
-                        "a live handle reaches exactly its own key",
-                    );
-                }
+        } else {
+            let target = if kani::any() {
+                tracked
+            } else {
+                forged(&slots, id)
+            };
+            let target_live = live(&slots, &target);
+            let result = slots.release(target);
+            if target_live {
+                kani::assert(result == Ok(()), "a live handle releases its key");
+                let slot = slot_at(&slots, target.index);
+                kani::assert(
+                    key(slot) == [0; 64] && *id_bytes(&slot.id) == [0; ID_LEN],
+                    "a released key and its identifier are zero at once",
+                );
+                tracked_released = tracked_live && target.index == tracked.index;
+                kani::cover!(tracked_released, "the tracked key is released");
+            } else {
+                kani::assert(
+                    result == Err(Error::StaleHandle),
+                    "a handle that is not live is refused",
+                );
+                kani::cover!(
+                    !tracked_live
+                        && target.index == tracked.index
+                        && target.generation == tracked.generation
+                        && slot_at(&slots, tracked.index).occupancy == Occupancy::Loaded,
+                    "a released handle is refused while its slot holds a new key"
+                );
             }
         }
+        kani::assert(
+            own_key_or_never_again(&slots, &tracked, &expected, length),
+            "a handle reaches exactly its own key or can never be live again",
+        );
+        kani::assert(
+            !tracked_live || tracked_released || live(&slots, &tracked),
+            "a live handle stays live until it is released",
+        );
     }
 
     /// From any state of two slots, a handle whose set number is not this set's is refused,
