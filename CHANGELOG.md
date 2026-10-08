@@ -62,6 +62,9 @@ Nothing is published while the version is below 0.1.0.
   need 25 KiB of stack, or 72 KiB. Tests read the memory of their own process back after a wrap and
   an unwrap, with and without optimisation and with the hardware and the software AES, POLYVAL and
   SHA-256, and check the wipe and the stack needed at every level of optimisation.
+- Tests also run on aarch64 Linux and on macOS on Apple silicon, with the hardware and the software
+  SHA-256, AES and POLYVAL; on aarch64 Linux they read the stack back after a derivation, a wrap and
+  an unwrap, at every level of optimisation.
 - A build step checks that the machine code of the comparison of key identifiers runs straight
   through on x86-64, aarch64, Cortex-M4 and WebAssembly: no branch, no call and no write of the
   program counter but the final return.
