@@ -388,6 +388,91 @@ jobs:
               cargo test -p lethewis-core --lib --locked --release
           done
 
+  test-aarch64-linux:
+    name: Tests on aarch64 Linux
+    needs: lockfile
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: The runner has the instructions of the hardware paths
+        run: |
+          features=$(grep -m1 '^Features' /proc/cpuinfo)
+          echo "$features"
+          for feature in aes pmull sha2; do
+            grep -qw "$feature" <<<"$features" || { echo "::error::no $feature on this runner"; exit 1; }
+          done
+
+      - name: Tests
+        run: |
+          cargo test --workspace --all-features --locked
+          cargo test --workspace --all-features --locked --release
+
+      - name: Tests, software SHA-256, AES and POLYVAL
+        env:
+          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+          LETHEWIS_BACK_ENDS: portable
+        run: |
+          cargo test --workspace --all-features --locked
+          cargo test --workspace --all-features --locked --release
+
+      - name: Core tests at the other levels of optimisation
+        env:
+          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+        run: |
+          for level in 1 2 s z; do
+            export CARGO_PROFILE_RELEASE_OPT_LEVEL=$level
+            cargo test -p lethewis-core --lib --locked --release
+            RUSTFLAGS="-D warnings $SOFTWARE" LETHEWIS_BACK_ENDS=portable \
+              cargo test -p lethewis-core --lib --locked --release
+          done
+
+  test-macos:
+    # The tests that read the stack back need /proc and do not build here.
+    name: Tests on macOS
+    needs: lockfile
+    if: github.event_name == 'pull_request'
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: The runner has the instructions of the hardware paths
+        run: |
+          sysctl hw.optional.arm.FEAT_AES hw.optional.arm.FEAT_PMULL hw.optional.arm.FEAT_SHA256 \
+            hw.optional.arm.FEAT_DIT || true
+          for feature in FEAT_AES FEAT_PMULL FEAT_SHA256; do
+            [ "$(sysctl -n "hw.optional.arm.$feature")" = 1 ] ||
+              { echo "::error::no $feature on this runner"; exit 1; }
+          done
+
+      - name: Tests
+        run: |
+          cargo test --workspace --all-features --locked
+          cargo test --workspace --all-features --locked --release
+
+      - name: Tests, software SHA-256, AES and POLYVAL
+        env:
+          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+          LETHEWIS_BACK_ENDS: portable
+        run: |
+          cargo test --workspace --all-features --locked
+          cargo test --workspace --all-features --locked --release
+
   mutants:
     name: Every mutant is caught
     needs: lockfile

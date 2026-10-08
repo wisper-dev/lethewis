@@ -69,7 +69,7 @@ identifier of the key that wraps it are checked, and every such failure is the s
 each key derivation, whether it succeeded or not, the stack below the caller is wiped: 8 KiB, or 64
 KiB in a build without optimisation. Tests read the memory of their own process back, with and
 without optimisation and with the hardware and the software SHA-256, and check that the wipe reaches
-that depth, that the derivation uses less than half of it and more than an eighth, and that no
+that depth, that the derivation uses less than half of it and more than a sixteenth, and that no
 16-byte piece is left of the key, the extracted key, the HMAC key blocks, the SHA-256 states, inner
 hashes and message schedules, or the output beyond the identifier, in the byte orders and
 arrangements the two SHA-256 paths use. After a wrap and an unwrap the stack below the caller is
@@ -88,15 +88,15 @@ crash dump. The stack wipe is best effort: it does not reach registers, it relie
 keeping the derivation, the wrap and the unwrap out of their caller's frame, its depth follows the
 optimisation of this crate, so a build that optimises this crate but not the hash and cipher code it
 calls has to set `--cfg lethewis_unoptimised`, and it is measured only where the tests run, so far
-x86-64 Linux. A set of slots leaked instead of dropped keeps its keys in memory. A copy of a new key
-kept by the platform's random source. A system component with elevated privileges is outside what
-process isolation provides. The AES round keys of the software AES are bitsliced and are not looked
-for in that form. A record is not bound to one key in the strict sense: whoever chooses two keys can
-cheaply build bytes the cipher accepts under both. For such bytes to unwrap under both keys they
-must also name each key's identifier, which raises the work to no less than about 2^64 by estimate;
-this is not proven. A key wrapped under itself is refused, also when it is loaded twice. Longer
-cycles, such as one key wrapped under another that is wrapped under the first, and a key whose bytes
-begin with the bytes of the key it is wrapped under, are not detected.
+x86-64 and aarch64 Linux. A set of slots leaked instead of dropped keeps its keys in memory. A copy
+of a new key kept by the platform's random source. A system component with elevated privileges is
+outside what process isolation provides. The AES round keys of the software AES are bitsliced and
+are not looked for in that form. A record is not bound to one key in the strict sense: whoever
+chooses two keys can cheaply build bytes the cipher accepts under both. For such bytes to unwrap
+under both keys they must also name each key's identifier, which raises the work to no less than
+about 2^64 by estimate; this is not proven. A key wrapped under itself is refused, also when it is
+loaded twice. Longer cycles, such as one key wrapped under another that is wrapped under the first,
+and a key whose bytes begin with the bytes of the key it is wrapped under, are not detected.
 
 ### 5. The supply chain
 
