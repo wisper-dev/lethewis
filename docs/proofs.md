@@ -31,8 +31,9 @@ All six must hold. A row missing any one of them is not written.
 | Record integrity | a key is loaded from a record only when the record is intact, opens with the parent named in it and the context it was wrapped for; a refused record loads nothing | `lethewis-core` |
 
 Key shares and the time lock will each add a row when the crate exists. A call into the operating
-system is covered by tests and by measurements on real devices, not by proof, so the crate that makes
-such calls will not appear in either table.
+system is covered by tests and by measurements on real devices, not by proof, so the crates that
+make such calls, `lethewis-dit` among them, appear in neither table. Under Kani, `lethewis-dit` only
+runs the work it is given.
 
 ## Proven
 

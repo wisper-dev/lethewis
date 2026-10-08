@@ -170,9 +170,17 @@ dependencies = [
  "aes-gcm-siv",
  "ctutils",
  "hkdf",
+ "lethewis-dit",
  "polyval",
  "sha2",
  "zeroize",
+]
+
+[[package]]
+name = "lethewis-dit"
+version = "0.0.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

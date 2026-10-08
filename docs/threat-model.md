@@ -126,13 +126,16 @@ aarch64, Cortex-M4 and WebAssembly and fails unless its machine code runs straig
 branch, no call and no write of the program counter but the final return. This shows how the pinned
 compiler laid the code out, before link-time optimisation, not how long each instruction takes. AES
 and POLYVAL run on the processor's instructions where present and on bitsliced portable code
-elsewhere. Whether those instructions take the same time for all data is up to the processor: on
-recent Intel processors only in a mode the operating system sets, on aarch64 only in a mode this
-library does not set, on Cortex-M3 the portable multiplication varies with its operands, and
-WebAssembly makes no promise. When timing is measured, the tool, its version, the compiler version
-and the coverage will be stated in [proofs.md](proofs.md). The available tools are statistical and
-detect only pronounced leaks, and compiler optimisation can reintroduce a leak after a check has
-passed.
+elsewhere. Whether those instructions take the same time for all data is up to the processor. On
+recent Intel processors that holds only in a mode the operating system sets. On aarch64 it holds
+only in the data-independent timing mode, which `lethewis-dit` switches on around loading, wrapping
+and unwrapping a key where Linux, Android or an Apple system reports the feature; elsewhere, and
+where the system or a virtual machine hides it, the mode stays off. On Apple M1 and M2 the mode does
+not stop the data prefetcher from reading memory by its contents; on M3 it does. On Cortex-M3 the
+portable multiplication varies with its operands, and WebAssembly makes no promise. When timing is
+measured, the tool, its version, the compiler version and the coverage will be stated in
+[proofs.md](proofs.md). The available tools are statistical and detect only pronounced leaks, and
+compiler optimisation can reintroduce a leak after a check has passed.
 
 ## Assumptions
 

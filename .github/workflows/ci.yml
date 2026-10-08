@@ -317,6 +317,8 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets --all-features --locked
           cargo clippy --manifest-path checks/no-alloc/Cargo.toml --locked --target thumbv7em-none-eabihf
+          # The unsafe code of lethewis-dit builds only for aarch64.
+          cargo clippy -p lethewis-dit --all-targets --locked --target aarch64-unknown-linux-gnu
 
       - name: Build
         run: cargo build --workspace --all-features --locked
@@ -410,6 +412,10 @@ jobs:
           for feature in aes pmull sha2; do
             grep -qw "$feature" <<<"$features" || { echo "::error::no $feature on this runner"; exit 1; }
           done
+          # What the system reports about data-independent timing, which the tests compare with what
+          # the library finds.
+          if grep -qw dit <<<"$features"; then dit=present; else dit=absent; fi
+          echo "LETHEWIS_DIT=$dit" >>"$GITHUB_ENV"
 
       - name: Tests
         run: |
@@ -435,6 +441,19 @@ jobs:
               cargo test -p lethewis-core --lib --locked --release
           done
 
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked --version 27.0.0
+
+      - name: Mutation testing of the detection of data-independent timing
+        # The runner has no data-independent timing, so a detection that always says no cannot be
+        # told apart from the right one here, and one that always says yes is caught.
+        run: |
+          cargo mutants -p lethewis-dit --no-config --cap-lints true --cargo-arg=--locked \
+            --re 'auxv::|supported -> bool with true' \
+            --exclude-re 'auxv::detect -> bool with false'
+          jq -e '.caught > 0' mutants.out/outcomes.json >/dev/null ||
+            { echo "::error::no mutant was caught, so nothing was tested"; exit 1; }
+
   test-macos:
     # The tests that read the stack back need /proc and do not build here.
     name: Tests on macOS
@@ -459,6 +478,9 @@ jobs:
             [ "$(sysctl -n "hw.optional.arm.$feature")" = 1 ] ||
               { echo "::error::no $feature on this runner"; exit 1; }
           done
+          dit=absent
+          [ "$(sysctl -n hw.optional.arm.FEAT_DIT 2>/dev/null)" = 1 ] && dit=present
+          echo "LETHEWIS_DIT=$dit" >>"$GITHUB_ENV"
 
       - name: Tests
         run: |
@@ -472,6 +494,23 @@ jobs:
         run: |
           cargo test --workspace --all-features --locked
           cargo test --workspace --all-features --locked --release
+
+      - name: Lints of the code for Apple's systems
+        run: cargo clippy -p lethewis-dit --all-targets --locked
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked --version 27.0.0
+
+      - name: Mutation testing of data-independent timing
+        # The runner has data-independent timing, so a detection that always says yes cannot be told
+        # apart from the right one here; the detection on Linux and the code for other systems are
+        # tested on aarch64 Linux and in the main mutation run.
+        run: |
+          cargo mutants -p lethewis-dit --no-config --cap-lints true --cargo-arg=--locked \
+            --exclude-re 'elsewhere\.rs|auxv::|supported -> bool with true' \
+            --exclude-re 'sysctl::detect -> bool with true'
+          jq -e '.caught > 0' mutants.out/outcomes.json >/dev/null ||
+            { echo "::error::no mutant was caught, so nothing was tested"; exit 1; }
 
   mutants:
     name: Every mutant is caught

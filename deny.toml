@@ -43,6 +43,10 @@ unused-allowed-license = "allow"
 name = "lethewis-core"
 allow = ["AGPL-3.0-only"]
 
+[[licenses.exceptions]]
+name = "lethewis-dit"
+allow = ["AGPL-3.0-only"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

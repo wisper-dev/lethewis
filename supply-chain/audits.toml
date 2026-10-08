@@ -785,17 +785,19 @@ definitions below, the module selection leading to them on these targets, and th
 directives. All other source, its unsafe code included, was not read. The archive matches the
 repository at the commit in .cargo_vcs_info.json apart from the files cargo generates.
 
-Only cpufeatures depends on libc here, with default features off, on aarch64 Linux, Android and
-Apple targets.
+cpufeatures and lethewis-dit depend on libc here, with default features off, on aarch64 Linux,
+Android and Apple targets. lethewis-dit calls getauxval(AT_HWCAP) and tests HWCAP_DIT, and calls
+sysctlbyname for hw.optional.arm.FEAT_DIT with a 4-byte value and no new value.
 
 Definitions used, checked against the arm64 kernel uapi headers, glibc and bionic sys/auxv.h and
 the XNU sys/sysctl.h prototype:
 - getauxval(c_ulong) -> c_ulong: unix/linux_like/linux/gnu/mod.rs:973,
-  unix/linux_like/android/mod.rs:3844.
+  unix/linux_like/linux/musl/mod.rs:731, unix/linux_like/android/mod.rs:3844.
 - AT_HWCAP = 16: unix/linux_like/linux_l4re_shared.rs:864, unix/linux_like/android/mod.rs:3407.
 - HWCAP_AES 1 << 3, PMULL 1 << 4, SHA2 1 << 6, SHA3 1 << 17, SM3 1 << 18, SM4 1 << 19,
   SHA512 1 << 21, DIT 1 << 24: unix/linux_like/linux/gnu/b64/aarch64/mod.rs:483-504,
-  unix/linux_like/android/b64/aarch64/mod.rs:108-129.
+  unix/linux_like/android/b64/aarch64/mod.rs:108-129; HWCAP_DIT also
+  unix/linux_like/linux/musl/b64/aarch64/mod.rs:237.
 - sysctlbyname(*const c_char, *mut c_void, *mut size_t, *mut c_void, size_t) -> c_int:
   unix/bsd/apple/mod.rs:4742.
 - c_ulong and c_char re-export core::ffi (primitives.rs:10-24), c_void too (lib.rs:232); size_t
