@@ -69,7 +69,7 @@ identifier of the key that wraps it are checked, and every such failure is the s
 each key derivation, whether it succeeded or not, the stack below the caller is wiped: 8 KiB, or 64
 KiB in a build without optimisation. Tests read the memory of their own process back, with and
 without optimisation and with the hardware and the software SHA-256, and check that the wipe reaches
-that depth, that the derivation uses less than half of it and more than an eighth, and that no
+that depth, that the derivation uses less than half of it and more than a sixteenth, and that no
 16-byte piece is left of the key, the extracted key, the HMAC key blocks, the SHA-256 states, inner
 hashes and message schedules, or the output beyond the identifier, in the byte orders and
 arrangements the two SHA-256 paths use. After a wrap and an unwrap the stack below the caller is

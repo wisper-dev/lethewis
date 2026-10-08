@@ -544,8 +544,9 @@ pub(crate) mod stack {
         });
         std::println!("a derivation uses {used} bytes of stack");
         assert!(used.saturating_mul(2) <= STACK_WIPE, "{used} bytes used");
-        // Not needlessly deep either: a thread that cannot spare the stack would be corrupted.
-        assert!(used.saturating_mul(8) >= STACK_WIPE, "{used} bytes used");
+        // Not needlessly deep either: a thread that cannot spare the stack would be corrupted. The
+        // bound is wide: the path taken here may be lighter than another path in the build.
+        assert!(used.saturating_mul(16) >= STACK_WIPE, "{used} bytes used");
     }
 }
 

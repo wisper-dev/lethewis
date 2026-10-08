@@ -128,7 +128,7 @@ compile error.
 | a derivation not followed by the stack wipe | no proof: the tests that read the stack back from the memory of the process, with and without optimisation and with both SHA-256 back ends |
 | the stack wipe run before the derivation instead of after it | no proof: the same tests |
 | a stack wipe constant smaller than twice what the derivation uses | no proof: the test that measures the stack the derivation uses, with or without optimisation, as the constant is for |
-| a build script that marks every build as built without optimisation | no proof: the test that measures the stack the derivation uses, which refuses a wipe more than eight times that, in an optimised build |
+| a build script that marks every build as built without optimisation | no proof: the test that measures the stack the derivation uses, which refuses a wipe more than sixteen times that, in an optimised build |
 | a build script that never marks a build as built without optimisation | no proof: the same test, in a build without optimisation |
 | a wipe call of a fixed size well short of the constant | no proof: the test that checks how deep the wipe reaches |
 | a derivation that returns before the wipe when it fails | no proof: the test that reads the stack back after a failed derivation |
@@ -164,7 +164,7 @@ compile error.
 | an unwrap not followed by the stack wipe | no proof: the test that reads the stack back after an unwrap whose record fails its tag, and, in an optimised build, the test that checks how deep the wipe after an unwrap reaches |
 | a wipe after the cipher only as deep as the one after a derivation | no proof: the test that checks how deep the wipes after a wrap and an unwrap reach, in an optimised build |
 | a cipher stack wipe constant smaller than twice what sealing or opening uses | no proof: the test that measures the stack the cipher uses, with or without optimisation, as the constant is for |
-| a cipher stack wipe constant more than eight times what the cipher uses | no proof: the same test, in an optimised build |
+| a cipher stack wipe constant more than sixteen times what the cipher uses | no proof: the same test, in an optimised build |
 | a cipher stack wipe of less than twice what the cipher uses when it is optimised for size | no proof: the same test, run at every level of optimisation |
 | a wrap, an unwrap or a load held to less stack than it reaches, or documented with a stack or a wipe other than its own | no proof: the test that checks the documentation of each of those calls against the stack the tests allow and the wipes the library makes, and the test that measures how deep the calls reach |
 | round keys looked for that a wrong S-box made | no proof: the test that checks the S-box and the key expansion against FIPS 197 |
