@@ -393,6 +393,7 @@ mod tests {
 }
 
 #[cfg(kani)]
+#[coverage(on)]
 mod proofs {
     use super::{Attributes, PLAINTEXT_LEN, Purpose, Status, build, parse};
     use crate::key::{Key, KeyLength};

@@ -11,6 +11,8 @@
 
 #![deny(missing_docs, unused_crate_dependencies)]
 #![no_std]
+// Line coverage is judged on proof code only, so Kani counts it nowhere else.
+#![cfg_attr(kani, feature(coverage_attribute), coverage(off))]
 
 /// Fails to compile if `$type` implements any of the traits.
 #[cfg(test)]

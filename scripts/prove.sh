@@ -65,7 +65,7 @@ run_proof() {
   rm -rf "${CARGO_TARGET_DIR:-target}"/kani/*/kanicov_*
   # In a crate without the standard library Kani reports an assert! or unwrap that is never reached
   # as a success; line coverage shows it.
-  cargo kani --harness "$proof" --exact --output-format terse --harness-timeout 150m --coverage \
+  cargo kani --harness "$proof" --exact --output-format terse --harness-timeout 20m --coverage \
     -Z source-coverage -Z unstable-options --export-json "$(run_file "$proof")"
 }
 

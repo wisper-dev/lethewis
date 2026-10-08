@@ -675,6 +675,7 @@ mod tests {
 }
 
 #[cfg(kani)]
+#[coverage(on)]
 mod proofs {
     use super::{PLAINTEXT_LEN, model::rejected, open, seal};
 
