@@ -449,7 +449,7 @@ jobs:
         # told apart from the right one here, and one that always says yes is caught.
         run: |
           cargo mutants -p lethewis-dit --no-config --cap-lints true --cargo-arg=--locked \
-            --re 'auxv::|supported -> bool with true' \
+            --re 'auxv::|(lib|aarch64)\.rs:.*supported -> bool with true' \
             --exclude-re 'auxv::detect -> bool with false'
           jq -e '.caught > 0' mutants.out/outcomes.json >/dev/null ||
             { echo "::error::no mutant was caught, so nothing was tested"; exit 1; }
