@@ -64,13 +64,17 @@ Nothing is published while the version is below 0.1.0.
   SHA-256, and check the wipe and the stack needed at every level of optimisation.
 - `lethewis-dit`: runs work with data-independent timing on, on aarch64 where Linux, Android or
   an Apple system reports the feature, and switches it back off when the work returns or unwinds.
-  The core runs each import, generation, wrap and unwrap of a key that way. It is the one crate with unsafe code:
-  two instructions that read and write the mode, and the calls that ask the system about it.
+  The core runs each import, generation, wrap and unwrap of a key that way. It is the one crate
+  with unsafe code: two instructions that read and write the mode, and the calls that ask the
+  system about it.
 - Dependency of `lethewis-dit`: `libc` 0.2.190 or a later compatible version, without default
   features, on aarch64 Linux, Android and Apple targets.
 - Tests also run on aarch64 Linux and on macOS on Apple silicon, with the hardware and the software
   SHA-256, AES and POLYVAL; on aarch64 Linux they read the stack back after a derivation, a wrap and
   an unwrap, at every level of optimisation.
+- A test unwraps random records sealed with the real derivation and cipher: random keys,
+  plaintexts, contexts, slots and changed bits; a million of them from a new seed on every pull
+  request.
 - A build step checks that the machine code of the comparison of key identifiers runs straight
   through on x86-64, aarch64, Cortex-M4 and WebAssembly: no branch, no call and no write of the
   program counter but the final return.

@@ -88,15 +88,19 @@ crash dump. The stack wipe is best effort: it does not reach registers, it relie
 keeping the derivation, the wrap and the unwrap out of their caller's frame, its depth follows the
 optimisation of this crate, so a build that optimises this crate but not the hash and cipher code it
 calls has to set `--cfg lethewis_unoptimised`, and it is measured only where the tests run, so far
-x86-64 and aarch64 Linux. A set of slots leaked instead of dropped keeps its keys in memory. A copy
-of a new key kept by the platform's random source. A system component with elevated privileges is
-outside what process isolation provides. The AES round keys of the software AES are bitsliced and
-are not looked for in that form. A record is not bound to one key in the strict sense: whoever
-chooses two keys can cheaply build bytes the cipher accepts under both. For such bytes to unwrap
-under both keys they must also name each key's identifier, which raises the work to no less than
-about 2^64 by estimate; this is not proven. A key wrapped under itself is refused, also when it is
-loaded twice. Longer cycles, such as one key wrapped under another that is wrapped under the first,
-and a key whose bytes begin with the bytes of the key it is wrapped under, are not detected.
+x86-64 and aarch64 Linux. On a microcontroller such as Cortex-M the stack these calls use is not
+measured; a call needs at least as much as the wipe after it reaches, 24 KiB after a wrap or an
+unwrap and 8 KiB after an import or a generation, or 64 KiB after each without optimisation, and
+without a guard on the stack, an MPU region or a layout that puts the stack below all other data, an
+overflow corrupts memory silently. A set of slots leaked instead of dropped keeps its keys in
+memory. A copy of a new key kept by the platform's random source. A system component with elevated
+privileges is outside what process isolation provides. The AES round keys of the software AES are
+bitsliced and are not looked for in that form. A record is not bound to one key in the strict sense:
+whoever chooses two keys can cheaply build bytes the cipher accepts under both. For such bytes to
+unwrap under both keys they must also name each key's identifier, which raises the work to no less
+than about 2^64 by estimate; this is not proven. A key wrapped under itself is refused, also when it
+is loaded twice. Longer cycles, such as one key wrapped under another that is wrapped under the
+first, and a key whose bytes begin with the bytes of the key it is wrapped under, are not detected.
 
 ### 5. The supply chain
 

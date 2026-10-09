@@ -1132,6 +1132,261 @@ mod tests {
         out
     }
 
+    /// Random bytes from a fixed seed, so that a failing round repeats.
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut mixed = self.0;
+            mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            mixed ^ (mixed >> 31)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            usize::try_from(self.next() % u64::try_from(bound).unwrap()).unwrap()
+        }
+
+        fn bytes<const N: usize>(&mut self) -> [u8; N] {
+            let mut out = [0; N];
+            for chunk in out.chunks_mut(8) {
+                chunk.copy_from_slice(&self.next().to_le_bytes()[..chunk.len()]);
+            }
+            out
+        }
+    }
+
+    type Holding = (
+        Occupancy,
+        u64,
+        [u8; 64],
+        KeyLength,
+        [u8; 16],
+        Purpose,
+        Status,
+    );
+
+    fn holdings(slots: &Slots<'_>) -> Vec<Holding> {
+        slots
+            .slots
+            .iter()
+            .map(|slot| {
+                (
+                    slot.occupancy,
+                    slot.generation,
+                    *slot.key.bytes(),
+                    slot.key.length(),
+                    slot.id.bytes(),
+                    slot.purpose,
+                    slot.status,
+                )
+            })
+            .collect()
+    }
+
+    fn import_any<'a>(slots: &mut Slots<'a>, random: &mut Random) -> Handle<'a> {
+        if random.below(2) == 0 {
+            slots.import32(Purpose::Wrap, &mut random.bytes())
+        } else {
+            slots.import64(Purpose::Wrap, &mut random.bytes())
+        }
+        .unwrap()
+    }
+
+    /// Records sealed under the parent through the real derivation and cipher, with random keys,
+    /// plaintexts, contexts of 0 to 300 bytes, a parent of either length in any slot among other
+    /// keys, released slots and random changes to the record or the context: unwrapping never
+    /// panics, refuses exactly what it should, loads the key the plaintext holds, with its length,
+    /// purpose, status and identifier, into the first free slot with that slot's generation when it
+    /// accepts, and changes no other slot, or none when it refuses.
+    fn unwrap_random_records(rounds: u64, seed: u64) {
+        let mut random = Random(seed);
+        for round in 0..rounds {
+            let mut memory = [const { Slot::empty() }; 3];
+            let mut slots = Slots::new(&mut memory);
+            let parent = random_slots(&mut slots, &mut random);
+            let parent_id = slots.slots[parent.index].id.bytes();
+            let plaintext = random_plaintext(&mut random, parent_id);
+            let context: Vec<u8> = (0..random.below(301))
+                .map(|_| random.bytes::<1>()[0])
+                .collect();
+            let valid_context = (1..=record::MAX_CONTEXT).contains(&context.len());
+            let sealed_for = if valid_context {
+                &context[..]
+            } else {
+                b"chat 7"
+            };
+            let mut record = sealed_under(&slots, parent, sealed_for, &plaintext, &mut random);
+            let changed = random.below(4) == 0;
+            if changed {
+                record[random.below(RECORD_LEN)] ^= 1_u8 << random.below(8);
+            }
+            let mut asked = context.clone();
+            let other_context = valid_context && random.below(8) == 0;
+            if other_context {
+                let at = random.below(asked.len());
+                asked[at] ^= 1_u8 << random.below(8);
+            }
+
+            let names_parent =
+                record::parse(&plaintext).is_ok_and(|(found, _)| found.parent == parent_id);
+            let before = holdings(&slots);
+            let first_free = before
+                .iter()
+                .position(|holding| holding.0 == Occupancy::Free);
+            let expected = if !valid_context {
+                Err(Error::InvalidContext)
+            } else if first_free.is_none() {
+                Err(Error::NoFreeSlot)
+            } else if changed || other_context || !names_parent {
+                Err(Error::RecordRejected)
+            } else {
+                Ok(())
+            };
+            let result = slots.unwrap(parent, &asked, &record);
+            assert_eq!(result.map(|_| ()), expected, "round {round} of seed {seed}");
+            let mut after = before.clone();
+            if let Ok(handle) = result {
+                let at = first_free.unwrap();
+                after[at] = loaded_from(&plaintext, before[at].1);
+                assert_eq!(
+                    (handle.index, handle.generation),
+                    (at, before[at].1),
+                    "round {round} of seed {seed}"
+                );
+            }
+            assert_eq!(holdings(&slots), after, "round {round} of seed {seed}");
+        }
+    }
+
+    /// Loads one to three keys of either length, releases and loads again up to twice, and returns
+    /// one of the keys left.
+    fn random_slots<'a>(slots: &mut Slots<'a>, random: &mut Random) -> Handle<'a> {
+        let mut loaded: Vec<Handle<'a>> = Vec::new();
+        for _ in 0..=random.below(3) {
+            loaded.push(import_any(slots, random));
+        }
+        for _ in 0..random.below(3) {
+            let gone = loaded.swap_remove(random.below(loaded.len()));
+            slots.release(gone).unwrap();
+            if loaded.is_empty() || random.below(2) == 0 {
+                loaded.push(import_any(slots, random));
+            }
+        }
+        loaded[random.below(loaded.len())]
+    }
+
+    /// The plaintext of a random key under `parent`, or under another parent, left as built, wholly
+    /// random or with one byte changed.
+    fn random_plaintext(random: &mut Random, parent: [u8; 16]) -> [u8; PLAINTEXT_LEN] {
+        let mut key = Key::empty();
+        if random.below(2) == 0 {
+            key.load32(&mut random.bytes());
+        } else {
+            key.load64(&mut random.bytes());
+        }
+        let attributes = Attributes {
+            purpose: Purpose::Wrap,
+            status: if random.below(2) == 0 {
+                Status::Enabled
+            } else {
+                Status::Disabled
+            },
+            parent: if random.below(8) == 0 {
+                random.bytes()
+            } else {
+                parent
+            },
+            epoch: random.next(),
+        };
+        let mut plaintext = [0; PLAINTEXT_LEN];
+        record::build(&attributes, &key, &mut plaintext);
+        match random.below(4) {
+            0 => plaintext = random.bytes(),
+            1 => plaintext[random.below(PLAINTEXT_LEN)] ^= random.bytes::<1>()[0] | 1,
+            _ => {}
+        }
+        plaintext
+    }
+
+    /// `plaintext` sealed under `parent` for `context` with a random nonce.
+    fn sealed_under(
+        slots: &Slots<'_>,
+        parent: Handle<'_>,
+        context: &[u8],
+        plaintext: &[u8; PLAINTEXT_LEN],
+        random: &mut Random,
+    ) -> [u8; RECORD_LEN] {
+        let mut cipher_key = [0; CIPHER_KEY_LEN];
+        derive_wrap_key(
+            &slots.slots[parent.index].key,
+            Purpose::Wrap,
+            &mut cipher_key,
+        )
+        .unwrap();
+        let associated = AssociatedData::new(context).unwrap();
+        let nonce: [u8; 12] = random.bytes();
+        let mut sealed = *plaintext;
+        let tag = seal::seal(&cipher_key, &nonce, associated.bytes(), &mut sealed).unwrap();
+        let mut record = [0; RECORD_LEN];
+        write_record(&mut record, &nonce, &sealed, &tag);
+        record
+    }
+
+    /// The slot that holds the key of an accepted `plaintext`: its bytes from offset 28, as long as
+    /// the length byte says, with the purpose and status it states and the identifier derived from
+    /// them.
+    fn loaded_from(plaintext: &[u8; PLAINTEXT_LEN], generation: u64) -> Holding {
+        let length = if plaintext[2] == 32 {
+            KeyLength::Bytes32
+        } else {
+            KeyLength::Bytes64
+        };
+        let mut held = [0; 64];
+        held[..length.bytes()].copy_from_slice(&plaintext[28..28 + length.bytes()]);
+        let (stated, _) = record::parse(plaintext).unwrap();
+        let mut key = Key::empty();
+        match length {
+            KeyLength::Bytes32 => key.load32(&mut held[..32].try_into().unwrap()),
+            KeyLength::Bytes64 => key.load64(&mut held),
+        }
+        let mut id = KeyId::empty();
+        derive_key_id(&key, stated.purpose, &mut id).unwrap();
+        (
+            Occupancy::Loaded,
+            generation,
+            *key.bytes(),
+            length,
+            id.bytes(),
+            stated.purpose,
+            stated.status,
+        )
+    }
+
+    #[test]
+    fn random_records_unwrap_as_their_plaintext_says() {
+        unwrap_random_records(300, 1);
+    }
+
+    /// The same over as many rounds and from the seed `LETHEWIS_RANDOM_ROUNDS` and
+    /// `LETHEWIS_RANDOM_SEED` give.
+    #[test]
+    #[ignore = "long; the rounds and the seed come from the environment"]
+    fn many_random_records_unwrap_as_their_plaintext_says() {
+        let read = |name: &str, default: u64| {
+            std::env::var(name).map_or(default, |value| {
+                value
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{name} is not a number: {value}"))
+            })
+        };
+        unwrap_random_records(
+            read("LETHEWIS_RANDOM_ROUNDS", 100_000),
+            read("LETHEWIS_RANDOM_SEED", 2),
+        );
+    }
+
     #[test]
     fn a_record_that_names_another_parent_or_is_malformed_is_rejected() {
         let mut memory = [const { Slot::empty() }; 2];
