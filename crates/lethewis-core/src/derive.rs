@@ -134,9 +134,34 @@ pub(crate) fn derive(
     branch: Branch,
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
+    #[cfg(test)]
+    timing::note();
     let derived = derive_on_stack(key, purpose, branch, out);
     wipe_stack();
     derived
+}
+
+/// Whether every derivation on this thread since the last look ran with data-independent timing
+/// on where it is offered: every call that derives holds the mode.
+#[cfg(test)]
+pub(crate) mod timing {
+    extern crate std;
+
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static SEEN: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn note() {
+        let now = lethewis_dit::active() == lethewis_dit::supported();
+        SEEN.set(Some(SEEN.get().unwrap_or(true) && now));
+    }
+
+    /// What the derivations since the last look saw, and forget it.
+    pub(crate) fn seen() -> Option<bool> {
+        SEEN.take()
+    }
 }
 
 /// Wipes the stack below the caller's frame, as deep as a derivation reaches.

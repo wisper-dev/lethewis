@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "lethewis-dit"
+description = "Data-independent timing on aarch64 for a piece of work: the one crate of the workspace with unsafe code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+publish = false
+include = ["src/**/*", "README.md", "LICENSE"]
+
+# Default features bring in `std`.
+[target.'cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "android", target_vendor = "apple")))'.dependencies]
+libc = { version = "0.2.190", default-features = false }
+
+# The workspace forbids unsafe code, and a forbidden lint cannot be relaxed, so this crate declares
+# the workspace lints itself, with unsafe code denied instead and two more lints on unsafe code;
+# scripts/supply-chain-rules.py checks that nothing else differs.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "deny"
+unexpected_cfgs = { level = "deny", check-cfg = [
+  "cfg(kani)",
+  "cfg(lethewis_unoptimised)",
+  'cfg(sha2_backend, values("soft"))',
+  'cfg(aes_backend, values("soft"))',
+  'cfg(polyval_backend, values("soft"))',
+] }
+unused_qualifications = "deny"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+multiple_unsafe_ops_per_block = "deny"
+mem_forget = "deny"
+indexing_slicing = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+float_arithmetic = "deny"
+integer_division = "deny"
+arithmetic_side_effects = "deny"

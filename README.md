@@ -71,7 +71,8 @@ separate crate, so the proof perimeter is visible from the directory listing.
 
 | Crate | Contents |
 |---|---|
-| `lethewis-core` | derivation, hierarchy, lifecycle, destruction, two-tier access. Pure logic: no system, no network, no clock |
+| `lethewis-core` | derivation, hierarchy, lifecycle, destruction, two-tier access. Pure logic: no network, no clock; the system is asked, through `lethewis-dit`, only whether the processor offers data-independent timing |
+| `lethewis-dit` | data-independent timing on aarch64 for a piece of work, where Linux, Android or an Apple system reports it; the one crate with unsafe code |
 
 Hardware binding, key shares and the time lock will each be a crate of its own, listed here when it
 exists.

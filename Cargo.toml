@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [workspace]
-members = ["crates/lethewis-core"]
+members = ["crates/lethewis-core", "crates/lethewis-dit"]
 resolver = "3"
 
 # Crates are split along the boundary of what is proven. A crate that reaches the system or the
@@ -22,8 +22,9 @@ categories = ["cryptography", "no-std"]
 
 [workspace.lints.rust]
 # No unsafe anywhere. "forbid" cannot be relaxed further down, which is the point and also the
-# catch: a crate that genuinely needs unsafe (the Android binding, when it exists) cannot inherit
-# these lints and must declare its own, with a written reason in front of every block.
+# catch: a crate that genuinely needs unsafe (lethewis-dit, and the Android binding when it
+# exists) cannot inherit these lints and must declare its own, with a written reason in front of
+# every block.
 unsafe_code = "forbid"
 unreachable_pub = "deny"
 # Kani sets cfg(kani) when it compiles the proofs; the build script of the core sets

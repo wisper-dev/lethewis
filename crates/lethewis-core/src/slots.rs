@@ -250,7 +250,8 @@ impl<'a> Slots<'a> {
         entropy: &mut (impl Entropy + ?Sized),
         record: &mut [u8; RECORD_LEN],
     ) -> Result<(), Error> {
-        let wrapped = self.wrap_on_stack(key, parent, context, entropy, record);
+        let wrapped =
+            lethewis_dit::with(|| self.wrap_on_stack(key, parent, context, entropy, record));
         wipe_cipher_stack();
         wrapped
     }
@@ -325,7 +326,7 @@ impl<'a> Slots<'a> {
         context: &[u8],
         record: &[u8; RECORD_LEN],
     ) -> Result<Handle<'a>, Error> {
-        let unwrapped = self.unwrap_on_stack(parent, context, record);
+        let unwrapped = lethewis_dit::with(|| self.unwrap_on_stack(parent, context, record));
         wipe_cipher_stack();
         unwrapped
     }
@@ -404,9 +405,18 @@ impl<'a> Slots<'a> {
     }
 
     /// Puts a key for `purpose` with `status` into the first free slot with `fill`, derives its
-    /// identifier, and issues a handle if both succeed. If the derivation fails, the key and what
-    /// the derivation wrote are wiped.
+    /// identifier, and issues a handle if both succeed, with data-independent timing on. If the
+    /// derivation fails, the key and what the derivation wrote are wiped.
     fn load(
+        &mut self,
+        purpose: Purpose,
+        status: Status,
+        fill: impl FnOnce(&mut Key) -> Result<(), Error>,
+    ) -> Result<Handle<'a>, Error> {
+        lethewis_dit::with(|| self.load_in_slot(purpose, status, fill))
+    }
+
+    fn load_in_slot(
         &mut self,
         purpose: Purpose,
         status: Status,
@@ -540,6 +550,32 @@ mod tests {
     };
 
     assert_not_impl!(Slot: Clone, PartialEq, Default);
+
+    /// Every import, generation, wrap and unwrap derives with data-independent timing on, where the
+    /// processor and the operating system offer it.
+    #[test]
+    fn every_call_that_derives_holds_data_independent_timing() {
+        use crate::derive::timing::seen;
+        assert!(!lethewis_dit::active(), "the mode is off before the work");
+        let _ = seen();
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut slots = Slots::new(&mut memory);
+        let parent = slots.import64(Purpose::Wrap, &mut [7; 64]).unwrap();
+        assert_eq!(seen(), Some(true));
+        let key = slots.import32(Purpose::Wrap, &mut [9; 32]).unwrap();
+        assert_eq!(seen(), Some(true));
+        slots
+            .generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting)
+            .unwrap();
+        assert_eq!(seen(), Some(true));
+        let mut record = [0; RECORD_LEN];
+        slots
+            .wrap(key, parent, b"context", &mut Counting, &mut record)
+            .unwrap();
+        assert_eq!(seen(), Some(true));
+        slots.unwrap(parent, b"context", &record).unwrap();
+        assert_eq!(seen(), Some(true));
+    }
 
     /// The stack, in KiB, that a load and that a wrap or an unwrap need, and the depth of the wipes
     /// that follow them, in an optimised build and in one without optimisation.

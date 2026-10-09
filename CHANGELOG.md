@@ -62,6 +62,12 @@ Nothing is published while the version is below 0.1.0.
   need 25 KiB of stack, or 72 KiB. Tests read the memory of their own process back after a wrap and
   an unwrap, with and without optimisation and with the hardware and the software AES, POLYVAL and
   SHA-256, and check the wipe and the stack needed at every level of optimisation.
+- `lethewis-dit`: runs work with data-independent timing on, on aarch64 where Linux, Android or
+  an Apple system reports the feature, and switches it back off when the work returns or unwinds.
+  The core runs each import, generation, wrap and unwrap of a key that way. It is the one crate with unsafe code:
+  two instructions that read and write the mode, and the calls that ask the system about it.
+- Dependency of `lethewis-dit`: `libc` 0.2.190 or a later compatible version, without default
+  features, on aarch64 Linux, Android and Apple targets.
 - Tests also run on aarch64 Linux and on macOS on Apple silicon, with the hardware and the software
   SHA-256, AES and POLYVAL; on aarch64 Linux they read the stack back after a derivation, a wrap and
   an unwrap, at every level of optimisation.

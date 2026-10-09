@@ -3,7 +3,7 @@
 
 [package]
 name = "lethewis-core"
-description = "Key derivation, hierarchy, lifecycle and destruction. Pure logic: no system, no network, no filesystem."
+description = "Key derivation, hierarchy, lifecycle and destruction. Pure logic: no network, no filesystem."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -38,6 +38,8 @@ aes-gcm-siv = { version = "0.12.1", default-features = false, features = [
 ] }
 # Compares a record's parent identifier with the unwrapping key's in constant time.
 ctutils = { version = "0.4.2", default-features = false }
+# Data-independent timing on aarch64 around the derivation and the cipher.
+lethewis-dit = { path = "../lethewis-dit", version = "0.0.0" }
 # Direct only for `zeroize`: without it the key schedule and the POLYVAL state are not wiped on drop.
 aes = { version = "0.9.3", default-features = false, features = ["zeroize"] }
 polyval = { version = "0.7.3", default-features = false, features = [

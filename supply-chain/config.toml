@@ -12,3 +12,7 @@ dependency-criteria = { typenum = "safe-to-deploy" }
 
 [policy.lethewis-core]
 criteria = "read-in-full"
+
+[policy.lethewis-dit]
+criteria = "read-in-full"
+dependency-criteria = { libc = "safe-to-deploy" }

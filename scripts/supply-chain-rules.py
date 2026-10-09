@@ -8,7 +8,8 @@ Only what is listed here may appear in the store: a review of our own is the onl
 never an exemption, an imported review or a trusted publisher; every crate of the workspace asks for
 a reading in full, and every locked version of a crate that handles secrets has a record of one.
 Nothing in the tree changes where dependencies or the compiler come from, or where cargo-vet looks
-for its store.
+for its store. Every crate of the workspace inherits its lints, but the one crate allowed unsafe
+code, whose own lints differ from them only there.
 """
 
 import json
@@ -30,6 +31,11 @@ DEPENDENCY_CRITERIA = {LOWERED, OWN_CRITERION}
 TESTS_ONLY = "safe-to-run"
 MEMBER_PREFIX = "lethewis-"
 TOOLCHAIN_KEYS = {"channel", "components", "targets", "profile"}
+UNSAFE_CRATE = "lethewis-dit"
+UNSAFE_LINTS = {
+    "rust": {"unsafe_code": "deny", "unsafe_op_in_unsafe_fn": "deny"},
+    "clippy": {"multiple_unsafe_ops_per_block": "deny"},
+}
 # Crates that handle key material: every locked version read in full, never lowered in a policy.
 HANDLE_SECRETS = {
     "aead", "aes", "aes-gcm-siv", "block-buffer", "cipher", "cmov", "ctr", "ctutils", "digest",
@@ -95,11 +101,13 @@ def main() -> int:
             )
 
     try:
-        members = workspace_members(root)
+        workspace = metadata(root)
     except SystemExit as failure:
         for problem in problems:
             print(f"supply-chain-rules: {problem}", file=sys.stderr)
         raise failure
+    problems += member_lints(root, workspace)
+    members = workspace_members(workspace)
     for member in members:
         if not member.startswith(MEMBER_PREFIX):
             problems.append(f"workspace crate {member}: its name must start with {MEMBER_PREFIX}")
@@ -211,7 +219,26 @@ def git(*args: str, cwd: Path | None = None) -> str:
     ).stdout.strip()
 
 
-def workspace_members(root: Path) -> list[str]:
+def member_lints(root: Path, workspace: dict) -> list[str]:
+    """Every member of the workspace inherits its lints, but the one allowed unsafe code."""
+    problems = []
+    shared = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["lints"]
+    unsafe_lints = {group: {**lints, **UNSAFE_LINTS.get(group, {})}
+                    for group, lints in shared.items()}
+    for package in workspace["packages"]:
+        manifest = Path(package["manifest_path"])
+        lints = tomllib.loads(manifest.read_text()).get("lints")
+        name = manifest.relative_to(root)
+        if package["name"] == UNSAFE_CRATE:
+            if lints != unsafe_lints:
+                problems.append(f"{name}: lints must be the workspace's, with unsafe code denied"
+                                " rather than forbidden")
+        elif lints != {"workspace": True}:
+            problems.append(f"{name}: lints must be inherited from the workspace")
+    return problems
+
+
+def metadata(root: Path) -> dict:
     result = subprocess.run(
         ["cargo", "metadata", "--no-deps", "--format-version", "1", "--locked"],
         cwd=root, check=False, capture_output=True, text=True,
@@ -219,7 +246,11 @@ def workspace_members(root: Path) -> list[str]:
     if result.returncode != 0:
         sys.stderr.write(result.stderr)
         raise SystemExit("supply-chain-rules: cargo metadata failed, so the workspace is unknown")
-    members = sorted(package["name"] for package in json.loads(result.stdout)["packages"])
+    return json.loads(result.stdout)
+
+
+def workspace_members(workspace: dict) -> list[str]:
+    members = sorted(package["name"] for package in workspace["packages"])
     if not members:
         raise SystemExit("supply-chain-rules: no crate found in the workspace")
     return members
