@@ -367,6 +367,16 @@ jobs:
         # The stack the hash and the cipher leave behind differs between the two builds.
         run: cargo test --workspace --all-features --locked --release
 
+      - name: A million random records
+        # A new seed on every run, shown with the step; the same seed repeats the run.
+        env:
+          LETHEWIS_RANDOM_ROUNDS: "1000000"
+          LETHEWIS_RANDOM_SEED: ${{ github.run_id }}
+        run: |
+          cargo test -p lethewis-core --lib --locked --release -- --ignored --exact \
+            slots::tests::many_random_records_unwrap_as_their_plaintext_says | tee random.txt
+          grep -q '^test result: ok. 1 passed' random.txt
+
       - name: Tests, software SHA-256, AES and POLYVAL
         # The runners have the instructions these use; the portable code is a path of its own, and
         # without them the hash and the cipher use a different amount of stack.

@@ -51,6 +51,10 @@ password and the hardware secret at each unlock, and neither alone is enough.
   reallocation, a CPU register, swap, or a crash dump is outside what this library clears. The stack
   a key derivation, a wrap or an unwrap used is wiped after it, as far as that can go without
   touching registers, and so far this is measured on x86-64 and aarch64 Linux only.
+- **The stack a call needs is not measured on microcontrollers.** On a target such as Cortex-M a
+  call needs at least as much stack as the wipe after it reaches, 24 KiB after a wrap or an unwrap
+  and 8 KiB after an import or a generation, or 64 KiB after each without optimisation, and an
+  overflow of an unguarded stack corrupts memory silently.
 - **Hardware-backed keys are not available everywhere.** A dedicated secure element is absent on a
   large share of Android devices, and our figure for that share is an estimate rather than a
   measurement. Where the element is missing, protection falls back and records the level actually
