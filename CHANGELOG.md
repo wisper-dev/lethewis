@@ -72,6 +72,10 @@ Nothing is published while the version is below 0.1.0.
 - Tests also run on aarch64 Linux and on macOS on Apple silicon, with the hardware and the software
   SHA-256, AES and POLYVAL; on aarch64 Linux they read the stack back after a derivation, a wrap and
   an unwrap, at every level of optimisation.
+- Proofs with Kani 0.68.0 for the plaintext layout of a key set, which holds up to three keys, the
+  position of the primary and a revision counter, and for the stages of its keys: from any set whose
+  primary is enabled, every transition keeps it so, counts one revision and changes only what it
+  names, and a transition out of order is refused and changes nothing.
 - A test unwraps random records sealed with the real derivation and cipher: random keys,
   plaintexts, contexts, slots and changed bits; a million of them from a new seed on every pull
   request.

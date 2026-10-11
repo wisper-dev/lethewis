@@ -32,7 +32,7 @@ pub enum Purpose {
 }
 
 impl Purpose {
-    const fn from_byte(byte: u8) -> Option<Self> {
+    pub(crate) const fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             1 => Some(Self::Wrap),
             _ => None,
@@ -51,7 +51,7 @@ pub(crate) enum Status {
 }
 
 impl Status {
-    const fn from_byte(byte: u8) -> Option<Self> {
+    pub(crate) const fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             1 => Some(Self::Enabled),
             2 => Some(Self::Disabled),
@@ -67,7 +67,7 @@ pub(crate) const fn length_to_byte(length: KeyLength) -> u8 {
     }
 }
 
-const fn length_from_byte(byte: u8) -> Option<KeyLength> {
+pub(crate) const fn length_from_byte(byte: u8) -> Option<KeyLength> {
     match byte {
         32 => Some(KeyLength::Bytes32),
         64 => Some(KeyLength::Bytes64),
@@ -185,7 +185,7 @@ pub(crate) fn parse(bytes: &[u8; PLAINTEXT_LEN]) -> Result<(Attributes, KeyBytes
 }
 
 /// Whether the bytes past the key's length are zero. Reads the whole tail, with no early exit.
-fn tail_is_zero(key: &[u8; CAPACITY], length: KeyLength) -> bool {
+pub(crate) fn tail_is_zero(key: &[u8; CAPACITY], length: KeyLength) -> bool {
     match length {
         KeyLength::Bytes32 => {
             key.iter()
