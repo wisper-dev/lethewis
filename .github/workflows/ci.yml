@@ -569,7 +569,23 @@ jobs:
       - name: Install Kani
         run: scripts/install-kani.sh
 
+      - name: Swap for the proofs
+        # Kani's driver keeps every trace the solver prints: up to 47 GB for one proof, on a runner
+        # with 16 GB of memory.
+        run: |
+          df -h /mnt
+          sudo swapoff -a
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 48G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -g
+
       - name: Every proof holds and every cover property is reached
+        # One at a time: two of the largest do not fit together even with the swap.
+        env:
+          LETHEWIS_PROOF_JOBS: 1
         run: scripts/prove.sh
 
       - name: Keep the results and the manifest
