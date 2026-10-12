@@ -44,7 +44,6 @@ mod derive;
 mod entropy;
 mod error;
 mod key;
-#[cfg_attr(not(any(test, kani)), expect(dead_code))]
 mod keyset;
 mod record;
 #[cfg(test)]

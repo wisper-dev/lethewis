@@ -27,7 +27,8 @@ device. After destruction, no call returns the key.
 does not change that. On a large share of Android devices there is no dedicated secure element, and
 the password can then be attacked off the device on fast hardware, where a short secret falls
 quickly. Our figure for that share is an estimate rather than a measurement. A record replaced by an
-older record of the same place opens: the epoch a record holds is written as zero and not checked.
+older record of the same place opens: the epoch a record holds is written as zero and not checked,
+and neither is the revision of a key set.
 The library is intended to record which level was actually reached rather than assume the better
 one.
 
@@ -57,29 +58,34 @@ reach.
 
 **Capability.** Another application, possibly with elevated privileges.
 
-**In place.** Keys are held only in fixed-size slots whose memory the caller provides, and no call
-returns a key. A new key is written straight into its slot from the platform's random source, and
-the library's own code makes no copy of it; if the source fails or panics halfway, the slot is
-wiped. A key is wiped when it is released, and every key is wiped when its set of slots is dropped.
-A key leaves its slot only as a record encrypted with AES-256-GCM-SIV under a key derived from the
-key that wraps it, bound to a context the caller names; before every wrap the cipher encrypts a
+**In place.** Keys are held only in fixed-size slots whose memory the caller provides, each slot a
+set of up to three keys, and no call returns a key. A key is held in one place only: a load of a key
+the slots already hold, or of a set that holds one key twice, is refused. A new key is written
+straight into its slot from the platform's random source, and the library's own code makes no copy
+of it; if the source fails or panics halfway, the slot is wiped. The keys of a set are wiped when it
+is released, and every key is wiped when its slots are dropped. A set leaves its slot only as one
+record of all its keys, encrypted with AES-256-GCM-SIV under a key derived from the primary key of
+the set that wraps it, bound to a context the caller names; before every wrap the cipher encrypts a
 known input of the shape of a record and must give the answer an independent implementation gives,
 or nothing is written. A record is unwrapped into a slot only after its tag, its layout and the
-identifier of the key that wraps it are checked, and every such failure is the same error. After
-each key derivation, whether it succeeded or not, the stack below the caller is wiped: 8 KiB, or 64
-KiB in a build without optimisation. Tests read the memory of their own process back, with and
-without optimisation and with the hardware and the software SHA-256, and check that the wipe reaches
-that depth, that the derivation uses less than half of it and more than a sixteenth, and that no
-16-byte piece is left of the key, the extracted key, the HMAC key blocks, the SHA-256 states, inner
-hashes and message schedules, or the output beyond the identifier, in the byte orders and
-arrangements the two SHA-256 paths use. After a wrap and an unwrap the stack below the caller is
-wiped as well: 24 KiB, or 64 KiB without optimisation, at least twice what the cipher uses at every
-level of optimisation by the same measurement; tests read the stack back after a wrap, an unwrap and
-an unwrap whose record fails its tag, and look for pieces of both keys, the derived cipher key, the
-message keys, the AES round keys of the derived key and of the message encryption key as laid out by
-the instructions, the keystream and the record's plaintext. The wipe on release and on creating a
-set, and the refusal of a released or foreign handle, are proven for two slots; the statements and
-their limits are in [proofs.md](proofs.md).
+identifier of the key that wraps it are checked; every key of the parent set is tried, also after
+one has opened the record. Every such failure is the same error, except a record wrapped under a
+disabled key of the parent, which is reported as such and loads nothing. After each key derivation,
+whether it succeeded or not, the stack below the caller is wiped: 8 KiB, or 64 KiB in a build
+without optimisation. Tests read the memory of their own process back, with and without optimisation
+and with the hardware and the software SHA-256, and check that the wipe reaches that depth, that the
+derivation uses less than half of it and more than a sixteenth, and that no 16-byte piece is left of
+the key, the extracted key, the HMAC key blocks, the SHA-256 states, inner hashes and message
+schedules, or the output beyond the identifier, in the byte orders and arrangements the two SHA-256
+paths use. After a wrap and an unwrap the stack below the caller is wiped as well: 24 KiB, or 64 KiB
+without optimisation, at least twice what the cipher uses at every level of optimisation by the same
+measurement; tests read the stack back after a wrap, an unwrap and an unwrap whose record fails its
+tag, with sets of three keys on both sides, and look for pieces of every key, and, for each key of
+the parent that is tried, the derived cipher key, the message keys, the AES round keys of the
+derived key and of the message encryption key as laid out by the instructions, the keystream and
+what the record decrypts to. The wipe on release and on creating the slots, and the refusal of a
+released or foreign handle, are proven for two slots; the statements and their limits are in
+[proofs.md](proofs.md).
 
 **Intended.** Drop keys from memory when the device locks.
 
@@ -98,9 +104,11 @@ privileges is outside what process isolation provides. The AES round keys of the
 bitsliced and are not looked for in that form. A record is not bound to one key in the strict sense:
 whoever chooses two keys can cheaply build bytes the cipher accepts under both. For such bytes to
 unwrap under both keys they must also name each key's identifier, which raises the work to no less
-than about 2^64 by estimate; this is not proven. A key wrapped under itself is refused, also when it
-is loaded twice. Longer cycles, such as one key wrapped under another that is wrapped under the
-first, and a key whose bytes begin with the bytes of the key it is wrapped under, are not detected.
+than about 2^64 by estimate; this is not proven. A set cannot wrap itself, and since no key is held
+in two places, no set is wrapped under one of its own keys. Longer cycles, such as one set wrapped
+under another that is wrapped under the first, and a key whose bytes begin with the bytes of the key
+it is wrapped under, are not detected. Two sets of slots alive at once may hold the same key; the
+one-place rule holds within each.
 
 ### 5. The supply chain
 
@@ -123,21 +131,23 @@ what stands against an attack is the reading of every changed file before it is 
 
 ### 6. Timing and other side channels
 
-**Not measured.** The cipher compares its tag, and the library compares the identifier of the
-wrapping key a record names, through a comparison written for constant time: inline assembly on
-x86-64 and aarch64, best effort on other targets. A build step compiles that comparison for x86-64,
-aarch64, Cortex-M4 and WebAssembly and fails unless its machine code runs straight through: no
-branch, no call and no write of the program counter but the final return. This shows how the pinned
-compiler laid the code out, before link-time optimisation, not how long each instruction takes. AES
-and POLYVAL run on the processor's instructions where present and on bitsliced portable code
-elsewhere. Whether those instructions take the same time for all data is up to the processor. On
-recent Intel processors that holds only in a mode the operating system sets. On aarch64 it holds
-only in the data-independent timing mode, which `lethewis-dit` switches on around loading, wrapping
-and unwrapping a key where Linux, Android or an Apple system reports the feature; elsewhere, and
-where the system or a virtual machine hides it, the mode stays off. On Apple M1 and M2 the mode does
-not stop the data prefetcher from reading memory by its contents; on M3 it does. On Cortex-M3 the
-portable multiplication varies with its operands, and WebAssembly makes no promise. When timing is
-measured, the tool, its version, the compiler version and the coverage will be stated in
+**Not measured.** An unwrap tries every key of the parent set whichever opens the record, so the
+work it does is the same; which key opened it is not hidden from caches or branch prediction. The
+cipher compares its tag, and the library compares the identifier of the wrapping key a record names,
+through a comparison written for constant time: inline assembly on x86-64 and aarch64, best effort
+on other targets. A build step compiles that comparison for x86-64, aarch64, Cortex-M4 and
+WebAssembly and fails unless its machine code runs straight through: no branch, no call and no write
+of the program counter but the final return. This shows how the pinned compiler laid the code out,
+before link-time optimisation, not how long each instruction takes. AES and POLYVAL run on the
+processor's instructions where present and on bitsliced portable code elsewhere. Whether those
+instructions take the same time for all data is up to the processor. On recent Intel processors that
+holds only in a mode the operating system sets. On aarch64 it holds only in the data-independent
+timing mode, which `lethewis-dit` switches on around loading a key and wrapping and unwrapping a set
+where Linux, Android or an Apple system reports the feature; elsewhere, and where the system or a
+virtual machine hides it, the mode stays off. On Apple M1 and M2 the mode does not stop the data
+prefetcher from reading memory by its contents; on M3 it does. On Cortex-M3 the portable
+multiplication varies with its operands, and WebAssembly makes no promise. When timing is measured,
+the tool, its version, the compiler version and the coverage will be stated in
 [proofs.md](proofs.md). The available tools are statistical and detect only pronounced leaks, and
 compiler optimisation can reintroduce a leak after a check has passed.
 

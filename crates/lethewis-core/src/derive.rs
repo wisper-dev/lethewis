@@ -581,14 +581,16 @@ use model::hkdf;
 /// What stands in for HKDF-SHA-256 under Kani, and how the proofs read an identifier.
 #[cfg(kani)]
 pub(crate) mod model {
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-    use super::{DerivationFailed, KeyId};
+    use super::{DerivationFailed, KeyId, LABEL_CAPACITY};
     use crate::record::ID_LEN;
 
     /// Whether the last derivation failed, so a proof can tell a failure of the derivation from one
     /// the code makes up.
     static FAILED: AtomicBool = AtomicBool::new(false);
+    /// How many derivations have failed, so a proof can tell whether any of several did.
+    static FAILURES: AtomicU8 = AtomicU8::new(0);
 
     /// HKDF-SHA-256 is beyond Kani. The model fails at will, after writing into `out`, and records
     /// whether it failed; otherwise `out` takes the first bytes of the key with the key's length
@@ -603,6 +605,10 @@ pub(crate) mod model {
         let fail: bool = kani::any();
         FAILED.store(fail, Ordering::Relaxed);
         if fail {
+            FAILURES.store(
+                FAILURES.load(Ordering::Relaxed).saturating_add(1),
+                Ordering::Relaxed,
+            );
             out.fill(0xa5);
             return Err(DerivationFailed);
         }
@@ -615,24 +621,39 @@ pub(crate) mod model {
         FAILED.load(Ordering::Relaxed)
     }
 
-    // Slices are copied whole and indexed directly: a loop over an iterator chain unrolls into
-    // many times the steps under Kani.
+    /// Whether any derivation has failed.
+    pub(crate) fn any_failed() -> bool {
+        FAILURES.load(Ordering::Relaxed) != 0
+    }
+
+    // Byte by byte through `get`, never indexing: a path that never derives would leave a check
+    // unreached, and Kani 0.68.0 reads stale bytes in a slice copy of unknown length.
     pub(crate) fn fold(material: &[u8], info: &[u8], out: &mut [u8]) {
-        if out.is_empty() {
-            return;
+        let length = out.len();
+        for (index, byte) in out.iter_mut().enumerate() {
+            *byte = material.get(index).copied().unwrap_or(0);
         }
-        let taken = material.len().min(out.len());
-        out[..taken].copy_from_slice(&material[..taken]);
-        out[taken..].fill(0);
-        out[0] ^= u8::try_from(material.len()).unwrap_or(u8::MAX);
-        for index in 0..info.len() {
-            out[index % out.len()] ^= info[index];
+        if let Some(first) = out.first_mut() {
+            *first ^= u8::try_from(material.len()).unwrap_or(u8::MAX);
+        }
+        // Up to the longest label rather than up to this one: a loop whose end the solver does not
+        // know unrolls to the whole bound of the proof.
+        for index in 0..LABEL_CAPACITY {
+            let target = index.checked_rem(length).and_then(|at| out.get_mut(at));
+            if let (Some(&byte), Some(target)) = (info.get(index), target) {
+                *target ^= byte;
+            }
         }
     }
 
-    /// What stands in for the constant-time comparison of identifiers.
+    /// What stands in for the constant-time comparison of identifiers. Byte by byte: comparing the
+    /// arrays whole reads bytes from before the latest write in Kani 0.68.0.
     pub(crate) fn same_id(a: &[u8; ID_LEN], b: &[u8; ID_LEN]) -> bool {
-        a == b
+        let mut same = true;
+        for index in 0..ID_LEN {
+            same &= a.get(index) == b.get(index);
+        }
+        same
     }
 
     pub(crate) const fn id_bytes(id: &KeyId) -> &[u8; ID_LEN] {
@@ -902,7 +923,7 @@ mod tests {
 #[cfg(kani)]
 #[coverage(on)]
 pub(crate) mod proofs {
-    use super::{Branch, label, model::fold};
+    use super::{Branch, CIPHER_KEY_LEN, label, model::fold};
     use crate::key::KeyLength;
     use crate::record::{ID_LEN, Purpose};
 
@@ -918,6 +939,20 @@ pub(crate) mod proofs {
             fold(&key[..length.bytes()], &label[..used], &mut id);
         });
         id
+    }
+
+    /// The key the model of HKDF gives a record's cipher from the first `length` bytes of `key`,
+    /// worked out in the same way.
+    pub(crate) fn expected_wrap_key(
+        key: &[u8; 64],
+        length: KeyLength,
+        purpose: Purpose,
+    ) -> [u8; CIPHER_KEY_LEN] {
+        let mut out = [0; CIPHER_KEY_LEN];
+        let _ = label(purpose, length, Branch::WrapKey, CIPHER_KEY_LEN).map(|(label, used)| {
+            fold(&key[..length.bytes()], &label[..used], &mut out);
+        });
+        out
     }
 
     fn any_length() -> KeyLength {

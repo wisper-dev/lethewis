@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use crate::key::{CAPACITY, Key, KeyBytes};
-use crate::record::{ID_LEN, Malformed, Purpose, Status, length_from_byte, length_to_byte};
+use crate::record::{
+    ID_LEN, Malformed, PLAINTEXT_LEN, Purpose, Status, VERSION, length_from_byte, length_to_byte,
+};
 
 /// The most keys a set holds: the primary, one on its way out, and one added before it becomes the
 /// primary.
@@ -10,11 +12,8 @@ pub(crate) const MEMBERS: usize = 3;
 /// A position of a set: the stage, the length and the key, zero past its length; all zero when the
 /// position is empty.
 const MEMBER_LEN: usize = 2 + CAPACITY;
-/// The size of a set's plaintext in bytes.
-pub(crate) const SET_PLAINTEXT_LEN: usize = 233;
-const VERSION: u8 = 1;
 
-const _: () = assert!(3 + ID_LEN + 8 + 8 + MEMBERS * MEMBER_LEN == SET_PLAINTEXT_LEN);
+const _: () = assert!(3 + ID_LEN + 8 + 8 + MEMBERS * MEMBER_LEN == PLAINTEXT_LEN);
 
 /// What a set's record holds besides its keys and their stages.
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +38,7 @@ pub(crate) struct Stages {
 
 /// Why a transition was refused. Nothing has changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(test, kani)), expect(dead_code))]
 pub(crate) enum Refused {
     /// Every position holds a key.
     Full,
@@ -65,6 +65,33 @@ impl Stages {
         self.members.get(self.primary) == Some(&Some(Status::Enabled))
     }
 
+    /// The stage of the key at `at`, or `None` where the position is empty.
+    pub(crate) fn stage(&self, at: usize) -> Option<Status> {
+        self.members.get(at).copied().flatten()
+    }
+
+    /// The position of the primary key.
+    pub(crate) const fn primary(&self) -> usize {
+        self.primary
+    }
+
+    /// Stages as given, whole or not.
+    #[cfg(test)]
+    pub(crate) const fn from_parts(
+        members: [Option<Status>; MEMBERS],
+        primary: usize,
+        revision: u64,
+    ) -> Self {
+        Self {
+            members,
+            primary,
+            revision,
+        }
+    }
+}
+
+#[cfg_attr(not(any(test, kani)), expect(dead_code))]
+impl Stages {
     /// Adds an enabled key in the first empty position, which is returned. It is not the primary.
     pub(crate) fn add(&mut self) -> Result<usize, Refused> {
         let at = self
@@ -132,7 +159,7 @@ pub(crate) fn build(
     header: &Header,
     stages: &Stages,
     keys: [&Key; MEMBERS],
-    out: &mut [u8; SET_PLAINTEXT_LEN],
+    out: &mut [u8; PLAINTEXT_LEN],
 ) {
     let Some((control, rest)) = out.split_first_chunk_mut::<3>() else {
         return;
@@ -186,13 +213,21 @@ fn build_member(stage: Option<Status>, key: &Key, out: &mut [u8; MEMBER_LEN]) {
     }
 }
 
+/// The identifier of the parent a set's plaintext names, read without parsing the rest.
+pub(crate) fn parent_of(bytes: &[u8; PLAINTEXT_LEN]) -> &[u8; ID_LEN] {
+    bytes
+        .split_first_chunk::<3>()
+        .and_then(|(_, rest)| rest.split_first_chunk::<ID_LEN>())
+        .map_or(&[0; ID_LEN], |(parent, _)| parent)
+}
+
 /// What parsing a set's plaintext gives: its header, its stages, and the bytes of each key, `None`
 /// where the position is empty.
 pub(crate) type Parsed<'a> = (Header, Stages, [Option<KeyBytes<'a>>; MEMBERS]);
 
 /// Reads the plaintext of a set. Anything [`build`] cannot write is refused, and so is a set whose
 /// primary position does not hold an enabled key.
-pub(crate) fn parse(bytes: &[u8; SET_PLAINTEXT_LEN]) -> Result<Parsed<'_>, Malformed> {
+pub(crate) fn parse(bytes: &[u8; PLAINTEXT_LEN]) -> Result<Parsed<'_>, Malformed> {
     let Some((&[version, purpose, primary], rest)) = bytes.split_first_chunk::<3>() else {
         return Err(Malformed);
     };
@@ -270,9 +305,7 @@ mod tests {
 
     use std::vec::Vec;
 
-    use super::{
-        Header, MEMBERS, Malformed, Refused, SET_PLAINTEXT_LEN, Stages, Status, build, parse,
-    };
+    use super::{Header, MEMBERS, Malformed, PLAINTEXT_LEN, Refused, Stages, Status, build, parse};
     use crate::key::{Key, KeyLength};
     use crate::record::Purpose;
 
@@ -288,12 +321,12 @@ mod tests {
     }
 
     /// The pieces, written out from the layout by hand, put one after another.
-    fn laid_out(pieces: &[&[u8]]) -> [u8; SET_PLAINTEXT_LEN] {
+    fn laid_out(pieces: &[&[u8]]) -> [u8; PLAINTEXT_LEN] {
         pieces.concat().try_into().unwrap()
     }
 
     /// A set of one 32-byte key.
-    fn one() -> [u8; SET_PLAINTEXT_LEN] {
+    fn one() -> [u8; PLAINTEXT_LEN] {
         laid_out(&[
             &[0x01, 0x01, 0x00], // version, purpose, primary position
             &PARENT,
@@ -309,7 +342,7 @@ mod tests {
 
     /// A full set: a disabled 64-byte key, an enabled 32-byte key, and the primary, a 64-byte key
     /// in the third position.
-    fn full() -> [u8; SET_PLAINTEXT_LEN] {
+    fn full() -> [u8; PLAINTEXT_LEN] {
         laid_out(&[
             &[0x01, 0x01, 0x02],
             &[0xf0; 16],
@@ -327,7 +360,7 @@ mod tests {
 
     /// The primary in the first position and a disabled 32-byte key in the third, with the second
     /// position empty between them.
-    fn gap() -> [u8; SET_PLAINTEXT_LEN] {
+    fn gap() -> [u8; PLAINTEXT_LEN] {
         laid_out(&[
             &[0x01, 0x01, 0x00],
             &PARENT,
@@ -356,7 +389,7 @@ mod tests {
     }
 
     struct Case {
-        bytes: fn() -> [u8; SET_PLAINTEXT_LEN],
+        bytes: fn() -> [u8; PLAINTEXT_LEN],
         header: Header,
         stages: Stages,
         keys: [Option<(KeyLength, Vec<u8>)>; MEMBERS],
@@ -433,7 +466,7 @@ mod tests {
     type Read = (Header, Stages, [Option<(KeyLength, Vec<u8>)>; MEMBERS]);
 
     /// The header, the stages and each key as its length and bytes, or the error.
-    fn read(bytes: &[u8; SET_PLAINTEXT_LEN]) -> Result<Read, Malformed> {
+    fn read(bytes: &[u8; PLAINTEXT_LEN]) -> Result<Read, Malformed> {
         parse(bytes).map(|(header, stages, keys)| {
             let keys = keys.map(|key| {
                 key.map(|key_bytes| {
@@ -452,7 +485,7 @@ mod tests {
         for case in cases() {
             let keys = keys_of(&case);
             for old in [0x00, 0x55, 0xff] {
-                let mut out = [old; SET_PLAINTEXT_LEN];
+                let mut out = [old; PLAINTEXT_LEN];
                 build(
                     &case.header,
                     &case.stages,
@@ -588,7 +621,7 @@ mod tests {
     #[test]
     fn every_byte_lands_in_its_field() {
         let expected = &cases()[1];
-        for offset in 0..SET_PLAINTEXT_LEN {
+        for offset in 0..PLAINTEXT_LEN {
             let mut bytes = full();
             bytes[offset] ^= 0xff;
             let mut header = expected.header;
@@ -710,9 +743,10 @@ mod tests {
 
 #[cfg(kani)]
 #[coverage(on)]
-mod proofs {
+pub(crate) mod proofs {
     use super::{
-        Header, MEMBER_LEN, MEMBERS, Refused, SET_PLAINTEXT_LEN, Stages, Status, build, parse,
+        Header, MEMBER_LEN, MEMBERS, PLAINTEXT_LEN, Refused, Stages, Status, build, parent_of,
+        parse,
     };
     use crate::key::{Key, KeyLength};
     use crate::record::Purpose;
@@ -721,7 +755,7 @@ mod proofs {
     const POSITIONS: [usize; MEMBERS] = [35, 101, 167];
 
     /// Whether every byte of `bytes` from `start` to `end` is zero.
-    fn zero(bytes: &[u8; SET_PLAINTEXT_LEN], start: usize, end: usize) -> bool {
+    fn zero(bytes: &[u8; PLAINTEXT_LEN], start: usize, end: usize) -> bool {
         let mut seen = 0;
         let mut at = start;
         while at < end {
@@ -732,7 +766,7 @@ mod proofs {
     }
 
     /// Whether the position starting at `at` is one `build` can write.
-    fn writable_position(bytes: &[u8; SET_PLAINTEXT_LEN], at: usize) -> bool {
+    fn writable_position(bytes: &[u8; PLAINTEXT_LEN], at: usize) -> bool {
         let stage = bytes[at];
         let length = bytes[at + 1];
         if stage == 0 {
@@ -744,7 +778,7 @@ mod proofs {
 
     /// Whether `build` can write `bytes` for stages that are whole, decided from the layout alone,
     /// not from `parse`.
-    fn writable(bytes: &[u8; SET_PLAINTEXT_LEN]) -> bool {
+    fn writable(bytes: &[u8; PLAINTEXT_LEN]) -> bool {
         let primary = bytes[2];
         bytes[0] == 1
             && bytes[1] == 1
@@ -757,7 +791,7 @@ mod proofs {
     }
 
     /// Whether `bytes` would be writable with the byte at `offset` set to `value`.
-    fn with(bytes: &[u8; SET_PLAINTEXT_LEN], offset: usize, value: u8) -> bool {
+    fn with(bytes: &[u8; PLAINTEXT_LEN], offset: usize, value: u8) -> bool {
         let mut changed = *bytes;
         changed[offset] = value;
         writable(&changed)
@@ -767,7 +801,7 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(67)]
     fn parsing_a_set_accepts_exactly_what_building_can_write() {
-        let bytes: [u8; SET_PLAINTEXT_LEN] = kani::any();
+        let bytes: [u8; PLAINTEXT_LEN] = kani::any();
         let accepted = parse(&bytes).is_ok();
         kani::assert(
             accepted == writable(&bytes),
@@ -826,13 +860,21 @@ mod proofs {
         }
     }
 
-    fn any_whole_stages() -> Stages {
+    pub(crate) fn any_whole_stages() -> Stages {
         let stages = Stages {
             members: [any_stage(), any_stage(), any_stage()],
             primary: kani::any(),
             revision: kani::any(),
         };
-        kani::assume(stages.is_whole());
+        // The primary's stage named by position, not read through an index chosen at run time.
+        let [first, second, third] = stages.members;
+        let primary = match stages.primary {
+            0 => first,
+            1 => second,
+            2 => third,
+            _ => None,
+        };
+        kani::assume(primary == Some(Status::Enabled));
         stages
     }
 
@@ -860,7 +902,7 @@ mod proofs {
         };
         let stages = any_whole_stages();
         let keys = [any_key(), any_key(), any_key()];
-        let mut out: [u8; SET_PLAINTEXT_LEN] = kani::any();
+        let mut out: [u8; PLAINTEXT_LEN] = kani::any();
         build(&header, &stages, [&keys[0], &keys[1], &keys[2]], &mut out);
 
         kani::assert(
@@ -868,6 +910,10 @@ mod proofs {
             "the control bytes are written as the layout says",
         );
         kani::assert(out[3..19] == header.parent, "the parent is at its offset");
+        kani::assert(
+            parent_of(&out) == &header.parent,
+            "the parent is read from its offset",
+        );
         kani::assert(
             out[19..27] == header.epoch.to_le_bytes(),
             "the epoch is at its offset, least significant byte first",
@@ -945,7 +991,7 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(234)]
     fn a_parsed_set_builds_back_to_the_same_bytes() {
-        let bytes: [u8; SET_PLAINTEXT_LEN] = kani::any();
+        let bytes: [u8; PLAINTEXT_LEN] = kani::any();
         let Ok((header, stages, read_keys)) = parse(&bytes) else {
             return;
         };
@@ -956,7 +1002,7 @@ mod proofs {
                 key_bytes.load_into(key);
             }
         }
-        let mut out: [u8; SET_PLAINTEXT_LEN] = kani::any();
+        let mut out: [u8; PLAINTEXT_LEN] = kani::any();
         build(&header, &stages, [&keys[0], &keys[1], &keys[2]], &mut out);
         kani::assert(out == bytes, "a parsed set builds back to the same bytes");
 

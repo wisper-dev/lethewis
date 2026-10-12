@@ -16,8 +16,8 @@ Nothing is published while the version is below 0.1.0.
 - Documents: licence, security policy, contribution rules, code of conduct, threat model, proof
   register.
 - `lethewis-core`: keys held in slots whose memory the caller provides (`Slot`, `Slots`) and
-  referred to by handles (`Handle`). No call returns a key. A key is wiped when it is released, and
-  every key is wiped when its `Slots` is created or dropped.
+  referred to by handles (`Handle`). No call returns a key. The keys of a set are wiped when it is
+  released, and every key is wiped when its `Slots` is created or dropped.
 - Dependency: `zeroize` 1.9.0 or a later compatible version, without default features.
 - Dependencies: `hkdf` 0.13.0 and `sha2` 0.11.0 or later compatible versions, without default
   features and with the `zeroize` feature of `sha2`.
@@ -25,13 +25,10 @@ Nothing is published while the version is below 0.1.0.
 - Keys of 32 or 64 bytes: `Slots::import32`, `Slots::import64`, and `Slots::generate`, which
   writes a key straight into its slot from the platform's random source, given through the
   `Entropy` trait; the library's own code makes no copy of it. `KeyLength` names the two lengths.
-- Proofs with Kani 0.68.0 for the slots: a released key is wiped and its handle refused, after any
-  sequence of imports and releases of any length; creating a set wipes the keys left in its memory,
-  a handle from another set is refused, a release advances the generation, no call panics unless the
-  caller's random source does. Run on every change; see `docs/proofs.md`.
-- Proofs with Kani 0.68.0 for the plaintext layout of a key record: parsing accepts exactly the
-  bytes building can write, building puts every field at its offset, and each returns what the
-  other was given.
+- Proofs with Kani 0.68.0 for the slots: a released set is wiped and its handle refused, after any
+  sequence of imports and releases of any length; creating the slots wipes the keys left in their
+  memory, a release with a handle from other slots is refused, a release advances the generation, no
+  call panics unless the caller's random source does. Run on every change; see `docs/proofs.md`.
 - Proof with Kani 0.68.0 that the labels built for two key derivations which differ in key
   length, branch or output length are different.
 - `Purpose`: what a key may be used for, given when the key is loaded and never changed. One purpose
@@ -49,11 +46,17 @@ Nothing is published while the version is below 0.1.0.
   schedules is left there.
 - Dependencies: `aes-gcm-siv` 0.12.1, `aes` 0.9.3 and `polyval` 0.7.3 or later compatible versions,
   without default features and with their `zeroize` features.
-- `Slots::wrap` writes the key a handle refers to as a record of `RECORD_LEN` bytes, encrypted with
-  AES-256-GCM-SIV under a key derived from the parent key, bound to a context of 1 to 255 bytes;
-  `Slots::unwrap` loads it back into a free slot. A record holds the key's purpose and status and
-  the identifier of its parent. New errors: `RecordRejected` for any record that does not open,
-  parse or name its parent, `KeyDisabled`, `SameKey`, `InvalidContext`, `CipherFailed`.
+- Key sets: a slot holds a set of up to three keys, each enabled or disabled, one of them the
+  primary, with a revision counter. An import or a generation loads a set of one. `Slots::wrap`
+  writes the set a handle refers to as one record of `RECORD_LEN` bytes, 261, encrypted with
+  AES-256-GCM-SIV under a key derived from the primary key of the parent set, bound to a context of 1
+  to 255 bytes; `Slots::unwrap` loads it back into a free slot, trying every key of the parent set,
+  also after one has opened the record. A record holds the set's purpose, the stage of each key, the
+  primary and the revision, and the identifier of the parent key. New errors: `RecordRejected` for
+  any record that does not open, parse or name the key that opened it, `KeyDisabled` for a record
+  wrapped under a disabled key of the parent, `SameKey` for a set wrapped under itself,
+  `InvalidContext`, `CipherFailed`, and `DuplicateKey`: a key is held in one place only, and a load
+  of a key the slots already hold, or of a set that holds one key twice, is refused.
 - Dependency: `ctutils` 0.4.2 or a later compatible version, without default features, to compare
   a record's parent identifier in constant time.
 - The stack a wrap or an unwrap used is wiped after it, also when it fails: 24 KiB, or 64 KiB when
@@ -64,7 +67,7 @@ Nothing is published while the version is below 0.1.0.
   SHA-256, and check the wipe and the stack needed at every level of optimisation.
 - `lethewis-dit`: runs work with data-independent timing on, on aarch64 where Linux, Android or
   an Apple system reports the feature, and switches it back off when the work returns or unwinds.
-  The core runs each import, generation, wrap and unwrap of a key that way. It is the one crate
+  The core runs each import, generation, wrap and unwrap that way. It is the one crate
   with unsafe code: two instructions that read and write the mode, and the calls that ask the
   system about it.
 - Dependency of `lethewis-dit`: `libc` 0.2.190 or a later compatible version, without default
@@ -76,15 +79,17 @@ Nothing is published while the version is below 0.1.0.
   position of the primary and a revision counter, and for the stages of its keys: from any set whose
   primary is enabled, every transition keeps it so, counts one revision and changes only what it
   names, and a transition out of order is refused and changes nothing.
-- A test unwraps random records sealed with the real derivation and cipher: random keys,
-  plaintexts, contexts, slots and changed bits; a million of them from a new seed on every pull
-  request.
+- A test unwraps random records sealed with the real derivation and cipher: random sets, parent sets
+  of one to three keys, keys held elsewhere, contexts, slots and changed bits; a million of them from
+  a new seed on every pull request.
 - A build step checks that the machine code of the comparison of key identifiers runs straight
   through on x86-64, aarch64, Cortex-M4 and WebAssembly: no branch, no call and no write of the
   program counter but the final return.
 - Proofs with Kani 0.68.0 for wrapping and unwrapping, with a model of the cipher: a wrap changes no
-  slot and writes the record only when it succeeds; a refused unwrap changes no slot; a decrypted
-  record loads exactly the key it holds, only when it names the parent.
+  slot and writes the record only when it succeeds; an unwrap tries every key of the parent once and
+  keeps the plaintext of the first that opens the record and is named in it; a refused unwrap
+  changes no slot; a decrypted set loads exactly the keys it holds, only when none is held already
+  or twice.
 - Proofs with Kani 0.68.0 for the code around the cipher of the key records: a seal that fails, and
   a record that does not open, leave the buffer zero, and a record is refused exactly when the
   cipher rejects it.

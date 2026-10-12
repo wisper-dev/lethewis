@@ -7,25 +7,28 @@ use core::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-    /// Every slot holds a key or is out of use.
+    /// Every slot holds a key set or is out of use.
     NoFreeSlot,
-    /// The handle does not refer to a key held now.
+    /// The handle does not refer to a key set held now.
     StaleHandle,
     /// The source of random bytes failed.
     EntropyFailed,
     /// A value could not be derived from a key.
     DerivationFailed,
-    /// The record does not open with this key and context, holds a plaintext this version of the
-    /// library cannot read, or names another key as the one it is wrapped with.
+    /// The record does not open with a key of the parent set and this context, holds a plaintext
+    /// this version of the library cannot read, or names a key other than the one that opens it.
     RecordRejected,
-    /// The key is disabled and cannot wrap or unwrap.
+    /// The record opens only with a disabled key, and a disabled key unwraps nothing.
     KeyDisabled,
-    /// A key cannot wrap itself.
+    /// A key set cannot wrap itself.
     SameKey,
     /// The context is empty or longer than 255 bytes.
     InvalidContext,
     /// The cipher gave a known input a wrong answer or refused the input, so nothing was written.
     CipherFailed,
+    /// A key of the set is held here already, or the set holds one key twice: a key is held in one
+    /// place only.
+    DuplicateKey,
 }
 
 impl fmt::Display for Error {
@@ -37,9 +40,10 @@ impl fmt::Display for Error {
             Self::DerivationFailed => "key derivation failed",
             Self::RecordRejected => "record rejected",
             Self::KeyDisabled => "key disabled",
-            Self::SameKey => "a key cannot wrap itself",
+            Self::SameKey => "a key set cannot wrap itself",
             Self::InvalidContext => "invalid context",
             Self::CipherFailed => "cipher failed",
+            Self::DuplicateKey => "duplicate key",
         })
     }
 }
@@ -62,8 +66,9 @@ mod tests {
         assert_eq!(Error::DerivationFailed.to_string(), "key derivation failed");
         assert_eq!(Error::RecordRejected.to_string(), "record rejected");
         assert_eq!(Error::KeyDisabled.to_string(), "key disabled");
-        assert_eq!(Error::SameKey.to_string(), "a key cannot wrap itself");
+        assert_eq!(Error::SameKey.to_string(), "a key set cannot wrap itself");
         assert_eq!(Error::InvalidContext.to_string(), "invalid context");
         assert_eq!(Error::CipherFailed.to_string(), "cipher failed");
+        assert_eq!(Error::DuplicateKey.to_string(), "duplicate key");
     }
 }
