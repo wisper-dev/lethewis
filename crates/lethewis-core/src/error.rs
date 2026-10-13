@@ -37,6 +37,16 @@ pub enum Error {
     WrongStage,
     /// The set has changed as many times as its counter holds.
     SetExhausted,
+    /// The set has changed in this epoch, and only a new epoch saves the change.
+    Unsaved,
+    /// A change to the next epoch has begun already.
+    EpochChanging,
+    /// No change to the next epoch has begun.
+    NoEpochChange,
+    /// This is the last epoch the counter holds.
+    EpochExhausted,
+    /// The platform did not switch the root of the epoch.
+    RootFailed,
 }
 
 impl From<crate::keyset::Refused> for Error {
@@ -68,6 +78,11 @@ impl fmt::Display for Error {
             Self::PrimaryKey => "primary key",
             Self::WrongStage => "wrong stage",
             Self::SetExhausted => "key set exhausted",
+            Self::Unsaved => "unsaved change",
+            Self::EpochChanging => "epoch change under way",
+            Self::NoEpochChange => "no epoch change",
+            Self::EpochExhausted => "epochs exhausted",
+            Self::RootFailed => "root not switched",
         })
     }
 }
@@ -98,5 +113,10 @@ mod tests {
         assert_eq!(Error::PrimaryKey.to_string(), "primary key");
         assert_eq!(Error::WrongStage.to_string(), "wrong stage");
         assert_eq!(Error::SetExhausted.to_string(), "key set exhausted");
+        assert_eq!(Error::Unsaved.to_string(), "unsaved change");
+        assert_eq!(Error::EpochChanging.to_string(), "epoch change under way");
+        assert_eq!(Error::NoEpochChange.to_string(), "no epoch change");
+        assert_eq!(Error::EpochExhausted.to_string(), "epochs exhausted");
+        assert_eq!(Error::RootFailed.to_string(), "root not switched");
     }
 }

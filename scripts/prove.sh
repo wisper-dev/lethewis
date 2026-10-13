@@ -7,6 +7,7 @@
 #   prove.sh             runs every proof, two at a time or LETHEWIS_PROOF_JOBS, then judges them
 #   prove.sh list        writes the declared proofs and prints their names as a JSON array
 #   prove.sh run PROOF   runs one proof; its results go to target/proofs/runs/
+#   prove.sh part K N    runs the K-th of N parts of the proofs, for N machines at once
 #   prove.sh judge       judges the results in target/proofs/runs/ against the declared proofs
 #   prove.sh agree       compares, on a few proofs, Kani's own results with how a run reads them
 #   prove.sh sources     prints a digest of Kani and of every file but the documents; a run
@@ -173,6 +174,22 @@ prove_all() {
     exit 1
   fi
   judge
+}
+
+# Every N-th declared proof, from the K-th on, in the order of their names.
+prove_part() {
+  local part=$1 parts=$2
+  if ! [[ $part =~ ^[1-9][0-9]*$ && $parts =~ ^[1-9][0-9]*$ ]] || ((part > parts)); then
+    echo "usage: prove.sh part K N, with 1 <= K <= N" >&2
+    exit 2
+  fi
+  rm -rf "$runs"
+  declare_proofs
+  jq -r --argjson part "$part" --argjson parts "$parts" '
+    [.["standard-harnesses"][]?[]] | sort | to_entries[]
+    | select(.key % $parts == $part - 1) | .value' "$out/declared.json" |
+    xargs -r -d '\n' -n 1 -P "${LETHEWIS_PROOF_JOBS:-2}" --process-slot-var=PROVE_SLOT \
+      scripts/prove.sh run
 }
 
 judge() {
@@ -344,11 +361,15 @@ case "${1:-}" in
     [ $# -eq 2 ] || { echo "usage: prove.sh run PROOF" >&2; exit 2; }
     run_proof "$2"
     ;;
+  part)
+    [ $# -eq 3 ] || { echo "usage: prove.sh part K N" >&2; exit 2; }
+    prove_part "$2" "$3"
+    ;;
   judge) judge ;;
   agree) agree ;;
   sources) sources ;;
   *)
-    echo "usage: prove.sh [list | run PROOF | judge | agree | sources]" >&2
+    echo "usage: prove.sh [list | run PROOF | part K N | judge | agree | sources]" >&2
     exit 2
     ;;
 esac

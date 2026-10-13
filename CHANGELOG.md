@@ -107,5 +107,14 @@ Nothing is published while the version is below 0.1.0.
 - A proof run reads its results from CBMC's own output. On every run the reading is compared with
   Kani's results on a proof with every outcome, failures among them, and on two of the library's
   proofs. A proof is limited to 10 minutes.
+- Epochs. `Slots::new` takes memory for the epoch from the caller (`Epoch`), and the number and
+  key of the current epoch. A record is wrapped under a key derived from its parent's key and the
+  key of its epoch, whose number it names; a record of another epoch is refused.
+- A set changes once in an epoch, and the change is saved by wrapping the set in the next:
+  `Slots::begin_epoch`, then `Slots::commit_epoch` or `Slots::abandon_epoch`; no set changes in
+  between. The platform switches and erases roots through the `Root` trait, and both calls return
+  how surely a root is erased (`Erasure`).
+- New errors: `Unsaved`, `EpochChanging`, `NoEpochChange`, `EpochExhausted` and `RootFailed`.
+- Proofs with Kani 0.68.0 for the change of epoch and for the refusals of an unsaved set.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

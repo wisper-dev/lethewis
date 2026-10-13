@@ -42,6 +42,7 @@ use {aes as _, polyval as _};
 
 mod derive;
 mod entropy;
+mod epoch;
 mod error;
 mod key;
 mod keyset;
@@ -53,6 +54,7 @@ mod seal;
 mod slots;
 
 pub use entropy::{Entropy, EntropyError};
+pub use epoch::{Epoch, Erasure, Root, RootFailed};
 pub use error::Error;
 pub use key::KeyLength;
 pub use keyset::Position;

@@ -10,9 +10,8 @@ use crate::key::{Key, KeyLength, wipe};
 use crate::record::{ID_LEN, Purpose, length_to_byte};
 use crate::seal::KEY_LEN as CIPHER_KEY_LEN;
 
-/// The salt of every derivation.
-#[cfg(not(kani))]
-const SALT: &[u8] = b"lethewis derivation salt v1";
+/// The salt of the derivation of an identifier.
+pub(crate) const SALT: &[u8] = b"lethewis derivation salt v1";
 /// The first bytes of every label.
 const PREFIX: &[u8; 8] = b"lethewis";
 const VERSION: u8 = 1;
@@ -108,30 +107,34 @@ pub(crate) fn derive_key_id(
     purpose: Purpose,
     id: &mut KeyId,
 ) -> Result<(), DerivationFailed> {
-    derive(key, purpose, Branch::KeyId, &mut id.0)
+    derive(key, SALT, purpose, Branch::KeyId, &mut id.0)
 }
 
-/// Derives the key that encrypts the records `key`, which serves `purpose`, wraps.
+/// Derives the key that encrypts the records `key`, which serves `purpose`, wraps in the epoch whose
+/// key is `epoch`.
 pub(crate) fn derive_wrap_key(
     key: &Key,
+    epoch: &Key,
     purpose: Purpose,
     out: &mut [u8; CIPHER_KEY_LEN],
 ) -> Result<(), DerivationFailed> {
-    derive(key, purpose, Branch::WrapKey, out)
+    let salt = epoch.material().ok_or(DerivationFailed)?;
+    derive(key, salt, purpose, Branch::WrapKey, out)
 }
 
 /// Fills `out` with the value of `branch` derived from `key`, which serves `purpose`. The key goes
-/// through HKDF-Extract with a fixed salt, and HKDF-Expand takes the label. Then the stack the
-/// derivation used is wiped, whether it succeeded or not.
+/// through HKDF-Extract with `salt`, and HKDF-Expand takes the label. Then the stack the derivation
+/// used is wiped, whether it succeeded or not.
 pub(crate) fn derive(
     key: &Key,
+    salt: &[u8],
     purpose: Purpose,
     branch: Branch,
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
     #[cfg(test)]
     timing::note();
-    let derived = derive_on_stack(key, purpose, branch, out);
+    let derived = derive_on_stack(key, salt, purpose, branch, out);
     wipe_stack();
     derived
 }
@@ -177,6 +180,7 @@ pub(crate) fn wipe_cipher_stack() {
 #[inline(never)]
 fn derive_on_stack(
     key: &Key,
+    salt: &[u8],
     purpose: Purpose,
     branch: Branch,
     out: &mut [u8],
@@ -184,12 +188,12 @@ fn derive_on_stack(
     let (label, used) = label(purpose, key.length(), branch, out.len())?;
     let info = label.get(..used).ok_or(DerivationFailed)?;
     let material = key.material().ok_or(DerivationFailed)?;
-    hkdf(material, info, out)
+    hkdf(salt, material, info, out)
 }
 
 #[cfg(not(kani))]
-fn hkdf(material: &[u8], info: &[u8], out: &mut [u8]) -> Result<(), DerivationFailed> {
-    Hkdf::<Sha256>::new(Some(SALT), material)
+fn hkdf(salt: &[u8], material: &[u8], info: &[u8], out: &mut [u8]) -> Result<(), DerivationFailed> {
+    Hkdf::<Sha256>::new(Some(salt), material)
         .expand(info, out)
         .map_err(|_| DerivationFailed)
 }
@@ -212,6 +216,7 @@ pub(crate) mod stack {
     use sha2::{Digest, Sha256, block_api::compress256};
 
     use super::{Branch, SALT, STACK_WIPE, derive, derive_on_stack, label};
+    use crate::epoch::Epoch;
     use crate::key::{
         Key, KeyLength,
         tests::{Counting, counted},
@@ -399,16 +404,21 @@ pub(crate) mod stack {
     /// Expand, the inner hash; the message schedules of every secret block; and the first output
     /// block. Of an identifier, which the caller asks for, the plain bytes past its first byte only
     /// are counted, so that the identifier itself is not.
-    pub(crate) fn secrets(key: &[u8], length: KeyLength, branch: Branch) -> Vec<Vec<u8>> {
+    pub(crate) fn secrets(
+        key: &[u8],
+        salt: &[u8],
+        length: KeyLength,
+        branch: Branch,
+    ) -> Vec<Vec<u8>> {
         let key = &key[..length.bytes()];
         let out_len = if branch == Branch::KeyId { 16 } else { 32 };
         let (label, used) = label(Purpose::Wrap, length, branch, out_len).unwrap();
         let info = &label[..used];
-        let (prk, expander) = Hkdf::<Sha256>::extract(Some(SALT), key);
+        let (prk, expander) = Hkdf::<Sha256>::extract(Some(salt), key);
         let mut output = [0; 32];
         expander.expand(info, &mut output).unwrap();
 
-        let salt_inner = key_block(SALT, 0x36);
+        let salt_inner = key_block(salt, 0x36);
         let key_block_of_message: [u8; 64] = match length {
             KeyLength::Bytes32 => final_block(key),
             _ => key.try_into().unwrap(),
@@ -426,6 +436,12 @@ pub(crate) mod stack {
             .finalize();
 
         let mut secrets = std::vec![key.to_vec(), output[1..].to_vec()];
+        // The salt of a wrap key is the key of an epoch.
+        if branch == Branch::WrapKey {
+            secrets.push(salt.to_vec());
+            secrets.extend(state_forms(state_after(&[salt_inner])));
+            secrets.extend(block_forms(&salt_inner));
+        }
         secrets.extend(hash_forms(&prk));
         // Every form of the output but, for an identifier, the plain one, whose first 16 bytes are
         // the identifier.
@@ -461,8 +477,8 @@ pub(crate) mod stack {
     fn pieces(key: &[u8], length: KeyLength) -> Vec<Vec<u8>> {
         let other: [u8; 64] = core::array::from_fn(|i| key[i] ^ 0xff);
         key_dependent(
-            &secrets(key, length, Branch::KeyId),
-            &secrets(&other, length, Branch::KeyId),
+            &secrets(key, SALT, length, Branch::KeyId),
+            &secrets(&other, SALT, length, Branch::KeyId),
         )
     }
 
@@ -479,7 +495,7 @@ pub(crate) mod stack {
         let key = loaded_key();
         let range = below_pad(false, || {
             let mut id = [0; 16];
-            derive_on_stack(&key, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
+            derive_on_stack(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
             black_box(&id);
         });
         assert!(residue(range, &pieces) > 0);
@@ -490,7 +506,7 @@ pub(crate) mod stack {
         let key = loaded_key();
         assert_clean(&pieces(&key_bytes(), KeyLength::Bytes64), || {
             let mut id = [0; 16];
-            derive(&key, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
+            derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
             black_box(&id);
         });
     }
@@ -502,13 +518,13 @@ pub(crate) mod stack {
         let key = loaded_key();
         let unwiped = below_pad(false, || {
             let mut out = [0; 8161];
-            assert!(derive_on_stack(&key, Purpose::Wrap, Branch::KeyId, &mut out).is_err());
+            assert!(derive_on_stack(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut out).is_err());
             black_box(&out);
         });
         assert!(residue(unwiped, &pieces) > 0);
         assert_clean(&pieces, || {
             let mut out = [0; 8161];
-            assert!(derive(&key, Purpose::Wrap, Branch::KeyId, &mut out).is_err());
+            assert!(derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut out).is_err());
             black_box(&out);
         });
     }
@@ -516,7 +532,8 @@ pub(crate) mod stack {
     #[test]
     fn importing_a_key_leaves_no_residue() {
         let mut memory = [const { Slot::empty() }; 2];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, 1, &mut [9; 32]);
         let mut long = key_bytes();
         assert_clean(&pieces(&key_bytes(), KeyLength::Bytes64), || {
             slots.import64(Purpose::Wrap, &mut long).unwrap();
@@ -530,12 +547,14 @@ pub(crate) mod stack {
     #[test]
     fn adding_a_key_leaves_no_residue() {
         let mut memory = [const { Slot::empty() }; 2];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, 1, &mut [9; 32]);
         let set = slots.import32(Purpose::Wrap, &mut [3; 32]).unwrap();
         let mut long = key_bytes();
         assert_clean(&pieces(&key_bytes(), KeyLength::Bytes64), || {
             slots.add64(set, &mut long).unwrap();
         });
+        slots.settle();
         let mut short: [u8; 32] = key_bytes()[..32].try_into().unwrap();
         assert_clean(&pieces(&key_bytes(), KeyLength::Bytes32), || {
             slots.add32(set, &mut short).unwrap();
@@ -545,20 +564,23 @@ pub(crate) mod stack {
     #[test]
     fn adding_a_generated_key_leaves_no_residue() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, 1, &mut [9; 32]);
         let set = slots.import32(Purpose::Wrap, &mut [3; 32]).unwrap();
         let counted = counted::<64>();
         for length in [KeyLength::Bytes64, KeyLength::Bytes32] {
             assert_clean(&pieces(&counted, length), || {
                 slots.add_generated(set, length, &mut Counting).unwrap();
             });
+            slots.settle();
         }
     }
 
     #[test]
     fn generating_a_key_leaves_no_residue() {
         let mut memory = [const { Slot::empty() }; 2];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, 1, &mut [9; 32]);
         let counted = counted::<64>();
         for length in [KeyLength::Bytes64, KeyLength::Bytes32] {
             assert_clean(&pieces(&counted, length), || {
@@ -575,7 +597,7 @@ pub(crate) mod stack {
         let key = loaded_key();
         let wiped = depth_changed(|| {
             let mut id = [0; 16];
-            derive(&key, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
+            derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
             black_box(&id);
         });
         assert!(wiped >= STACK_WIPE, "{wiped} bytes wiped");
@@ -587,7 +609,7 @@ pub(crate) mod stack {
         let key = loaded_key();
         let used = depth_changed(|| {
             let mut id = [0; 16];
-            derive_on_stack(&key, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
+            derive_on_stack(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
             black_box(&id);
         });
         std::println!("a derivation uses {used} bytes of stack");
@@ -617,10 +639,12 @@ pub(crate) mod model {
 
     /// HKDF-SHA-256 is beyond Kani. The model fails at will, after writing into `out`, and records
     /// whether it failed; otherwise `out` takes the first bytes of the key, or zeros for a key
-    /// shorter than `out`, with the key's length and the label folded in, so equal inputs give equal outputs, and the output depends on those
-    /// bytes, that length and the label. Folding every byte of the key would be too slow for the
-    /// solver; that HKDF uses the whole key and the output length, the unit tests check.
+    /// shorter than `out`, with the key's length, the label and the first bytes of the salt folded
+    /// in, so equal inputs give equal outputs, and the output depends on those bytes, that length
+    /// and the label. Folding every byte of the key would be too slow for the solver; that HKDF
+    /// uses the whole key and the output length, the unit tests check.
     pub(super) fn hkdf(
+        salt: &[u8],
         material: &[u8],
         info: &[u8],
         out: &mut [u8],
@@ -635,7 +659,7 @@ pub(crate) mod model {
             out.fill(0xa5);
             return Err(DerivationFailed);
         }
-        fold(material, info, out);
+        fold(salt, material, info, out);
         Ok(())
     }
 
@@ -652,7 +676,7 @@ pub(crate) mod model {
     // Never indexing: a path that never derives would leave a check unreached. Copies have lengths
     // known at each call: Kani 0.68.0 reads stale bytes in a slice copy of unknown length. The two
     // lengths derived are folded as numbers: byte by byte costs the proofs many times more.
-    pub(crate) fn fold(material: &[u8], info: &[u8], out: &mut [u8]) {
+    pub(crate) fn fold(salt: &[u8], material: &[u8], info: &[u8], out: &mut [u8]) {
         let mut label = [0; 32];
         if let Some(to) = label.get_mut(..info.len()) {
             to.copy_from_slice(info);
@@ -666,9 +690,14 @@ pub(crate) mod model {
                 (u128::from_ne_bytes(*low), high)
             });
         let head = |bytes: &[u8; 16]| u128::from_ne_bytes(*bytes);
+        let salt_low = salt.first_chunk::<16>().map_or(0, head);
+        let salt_high = salt
+            .get(16..)
+            .and_then(<[u8]>::first_chunk::<16>)
+            .map_or(0, head);
         if let Ok(out) = <&mut [u8; 16]>::try_from(&mut *out) {
             let key = material.first_chunk::<16>().map_or(0, head);
-            *out = (key ^ low ^ high).to_ne_bytes();
+            *out = (key ^ low ^ high ^ salt_low).to_ne_bytes();
         } else if let Ok(out) = <&mut [u8; 32]>::try_from(&mut *out) {
             let (first, second) = material
                 .first_chunk::<32>()
@@ -677,8 +706,8 @@ pub(crate) mod model {
                     (head(first), second.first_chunk::<16>().map_or(0, head))
                 });
             if let Some((to_first, to_second)) = out.split_first_chunk_mut::<16>() {
-                *to_first = (first ^ low).to_ne_bytes();
-                to_second.copy_from_slice(&(second ^ high).to_ne_bytes());
+                *to_first = (first ^ low ^ salt_low).to_ne_bytes();
+                to_second.copy_from_slice(&(second ^ high ^ salt_high).to_ne_bytes());
             }
         } else {
             match material.get(..out.len()) {
@@ -776,7 +805,9 @@ mod tests {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
-    use super::{Branch, DerivationFailed, KEY_ID, KeyId, WRAP_KEY, derive, derive_key_id, label};
+    use super::{
+        Branch, DerivationFailed, KEY_ID, KeyId, SALT, WRAP_KEY, derive, derive_key_id, label,
+    };
     use crate::key::{Key, KeyLength};
     use crate::record::Purpose;
 
@@ -860,7 +891,7 @@ mod tests {
         for (length, length_byte) in [(KeyLength::Bytes32, 32_u8), (KeyLength::Bytes64, 64)] {
             let key = counted_key(length);
             let mut ours = [0; 16];
-            derive(&key, Purpose::Wrap, Branch::KeyId, &mut ours).unwrap();
+            derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut ours).unwrap();
 
             let ikm: [u8; 64] = core::array::from_fn(|i| u8::try_from(i).unwrap());
             let ikm = &ikm[..usize::from(length_byte)];
@@ -904,7 +935,7 @@ mod tests {
         for (length, branch, expected) in cases {
             let mut out = [0; 32];
             let out = &mut out[..expected.len().checked_div(2).unwrap()];
-            derive(&counted_key(length), Purpose::Wrap, branch, out).unwrap();
+            derive(&counted_key(length), SALT, Purpose::Wrap, branch, out).unwrap();
             assert_eq!(hex(out), expected, "{length:?} {branch:?}");
         }
     }
@@ -916,9 +947,9 @@ mod tests {
         let mut id = [0; 32];
         let mut wrap = [0; 32];
         let mut short = [0; 16];
-        derive(&key, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
-        derive(&key, Purpose::Wrap, Branch::WrapKey, &mut wrap).unwrap();
-        derive(&key, Purpose::Wrap, Branch::KeyId, &mut short).unwrap();
+        derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
+        derive(&key, SALT, Purpose::Wrap, Branch::WrapKey, &mut wrap).unwrap();
+        derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut short).unwrap();
         assert_ne!(id, wrap);
         assert_ne!(id[..16], short);
     }
@@ -936,8 +967,8 @@ mod tests {
         long.load64(&mut padded);
         let mut from_short = [0; 16];
         let mut from_long = [0; 16];
-        derive(&short, Purpose::Wrap, Branch::KeyId, &mut from_short).unwrap();
-        derive(&long, Purpose::Wrap, Branch::KeyId, &mut from_long).unwrap();
+        derive(&short, SALT, Purpose::Wrap, Branch::KeyId, &mut from_short).unwrap();
+        derive(&long, SALT, Purpose::Wrap, Branch::KeyId, &mut from_long).unwrap();
         assert_ne!(from_short, from_long);
     }
 
@@ -976,10 +1007,10 @@ mod tests {
     #[test]
     fn an_output_longer_than_hkdf_gives_is_refused() {
         let key = counted_key(KeyLength::Bytes32);
-        assert!(derive(&key, Purpose::Wrap, Branch::KeyId, &mut [0; 8160]).is_ok());
+        assert!(derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut [0; 8160]).is_ok());
         let mut out = [9; 8161];
         assert_eq!(
-            derive(&key, Purpose::Wrap, Branch::KeyId, &mut out),
+            derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut out),
             Err(DerivationFailed)
         );
         assert!(out.iter().all(|&byte| byte == 9));
@@ -997,7 +1028,7 @@ mod tests {
 #[cfg(kani)]
 #[coverage(on)]
 pub(crate) mod proofs {
-    use super::{Branch, CIPHER_KEY_LEN, label, model::fold};
+    use super::{Branch, CIPHER_KEY_LEN, SALT, label, model::fold};
     use crate::key::KeyLength;
     use crate::record::{ID_LEN, Purpose};
 
@@ -1010,21 +1041,22 @@ pub(crate) mod proofs {
     ) -> [u8; ID_LEN] {
         let mut id = [0; ID_LEN];
         let _ = label(purpose, length, Branch::KeyId, ID_LEN).map(|(label, used)| {
-            fold(&key[..length.bytes()], &label[..used], &mut id);
+            fold(SALT, &key[..length.bytes()], &label[..used], &mut id);
         });
         id
     }
 
-    /// The key the model of HKDF gives a record's cipher from the first `length` bytes of `key`,
-    /// worked out in the same way.
+    /// The key the model of HKDF gives a record's cipher from the first `length` bytes of `key` in
+    /// the epoch whose key is `epoch`, worked out in the same way.
     pub(crate) fn expected_wrap_key(
         key: &[u8; 64],
         length: KeyLength,
+        epoch: &[u8; 32],
         purpose: Purpose,
     ) -> [u8; CIPHER_KEY_LEN] {
         let mut out = [0; CIPHER_KEY_LEN];
         let _ = label(purpose, length, Branch::WrapKey, CIPHER_KEY_LEN).map(|(label, used)| {
-            fold(&key[..length.bytes()], &label[..used], &mut out);
+            fold(epoch, &key[..length.bytes()], &label[..used], &mut out);
         });
         out
     }

@@ -550,13 +550,17 @@ jobs:
             exit 1
           fi
 
-  proofs:
-    name: Proofs hold
+  proof-parts:
+    name: Proofs, part ${{ matrix.part }} of 3
     needs: lockfile
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     # A proof that grows past its budget fails the job rather than slowing every pull request.
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3]
     permissions:
       contents: read
     steps:
@@ -572,24 +576,73 @@ jobs:
         run: scripts/install-kani.sh
 
       - name: The results are read as Kani reads them
+        if: matrix.part == 1
         run: scripts/prove.sh agree
 
-      - name: Every proof holds and every cover property is reached
+      - name: Every proof of this part runs
         # One per processor of the runner: none needs more than 3 GB of its 16.
         env:
           LETHEWIS_PROOF_JOBS: 4
-        run: scripts/prove.sh
+          PART: ${{ matrix.part }}
+        run: scripts/prove.sh part "$PART" 3
+
+      - name: Keep the results
+        # Also after a failed proof, whose results explain it.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: proofs-part-${{ matrix.part }}
+          path: target/proofs/runs/
+          if-no-files-found: warn
+          # A job run again replaces its results.
+          overwrite: true
+
+  proofs:
+    name: Proofs hold
+    needs: proof-parts
+    # Runs after a failed or cancelled part too: a required check that is skipped counts as passed.
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Every part ran to the end
+        if: needs.proof-parts.result != 'success'
+        env:
+          RESULT: ${{ needs.proof-parts.result }}
+        run: |
+          echo "prove: a part of the proofs did not succeed: $RESULT" >&2
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install Kani
+        run: scripts/install-kani.sh
+
+      - name: The results of every part
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: proofs-part-*
+          path: target/proofs/runs/
+          merge-multiple: true
+
+      - name: Every proof holds and every cover property is reached
+        run: |
+          scripts/prove.sh list >/dev/null
+          scripts/prove.sh judge
 
       - name: Keep the results and the manifest
-        # Also after a failed proof, whose results explain it; a missing directory means Kani never
-        # ran, which the failed step above already reports.
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: proofs
-          path: |
-            target/proofs/
-            !target/proofs/slot-*/
+          path: target/proofs/
           if-no-files-found: warn
 
   reproducible:

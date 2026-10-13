@@ -23,14 +23,10 @@ attempt passwords. No knowledge of the password.
 target device, and have the hardware element wrap the master key, confining attempts to that one
 device. After destruction, no call returns the key.
 
-**Not defended.** A device unlocked at least once since boot holds keys in memory, and a lock screen
-does not change that. On a large share of Android devices there is no dedicated secure element, and
-the password can then be attacked off the device on fast hardware, where a short secret falls
-quickly. Our figure for that share is an estimate rather than a measurement. A record replaced by an
-older record of the same place opens: the epoch a record holds is written as zero and not checked,
-and neither is the revision of a key set.
-The library is intended to record which level was actually reached rather than assume the better
-one.
+**Not defended.** A device unlocked once since boot holds keys in memory, lock screen or not. Many
+Android devices lack a dedicated secure element, so the password can be attacked off the device on
+fast hardware, where a short secret falls quickly; their share is our estimate. The library is
+intended to record the level actually reached.
 
 ### 2. Someone who compels the password
 
@@ -50,9 +46,16 @@ some jurisdictions using it is itself an offence.
 
 **Capability.** Desoldering, reading raw flash, recovering superseded writes.
 
-**Not defended, at all.** Deleting a key file is "most likely gone", never "certainly gone": flash is
-not overwritten in place, and traces of earlier writes remain below the level any application can
-reach.
+**In place, in the library.** A record is wrapped under a key derived from its epoch's key, and a
+key set's change is saved only in a new epoch. Once the platform erases the old root, a record left
+on flash from an earlier epoch no longer opens, even with the password; the commit reports how
+surely it was erased.
+
+**Intended.** A platform layer whose root the hardware erases.
+
+**Not defended.** Whether a chip really erases its key cannot be checked from outside. On a device
+without an erasable root, old records stay readable to whoever holds the password and the flash, and
+so they do if a platform gives two epochs the same key.
 
 ### 4. An attacker on the same device
 
@@ -87,9 +90,9 @@ what the record decrypts to. The wipe on release and on creating the slots, and 
 released or foreign handle, are proven for two slots; the statements and their limits are in
 [proofs.md](proofs.md).
 
-A key is added to a set enabled, and only a disabled key that is not the primary is destroyed. A
-destroyed key is wiped with its identifier, and a record of its set wrapped afterwards does not hold
-it. A record wrapped before the destruction still does.
+A key is added enabled, and only a disabled key other than the primary is destroyed, wiped with its
+identifier. A record of its set wrapped afterwards does not hold it; one wrapped before still does,
+and opens until the next epoch is committed, then only while the platform keeps the old root.
 
 **Intended.** Drop keys from memory when the device locks.
 

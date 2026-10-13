@@ -6,6 +6,7 @@ use core::{fmt, marker::PhantomData};
 use crate::{
     derive::{KeyId, derive_key_id, derive_wrap_key, wipe_cipher_stack, wipe_stack},
     entropy::{Entropy, EntropyError},
+    epoch::{Epoch, Erasure, Root, RootFailed},
     error::Error,
     key::{Key, KeyBytes, KeyLength, wipe},
     keyset::{self, Header, MEMBERS, Position, Refused, Stages},
@@ -25,6 +26,10 @@ pub struct Slot {
     purpose: Purpose,
     generation: u64,
     occupancy: Occupancy,
+    /// The set has changed in this epoch.
+    changed: bool,
+    /// The set is wrapped in the next epoch, and has not changed since.
+    sealed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +51,8 @@ impl Slot {
             purpose: Purpose::Wrap,
             generation: 0,
             occupancy: Occupancy::Free,
+            changed: false,
+            sealed: false,
         }
     }
 
@@ -64,6 +71,8 @@ impl Slot {
 
     fn unload(&mut self) {
         self.wipe_keys();
+        self.changed = false;
+        self.sealed = false;
         match self.generation.checked_add(1) {
             Some(next) => {
                 self.generation = next;
@@ -121,15 +130,16 @@ impl fmt::Debug for Slot {
 /// Refers to a key set held in [`Slots`].
 ///
 /// A handle works only with the `Slots` that issued it, stops working when its set is released,
-/// and cannot outlive the memory of its slots. It may outlive the `Slots` itself:
+/// and cannot outlive the memory of its slots and epoch. It may outlive the `Slots` itself:
 ///
 /// ```
-/// use lethewis_core::{Purpose, Slot, Slots};
+/// use lethewis_core::{Epoch, Purpose, Slot, Slots};
 ///
 /// let mut memory = [const { Slot::empty() }; 1];
+/// let mut epoch = Epoch::empty();
 /// let handle;
 /// {
-///     let mut slots = Slots::new(&mut memory);
+///     let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut [9; 32]);
 ///     handle = slots.import32(Purpose::Wrap, &mut [7; 32])?;
 /// }
 /// let _ = handle;
@@ -139,12 +149,13 @@ impl fmt::Debug for Slot {
 /// The same code with the memory gone before the handle does not compile:
 ///
 /// ```compile_fail
-/// use lethewis_core::{Purpose, Slot, Slots};
+/// use lethewis_core::{Epoch, Purpose, Slot, Slots};
 ///
 /// let handle;
 /// {
 ///     let mut memory = [const { Slot::empty() }; 1];
-///     let mut slots = Slots::new(&mut memory);
+///     let mut epoch = Epoch::empty();
+///     let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut [9; 32]);
 ///     handle = slots.import32(Purpose::Wrap, &mut [7; 32])?;
 /// }
 /// let _ = handle;
@@ -168,15 +179,18 @@ impl fmt::Debug for Handle<'_> {
 ///
 /// A key goes in, and only a handle to its set comes out: no call returns a key itself. A key is
 /// held in one place only: a load that would hold a key these slots already hold is refused.
-/// Creating and dropping `Slots` wipes every key in its slots. A `Slots` leaked instead of dropped,
-/// for example through [`core::mem::forget`], [`core::mem::ManuallyDrop`] or `Box::leak`, skips that
-/// wipe, and its keys stay in memory until the next `Slots` over the same memory.
+/// Creating and dropping `Slots` wipes every key in its slots and its epoch, and dropping it
+/// discards every change no epoch has saved; a change of epoch under way is to be abandoned first,
+/// so that its root is erased. A `Slots` leaked instead of dropped, for example through
+/// [`core::mem::forget`], [`core::mem::ManuallyDrop`] or `Box::leak`, skips that wipe, and its keys
+/// stay in memory until the next `Slots` over the same memory.
 ///
 /// ```
-/// use lethewis_core::{Purpose, Slot, Slots};
+/// use lethewis_core::{Epoch, Purpose, Slot, Slots};
 ///
 /// let mut memory = [const { Slot::empty() }; 4];
-/// let mut slots = Slots::new(&mut memory);
+/// let mut epoch = Epoch::empty();
+/// let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut [9; 32]);
 ///
 /// let mut secret = [7; 32];
 /// let handle = slots.import32(Purpose::Wrap, &mut secret)?;
@@ -186,7 +200,8 @@ impl fmt::Debug for Handle<'_> {
 /// # Ok::<(), lethewis_core::Error>(())
 /// ```
 pub struct Slots<'a> {
-    slots: &'a mut [Slot],
+    memory: &'a mut [Slot],
+    epoch: &'a mut Epoch,
 }
 
 /// What opens a sealed plaintext: AES-256-GCM-SIV, or a model of it in the proofs.
@@ -213,10 +228,23 @@ impl<F> Open for F where
 }
 
 impl<'a> Slots<'a> {
-    /// Keeps key sets in `slots`. A key left there earlier is wiped first.
+    /// Keeps key sets in `slots`, in the epoch numbered `number`, whose key it takes from `key`
+    /// into `epoch` and then wipes. A key left in `slots` or `epoch` earlier is wiped first.
     #[must_use]
-    pub fn new(slots: &'a mut [Slot]) -> Self {
-        let mut this = Self { slots };
+    pub fn new(
+        slots: &'a mut [Slot],
+        epoch: &'a mut Epoch,
+        number: u64,
+        key: &mut [u8; 32],
+    ) -> Self {
+        epoch.wipe();
+        epoch.number = number;
+        epoch.key.copy32(key);
+        wipe(key);
+        let mut this = Self {
+            memory: slots,
+            epoch,
+        };
         this.unload_all();
         this
     }
@@ -306,7 +334,8 @@ impl<'a> Slots<'a> {
     }
 
     /// Wraps the key set that `set` refers to under the primary key of the set that `parent` refers
-    /// to and writes the record into `record`. The record holds every key of the set, its stage and
+    /// to and writes the record into `record`, in this epoch, or in the next while a change to it
+    /// is under way. The record holds every key of the set, its stage and
     /// which key is the primary, and opens only with that key of the parent and the same `context`,
     /// which names the place the record is kept, from 1 to 255 bytes. The nonce comes from
     /// `entropy`.
@@ -320,10 +349,12 @@ impl<'a> Slots<'a> {
     ///
     /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
     /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
-    /// [`Error::SameKey`] if both refer to the same set, [`Error::EntropyFailed`] if `entropy`
-    /// fails, [`Error::DerivationFailed`] if the key that encrypts the record cannot be derived,
-    /// and [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or fails.
-    /// `record` is then left as it was.
+    /// [`Error::SameKey`] if both refer to the same set, [`Error::Unsaved`] if the set `set` refers
+    /// to has changed in this epoch and no change to the next is under way,
+    /// [`Error::EntropyFailed`] if `entropy` fails,
+    /// [`Error::DerivationFailed`] if the key that encrypts the record cannot be derived, and
+    /// [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or fails. `record`
+    /// is then left as it was.
     pub fn wrap(
         &mut self,
         set: Handle<'a>,
@@ -350,13 +381,27 @@ impl<'a> Slots<'a> {
         record: &mut [u8; RECORD_LEN],
     ) -> Result<(), Error> {
         let associated = AssociatedData::new(context).map_err(|_| Error::InvalidContext)?;
-        let (child, wrapping) = (self.loaded(set)?, self.loaded(parent)?);
-        if child == wrapping {
+        let (index, wrapping) = (self.loaded(set)?, self.loaded(parent)?);
+        if index == wrapping {
             return Err(Error::SameKey);
         }
-        let (Some(child), Some(wrapping)) = (self.slots.get(child), self.slots.get(wrapping))
+        let (Some(child), Some(wrapping)) = (self.memory.get(index), self.memory.get(wrapping))
         else {
             return Err(Error::StaleHandle);
+        };
+        if child.changed && !self.epoch.changing {
+            return Err(Error::Unsaved);
+        }
+        let (epoch, epoch_key) = if self.epoch.changing {
+            (
+                self.epoch
+                    .number
+                    .checked_add(1)
+                    .ok_or(Error::EpochExhausted)?,
+                &self.epoch.next,
+            )
+        } else {
+            (self.epoch.number, &self.epoch.key)
         };
         let (parent_key, parent_id) = wrapping.primary();
         let mut nonce = [0; NONCE_LEN];
@@ -364,14 +409,14 @@ impl<'a> Slots<'a> {
             .fill(&mut nonce)
             .map_err(|EntropyError| Error::EntropyFailed)?;
         let mut cipher_key = [0; CIPHER_KEY_LEN];
-        if derive_wrap_key(parent_key, wrapping.purpose, &mut cipher_key).is_err() {
+        if derive_wrap_key(parent_key, epoch_key, wrapping.purpose, &mut cipher_key).is_err() {
             wipe(&mut cipher_key);
             return Err(Error::DerivationFailed);
         }
         let header = Header {
             purpose: child.purpose,
             parent: parent_id.bytes(),
-            epoch: 0,
+            epoch,
         };
         let [first, second, third] = &child.keys;
         let mut sealed = [0; PLAINTEXT_LEN];
@@ -380,6 +425,11 @@ impl<'a> Slots<'a> {
         wipe(&mut cipher_key);
         let tag = tag.map_err(|_| Error::CipherFailed)?;
         write_record(record, &nonce, &sealed, &tag);
+        if self.epoch.changing
+            && let Some(child) = self.memory.get_mut(index)
+        {
+            child.sealed = true;
+        }
         Ok(())
     }
 
@@ -398,8 +448,9 @@ impl<'a> Slots<'a> {
     /// [`Error::StaleHandle`] if `parent` does not refer to a set held here now,
     /// [`Error::NoFreeSlot`] if no slot is free, [`Error::DerivationFailed`] if a value cannot be
     /// derived from a key, [`Error::RecordRejected`] if the record does not open with a key of the
-    /// parent and this context, names a key other than the one that opens it, or holds a plaintext
-    /// this version of the library cannot read, [`Error::KeyDisabled`] if only a disabled key of
+    /// parent, this context and the key of this epoch, names a key other than the one that opens
+    /// it or another epoch, or holds a plaintext this version of the library cannot read,
+    /// [`Error::KeyDisabled`] if only a disabled key of
     /// the parent opens it, and [`Error::DuplicateKey`] if these slots hold a key of the set already
     /// or the set holds one key twice. No slot changes then.
     pub fn unwrap(
@@ -449,7 +500,7 @@ impl<'a> Slots<'a> {
         found: &mut [u8; PLAINTEXT_LEN],
         open: &mut impl Open,
     ) -> Result<(), Error> {
-        let set = self.slots.get(parent).ok_or(Error::StaleHandle)?;
+        let set = self.memory.get(parent).ok_or(Error::StaleHandle)?;
         let (nonce, mut sealed, tag) = split_record(record);
         // The winner in two plain values: Kani 0.68.0 decodes values packed around `Status`, such as
         // `Result<Status, Error>`, wrongly.
@@ -461,7 +512,7 @@ impl<'a> Slots<'a> {
                 return;
             };
             let mut cipher_key = [0; CIPHER_KEY_LEN];
-            failed |= derive_wrap_key(key, set.purpose, &mut cipher_key).is_err();
+            failed |= derive_wrap_key(key, &self.epoch.key, set.purpose, &mut cipher_key).is_err();
             let mut trial = sealed;
             let opened = open(&cipher_key, &nonce, aad, &mut trial, &tag).is_ok();
             wipe(&mut cipher_key);
@@ -496,6 +547,9 @@ impl<'a> Slots<'a> {
             return Err(Error::NoFreeSlot);
         }
         let (header, stages, keys) = keyset::parse(plaintext).map_err(|_| Error::RecordRejected)?;
+        if header.epoch != self.epoch.number {
+            return Err(Error::RecordRejected);
+        }
         self.load(header.purpose, stages, |[first, second, third]| {
             let [first_bytes, second_bytes, third_bytes] = keys;
             let load = |key: &mut Key, bytes: Option<KeyBytes<'_>>| {
@@ -511,7 +565,7 @@ impl<'a> Slots<'a> {
     }
 
     fn has_free(&self) -> bool {
-        self.slots
+        self.memory
             .iter()
             .any(|slot| slot.occupancy == Occupancy::Free)
     }
@@ -521,7 +575,7 @@ impl<'a> Slots<'a> {
         if handle.slots != self.id() {
             return Err(Error::StaleHandle);
         }
-        self.slots
+        self.memory
             .get(handle.index)
             .filter(|slot| {
                 slot.occupancy == Occupancy::Loaded && slot.generation == handle.generation
@@ -554,16 +608,16 @@ impl<'a> Slots<'a> {
     ) -> Result<Handle<'a>, Error> {
         let slots = self.id();
         let index = self
-            .slots
+            .memory
             .iter()
             .position(|slot| slot.occupancy == Occupancy::Free)
             .ok_or(Error::NoFreeSlot)?;
         let filled = self
-            .slots
+            .memory
             .get_mut(index)
             .map_or(Err(Error::NoFreeSlot), |slot| fill(&mut slot.keys));
         let identified = filled.and_then(|()| self.identify(index, purpose, &stages));
-        let slot = self.slots.get_mut(index).ok_or(Error::NoFreeSlot)?;
+        let slot = self.memory.get_mut(index).ok_or(Error::NoFreeSlot)?;
         let mut ids = match identified {
             Ok(ids) => ids,
             Err(error) => {
@@ -597,7 +651,7 @@ impl<'a> Slots<'a> {
         purpose: Purpose,
         stages: &Stages,
     ) -> Result<[KeyId; MEMBERS], Error> {
-        let slot = self.slots.get(index).ok_or(Error::NoFreeSlot)?;
+        let slot = self.memory.get(index).ok_or(Error::NoFreeSlot)?;
         let derive = |position: usize, key: &Key, id: &mut KeyId| -> Result<(), Error> {
             if stages.stage(position).is_some() {
                 derive_key_id(key, purpose, id).map_err(|_| Error::DerivationFailed)?;
@@ -612,7 +666,7 @@ impl<'a> Slots<'a> {
         derive(2, third, third_id)?;
         let [first_id, second_id, third_id] = &ids;
         let filled = |position: usize| stages.stage(position).is_some();
-        let held = |id: &KeyId| self.slots.iter().any(|other| other.holds(id));
+        let held = |id: &KeyId| self.memory.iter().any(|other| other.holds(id));
         let repeated = (filled(0) && held(first_id))
             || (filled(1) && (held(second_id) || (filled(0) && first_id.same(second_id))))
             || (filled(2)
@@ -635,11 +689,13 @@ impl<'a> Slots<'a> {
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now, [`Error::SetFull`] if
-    /// every position holds a key, [`Error::SetExhausted`] if the set has changed as many times as
-    /// its counter holds, [`Error::DerivationFailed`] if the identifier of the key cannot be
-    /// derived, and [`Error::DuplicateKey`] if these slots hold the key already. `source` is then
-    /// left as it was, and nothing changes.
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
+    /// the set has changed in this epoch, [`Error::SetFull`] if every position holds a key,
+    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds,
+    /// [`Error::DerivationFailed`] if the identifier of the key cannot be derived, and
+    /// [`Error::DuplicateKey`] if these slots hold the key already. `source` is then left as it
+    /// was, and nothing changes.
     pub fn add32(&mut self, set: Handle<'a>, source: &mut [u8; 32]) -> Result<Position, Error> {
         let at = self.add(set, |key| {
             key.copy32(source);
@@ -659,11 +715,13 @@ impl<'a> Slots<'a> {
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now, [`Error::SetFull`] if
-    /// every position holds a key, [`Error::SetExhausted`] if the set has changed as many times as
-    /// its counter holds, [`Error::DerivationFailed`] if the identifier of the key cannot be
-    /// derived, and [`Error::DuplicateKey`] if these slots hold the key already. `source` is then
-    /// left as it was, and nothing changes.
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
+    /// the set has changed in this epoch, [`Error::SetFull`] if every position holds a key,
+    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds,
+    /// [`Error::DerivationFailed`] if the identifier of the key cannot be derived, and
+    /// [`Error::DuplicateKey`] if these slots hold the key already. `source` is then left as it
+    /// was, and nothing changes.
     pub fn add64(&mut self, set: Handle<'a>, source: &mut [u8; 64]) -> Result<Position, Error> {
         let at = self.add(set, |key| {
             key.copy64(source);
@@ -684,11 +742,13 @@ impl<'a> Slots<'a> {
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now, [`Error::SetFull`] if
-    /// every position holds a key, [`Error::SetExhausted`] if the set has changed as many times as
-    /// its counter holds, [`Error::DerivationFailed`] if the identifier of the key cannot be
-    /// derived, [`Error::EntropyFailed`] if `entropy` fails, and [`Error::DuplicateKey`] if these
-    /// slots hold the key already. Nothing changes then.
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
+    /// the set has changed in this epoch, [`Error::SetFull`] if every position holds a key,
+    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds,
+    /// [`Error::DerivationFailed`] if the identifier of the key cannot be derived,
+    /// [`Error::EntropyFailed`] if `entropy` fails, and [`Error::DuplicateKey`] if these slots hold
+    /// the key already. Nothing changes then.
     ///
     /// # Panics
     ///
@@ -710,10 +770,12 @@ impl<'a> Slots<'a> {
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now, [`Error::PrimaryKey`]
-    /// if the key at `at` is the primary already, [`Error::WrongStage`] if `at` does not hold an
-    /// enabled key, and [`Error::SetExhausted`] if the set has changed as many times as its counter
-    /// holds. Nothing changes then.
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
+    /// the set has changed in this epoch, [`Error::PrimaryKey`] if the key at `at` is the primary
+    /// already, [`Error::WrongStage`] if `at` does not hold an enabled key, and
+    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds. Nothing
+    /// changes then.
     pub fn promote(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
         self.change(set, at, Stages::promote).map(|_| ())
     }
@@ -723,10 +785,11 @@ impl<'a> Slots<'a> {
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now, [`Error::PrimaryKey`]
-    /// if the key at `at` is the primary, [`Error::WrongStage`] if `at` does not hold an enabled
-    /// key, and [`Error::SetExhausted`] if the set has changed as many times as its counter holds.
-    /// Nothing changes then.
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
+    /// the set has changed in this epoch, [`Error::PrimaryKey`] if the key at `at` is the primary,
+    /// [`Error::WrongStage`] if `at` does not hold an enabled key, and [`Error::SetExhausted`] if
+    /// the set has changed as many times as its counter holds. Nothing changes then.
     pub fn disable(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
         self.change(set, at, Stages::disable).map(|_| ())
     }
@@ -735,23 +798,27 @@ impl<'a> Slots<'a> {
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now, [`Error::PrimaryKey`]
-    /// if `at` is the primary position, [`Error::WrongStage`] if `at` does not hold a disabled key,
-    /// and [`Error::SetExhausted`] if the set has changed as many times as its counter holds.
-    /// Nothing changes then.
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
+    /// the set has changed in this epoch, [`Error::PrimaryKey`] if `at` is the primary position,
+    /// [`Error::WrongStage`] if `at` does not hold a disabled key, and [`Error::SetExhausted`] if
+    /// the set has changed as many times as its counter holds. Nothing changes then.
     pub fn enable(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
         self.change(set, at, Stages::enable).map(|_| ())
     }
 
     /// Wipes the disabled key at `at` of the set that `set` refers to, with its identifier, and
-    /// empties the position. A record of the set wrapped afterwards does not hold the key.
+    /// empties the position. A record of the set wrapped afterwards does not hold the key. The
+    /// destruction is saved only by the commit of the next epoch, and a record wrapped before stays
+    /// readable until then; dropping these slots first discards it.
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now, [`Error::PrimaryKey`]
-    /// if `at` is the primary position, [`Error::WrongStage`] if `at` does not hold a disabled key,
-    /// and [`Error::SetExhausted`] if the set has changed as many times as its counter holds.
-    /// Nothing changes then.
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
+    /// the set has changed in this epoch, [`Error::PrimaryKey`] if `at` is the primary position,
+    /// [`Error::WrongStage`] if `at` does not hold a disabled key, and [`Error::SetExhausted`] if
+    /// the set has changed as many times as its counter holds. Nothing changes then.
     pub fn destroy(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
         let (key, id) = self.change(set, at, Stages::destroy)?.member(at);
         key.wipe();
@@ -768,10 +835,18 @@ impl<'a> Slots<'a> {
         transition: impl FnOnce(&mut Stages, usize) -> Result<(), Refused>,
     ) -> Result<&mut Slot, Error> {
         let index = self.loaded(set)?;
-        let slot = self.slots.get_mut(index).ok_or(Error::StaleHandle)?;
+        if self.epoch.changing {
+            return Err(Error::EpochChanging);
+        }
+        let slot = self.memory.get_mut(index).ok_or(Error::StaleHandle)?;
+        if slot.changed {
+            return Err(Error::Unsaved);
+        }
         let mut stages = slot.stages;
         transition(&mut stages, at.index())?;
         slot.stages = stages;
+        slot.changed = true;
+        slot.sealed = false;
         Ok(slot)
     }
 
@@ -795,20 +870,26 @@ impl<'a> Slots<'a> {
         fill: impl FnOnce(&mut Key) -> Result<(), Error>,
     ) -> Result<Position, Error> {
         let index = self.loaded(set)?;
-        let slot = self.slots.get_mut(index).ok_or(Error::StaleHandle)?;
+        if self.epoch.changing {
+            return Err(Error::EpochChanging);
+        }
+        let slot = self.memory.get_mut(index).ok_or(Error::StaleHandle)?;
+        if slot.changed {
+            return Err(Error::Unsaved);
+        }
         let (mut stages, purpose) = (slot.stages, slot.purpose);
         let at = Position::at(stages.add()?).ok_or(Error::SetFull)?;
         let filled = fill(slot.member(at).0);
         let mut id = KeyId::empty();
         let identified = filled.and_then(|()| {
-            let key = self.slots.get(index).ok_or(Error::StaleHandle)?.key(at);
+            let key = self.memory.get(index).ok_or(Error::StaleHandle)?.key(at);
             derive_key_id(key, purpose, &mut id).map_err(|_| Error::DerivationFailed)?;
-            if self.slots.iter().any(|other| other.holds(&id)) {
+            if self.memory.iter().any(|other| other.holds(&id)) {
                 return Err(Error::DuplicateKey);
             }
             Ok(())
         });
-        let slot = self.slots.get_mut(index).ok_or(Error::StaleHandle)?;
+        let slot = self.memory.get_mut(index).ok_or(Error::StaleHandle)?;
         let (key, held) = slot.member(at);
         if let Err(error) = identified {
             key.wipe();
@@ -816,33 +897,139 @@ impl<'a> Slots<'a> {
         }
         held.take(&mut id);
         slot.stages = stages;
+        slot.changed = true;
+        slot.sealed = false;
         Ok(at)
+    }
+
+    /// Begins the change to the next epoch, whose key it takes from `key` and then wipes. Until the
+    /// change is committed or abandoned, records are wrapped in the next epoch and unwrapped in
+    /// this one. `key` comes from the platform with the root of the next epoch, and is never used
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EpochChanging`] if a change has begun already, and [`Error::EpochExhausted`] if
+    /// this is the last epoch the counter holds. `key` is then left as it was.
+    pub fn begin_epoch(&mut self, key: &mut [u8; 32]) -> Result<(), Error> {
+        if self.epoch.changing {
+            return Err(Error::EpochChanging);
+        }
+        if self.epoch.number == u64::MAX {
+            return Err(Error::EpochExhausted);
+        }
+        self.epoch.next.copy32(key);
+        wipe(key);
+        self.epoch.changing = true;
+        Ok(())
+    }
+
+    /// Abandons the change to the next epoch: wipes its key, and has `root` erase the root made for
+    /// it, so that no record wrapped for it opens. Returns how surely that root is gone. A set that
+    /// has changed in this epoch stays unsaved.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoEpochChange`] if no change has begun. Nothing changes then.
+    pub fn abandon_epoch(&mut self, root: &mut (impl Root + ?Sized)) -> Result<Erasure, Error> {
+        if !self.epoch.changing {
+            return Err(Error::NoEpochChange);
+        }
+        let next = self
+            .epoch
+            .number
+            .checked_add(1)
+            .ok_or(Error::EpochExhausted)?;
+        self.epoch.next.wipe();
+        self.epoch.changing = false;
+        for slot in self.memory.iter_mut() {
+            slot.sealed = false;
+        }
+        Ok(root.erase(next))
+    }
+
+    /// Commits the change to the next epoch: `root` makes the root of the next epoch the current
+    /// one, the key of this epoch is wiped, and `root` erases its root. Returns how surely the root
+    /// is gone. Only then are the keys destroyed in this epoch out of reach of the records wrapped
+    /// before. Before the commit, every record of the next epoch is to be stored, and the records
+    /// of this epoch kept until it returns: a record of the next epoch opens only after it, and a
+    /// record of this epoch not wrapped again opens no more. Should the platform stop between
+    /// switching the root and erasing the old one, it erases the old one at its next start.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoEpochChange`] if no change has begun, [`Error::Unsaved`] if a set that has
+    /// changed in this epoch has not been wrapped in the next since, and [`Error::RootFailed`] if
+    /// `root` does not switch the root. Nothing changes then.
+    pub fn commit_epoch(&mut self, root: &mut (impl Root + ?Sized)) -> Result<Erasure, Error> {
+        if !self.epoch.changing {
+            return Err(Error::NoEpochChange);
+        }
+        let next = self
+            .epoch
+            .number
+            .checked_add(1)
+            .ok_or(Error::EpochExhausted)?;
+        if self
+            .memory
+            .iter()
+            .any(|slot| slot.occupancy == Occupancy::Loaded && slot.changed && !slot.sealed)
+        {
+            return Err(Error::Unsaved);
+        }
+        let next_key = self
+            .epoch
+            .next
+            .material()
+            .and_then(<[u8]>::first_chunk::<32>)
+            .ok_or(Error::NoEpochChange)?;
+        root.switch(next).map_err(|RootFailed| Error::RootFailed)?;
+        let old = self.epoch.number;
+        self.epoch.key.copy32(next_key);
+        self.epoch.next.wipe();
+        self.epoch.number = next;
+        self.epoch.changing = false;
+        for slot in self.memory.iter_mut() {
+            slot.changed = false;
+            slot.sealed = false;
+        }
+        Ok(root.erase(old))
     }
 
     /// Wipes every key of the set that `handle` refers to and frees its slot.
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `handle` does not refer to a set held here now.
+    /// [`Error::StaleHandle`] if `handle` does not refer to a set held here now, and
+    /// [`Error::Unsaved`] if the set has changed in this epoch. Nothing changes then.
     pub fn release(&mut self, handle: Handle<'a>) -> Result<(), Error> {
         let index = self.loaded(handle)?;
-        self.slots
-            .get_mut(index)
-            .ok_or(Error::StaleHandle)?
-            .unload();
+        let slot = self.memory.get_mut(index).ok_or(Error::StaleHandle)?;
+        if slot.changed {
+            return Err(Error::Unsaved);
+        }
+        slot.unload();
         Ok(())
+    }
+
+    /// Marks every set saved, as a new epoch would: for tests of the stages alone.
+    #[cfg(test)]
+    pub(crate) fn settle(&mut self) {
+        for slot in self.memory.iter_mut() {
+            slot.changed = false;
+        }
     }
 
     /// Tells apart two `Slots` alive at once: their memory does not overlap, so neither do the
     /// addresses. Empty ones may share an address, but they issue no handles. A handle keeps its
     /// memory borrowed, so no other `Slots` can take that memory over while the handle exists.
     fn id(&self) -> usize {
-        self.slots.as_ptr().addr()
+        self.memory.as_ptr().addr()
     }
 
     /// Wipes every key and identifier in every slot, loaded or not, and frees the loaded ones.
     fn unload_all(&mut self) {
-        for slot in self.slots.iter_mut() {
+        for slot in self.memory.iter_mut() {
             if slot.occupancy == Occupancy::Loaded {
                 slot.unload();
             } else {
@@ -884,6 +1071,7 @@ fn write_record(
 impl Drop for Slots<'_> {
     fn drop(&mut self) {
         self.unload_all();
+        self.epoch.wipe();
     }
 }
 
@@ -908,9 +1096,9 @@ mod tests {
     use std::vec::Vec;
 
     use super::{
-        AssociatedData, CIPHER_KEY_LEN, Entropy, EntropyError, Error, Handle, Header, KeyLength,
-        MEMBERS, Occupancy, PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Slot, Slots, Stages,
-        Status, derive_wrap_key, keyset, seal, write_record,
+        AssociatedData, CIPHER_KEY_LEN, Entropy, EntropyError, Epoch, Erasure, Error, Handle,
+        Header, KeyLength, MEMBERS, Occupancy, PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Root,
+        RootFailed, Slot, Slots, Stages, Status, derive_wrap_key, keyset, seal, write_record,
     };
     use crate::derive::{CIPHER_STACK_WIPE, KeyId, STACK_WIPE, derive_key_id};
     use crate::key::{
@@ -919,7 +1107,36 @@ mod tests {
     };
     use crate::record::MAX_CONTEXT;
 
+    pub(super) const EPOCH: u64 = 1;
+
+    pub(super) fn epoch_key() -> [u8; 32] {
+        flipped_epoch_key(0)
+    }
+
+    /// The key of the test epoch with every bit of `flip` flipped in each byte; its bytes vary, so
+    /// that the tests of residue look for it.
+    pub(super) fn flipped_epoch_key(flip: u8) -> [u8; 32] {
+        core::array::from_fn(|at| {
+            u8::try_from(at)
+                .unwrap()
+                .wrapping_mul(29)
+                .wrapping_add(0xe5)
+                ^ flip
+        })
+    }
+
+    pub(super) fn epoch() -> Key {
+        flipped_epoch(0)
+    }
+
+    pub(super) fn flipped_epoch(flip: u8) -> Key {
+        let mut key = Key::empty();
+        key.load32(&mut flipped_epoch_key(flip));
+        key
+    }
+
     assert_not_impl!(Slot: Clone, PartialEq, Default);
+    assert_not_impl!(Epoch: Clone, PartialEq, Default);
 
     /// Every import, generation, wrap and unwrap derives with data-independent timing on, where the
     /// processor and the operating system offer it.
@@ -929,7 +1146,8 @@ mod tests {
         assert!(!lethewis_dit::active(), "the mode is off before the work");
         let _ = seen();
         let mut memory = [const { Slot::empty() }; 4];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let parent = slots.import64(Purpose::Wrap, &mut [7; 64]).unwrap();
         assert_eq!(seen(), Some(true));
         let key = slots.import32(Purpose::Wrap, &mut [9; 32]).unwrap();
@@ -948,8 +1166,10 @@ mod tests {
         assert_eq!(seen(), Some(true));
         slots.add32(set, &mut [3; 32]).unwrap();
         assert_eq!(seen(), Some(true));
+        slots.settle();
         slots.add64(set, &mut [4; 64]).unwrap();
         assert_eq!(seen(), Some(true));
+        slots.settle();
         slots.release(set).unwrap();
         let set = slots.import32(Purpose::Wrap, &mut [5; 32]).unwrap();
         let _ = seen();
@@ -1012,13 +1232,16 @@ mod tests {
     #[test]
     fn keys_are_added_enabled_in_the_first_empty_position() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let set = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         let mut long = [5; 64];
         assert_eq!(slots.add64(set, &mut long), Ok(Position::Second));
         assert_eq!(long, [0; 64]);
+        slots.settle();
         let added = slots.add_generated(set, KeyLength::Bytes32, &mut Counting);
         assert_eq!(added, Ok(Position::Third));
+        slots.settle();
         let generated = counted::<32>();
         assert_holds(
             &slots,
@@ -1038,17 +1261,20 @@ mod tests {
     #[test]
     fn a_generated_key_is_written_straight_into_its_position() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let set = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         let mut source = Recording::default();
         let added = slots.add_generated(set, KeyLength::Bytes64, &mut source);
         assert_eq!(added, Ok(Position::Second));
         assert_eq!((source.calls, source.asked), (1, 64));
-        assert_eq!(source.at, slots.slots[0].keys[1].bytes().as_ptr().addr());
+        assert_eq!(source.at, slots.memory[0].keys[1].bytes().as_ptr().addr());
         let mut full = Recording::default();
+        slots.settle();
         slots
             .add_generated(set, KeyLength::Bytes32, &mut Counting)
             .unwrap();
+        slots.settle();
         let refused = slots.add_generated(set, KeyLength::Bytes32, &mut full);
         assert_eq!((refused, full.calls), (Err(Error::SetFull), 0));
     }
@@ -1056,7 +1282,8 @@ mod tests {
     #[test]
     fn a_key_held_anywhere_is_not_added() {
         let mut memory = [const { Slot::empty() }; 2];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let first = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
         let second = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
         for (set, bytes) in [(second, [1; 32]), (second, [2; 32]), (first, [1; 32])] {
@@ -1081,7 +1308,8 @@ mod tests {
     #[test]
     fn a_failed_addition_leaves_the_position_empty_and_wiped() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let set = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         let failed = slots.add_generated(set, KeyLength::Bytes64, &mut Failing);
         assert_eq!(failed, Err(Error::EntropyFailed));
@@ -1097,18 +1325,24 @@ mod tests {
     fn the_stages_change_only_as_the_set_allows() {
         use Position::{First, Second, Third};
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
         assert_eq!(slots.promote(set, Second), Err(Error::WrongStage));
         assert_eq!(slots.add32(set, &mut [2; 32]), Ok(Second));
+        slots.settle();
         assert_eq!(slots.promote(set, First), Err(Error::PrimaryKey));
         assert_eq!(slots.disable(set, First), Err(Error::PrimaryKey));
         assert_eq!(slots.destroy(set, Second), Err(Error::WrongStage));
         assert_eq!(slots.promote(set, Second), Ok(()));
+        slots.settle();
         assert_eq!(slots.disable(set, First), Ok(()));
+        slots.settle();
         assert_eq!(slots.disable(set, First), Err(Error::WrongStage));
         assert_eq!(slots.enable(set, First), Ok(()));
+        slots.settle();
         assert_eq!(slots.disable(set, First), Ok(()));
+        slots.settle();
         assert_holds(
             &slots,
             set,
@@ -1122,6 +1356,7 @@ mod tests {
         assert_eq!(slots.destroy(set, Second), Err(Error::PrimaryKey));
         assert_eq!(slots.destroy(set, Third), Err(Error::WrongStage));
         assert_eq!(slots.destroy(set, First), Ok(()));
+        slots.settle();
         assert_eq!(slots.destroy(set, First), Err(Error::WrongStage));
         assert_holds(
             &slots,
@@ -1130,16 +1365,19 @@ mod tests {
             1,
         );
         assert_eq!(slots.add32(set, &mut [3; 32]), Ok(First));
+        slots.settle();
     }
 
     #[test]
     fn an_exhausted_set_changes_no_more() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
         slots.add32(set, &mut [2; 32]).unwrap();
+        slots.settle();
         let members = [Some(Status::Enabled), Some(Status::Enabled), None];
-        slots.slots[0].stages = Stages::from_parts(members, 0, u64::MAX);
+        slots.memory[0].stages = Stages::from_parts(members, 0, u64::MAX);
         let mut source = [3; 32];
         assert_eq!(slots.add32(set, &mut source), Err(Error::SetExhausted));
         assert_eq!(source, [3; 32]);
@@ -1168,7 +1406,8 @@ mod tests {
     #[test]
     fn a_panic_in_the_source_of_an_addition_leaves_the_position_empty_and_wiped() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = slots.add_generated(set, KeyLength::Bytes64, &mut Panicking);
@@ -1185,7 +1424,8 @@ mod tests {
     #[test]
     fn a_stale_handle_changes_nothing() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
         slots.release(set).unwrap();
         let mut source = [2; 32];
@@ -1203,52 +1443,329 @@ mod tests {
         );
         let added = slots.add_generated(set, KeyLength::Bytes32, &mut Untouched);
         assert_eq!(added, Err(Error::StaleHandle));
-        assert_eq!(slots.slots[0].occupancy, Occupancy::Free);
+        assert_eq!(slots.memory[0].occupancy, Occupancy::Free);
     }
 
-    /// A destroyed key is in no record of its set wrapped afterwards, and a disabled key unwraps
-    /// nothing until it is enabled again.
+    /// A platform that records what it is asked, and switches the root unless told to fail.
+    #[derive(Default)]
+    struct Platform {
+        switched: Vec<u64>,
+        erased: Vec<u64>,
+        fail: bool,
+    }
+
+    impl Root for Platform {
+        fn switch(&mut self, next: u64) -> Result<(), RootFailed> {
+            if self.fail {
+                return Err(RootFailed);
+            }
+            self.switched.push(next);
+            Ok(())
+        }
+
+        fn erase(&mut self, old: u64) -> Erasure {
+            self.erased.push(old);
+            Erasure::Guaranteed
+        }
+    }
+
+    /// Saves the change of `set` by a new epoch whose key is all `byte`: wraps `set` under `root`
+    /// into `set_record`, and moves `chat`, a record under `set`, into the new epoch.
+    fn save<'a>(
+        slots: &mut Slots<'a>,
+        platform: &mut Platform,
+        (root, set): (Handle<'a>, Handle<'a>),
+        set_record: &mut [u8; RECORD_LEN],
+        chat: &mut [u8; RECORD_LEN],
+        byte: u8,
+    ) {
+        slots.begin_epoch(&mut [byte; 32]).unwrap();
+        slots
+            .wrap(set, root, b"set", &mut Counting, set_record)
+            .unwrap();
+        let child = slots.unwrap(set, b"chat", chat).unwrap();
+        slots
+            .wrap(child, set, b"chat", &mut Counting, chat)
+            .unwrap();
+        slots.release(child).unwrap();
+        assert_eq!(slots.commit_epoch(platform), Ok(Erasure::Guaranteed));
+    }
+
+    /// A key goes from added to destroyed, each change saved by a new epoch with the record under
+    /// its set moved along. The copy of the set that holds the destroyed key does not reach the
+    /// last epoch, and no copy of an epoch past opens.
     #[test]
     fn keys_rotate_from_added_to_destroyed() {
         use Position::{First, Second};
-        let mut memory = [const { Slot::empty() }; 3];
-        let mut slots = Slots::new(&mut memory);
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let mut platform = Platform::default();
         let root = slots.import64(Purpose::Wrap, &mut [9; 64]).unwrap();
         let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
         let child = slots.import32(Purpose::Wrap, &mut [5; 32]).unwrap();
-        let mut under_old = [0; RECORD_LEN];
+        let mut chat = [0; RECORD_LEN];
         slots
-            .wrap(child, set, b"chat", &mut Counting, &mut under_old)
+            .wrap(child, set, b"chat", &mut Counting, &mut chat)
             .unwrap();
         slots.release(child).unwrap();
-        assert_eq!(slots.add32(set, &mut [2; 32]), Ok(Second));
-        slots.promote(set, Second).unwrap();
-        slots.disable(set, First).unwrap();
-        assert_eq!(
-            slots.unwrap(set, b"chat", &under_old),
-            Err(Error::KeyDisabled)
+        let first_chat = chat;
+        let mut set_record = [0; RECORD_LEN];
+        slots.add32(set, &mut [2; 32]).unwrap();
+        save(
+            &mut slots,
+            &mut platform,
+            (root, set),
+            &mut set_record,
+            &mut chat,
+            2,
         );
-        slots.enable(set, First).unwrap();
-        let child = slots.unwrap(set, b"chat", &under_old).unwrap();
-        slots.release(child).unwrap();
+        slots.promote(set, Second).unwrap();
+        save(
+            &mut slots,
+            &mut platform,
+            (root, set),
+            &mut set_record,
+            &mut chat,
+            3,
+        );
         slots.disable(set, First).unwrap();
+        save(
+            &mut slots,
+            &mut platform,
+            (root, set),
+            &mut set_record,
+            &mut chat,
+            4,
+        );
+        let with_disabled = set_record;
         slots.destroy(set, First).unwrap();
-        let mut record = [0; RECORD_LEN];
+        slots.begin_epoch(&mut [5; 32]).unwrap();
+        assert_eq!(
+            slots.unwrap(root, b"set", &with_disabled),
+            Err(Error::DuplicateKey)
+        );
         slots
-            .wrap(set, root, b"set", &mut Counting, &mut record)
+            .wrap(set, root, b"set", &mut Counting, &mut set_record)
             .unwrap();
+        let child = slots.unwrap(set, b"chat", &chat).unwrap();
+        slots
+            .wrap(child, set, b"chat", &mut Counting, &mut chat)
+            .unwrap();
+        slots.release(child).unwrap();
+        assert_eq!(slots.commit_epoch(&mut platform), Ok(Erasure::Guaranteed));
+        assert_eq!(platform.switched, [2, 3, 4, 5]);
+        assert_eq!(platform.erased, [1, 2, 3, 4]);
         slots.release(set).unwrap();
-        let back = slots.unwrap(root, b"set", &record).unwrap();
+        let back = slots.unwrap(root, b"set", &set_record).unwrap();
         assert_holds(
             &slots,
             back,
             [None, Some((Status::Enabled, &[2; 32])), None],
             1,
         );
+        let child = slots.unwrap(back, b"chat", &chat).unwrap();
+        slots.release(child).unwrap();
         assert_eq!(
-            slots.unwrap(back, b"chat", &under_old),
+            slots.unwrap(root, b"set", &with_disabled),
             Err(Error::RecordRejected)
         );
+        assert_eq!(
+            slots.unwrap(back, b"chat", &first_chat),
+            Err(Error::RecordRejected)
+        );
+    }
+
+    /// A set changes once in an epoch, and is neither released nor wrapped in it after the
+    /// change; the change is saved by committing a new epoch the set is wrapped in. Calls out of
+    /// order are refused and change nothing.
+    #[test]
+    fn an_epoch_changes_only_in_order() {
+        let mut memory = [const { Slot::empty() }; 3];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let mut platform = Platform::default();
+        assert_eq!(slots.commit_epoch(&mut platform), Err(Error::NoEpochChange));
+        let root = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        let set = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
+        slots.add32(set, &mut [3; 32]).unwrap();
+        let mut more = [4; 32];
+        assert_eq!(slots.add32(set, &mut more), Err(Error::Unsaved));
+        assert_eq!(more, [4; 32]);
+        assert_eq!(slots.promote(set, Position::Second), Err(Error::Unsaved));
+        assert_eq!(slots.release(set), Err(Error::Unsaved));
+        let mut record = [0; RECORD_LEN];
+        let wrapped = slots.wrap(set, root, b"set", &mut Counting, &mut record);
+        assert_eq!((wrapped, record), (Err(Error::Unsaved), [0; RECORD_LEN]));
+        let mut key = [5; 32];
+        slots.begin_epoch(&mut key).unwrap();
+        assert_eq!(key, [0; 32]);
+        let mut again = [6; 32];
+        assert_eq!(slots.begin_epoch(&mut again), Err(Error::EpochChanging));
+        assert_eq!(again, [6; 32]);
+        assert_eq!(slots.commit_epoch(&mut platform), Err(Error::Unsaved));
+        slots
+            .wrap(set, root, b"set", &mut Counting, &mut record)
+            .unwrap();
+        platform.fail = true;
+        assert_eq!(slots.commit_epoch(&mut platform), Err(Error::RootFailed));
+        assert_eq!(slots.release(set), Err(Error::Unsaved));
+        platform.fail = false;
+        assert_eq!(slots.commit_epoch(&mut platform), Ok(Erasure::Guaranteed));
+        assert_eq!(
+            (platform.switched, platform.erased),
+            ([2].into(), [1].into())
+        );
+        slots.release(set).unwrap();
+        let back = slots.unwrap(root, b"set", &record).unwrap();
+        assert_holds(
+            &slots,
+            back,
+            [
+                Some((Status::Enabled, &[2; 32])),
+                Some((Status::Enabled, &[3; 32])),
+                None,
+            ],
+            0,
+        );
+    }
+
+    /// An abandoned change leaves the epoch as it was: a record wrapped for the next epoch does not
+    /// open, and a change stays unsaved until a later epoch the set is wrapped in.
+    #[test]
+    fn an_abandoned_epoch_change_leaves_the_epoch_as_it_was() {
+        let mut memory = [const { Slot::empty() }; 3];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let mut platform = Platform::default();
+        let root = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        let set = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
+        slots.add32(set, &mut [3; 32]).unwrap();
+        slots.begin_epoch(&mut [5; 32]).unwrap();
+        let mut abandoned = [0; RECORD_LEN];
+        slots
+            .wrap(set, root, b"set", &mut Counting, &mut abandoned)
+            .unwrap();
+        assert_eq!(slots.abandon_epoch(&mut platform), Ok(Erasure::Guaranteed));
+        assert_eq!(platform.erased, [EPOCH + 1]);
+        assert_eq!(
+            slots.abandon_epoch(&mut platform),
+            Err(Error::NoEpochChange)
+        );
+        assert_eq!(slots.commit_epoch(&mut platform), Err(Error::NoEpochChange));
+        assert_eq!(slots.release(set), Err(Error::Unsaved));
+        slots.begin_epoch(&mut [6; 32]).unwrap();
+        assert_eq!(slots.commit_epoch(&mut platform), Err(Error::Unsaved));
+        let mut record = [0; RECORD_LEN];
+        slots
+            .wrap(set, root, b"set", &mut Counting, &mut record)
+            .unwrap();
+        assert_eq!(slots.commit_epoch(&mut platform), Ok(Erasure::Guaranteed));
+        slots.release(set).unwrap();
+        assert_eq!(
+            slots.unwrap(root, b"set", &abandoned),
+            Err(Error::RecordRejected)
+        );
+        assert!(slots.unwrap(root, b"set", &record).is_ok());
+    }
+
+    #[test]
+    fn dropping_the_slots_wipes_the_epoch() {
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut epoch_memory = Epoch::empty();
+        {
+            let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+            slots.begin_epoch(&mut [5; 32]).unwrap();
+        }
+        assert_eq!(*epoch_memory.key.bytes(), [0; 64]);
+        assert_eq!(*epoch_memory.next.bytes(), [0; 64]);
+        assert!(!epoch_memory.changing);
+    }
+
+    /// No set changes while a change of epoch is under way: a set wrapped for the next epoch could
+    /// otherwise change after, and leave that record of the next epoch holding a destroyed key.
+    #[test]
+    fn a_set_does_not_change_during_an_epoch_change() {
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let root = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        let set = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
+        slots.add32(set, &mut [3; 32]).unwrap();
+        slots.settle();
+        slots.disable(set, Position::Second).unwrap();
+        slots.settle();
+        slots.begin_epoch(&mut [5; 32]).unwrap();
+        let mut record = [0; RECORD_LEN];
+        slots
+            .wrap(set, root, b"set", &mut Counting, &mut record)
+            .unwrap();
+        let mut source = [4; 32];
+        assert_eq!(slots.add32(set, &mut source), Err(Error::EpochChanging));
+        assert_eq!(source, [4; 32]);
+        for refused in [
+            slots.destroy(set, Position::Second),
+            slots.enable(set, Position::Second),
+            slots.promote(set, Position::Second),
+            slots.disable(set, Position::First),
+        ] {
+            assert_eq!(refused, Err(Error::EpochChanging));
+        }
+        assert_holds(
+            &slots,
+            set,
+            [
+                Some((Status::Enabled, &[2; 32])),
+                Some((Status::Disabled, &[3; 32])),
+                None,
+            ],
+            0,
+        );
+    }
+
+    /// A record opens only in the epoch it was wrapped in: with another key of the epoch it does
+    /// not open, and with the same key under another number it is refused.
+    #[test]
+    fn a_record_opens_only_in_its_epoch() {
+        let wrapped = |epoch, key: [u8; 32]| {
+            let mut memory = [const { Slot::empty() }; 2];
+            let mut epoch_memory = Epoch::empty();
+            let mut slots = Slots::new(&mut memory, &mut epoch_memory, epoch, &mut key.clone());
+            let parent = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+            let set = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
+            let mut record = [0; RECORD_LEN];
+            slots
+                .wrap(set, parent, b"set", &mut Counting, &mut record)
+                .unwrap();
+            record
+        };
+        let opened = |epoch, key: [u8; 32], record: &[u8; RECORD_LEN]| {
+            let mut memory = [const { Slot::empty() }; 2];
+            let mut epoch_memory = Epoch::empty();
+            let mut slots = Slots::new(&mut memory, &mut epoch_memory, epoch, &mut key.clone());
+            let parent = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+            slots.unwrap(parent, b"set", record).map(|_| ())
+        };
+        let record = wrapped(EPOCH, epoch_key());
+        assert_eq!(opened(EPOCH, epoch_key(), &record), Ok(()));
+        assert_eq!(
+            opened(EPOCH, [0xe6; 32], &record),
+            Err(Error::RecordRejected)
+        );
+        assert_eq!(
+            opened(EPOCH + 1, epoch_key(), &record),
+            Err(Error::RecordRejected)
+        );
+    }
+
+    #[test]
+    fn the_last_epoch_does_not_change() {
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, u64::MAX, &mut epoch_key());
+        let mut key = [5; 32];
+        assert_eq!(slots.begin_epoch(&mut key), Err(Error::EpochExhausted));
+        assert_eq!(key, [5; 32]);
     }
 
     /// Fails the test if it is ever asked for bytes.
@@ -1267,32 +1784,35 @@ mod tests {
     #[test]
     fn import32_loads_the_key_and_wipes_the_source() {
         let mut memory = [const { Slot::empty() }; 2];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let mut source = secret();
         let handle = slots.import32(Purpose::Wrap, &mut source).unwrap();
         assert_eq!((handle.index, handle.generation), (0, 0));
-        assert_eq!(slots.slots[0].keys[0].bytes(), &padded(&secret()));
-        assert_eq!(slots.slots[0].keys[0].length(), KeyLength::Bytes32);
-        assert_eq!(slots.slots[0].occupancy, Occupancy::Loaded);
+        assert_eq!(slots.memory[0].keys[0].bytes(), &padded(&secret()));
+        assert_eq!(slots.memory[0].keys[0].length(), KeyLength::Bytes32);
+        assert_eq!(slots.memory[0].occupancy, Occupancy::Loaded);
         assert_eq!(source, [0; 32]);
     }
 
     #[test]
     fn import64_loads_the_key_and_wipes_the_source() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let mut source = [5; 64];
         slots.import64(Purpose::Wrap, &mut source).unwrap();
-        assert_eq!(slots.slots[0].keys[0].bytes(), &[5; 64]);
-        assert_eq!(slots.slots[0].keys[0].length(), KeyLength::Bytes64);
-        assert_eq!(slots.slots[0].occupancy, Occupancy::Loaded);
+        assert_eq!(slots.memory[0].keys[0].bytes(), &[5; 64]);
+        assert_eq!(slots.memory[0].keys[0].length(), KeyLength::Bytes64);
+        assert_eq!(slots.memory[0].occupancy, Occupancy::Loaded);
         assert_eq!(source, [0; 64]);
     }
 
     #[test]
     fn generate_writes_random_bytes_into_the_slot() {
         let mut memory = [const { Slot::empty() }; 2];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let short = slots
             .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
             .unwrap();
@@ -1300,59 +1820,63 @@ mod tests {
             .generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting)
             .unwrap();
         assert_eq!((short.index, long.index), (0, 1));
-        assert_eq!(slots.slots[0].keys[0].bytes(), &padded(&counted::<32>()));
-        assert_eq!(slots.slots[0].keys[0].length(), KeyLength::Bytes32);
-        assert_eq!(slots.slots[1].keys[0].bytes(), &counted::<64>());
-        assert_eq!(slots.slots[1].keys[0].length(), KeyLength::Bytes64);
-        assert_eq!(slots.slots[1].occupancy, Occupancy::Loaded);
+        assert_eq!(slots.memory[0].keys[0].bytes(), &padded(&counted::<32>()));
+        assert_eq!(slots.memory[0].keys[0].length(), KeyLength::Bytes32);
+        assert_eq!(slots.memory[1].keys[0].bytes(), &counted::<64>());
+        assert_eq!(slots.memory[1].keys[0].length(), KeyLength::Bytes64);
+        assert_eq!(slots.memory[1].occupancy, Occupancy::Loaded);
     }
 
     #[test]
     fn a_failed_generate_leaves_the_slot_free_and_wiped() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         assert_eq!(
             slots.generate(Purpose::Wrap, KeyLength::Bytes64, &mut Failing),
             Err(Error::EntropyFailed)
         );
-        assert_eq!(slots.slots[0].occupancy, Occupancy::Free);
-        assert_eq!(slots.slots[0].generation, 0);
-        assert_eq!(slots.slots[0].keys[0].bytes(), &padded(&[]));
+        assert_eq!(slots.memory[0].occupancy, Occupancy::Free);
+        assert_eq!(slots.memory[0].generation, 0);
+        assert_eq!(slots.memory[0].keys[0].bytes(), &padded(&[]));
     }
 
     #[test]
     fn generate_asks_the_source_once_for_the_length() {
         let mut memory = [const { Slot::empty() }; 2];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let mut source = Recording::default();
         slots
             .generate(Purpose::Wrap, KeyLength::Bytes64, &mut source)
             .unwrap();
         assert_eq!((source.calls, source.asked), (1, 64));
-        assert_eq!(source.at, slots.slots[0].keys[0].bytes().as_ptr().addr());
+        assert_eq!(source.at, slots.memory[0].keys[0].bytes().as_ptr().addr());
     }
 
     #[test]
     fn generate_takes_a_source_behind_a_trait_object() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let source: &mut dyn Entropy = &mut Counting;
         slots
             .generate(Purpose::Wrap, KeyLength::Bytes32, source)
             .unwrap();
-        assert_eq!(slots.slots[0].keys[0].bytes(), &padded(&counted::<32>()));
+        assert_eq!(slots.memory[0].keys[0].bytes(), &padded(&counted::<32>()));
     }
 
     #[test]
     fn a_panic_in_the_source_leaves_the_slot_free_and_wiped() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = slots.generate(Purpose::Wrap, KeyLength::Bytes64, &mut Panicking);
         }));
         assert!(outcome.is_err());
-        assert_eq!(slots.slots[0].occupancy, Occupancy::Free);
-        assert_eq!(slots.slots[0].keys[0].bytes(), &padded(&[]));
+        assert_eq!(slots.memory[0].occupancy, Occupancy::Free);
+        assert_eq!(slots.memory[0].keys[0].bytes(), &padded(&[]));
         assert!(
             slots
                 .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
@@ -1363,7 +1887,8 @@ mod tests {
     #[test]
     fn generate_without_a_free_slot_asks_for_no_bytes() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         assert_eq!(
             slots.generate(Purpose::Wrap, KeyLength::Bytes32, &mut Untouched),
@@ -1380,7 +1905,8 @@ mod tests {
     #[test]
     fn a_load_keeps_the_purpose_and_the_identifier_of_the_key() {
         let mut memory = [const { Slot::empty() }; 2];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         slots
             .generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting)
@@ -1389,23 +1915,24 @@ mod tests {
         short.load32(&mut secret());
         let mut long = Key::empty();
         long.load64(&mut counted::<64>());
-        assert_eq!(slots.slots[0].purpose, Purpose::Wrap);
-        assert_eq!(slots.slots[1].purpose, Purpose::Wrap);
-        assert_eq!(slots.slots[0].stages.stage(0), Some(Status::Enabled));
-        assert_eq!(slots.slots[1].stages.stage(0), Some(Status::Enabled));
-        assert_eq!(slots.slots[0].ids[0], id_of(&short));
-        assert_eq!(slots.slots[1].ids[0], id_of(&long));
-        assert_ne!(slots.slots[0].ids[0], slots.slots[1].ids[0]);
+        assert_eq!(slots.memory[0].purpose, Purpose::Wrap);
+        assert_eq!(slots.memory[1].purpose, Purpose::Wrap);
+        assert_eq!(slots.memory[0].stages.stage(0), Some(Status::Enabled));
+        assert_eq!(slots.memory[1].stages.stage(0), Some(Status::Enabled));
+        assert_eq!(slots.memory[0].ids[0], id_of(&short));
+        assert_eq!(slots.memory[1].ids[0], id_of(&long));
+        assert_ne!(slots.memory[0].ids[0], slots.memory[1].ids[0]);
     }
 
     #[test]
     fn release_wipes_the_identifier() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let handle = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
-        assert_ne!(slots.slots[0].ids[0], KeyId::empty());
+        assert_ne!(slots.memory[0].ids[0], KeyId::empty());
         slots.release(handle).unwrap();
-        assert_eq!(slots.slots[0].ids[0], KeyId::empty());
+        assert_eq!(slots.memory[0].ids[0], KeyId::empty());
     }
 
     #[test]
@@ -1414,15 +1941,17 @@ mod tests {
         let mut key = Key::empty();
         key.load32(&mut secret());
         memory[0].ids[0] = id_of(&key);
-        let slots = Slots::new(&mut memory);
-        assert_eq!(slots.slots[0].ids[0], KeyId::empty());
+        let mut epoch_memory = Epoch::empty();
+        let slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        assert_eq!(slots.memory[0].ids[0], KeyId::empty());
     }
 
     #[test]
     fn import_takes_the_first_free_slot() {
         let mut memory = [const { Slot::empty() }; 3];
         memory[1].occupancy = Occupancy::Retired;
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         let handle = slots.import64(Purpose::Wrap, &mut [5; 64]).unwrap();
         assert_eq!(handle.index, 2);
@@ -1431,7 +1960,8 @@ mod tests {
     #[test]
     fn import_without_a_free_slot_keeps_the_source() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         let mut short = secret();
         assert_eq!(
@@ -1450,22 +1980,24 @@ mod tests {
     #[test]
     fn release_wipes_only_its_own_key() {
         let mut memory = [const { Slot::empty() }; 2];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         let second = slots.import64(Purpose::Wrap, &mut [5; 64]).unwrap();
         slots.release(second).unwrap();
-        assert_eq!(slots.slots[1].keys[0].bytes(), &padded(&[]));
-        assert_eq!(slots.slots[1].keys[0].length(), KeyLength::Bytes32);
-        assert_eq!(slots.slots[1].occupancy, Occupancy::Free);
-        assert_eq!(slots.slots[1].generation, 1);
-        assert_eq!(slots.slots[0].keys[0].bytes(), &padded(&secret()));
-        assert_eq!(slots.slots[0].occupancy, Occupancy::Loaded);
+        assert_eq!(slots.memory[1].keys[0].bytes(), &padded(&[]));
+        assert_eq!(slots.memory[1].keys[0].length(), KeyLength::Bytes32);
+        assert_eq!(slots.memory[1].occupancy, Occupancy::Free);
+        assert_eq!(slots.memory[1].generation, 1);
+        assert_eq!(slots.memory[0].keys[0].bytes(), &padded(&secret()));
+        assert_eq!(slots.memory[0].occupancy, Occupancy::Loaded);
     }
 
     #[test]
     fn a_released_handle_is_stale() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let handle = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         slots.release(handle).unwrap();
         assert_eq!(slots.release(handle), Err(Error::StaleHandle));
@@ -1474,7 +2006,8 @@ mod tests {
     #[test]
     fn an_old_handle_does_not_reach_a_new_key_in_the_same_slot() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let old = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         slots.release(old).unwrap();
         let new = slots
@@ -1489,19 +2022,32 @@ mod tests {
     fn a_handle_from_other_slots_is_stale() {
         let mut first_memory = [const { Slot::empty() }; 1];
         let mut second_memory = [const { Slot::empty() }; 1];
-        let mut first = Slots::new(&mut first_memory);
-        let mut second = Slots::new(&mut second_memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut first = Slots::new(
+            &mut first_memory,
+            &mut epoch_memory,
+            EPOCH,
+            &mut epoch_key(),
+        );
+        let mut epoch_memory = Epoch::empty();
+        let mut second = Slots::new(
+            &mut second_memory,
+            &mut epoch_memory,
+            EPOCH,
+            &mut epoch_key(),
+        );
         let handle = first.import32(Purpose::Wrap, &mut secret()).unwrap();
         second.import32(Purpose::Wrap, &mut secret()).unwrap();
         assert_eq!(second.release(handle), Err(Error::StaleHandle));
-        assert_eq!(second.slots[0].keys[0].bytes(), &padded(&secret()));
+        assert_eq!(second.memory[0].keys[0].bytes(), &padded(&secret()));
     }
 
     #[test]
     fn a_handle_outside_the_slots_is_stale() {
         let mut memory = [const { Slot::empty() }; 1];
         let id = memory.as_ptr().addr();
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         let outside = Handle {
             slots: id,
@@ -1510,14 +2056,15 @@ mod tests {
             memory: PhantomData,
         };
         assert_eq!(slots.release(outside), Err(Error::StaleHandle));
-        assert_eq!(slots.slots[0].keys[0].bytes(), &padded(&secret()));
+        assert_eq!(slots.memory[0].keys[0].bytes(), &padded(&secret()));
     }
 
     #[test]
     fn a_slot_whose_generation_runs_out_is_retired() {
         let mut memory = [const { Slot::empty() }; 1];
         memory[0].generation = u64::MAX;
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let handle = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         slots.release(handle).unwrap();
         assert_eq!(
@@ -1525,15 +2072,16 @@ mod tests {
             Err(Error::NoFreeSlot)
         );
         assert_eq!(slots.release(handle), Err(Error::StaleHandle));
-        assert_eq!(slots.slots[0].occupancy, Occupancy::Retired);
-        assert_eq!(slots.slots[0].keys[0].bytes(), &padded(&[]));
+        assert_eq!(slots.memory[0].occupancy, Occupancy::Retired);
+        assert_eq!(slots.memory[0].keys[0].bytes(), &padded(&[]));
     }
 
     #[test]
     fn dropping_the_slots_wipes_every_key() {
         let mut memory = [const { Slot::empty() }; 2];
         {
-            let mut slots = Slots::new(&mut memory);
+            let mut epoch_memory = Epoch::empty();
+            let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
             slots.import32(Purpose::Wrap, &mut secret()).unwrap();
             slots.import64(Purpose::Wrap, &mut [5; 64]).unwrap();
         }
@@ -1549,19 +2097,21 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         memory[0].keys[0].load64(&mut [5; 64]);
         memory[0].occupancy = Occupancy::Loaded;
-        let slots = Slots::new(&mut memory);
-        assert_eq!(slots.slots[0].keys[0].bytes(), &padded(&[]));
-        assert_eq!(slots.slots[0].occupancy, Occupancy::Free);
+        let mut epoch_memory = Epoch::empty();
+        let slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        assert_eq!(slots.memory[0].keys[0].bytes(), &padded(&[]));
+        assert_eq!(slots.memory[0].occupancy, Occupancy::Free);
     }
 
     #[test]
     fn new_slots_wipe_bytes_left_in_a_free_slot() {
         let mut memory = [const { Slot::empty() }; 1];
         memory[0].keys[0].load64(&mut [5; 64]);
-        let slots = Slots::new(&mut memory);
-        assert_eq!(slots.slots[0].keys[0].bytes(), &padded(&[]));
+        let mut epoch_memory = Epoch::empty();
+        let slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        assert_eq!(slots.memory[0].keys[0].bytes(), &padded(&[]));
         assert_eq!(
-            (slots.slots[0].occupancy, slots.slots[0].generation),
+            (slots.memory[0].occupancy, slots.memory[0].generation),
             (Occupancy::Free, 0)
         );
     }
@@ -1593,43 +2143,44 @@ mod tests {
         core::array::from_fn(|at| u8::from_str_radix(&text[2 * at..2 * at + 2], 16).unwrap())
     }
 
-    /// Records computed by an implementation independent of this library: under a 32-byte parent,
-    /// a set of one 64-byte key in "chat 7"; under a 64-byte parent, a set of one 32-byte key in
-    /// "profile"; and under the 32-byte parent, in "archive", a full set at revision 9: a disabled
-    /// 64-byte key, an enabled 32-byte key, and the primary, an enabled 64-byte key.
+    /// Records computed by an implementation independent of this library, in epoch `EPOCH` with the
+    /// key `epoch_key()`: under a 32-byte parent, a set of one 64-byte key in "chat 7"; under a
+    /// 64-byte parent, a set of one 32-byte key in "profile"; and under the 32-byte parent, in
+    /// "archive", a full set at revision 9: a disabled 64-byte key, an enabled 32-byte key, and the
+    /// primary, an enabled 64-byte key.
     const KNOWN_RECORDS: [&str; 3] = [
         concat!(
-            "05162738495a6b7c8d9eafc0ff05955c91a5db9d5571ee2ef4ab20a64de07207",
-            "7ed17a8fc57c373bf13c65458ce9776280c7dd47ea624064c2485ee86c273ad8",
-            "ea11746f76409a1c11f86659c8fb0f0458ba461eb215e303046006d4da77f411",
-            "730341925a0506f36e3023484fd88e658e931aca37bf493b723f706d6ac560cd",
-            "3b8ae9cbae5f6cd05b7c82a25b3d1f901180dcf1ea374761b38f8c27fa598648",
-            "4a31a56b3c76751272a7d33e48d67e366351e5ba5cdc86bc48a1001ec760f000",
-            "bd6720cf0103ae9921e274506543bac0d735c92e52df4889d00ffe30e5b6e150",
-            "917fb056a997a58bb351a9a2b30ee159d979eda09aad6b1291d0f5c985854818",
-            "b271eb36c5",
+            "05162738495a6b7c8d9eafc05865bec3397d38004335349d151303670af62316",
+            "9ee373a30a008f515426a8d3b32d7165932ca112ba06fc48502bcf7a4934213c",
+            "17279974c2fc01a08ed52596a7a8547ceb587e2ac3028bcaf9d72e39e2a81c38",
+            "49c103607a35d4be526c6842a96db657cddab478bea06b381f82aa2662a74222",
+            "3157b08dd1b4259636ca6d056078f4d104c1d91f2a28da5be5b1f588fe7f846e",
+            "d9bdbbff4237e9935218331e64e21503c5ea1263c9fd5850eb7d11475b27da33",
+            "ad79bf72a971085f8596be1a4602b1882a8c571a260cd99678c4ec84ae473f59",
+            "46aa885f934fce7f54ddbde4a210ef3b980870df7946153a56e9e008dafe0720",
+            "274f24120a",
         ),
         concat!(
-            "05162738495a6b7c8d9eafc0664c5a9a3eac62e6aed93b05aa1bb4b2496a5db8",
-            "6ee42ecca737f2ed4bdc3b36481dfb6c1202dd234a27e94ccfac981aea57c630",
-            "beb8eb98381d5b08931a188e9dbaf81993ef64549417195666f6de43b2722f54",
-            "3d87be751f5463e9a05f6ce0b16efa69366b201708222e8031dd1b00f1ee844f",
-            "cad9dab97a9c73aaad76d834377da5e59273b5e8356f1073781cfa949398ba7d",
-            "bfc3e6ac62cdd8c2222d7760190536ed2f616544535b7a527bdc2b51e621fce7",
-            "b8f3b17d5c7557c80b0e4c6db782c760f9658a48fffd7575d66033d519a875f1",
-            "a7394e8db2f356c4ba2b92558dcc2bf026aa0f5bcaee668d4e385653ec351c80",
-            "8a99b1d2be",
+            "05162738495a6b7c8d9eafc086875ecd1bee4b6b4ee73108e060116f7bc69c00",
+            "5c34c1bfa8331c7ea334ea40a0b2aa8cb7e269e4abd34ebc385690999f9f5e42",
+            "96a33cf38ad2785ee523d94c7293215f90c31d4393bd274b207c20b57883ad68",
+            "904a354c18e0b31dd338e910ae13b93af38bc6c6bfbcb654d8120dd4881a747a",
+            "874670e291621e4247ca61ed58baf69604547971bee11dd3dabf31b00b6d2b65",
+            "a337adf0fde305ff0f2bf893d338822ecefb5f13f8394447766f78bcf5ec3e28",
+            "aa6d60b3c5f660ff5cb3e3a86fe2f2bbf0d5f720670d6ecca2cc9b85b603368c",
+            "5ab7b91e09480fb3b461caa26e1f5c65c93979c4542c11a25737fb31a00244ec",
+            "f5b70fb39b",
         ),
         concat!(
-            "05162738495a6b7c8d9eafc0d85956d048dac26b35da8edef5b8c0237d2de9a0",
-            "1d4c6df6ddf4afe323f2dfa5a34e71beb45a1a8901323524543f6dfe24c4a7ec",
-            "dd6c5100b206dbba2bcba29b56f34717c14d565a0705708604564c84cfca0d32",
-            "0d156360a72e98cb93fe28ee0389b0952e9ffaac6033307e5aa1aea87ee9e8ab",
-            "3e1b84dd31b2446d11fb36f2122d5f3cb6071325d02947b6526cb7e90f7fc6c8",
-            "23c5f37d79f1428161fd8589b9d32218f2e805091d9293679739596fa5f01495",
-            "a00bb4bfc1bdceaf5fd6792411b96046be5f2263164912d31eb2741494b6a41d",
-            "c3e052841f07860f0dc4d45b16f9ab89a55a1c37639da0f6cbd6de847b58f78e",
-            "816093a4dc",
+            "05162738495a6b7c8d9eafc0e9b6288e75cd46c7353d8d3bb98b6d1b35440561",
+            "06006a9b43b19be459f99a49d87c60c37a40003d5e122bf56c0ffa69d76336c7",
+            "5bba94b3e238d3182ea1f5fe2c3fa752759e94655f10793d71275a60f70a8723",
+            "a5086fe60dcd269b22606cd1e7f4a1162c0c0619d9a011a0c16af1ebe44a0438",
+            "17b979ae017344c0e05300409c4c425756db79a93c6b091ddbea52f7c8d88708",
+            "c8377aab53f12886e267cbf431308fa609f2a63c8c0f5b980ed7e6ce4e73c882",
+            "67dd2de6911b2b3a3ddff4f7071be1ddda83c531abd5491ac285ae730ca4fe8c",
+            "f3078ec57ee5b96c1e9a828eb8d85a64e7a106081478b4d73333f02e07621786",
+            "7ee8d4dc6a",
         ),
     ];
 
@@ -1655,7 +2206,7 @@ mod tests {
         members: [Member<'_>; MEMBERS],
         primary: usize,
     ) {
-        let slot = &slots.slots[handle.index];
+        let slot = &slots.memory[handle.index];
         assert_eq!(slot.occupancy, Occupancy::Loaded);
         assert_eq!(
             (slot.stages.primary(), slot.purpose),
@@ -1679,7 +2230,8 @@ mod tests {
     #[test]
     fn records_match_ones_computed_independently() {
         let mut memory = [const { Slot::empty() }; 4];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let short_parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
         let long_key = slots
             .import64(Purpose::Wrap, &mut pattern(59, 201))
@@ -1763,7 +2315,8 @@ mod tests {
             cases.into_iter().zip(KNOWN_RECORDS)
         {
             let mut memory = [const { Slot::empty() }; 2];
-            let mut slots = Slots::new(&mut memory);
+            let mut epoch_memory = Epoch::empty();
+            let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
             let parent = match parent_bytes.len() {
                 32 => slots.import32(Purpose::Wrap, &mut parent_bytes.try_into().unwrap()),
                 _ => slots.import64(Purpose::Wrap, &mut parent_bytes.try_into().unwrap()),
@@ -1775,8 +2328,11 @@ mod tests {
     }
 
     /// Two slots holding a parent and a key, and the record of the key under the parent.
-    fn wrapped(memory: &mut [Slot]) -> (Slots<'_>, Handle<'_>, [u8; RECORD_LEN]) {
-        let mut slots = Slots::new(memory);
+    fn wrapped<'a>(
+        memory: &'a mut [Slot],
+        epoch: &'a mut Epoch,
+    ) -> (Slots<'a>, Handle<'a>, [u8; RECORD_LEN]) {
+        let mut slots = Slots::new(memory, epoch, EPOCH, &mut epoch_key());
         let parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
         let key = slots
             .import64(Purpose::Wrap, &mut pattern(59, 201))
@@ -1792,7 +2348,8 @@ mod tests {
     #[test]
     fn every_changed_bit_of_a_record_is_rejected() {
         let mut memory = [const { Slot::empty() }; 2];
-        let (mut slots, parent, record) = wrapped(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let (mut slots, parent, record) = wrapped(&mut memory, &mut epoch_memory);
         for bit in 0..RECORD_LEN * 8 {
             let mut changed = record;
             changed[bit / 8] ^= 1 << (bit % 8);
@@ -1801,8 +2358,8 @@ mod tests {
                 Err(Error::RecordRejected),
                 "bit {bit}"
             );
-            assert_eq!(slots.slots[1].occupancy, Occupancy::Free);
-            assert_eq!(slots.slots[1].keys[0].bytes(), &padded(&[]));
+            assert_eq!(slots.memory[1].occupancy, Occupancy::Free);
+            assert_eq!(slots.memory[1].keys[0].bytes(), &padded(&[]));
         }
         assert!(slots.unwrap(parent, b"chat 7", &record).is_ok());
     }
@@ -1810,7 +2367,8 @@ mod tests {
     #[test]
     fn a_record_opens_only_with_its_parent_and_context() {
         let mut memory = [const { Slot::empty() }; 3];
-        let (mut slots, parent, record) = wrapped(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let (mut slots, parent, record) = wrapped(&mut memory, &mut epoch_memory);
         let other = slots.import32(Purpose::Wrap, &mut pattern(97, 14)).unwrap();
         assert_eq!(
             slots.unwrap(other, b"chat 7", &record),
@@ -1820,7 +2378,7 @@ mod tests {
             slots.unwrap(parent, b"chat 8", &record),
             Err(Error::RecordRejected)
         );
-        assert_eq!(slots.slots[2].occupancy, Occupancy::Free);
+        assert_eq!(slots.memory[2].occupancy, Occupancy::Free);
         assert!(slots.unwrap(parent, b"chat 7", &record).is_ok());
     }
 
@@ -1832,7 +2390,7 @@ mod tests {
         nonce: &[u8; 12],
     ) -> [u8; RECORD_LEN] {
         let mut cipher_key = [0; CIPHER_KEY_LEN];
-        derive_wrap_key(sealer, Purpose::Wrap, &mut cipher_key).unwrap();
+        derive_wrap_key(sealer, &epoch(), Purpose::Wrap, &mut cipher_key).unwrap();
         let associated = AssociatedData::new(context).unwrap();
         let mut encrypted = *plaintext;
         let tag = seal::seal(&cipher_key, nonce, associated.bytes(), &mut encrypted).unwrap();
@@ -1858,7 +2416,7 @@ mod tests {
         let header = Header {
             purpose: Purpose::Wrap,
             parent: named,
-            epoch: 0,
+            epoch: EPOCH,
         };
         let mut plaintext = [0; PLAINTEXT_LEN];
         keyset::build(
@@ -1880,7 +2438,7 @@ mod tests {
         primary: usize,
         context: &[u8],
     ) -> [u8; RECORD_LEN] {
-        let slot = &slots.slots[parent.index];
+        let slot = &slots.memory[parent.index];
         let plaintext = set_plaintext(members, primary, slot.ids[at].bytes());
         seal_plaintext(&slot.keys[at], &plaintext, context, &NONCE)
     }
@@ -1902,7 +2460,8 @@ mod tests {
     #[test]
     fn every_key_of_the_parent_is_tried() {
         let mut memory = [const { Slot::empty() }; 3];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
         let (first, second, third) = (
             pattern::<32>(5, 2),
@@ -1939,9 +2498,9 @@ mod tests {
                 assert_holds(&slots, handle, only, 0);
                 slots.release(handle).unwrap();
             }
-            assert_eq!(slots.slots[2].occupancy, Occupancy::Free, "position {at}");
+            assert_eq!(slots.memory[2].occupancy, Occupancy::Free, "position {at}");
             assert_eq!(
-                slots.slots[2].keys[0].bytes(),
+                slots.memory[2].keys[0].bytes(),
                 &padded(&[]),
                 "position {at}"
             );
@@ -1964,7 +2523,8 @@ mod tests {
         let (other, last) = (pattern::<64>(7, 3), pattern::<32>(11, 4));
         for at in 0..MEMBERS {
             let mut memory = [const { Slot::empty() }; 3];
-            let mut slots = Slots::new(&mut memory);
+            let mut epoch_memory = Epoch::empty();
+            let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
             let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
             let mut others =
                 [(Status::Disabled, &other[..]), (Status::Enabled, &last[..])].into_iter();
@@ -1992,7 +2552,8 @@ mod tests {
     #[test]
     fn a_key_is_held_in_one_place_only() {
         let mut memory = [const { Slot::empty() }; 3];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let held = pattern::<32>(97, 13);
         let mut source = held;
         let root = slots.import32(Purpose::Wrap, &mut source).unwrap();
@@ -2041,7 +2602,8 @@ mod tests {
     #[test]
     fn a_set_cannot_wrap_itself() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let set = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
         let mut record = [0x55; RECORD_LEN];
         assert_eq!(
@@ -2055,7 +2617,8 @@ mod tests {
     #[test]
     fn a_set_comes_out_of_a_wrap_as_it_went_in() {
         let mut memory = [const { Slot::empty() }; 2];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
         let (first, third) = (pattern::<64>(5, 2), pattern::<32>(11, 4));
         let members = [
@@ -2076,11 +2639,12 @@ mod tests {
     #[test]
     fn a_record_that_names_another_parent_or_is_malformed_is_rejected() {
         let mut memory = [const { Slot::empty() }; 2];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
         let child = pattern::<32>(59, 201);
         let members = [Some((Status::Enabled, &child[..])), None, None];
-        let parent_id = slots.slots[0].ids[0].bytes();
+        let parent_id = slots.memory[0].ids[0].bytes();
         let parent_key = key_from(&pattern::<32>(97, 13));
         let good = set_plaintext(members, 0, parent_id);
         let refused: Vec<[u8; PLAINTEXT_LEN]> = (0..16)
@@ -2101,7 +2665,7 @@ mod tests {
                 slots.unwrap(parent, b"chat 7", &record),
                 Err(Error::RecordRejected)
             );
-            assert_eq!(slots.slots[1].occupancy, Occupancy::Free);
+            assert_eq!(slots.memory[1].occupancy, Occupancy::Free);
         }
         let record = seal_plaintext(&parent_key, &good, b"chat 7", &NONCE);
         assert!(slots.unwrap(parent, b"chat 7", &record).is_ok());
@@ -2110,7 +2674,8 @@ mod tests {
     #[test]
     fn a_failed_wrap_leaves_the_record_as_it_was() {
         let mut memory = [const { Slot::empty() }; 3];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
         let key = slots
             .import64(Purpose::Wrap, &mut pattern(59, 201))
@@ -2154,7 +2719,8 @@ mod tests {
     #[test]
     fn a_context_of_1_to_255_bytes_is_taken() {
         let mut memory = [const { Slot::empty() }; 3];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
         let mut key = slots
             .import32(Purpose::Wrap, &mut pattern(59, 201))
@@ -2180,7 +2746,8 @@ mod tests {
     #[test]
     fn unwrap_needs_a_live_parent_and_a_free_slot_before_it_decrypts() {
         let mut memory = [const { Slot::empty() }; 2];
-        let (mut slots, parent, record) = wrapped(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let (mut slots, parent, record) = wrapped(&mut memory, &mut epoch_memory);
         let filler = slots.import32(Purpose::Wrap, &mut pattern(1, 1)).unwrap();
         assert_eq!(
             slots.unwrap(parent, b"chat 7", &record),
@@ -2201,10 +2768,11 @@ mod tests {
     #[test]
     fn debug_shows_no_state() {
         let mut memory = [const { Slot::empty() }; 1];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let handle = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         assert_eq!(format!("{handle:?}"), "Handle { .. }");
-        assert_eq!(format!("{:?}", slots.slots[0]), "Slot { .. }");
+        assert_eq!(format!("{:?}", slots.memory[0]), "Slot { .. }");
         assert_eq!(format!("{slots:?}"), "Slots { .. }");
     }
 
@@ -2253,7 +2821,7 @@ mod tests {
 
     fn holdings(slots: &Slots<'_>) -> Vec<Holding> {
         slots
-            .slots
+            .memory
             .iter()
             .map(|slot| {
                 (
@@ -2272,7 +2840,7 @@ mod tests {
     /// The bytes of every key held in `slots`.
     fn held_keys(slots: &Slots<'_>) -> Vec<Vec<u8>> {
         slots
-            .slots
+            .memory
             .iter()
             .filter(|slot| slot.occupancy == Occupancy::Loaded)
             .flat_map(|slot| {
@@ -2427,9 +2995,10 @@ mod tests {
         let mut random = Random(seed);
         for round in 0..rounds {
             let mut memory = [const { Slot::empty() }; 4];
-            let mut slots = Slots::new(&mut memory);
+            let mut epoch_memory = Epoch::empty();
+            let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
             let parent = random_parent(&mut slots, &mut random);
-            let parent_slot = &slots.slots[parent.index];
+            let parent_slot = &slots.memory[parent.index];
             let positions: Vec<usize> = (0..MEMBERS)
                 .filter(|&at| parent_slot.stages.stage(at).is_some())
                 .collect();
@@ -2560,12 +3129,14 @@ mod stack {
     use aes::Aes256;
     use aes::cipher::{BlockCipherEncrypt, KeyInit};
 
-    use super::tests::{LOAD_NEEDS, WRAP_NEEDS};
-    use super::{
-        Entropy, EntropyError, Error, Handle, Header, MEMBERS, Purpose, RECORD_LEN, Slot, Slots,
-        Stages, Status, keyset, write_record,
+    use super::tests::{
+        EPOCH, LOAD_NEEDS, WRAP_NEEDS, epoch_key, flipped_epoch, flipped_epoch_key,
     };
-    use crate::derive::{Branch, CIPHER_STACK_WIPE, derive_wrap_key, stack::secrets};
+    use super::{
+        Entropy, EntropyError, Epoch, Error, Handle, Header, MEMBERS, Purpose, RECORD_LEN, Slot,
+        Slots, Stages, Status, keyset, write_record,
+    };
+    use crate::derive::{Branch, CIPHER_STACK_WIPE, SALT, derive_wrap_key, stack::secrets};
     use crate::key::{
         Key, KeyLength,
         tests::{Counting, Failing},
@@ -2758,8 +3329,8 @@ mod stack {
         let keys = keys.each_ref().map(|bytes| key_from(bytes));
         let header = Header {
             purpose: Purpose::Wrap,
-            parent: slots.slots[root.index].ids[0].bytes(),
-            epoch: 0,
+            parent: slots.memory[root.index].ids[0].bytes(),
+            epoch: EPOCH,
         };
         let mut plaintext = [0; PLAINTEXT_LEN];
         keyset::build(
@@ -2770,7 +3341,8 @@ mod stack {
         );
         let mut cipher_key = [0; 32];
         derive_wrap_key(
-            &slots.slots[root.index].keys[0],
+            &slots.memory[root.index].keys[0],
+            &slots.epoch.key,
             Purpose::Wrap,
             &mut cipher_key,
         )
@@ -2826,7 +3398,13 @@ mod stack {
     /// derivations of the identifiers of the child's keys.
     fn handled(flip: u8, work: Work) -> Vec<Vec<u8>> {
         let mut memory = [const { Slot::empty() }; 4];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(
+            &mut memory,
+            &mut epoch_memory,
+            EPOCH,
+            &mut flipped_epoch_key(flip),
+        );
         let (parent, child) = sets(&mut slots, flip);
         let mut record = [0; RECORD_LEN];
         slots
@@ -2840,11 +3418,16 @@ mod stack {
         for bytes in &parent_keys[tried] {
             let key = key_from(bytes);
             let mut cipher_key = [0; 32];
-            derive_wrap_key(&key, Purpose::Wrap, &mut cipher_key).unwrap();
+            derive_wrap_key(&key, &flipped_epoch(flip), Purpose::Wrap, &mut cipher_key).unwrap();
             let (mac_key, enc_key) = message_keys(&cipher_key, &NONCE);
             let stream = keystream(&enc_key, &tag);
             let decrypted = ciphertext.iter().zip(&stream).map(|(c, k)| c ^ k).collect();
-            handled.extend(secrets(bytes, key.length(), Branch::WrapKey));
+            handled.extend(secrets(
+                bytes,
+                &flipped_epoch_key(flip),
+                key.length(),
+                Branch::WrapKey,
+            ));
             handled.extend([
                 cipher_key.to_vec(),
                 mac_key.to_vec(),
@@ -2858,7 +3441,12 @@ mod stack {
         handled.extend(parent_keys.iter().cloned());
         if work == Work::Unwrap {
             for bytes in child_keys(flip) {
-                handled.extend(secrets(&bytes, key_from(&bytes).length(), Branch::KeyId));
+                handled.extend(secrets(
+                    &bytes,
+                    SALT,
+                    key_from(&bytes).length(),
+                    Branch::KeyId,
+                ));
             }
         }
         handled
@@ -2872,7 +3460,8 @@ mod stack {
     fn a_wrap_without_the_wipe_leaves_residue() {
         let pieces = pieces(Work::Wrap);
         let mut memory = [const { Slot::empty() }; 4];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let (parent, child) = sets(&mut slots, 0);
         let mut record = [0; RECORD_LEN];
         let range = below_pad(false, || {
@@ -2888,7 +3477,8 @@ mod stack {
     fn a_wrap_leaves_no_residue() {
         let pieces = pieces(Work::Wrap);
         let mut memory = [const { Slot::empty() }; 4];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let (parent, child) = sets(&mut slots, 0);
         let mut record = [0; RECORD_LEN];
         assert_clean(&pieces, || {
@@ -2914,7 +3504,8 @@ mod stack {
     fn an_unwrap_leaves_no_residue() {
         let pieces = pieces(Work::Unwrap);
         let mut memory = [const { Slot::empty() }; 4];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let (parent, record) = wrapped(&mut slots);
         assert_clean(&pieces, || {
             black_box(slots.unwrap(parent, CONTEXT, &record).unwrap());
@@ -2929,7 +3520,8 @@ mod stack {
     fn a_rejected_unwrap_leaves_no_residue() {
         let pieces = pieces(Work::Trials);
         let mut memory = [const { Slot::empty() }; 4];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let (parent, mut record) = wrapped(&mut slots);
         record[40] ^= 1;
         let range = below_pad(false, || {
@@ -2983,7 +3575,8 @@ mod stack {
     #[test]
     fn wraps_unwraps_and_loads_wipe_and_need_the_stack_documented() {
         let mut memory = [const { Slot::empty() }; 8];
-        let mut slots = Slots::new(&mut memory);
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let (parent, record) = wrapped(&mut slots);
         let mut changed = record;
         changed[40] ^= 1;
@@ -3033,6 +3626,7 @@ mod stack {
                 black_box(slots.add64(key, &mut long).unwrap());
             }),
             depth_changed(|| {
+                slots.settle();
                 let added = slots.add_generated(key, KeyLength::Bytes32, &mut Counting);
                 black_box(added.unwrap());
             }),
@@ -3049,9 +3643,9 @@ mod proofs {
     use core::marker::PhantomData;
 
     use super::{
-        CIPHER_KEY_LEN, Entropy, EntropyError, Error, Handle, Key, KeyId, KeyLength, MEMBERS,
-        Occupancy, PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Rejected, Slot, Slots, Stages,
-        Status,
+        CIPHER_KEY_LEN, Entropy, EntropyError, Epoch, Erasure, Error, Handle, Key, KeyId,
+        KeyLength, MEMBERS, Occupancy, PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Rejected,
+        Root, RootFailed, Slot, Slots, Stages, Status,
     };
     use crate::derive::{
         model::{any_failed, failed, id_bytes, id_from_bytes},
@@ -3077,6 +3671,8 @@ mod proofs {
         ids: Three<Id>,
         stages: Stages,
         purpose: Purpose,
+        changed: bool,
+        sealed: bool,
     }
 
     fn snapshot(slot: &Slot) -> Snapshot {
@@ -3094,6 +3690,8 @@ mod proofs {
             ),
             stages: slot.stages,
             purpose: slot.purpose,
+            changed: slot.changed,
+            sealed: slot.sealed,
         }
     }
 
@@ -3101,7 +3699,7 @@ mod proofs {
     // the reads below take every element and then pick one, with no check left behind a branch.
 
     fn slot_at<'s>(slots: &'s Slots<'_>, index: usize) -> &'s Slot {
-        let (first, second) = (&slots.slots[0], &slots.slots[1]);
+        let (first, second) = (&slots.memory[0], &slots.memory[1]);
         if index == 0 { first } else { second }
     }
 
@@ -3133,12 +3731,12 @@ mod proofs {
     }
 
     fn snapshots(slots: &Slots<'_>) -> [Snapshot; 2] {
-        [snapshot(&slots.slots[0]), snapshot(&slots.slots[1])]
+        [snapshot(&slots.memory[0]), snapshot(&slots.memory[1])]
     }
 
     /// Every slot but `changed` matches its snapshot.
     fn unchanged_except(slots: &Slots<'_>, before: &[Snapshot; 2], changed: usize) -> bool {
-        (0..2).all(|index| index == changed || snapshot(&slots.slots[index]) == before[index])
+        (0..2).all(|index| index == changed || snapshot(&slots.memory[index]) == before[index])
     }
 
     /// Whether the slot holds no key and no identifier at any position.
@@ -3177,7 +3775,8 @@ mod proofs {
     }
 
     /// A slot in any state, with any generation and any stages whose primary is enabled, holding a
-    /// key of either length and any identifier at each position the stages fill, only when loaded.
+    /// key of either length and any identifier at each position the stages fill, and changed and
+    /// wrapped for the next epoch or not, only when loaded.
     fn any_slot() -> Slot {
         any_slot_in(match kani::any::<u8>() % 3 {
             0 => Occupancy::Free,
@@ -3192,6 +3791,8 @@ mod proofs {
         slot.occupancy = occupancy;
         slot.stages = any_whole_stages();
         if slot.occupancy == Occupancy::Loaded {
+            slot.changed = kani::any();
+            slot.sealed = kani::any();
             let stages = slot.stages;
             let fill = |position: usize, key: &mut Key, id: &mut KeyId| {
                 if stages.stage(position).is_some() {
@@ -3206,6 +3807,26 @@ mod proofs {
             fill(2, third, third_id);
         }
         slot
+    }
+
+    /// Any epoch with any key, and, if `changing`, with a change to the next under way and any key
+    /// for it.
+    fn any_epoch(changing: bool) -> Epoch {
+        let mut epoch = Epoch::empty();
+        epoch.number = kani::any();
+        epoch.key.load32(&mut kani::any());
+        if changing {
+            epoch.next.load32(&mut kani::any());
+        }
+        epoch.changing = changing;
+        epoch
+    }
+
+    /// The first 32 bytes of `key`.
+    fn first_half(key: &Key) -> [u8; 32] {
+        let mut half = [0; 32];
+        half.copy_from_slice(&key.bytes()[..32]);
+        half
     }
 
     // Three cases by the state of the first slot cover every state; the slot written has a constant
@@ -3275,6 +3896,18 @@ mod proofs {
                 );
                 return Err(EntropyError);
             }
+            Ok(())
+        }
+    }
+
+    /// A platform source that only counts how often it was asked.
+    struct Counted {
+        calls: u8,
+    }
+
+    impl Entropy for Counted {
+        fn fill(&mut self, _: &mut [u8]) -> Result<(), EntropyError> {
+            self.calls = self.calls.saturating_add(1);
             Ok(())
         }
     }
@@ -3482,7 +4115,11 @@ mod proofs {
     /// was live.
     fn import_step(mut memory: [Slot; 2]) -> (bool, bool) {
         let id = memory.as_ptr().addr();
-        let mut slots = Slots { slots: &mut memory };
+        let mut epoch = any_epoch(false);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
         let tracked = track(&slots, id);
         let (result, issued, issued_length) = import_any(&mut slots);
         kani::assert(
@@ -3539,13 +4176,18 @@ mod proofs {
     /// The step of a release, from any state of two slots: for any handle of this set and any
     /// position whose key the handle reaches exactly or that can never be live again, the release
     /// keeps it so, and a live handle stays live unless it is the one released; a release of a live
-    /// handle wipes every key and identifier of its set at once, and any other is refused.
+    /// handle wipes every key and identifier of its set at once, unless the set has changed in
+    /// this epoch, and any other is refused.
     #[kani::proof]
     #[kani::unwind(65)]
     fn a_step_by_a_release() {
         let mut memory = [any_slot(), any_slot()];
         let id = memory.as_ptr().addr();
-        let mut slots = Slots { slots: &mut memory };
+        let mut epoch = any_epoch(kani::any());
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
         let tracked = track(&slots, id);
         let target = if kani::any() {
             tracked.handle
@@ -3553,16 +4195,20 @@ mod proofs {
             forged(id)
         };
         let target_live = live(&slots, id, &target);
+        let target_changed = target_live && slot_at(&slots, target.index).changed;
         let result = slots.release(target);
-        let released = target_live && tracked.live && target.index == tracked.handle.index;
+        let released =
+            target_live && !target_changed && tracked.live && target.index == tracked.handle.index;
         kani::assert(
-            if target_live {
+            if target_changed {
+                result == Err(Error::Unsaved)
+            } else if target_live {
                 result == Ok(()) && wiped(slot_at(&slots, target.index))
             } else {
                 result == Err(Error::StaleHandle)
             },
-            "a live handle releases its set, whose keys and identifiers are zero at once, and any \
-             other is refused",
+            "a live handle releases its set, whose keys and identifiers are zero at once, unless \
+             the set has changed in this epoch, and any other is refused",
         );
         kani::cover!(released, "the tracked set is released");
         kani::cover!(
@@ -3583,7 +4229,11 @@ mod proofs {
     fn a_handle_from_other_slots_is_refused() {
         let mut memory = [any_slot(), any_slot()];
         let id = memory.as_ptr().addr();
-        let mut slots = Slots { slots: &mut memory };
+        let mut epoch = any_epoch(false);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
         let before = snapshots(&slots);
 
         let foreign = Handle {
@@ -3609,7 +4259,7 @@ mod proofs {
     }
 
     /// A slot in any state and with any generation whose buffers hold keys of any bytes and either
-    /// length and any identifiers at every position, loaded or not.
+    /// length and any identifiers at every position, loaded or not, and changed or not if loaded.
     fn any_dirty_slot() -> Slot {
         let mut slot = Slot::empty();
         slot.generation = kani::any();
@@ -3627,11 +4277,15 @@ mod proofs {
             id_from_bytes(kani::any()),
             id_from_bytes(kani::any()),
         ];
+        if slot.occupancy == Occupancy::Loaded {
+            slot.changed = kani::any();
+            slot.sealed = kani::any();
+        }
         slot
     }
 
     /// From any state of two slots, with any bytes left in any buffer, creating `Slots` wipes every
-    /// key and identifier and loads no slot.
+    /// key and identifier, loads no slot and leaves none changed, and takes the epoch and its key.
     #[kani::proof]
     #[kani::unwind(65)]
     fn creating_slots_wipes_every_key() {
@@ -3648,13 +4302,33 @@ mod proofs {
             }),
             "a free slot holds bytes before"
         );
-        let slots = Slots::new(&mut memory);
-        for slot in slots.slots.iter() {
+        let epoch = kani::any();
+        let mut epoch_key: [u8; 32] = kani::any();
+        let original = epoch_key;
+        let mut epoch_memory = any_epoch(kani::any());
+        epoch_memory.key.fill_any();
+        let slots = Slots::new(&mut memory, &mut epoch_memory, epoch, &mut epoch_key);
+        kani::assert(
+            slots.epoch.number == epoch
+                && first_half(&slots.epoch.key) == original
+                && slots.epoch.key.bytes()[32..] == [0; 32]
+                && slots.epoch.key.length() == KeyLength::Bytes32
+                && *slots.epoch.next.bytes() == [0; 64]
+                && epoch_key == [0; 32]
+                && !slots.epoch.changing,
+            "creating slots takes the epoch and its key, wipes the source, and leaves nothing else \
+             in the memory of the epoch",
+        );
+        for slot in slots.memory.iter() {
             kani::assert(
                 slot.occupancy != Occupancy::Loaded,
                 "creating slots loads no slot",
             );
             kani::assert(wiped(slot), "creating slots wipes every key and identifier");
+            kani::assert(
+                !slot.changed && !slot.sealed,
+                "creating slots leaves no set changed",
+            );
         }
     }
 
@@ -3667,7 +4341,11 @@ mod proofs {
     /// `DuplicateKey` exactly when a loaded slot holds a key with that identifier; a failed load
     /// changes no slot, and a full set asks the source for nothing; no load panics or overflows.
     fn load_from(mut memory: [Slot; 2]) -> Result<Handle<'static>, Error> {
-        let mut slots = Slots { slots: &mut memory };
+        let mut epoch = any_epoch(false);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
         let before = snapshots(&slots);
         let first_free = first_free(&before);
         let (result, expected, length, source_failed) = load_any(&mut slots);
@@ -3762,7 +4440,8 @@ mod proofs {
 
     /// From any state of two slots and any generation, which includes every state a load leaves: a
     /// handle of this set naming any slot and generation releases a set only if that slot is
-    /// loaded with that generation, and otherwise is refused and changes nothing; a release wipes
+    /// loaded with that generation and unchanged in this epoch, and otherwise is refused and changes
+    /// nothing; a release wipes
     /// every key and identifier of the set and advances the generation by one, or retires the slot
     /// when the generation runs out; no release panics or overflows.
     #[kani::proof]
@@ -3770,7 +4449,11 @@ mod proofs {
     fn a_handle_releases_only_a_matching_loaded_slot() {
         let mut memory = [any_slot(), any_slot()];
         let id = memory.as_ptr().addr();
-        let mut slots = Slots { slots: &mut memory };
+        let mut epoch = any_epoch(kani::any());
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
 
         let handle = forged(id);
         let before = snapshots(&slots);
@@ -3791,7 +4474,13 @@ mod proofs {
                 named.occupancy == Occupancy::Loaded && named.generation == handle.generation
             });
         let result = slots.release(handle);
-        if let Some(named) = target {
+        if target.is_some_and(|named| named.changed) {
+            kani::assert(
+                result == Err(Error::Unsaved) && unchanged_except(&slots, &before, 2),
+                "a set changed in this epoch is not released, and no slot changes",
+            );
+            kani::cover!(true, "a changed set is kept");
+        } else if let Some(named) = target {
             kani::assert(result == Ok(()), "a matching handle releases its set");
             let slot = slot_at(&slots, handle.index);
             kani::assert(
@@ -3852,12 +4541,18 @@ mod proofs {
     /// and no key is held in a loaded slot or twice in the set; then the slot holds, at each
     /// position the plaintext fills, exactly the key it holds there with the stage it states and the
     /// identifier derived from it, nothing at the others, and the primary and revision the
-    /// plaintext states. Otherwise no slot changes, and the failure is `NoFreeSlot`,
+    /// plaintext states, unchanged in this epoch. A plaintext of another epoch is refused as
+    /// `RecordRejected`. Otherwise no slot changes, and the failure is `NoFreeSlot`,
     /// `RecordRejected`, `DerivationFailed` or `DuplicateKey`, in that order. The offsets are written
     /// from the layout, independently of the parser.
     fn admit_from(mut memory: [Slot; 2]) {
         let id = memory.as_ptr().addr();
-        let mut slots = Slots { slots: &mut memory };
+        let changing = kani::any();
+        let mut epoch = any_epoch(changing);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
         let plaintext: [u8; PLAINTEXT_LEN] = kani::any();
         let before = snapshots(&slots);
         let first_free = first_free(&before);
@@ -3873,6 +4568,9 @@ mod proofs {
             return;
         };
         let parsed = crate::keyset::parse(&plaintext).map(|(_, stages, _)| stages);
+        let mut named_epoch = [0; 8];
+        named_epoch.copy_from_slice(&plaintext[19..27]);
+        let other_epoch = u64::from_le_bytes(named_epoch) != slots.epoch.number;
         let members = [0, 1, 2].map(|position| plaintext_key(&plaintext, position));
         let ids = members.map(|(key, length)| expected_key_id(&key, length, Purpose::Wrap));
         let filled = [0, 1, 2].map(|position| plaintext[35 + 66 * position] != 0);
@@ -3884,7 +4582,7 @@ mod proofs {
                     }))
         });
         kani::assert(
-            if parsed.is_err() {
+            if parsed.is_err() || other_epoch {
                 result == Err(Error::RecordRejected)
             } else if any_failed() {
                 result == Err(Error::DerivationFailed)
@@ -3893,8 +4591,8 @@ mod proofs {
             } else {
                 result.is_ok()
             },
-            "a plaintext is admitted exactly when it parses, finds a free slot, its keys' \
-             identifiers are derived and none is held already or twice",
+            "a plaintext is admitted exactly when it parses, names this epoch, finds a free slot, \
+             its keys' identifiers are derived and none is held already or twice",
         );
         if let (Ok(handle), Ok(stages)) = (result, parsed) {
             let now = snapshot(slot_at(&slots, index));
@@ -3934,8 +4632,10 @@ mod proofs {
             kani::assert(
                 now.stages == stages
                     && now.stages.primary() == usize::from(plaintext[2])
-                    && now.purpose == Purpose::Wrap,
-                "the slot keeps the primary, the revision and the purpose the plaintext states",
+                    && now.purpose == Purpose::Wrap
+                    && !now.changed,
+                "the slot keeps the primary, the revision and the purpose the plaintext states, \
+                 unchanged in this epoch",
             );
             kani::assert(
                 unchanged_except(&slots, &before, index),
@@ -3952,6 +4652,10 @@ mod proofs {
             );
         }
         kani::cover!(parsed.is_err(), "a malformed plaintext is refused");
+        kani::cover!(
+            parsed.is_ok() && other_epoch,
+            "a plaintext of another epoch is refused"
+        );
         kani::cover!(
             result == Err(Error::DerivationFailed),
             "an identifier is not derived"
@@ -4068,15 +4772,21 @@ mod proofs {
     /// trial the cipher accepts and whose plaintext names that key's identifier as its parent, and
     /// succeeds if that key is enabled and fails with `KeyDisabled` if it is disabled; it fails
     /// with `DerivationFailed` when a derivation fails, and otherwise with `RecordRejected` when no
-    /// trial does both.
+    /// trial does both. The cipher key is derived with the key of this epoch.
     #[kani::proof]
     #[kani::unwind(65)]
     fn opening_tries_every_key_of_the_parent() {
         let mut memory = [any_slot_in(Occupancy::Loaded)];
-        let slots = Slots { slots: &mut memory };
+        let changing = kani::any();
+        let mut epoch = any_epoch(changing);
+        let slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
         let record: [u8; RECORD_LEN] = kani::any();
         let aad: [u8; 2] = kani::any();
-        let before = snapshot(&slots.slots[0]);
+        let before = snapshot(&slots.memory[0]);
+        let epoch_key = first_half(&slots.epoch.key);
         let (order, count) = filled_positions(&before.stages);
         let mut cipher = AnyCipher::new();
         let mut found: [u8; PLAINTEXT_LEN] = kani::any();
@@ -4094,6 +4804,7 @@ mod proofs {
                         == expected_wrap_key(
                             &pick(&before.keys, position),
                             at(&before.lengths, position),
+                            &epoch_key,
                             Purpose::Wrap,
                         ),
                 "each trial uses the cipher key derived from the key at its position",
@@ -4167,7 +4878,11 @@ mod proofs {
     /// among it, `opening_tries_every_key_of_the_parent` proves.
     fn unwrap_from(mut memory: [Slot; 2]) -> Result<(), Error> {
         let id = memory.as_ptr().addr();
-        let mut slots = Slots { slots: &mut memory };
+        let mut epoch = any_epoch(kani::any());
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
         let parent = forged(id);
         let record: [u8; RECORD_LEN] = kani::any();
         let context_bytes: [u8; 2] = kani::any();
@@ -4255,17 +4970,25 @@ mod proofs {
         );
     }
 
-    /// From any state of two slots, for handles of this set naming any slots and generations, any
-    /// context of up to two bytes and any record buffer, whatever the platform's source and the
-    /// cipher do: wrapping changes no slot; it writes the record only when it succeeds, starting
-    /// with the nonce the source gave; it refuses an empty context, a stale handle, a set wrapped
-    /// under itself and a failed source.
+    /// From any state of two slots and of the epoch, with a change to the next under way or not,
+    /// for handles of this set naming any slots and generations, any context of up to two bytes
+    /// and any record buffer, whatever the platform's source and the cipher do: wrapping changes no
+    /// key, stage or epoch, and marks the set wrapped for the next epoch only when it succeeds
+    /// during a change; it writes the record only when it succeeds, starting with the nonce the
+    /// source gave; it refuses an empty context, a stale handle, a set wrapped under itself, a set
+    /// changed in this epoch outside a change, and a failed source.
     #[kani::proof]
     #[kani::unwind(234)]
     fn a_wrap_changes_no_slot_and_writes_only_when_it_succeeds() {
         let mut memory = [any_slot(), any_slot()];
         let id = memory.as_ptr().addr();
-        let mut slots = Slots { slots: &mut memory };
+        let changing = kani::any();
+        let mut epoch = any_epoch(changing);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let epoch = slots.epoch.number;
         let (set, parent) = (forged(id), forged(id));
         let context_bytes: [u8; 2] = kani::any();
         let context = any_context(&context_bytes);
@@ -4275,10 +4998,26 @@ mod proofs {
         let before = snapshots(&slots);
         let live = names_loaded(&before, &set) && names_loaded(&before, &parent);
 
+        let (epoch_key, next_key) = (*slots.epoch.key.bytes(), *slots.epoch.next.bytes());
         let result = slots.wrap(set, parent, context, &mut entropy, &mut record);
+        let sealing = result.is_ok() && changing;
         kani::assert(
-            unchanged_except(&slots, &before, 2),
-            "a wrap changes no slot",
+            if sealing {
+                let named = snapshot_at(&before, set.index);
+                unchanged_except(&slots, &before, set.index)
+                    && snapshot(slot_at(&slots, set.index)) == marked(named, named.changed, true)
+            } else {
+                unchanged_except(&slots, &before, 2)
+            },
+            "a wrap changes no key or stage, and marks the set wrapped for the next epoch only when \
+             it succeeds during a change",
+        );
+        kani::assert(
+            slots.epoch.number == epoch
+                && slots.epoch.changing == changing
+                && *slots.epoch.key.bytes() == epoch_key
+                && *slots.epoch.next.bytes() == next_key,
+            "a wrap changes no epoch and no key of one",
         );
         kani::assert(
             if context.is_empty() {
@@ -4287,6 +5026,10 @@ mod proofs {
                 result == Err(Error::StaleHandle)
             } else if set.index == parent.index {
                 result == Err(Error::SameKey)
+            } else if snapshot_at(&before, set.index).changed && !changing {
+                result == Err(Error::Unsaved)
+            } else if changing && epoch == u64::MAX {
+                result == Err(Error::EpochExhausted)
             } else if entropy.failed {
                 result == Err(Error::EntropyFailed)
             } else {
@@ -4294,8 +5037,8 @@ mod proofs {
                     || result == Err(Error::DerivationFailed)
                     || result == Err(Error::CipherFailed)
             },
-            "a wrap refuses a bad context, a stale handle, a set wrapping itself and a failed \
-             source",
+            "a wrap refuses a bad context, a stale handle, a set wrapping itself, an unsaved set \
+             outside a change and a failed source",
         );
         kani::assert(
             if result.is_ok() {
@@ -4306,6 +5049,14 @@ mod proofs {
             "a wrap writes the record only when it succeeds, starting with the nonce",
         );
         kani::cover!(result.is_ok(), "a set is wrapped");
+        kani::cover!(
+            sealing && snapshot_at(&before, set.index).changed,
+            "a changed set is wrapped for the next epoch"
+        );
+        kani::cover!(
+            result == Err(Error::Unsaved),
+            "a changed set is not wrapped in its epoch"
+        );
         kani::cover!(result == Err(Error::CipherFailed), "the cipher fails");
         kani::cover!(
             result == Err(Error::DerivationFailed),
@@ -4352,13 +5103,20 @@ mod proofs {
     }
 
     /// From `memory`, with the slot `index` loaded and any position: promoting, disabling, enabling
-    /// and destroying through the live handle of that slot change its stages exactly as the
-    /// transition of the stages gives, and a refusal is that transition's and changes nothing; a
-    /// destroy wipes the key and the identifier at the position and leaves every other key as it
-    /// was; the slot keeps its generation and purpose, and no other slot changes.
+    /// and destroying through the live handle of that slot are refused as `EpochChanging` during a
+    /// change of epoch, then as `Unsaved` if the set has changed in this epoch, and otherwise
+    /// change its stages exactly as the transition of the stages gives, marking the set changed and
+    /// not wrapped for the next epoch; a refusal changes nothing; a destroy wipes the key and the
+    /// identifier at the position and leaves every other key as it was; the slot keeps its
+    /// generation and purpose, and no other slot changes.
     fn change_in(mut memory: [Slot; 2], index: usize) {
         let id = memory.as_ptr().addr();
-        let mut slots = Slots { slots: &mut memory };
+        let changing = kani::any();
+        let mut epoch = any_epoch(changing);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
         let before = snapshots(&slots);
         let named = snapshot_at(&before, index);
         let handle = Handle {
@@ -4370,20 +5128,32 @@ mod proofs {
         let chosen = any_position();
         let mut expected = named.stages;
         let (result, outcome, destroying) = any_change(&mut slots, handle, chosen, &mut expected);
+        let refused = changing || named.changed;
         kani::assert(
-            result == outcome,
-            "a change succeeds exactly when the transition of the stages does, or fails as it does",
+            result
+                == if changing {
+                    Err(Error::EpochChanging)
+                } else if named.changed {
+                    Err(Error::Unsaved)
+                } else {
+                    outcome
+                },
+            "a change during a change of epoch, or of a set changed in this epoch, is refused, and \
+             otherwise succeeds exactly when the transition of the stages does, or fails as it does",
         );
+        let applied = result.is_ok();
         let now = snapshot(slot_at(&slots, index));
         kani::assert(
-            now.stages == expected
+            now.stages == if refused { named.stages } else { expected }
                 && now.occupancy == Occupancy::Loaded
                 && now.generation == named.generation
-                && now.purpose == named.purpose,
-            "the set keeps its slot, generation and purpose, and its stages change as the \
-             transition gives",
+                && now.purpose == named.purpose
+                && now.changed == (named.changed || applied)
+                && now.sealed == (named.sealed && !applied),
+            "the set keeps its slot, generation and purpose, its stages change as the transition \
+             gives, and a change marks it changed and not wrapped for the next epoch",
         );
-        let wiped = destroying && result.is_ok();
+        let wiped = destroying && applied;
         for position in 0..MEMBERS {
             kani::assert(
                 if wiped && position == chosen.index() {
@@ -4418,6 +5188,14 @@ mod proofs {
             result == Err(Error::WrongStage),
             "a change finds the wrong stage"
         );
+        kani::cover!(
+            result == Err(Error::Unsaved),
+            "a set changes once in an epoch"
+        );
+        kani::cover!(
+            result == Err(Error::EpochChanging),
+            "no set changes during a change of epoch"
+        );
     }
 
     /// A change through the first slot; with the next, through either slot of two in any state.
@@ -4441,7 +5219,12 @@ mod proofs {
     fn a_change_of_stage_with_a_stale_handle_changes_nothing() {
         let mut memory = [any_slot(), any_slot()];
         let id = memory.as_ptr().addr();
-        let mut slots = Slots { slots: &mut memory };
+        let changing = kani::any();
+        let mut epoch = any_epoch(changing);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
         let handle = forged(id);
         kani::assume(!live(&slots, id, &handle));
         let before = snapshots(&slots);
@@ -4462,45 +5245,56 @@ mod proofs {
         );
     }
 
-    /// Imports one key of either length with any bytes through `handle`. Returns the outcome and
-    /// the bytes and length the position must hold on success. An import wipes its source exactly
+    /// The outcome of an addition through `handle`, and the bytes and length the position must
+    /// hold on success.
+    type Added = (Result<Position, Error>, Bytes, KeyLength);
+
+    /// Adds a key of 32 bytes, any bytes, through `handle`. An addition wipes its source exactly
     /// when it succeeds. A generation fills a key as a load does, which the proofs of a load cover.
-    fn add_any(
-        slots: &mut Slots<'_>,
-        handle: Handle<'static>,
-    ) -> (Result<Position, Error>, Bytes, KeyLength) {
-        if kani::any() {
-            let mut source: [u8; 32] = kani::any();
-            let original = source;
-            let result = slots.add32(handle, &mut source);
-            kani::assert(
-                source == if result.is_ok() { [0; 32] } else { original },
-                "an addition wipes its source exactly when it succeeds",
-            );
-            let mut bytes = [0; 64];
-            bytes[..32].copy_from_slice(&original);
-            (result, bytes, KeyLength::Bytes32)
-        } else {
-            let mut source: [u8; 64] = kani::any();
-            let original = source;
-            let result = slots.add64(handle, &mut source);
-            kani::assert(
-                source == if result.is_ok() { [0; 64] } else { original },
-                "an addition wipes its source exactly when it succeeds",
-            );
-            (result, original, KeyLength::Bytes64)
-        }
+    fn add_short(slots: &mut Slots<'_>, handle: Handle<'static>) -> Added {
+        let mut source: [u8; 32] = kani::any();
+        let original = source;
+        let result = slots.add32(handle, &mut source);
+        kani::assert(
+            source == if result.is_ok() { [0; 32] } else { original },
+            "an addition wipes its source exactly when it succeeds",
+        );
+        let mut bytes = [0; 64];
+        bytes[..32].copy_from_slice(&original);
+        (result, bytes, KeyLength::Bytes32)
     }
 
-    /// From `memory`, with the slot `index` loaded: adding a key through its live handle puts it
-    /// into the first empty position of the set, enabled, with the identifier derived from its
-    /// bytes, its length and the set's purpose, and changes nothing else; it fails as the
-    /// transition of the stages does when no position is empty or the set is exhausted, and
-    /// otherwise with DerivationFailed when the derivation fails and with DuplicateKey exactly when
-    /// a loaded slot holds a key with that identifier; a failed addition changes no slot.
-    fn add_in(mut memory: [Slot; 2], index: usize) {
+    /// Adds a key of 64 bytes, any bytes, through `handle`, as above.
+    fn add_long(slots: &mut Slots<'_>, handle: Handle<'static>) -> Added {
+        let mut source: [u8; 64] = kani::any();
+        let original = source;
+        let result = slots.add64(handle, &mut source);
+        kani::assert(
+            source == if result.is_ok() { [0; 64] } else { original },
+            "an addition wipes its source exactly when it succeeds",
+        );
+        (result, original, KeyLength::Bytes64)
+    }
+
+    /// From `memory`, with the slot `index` loaded and no change of epoch under way: adding a key
+    /// with `add` through its live handle puts it into the first
+    /// empty position of the set, enabled, with the identifier derived from its bytes, its length
+    /// and the set's purpose, marks the set changed and not wrapped for the next epoch, and changes
+    /// nothing else; it fails as `Unsaved` if the set has changed in this epoch, as the transition
+    /// of the stages does when no position is empty or the set is exhausted, and otherwise with
+    /// DerivationFailed when the derivation fails and with DuplicateKey exactly when a loaded slot
+    /// holds a key with that identifier; a failed addition changes no slot.
+    fn add_in(
+        mut memory: [Slot; 2],
+        index: usize,
+        add: impl FnOnce(&mut Slots<'_>, Handle<'static>) -> Added,
+    ) {
         let id = memory.as_ptr().addr();
-        let mut slots = Slots { slots: &mut memory };
+        let mut epoch = any_epoch(false);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
         let before = snapshots(&slots);
         let named = snapshot_at(&before, index);
         let handle = Handle {
@@ -4511,10 +5305,11 @@ mod proofs {
         };
         let mut expected = named.stages;
         let position = expected.add();
-        let (result, bytes, length) = add_any(&mut slots, handle);
+        let (result, bytes, length) = add(&mut slots, handle);
         let key_id = expected_key_id(&bytes, length, named.purpose);
         kani::assert(
             match position {
+                _ if named.changed => result == Err(Error::Unsaved),
                 Err(refused) => result == Err(Error::from(refused)),
                 Ok(at) => {
                     if failed() {
@@ -4526,9 +5321,9 @@ mod proofs {
                     }
                 }
             },
-            "an addition fails as the stages refuse it, then with DerivationFailed when the \
-             derivation fails, with DuplicateKey when the key is held, and otherwise succeeds at \
-             the first empty position",
+            "an addition fails as Unsaved for a set changed in this epoch, as the stages refuse \
+             it, then with DerivationFailed when the derivation fails, with DuplicateKey when the \
+             key is held, and otherwise succeeds at the first empty position",
         );
         if let (Ok(added), Ok(at)) = (result, position) {
             let now = snapshot(slot_at(&slots, index));
@@ -4537,8 +5332,11 @@ mod proofs {
                     && now.stages == expected
                     && now.occupancy == Occupancy::Loaded
                     && now.generation == named.generation
-                    && now.purpose == named.purpose,
-                "the set keeps its slot, generation and purpose, and its stages gain the key",
+                    && now.purpose == named.purpose
+                    && now.changed
+                    && !now.sealed,
+                "the set keeps its slot, generation and purpose, its stages gain the key, and it is \
+                 marked changed and not wrapped for the next epoch",
             );
             for position in 0..MEMBERS {
                 kani::assert(
@@ -4559,10 +5357,7 @@ mod proofs {
                 unchanged_except(&slots, &before, index),
                 "an addition touches no other slot",
             );
-            kani::cover!(
-                at == 2 && length == KeyLength::Bytes64,
-                "a long key is added last"
-            );
+            kani::cover!(at == 2, "a key is added last");
         } else {
             kani::assert(
                 unchanged_except(&slots, &before, 2),
@@ -4570,6 +5365,10 @@ mod proofs {
             );
         }
         kani::cover!(result == Err(Error::DuplicateKey), "the added key is held");
+        kani::cover!(
+            result == Err(Error::Unsaved),
+            "a set changed in this epoch takes no key"
+        );
         kani::cover!(result == Err(Error::SetFull), "the set is full");
         kani::cover!(
             result == Err(Error::DerivationFailed),
@@ -4577,21 +5376,288 @@ mod proofs {
         );
     }
 
+    /// Stands in for the platform: switches the root or fails, as chosen when made, erases with any
+    /// outcome, and remembers what it was asked.
+    struct AnyRoot {
+        switches: bool,
+        answer: Erasure,
+        switched: Option<u64>,
+        erased: Option<u64>,
+    }
+
+    impl Root for AnyRoot {
+        fn switch(&mut self, next: u64) -> Result<(), RootFailed> {
+            self.switched = Some(next);
+            if self.switches {
+                Ok(())
+            } else {
+                Err(RootFailed)
+            }
+        }
+
+        fn erase(&mut self, old: u64) -> Erasure {
+            self.erased = Some(old);
+            self.answer
+        }
+    }
+
+    fn any_root() -> AnyRoot {
+        AnyRoot {
+            switches: kani::any(),
+            answer: match kani::any::<u8>() % 3 {
+                0 => Erasure::Guaranteed,
+                1 => Erasure::BestEffort,
+                _ => Erasure::NotErased,
+            },
+            switched: None,
+            erased: None,
+        }
+    }
+
+    /// `snapshot` with its marks of a change set to `changed` and `sealed`.
+    fn marked(snapshot: Snapshot, changed: bool, sealed: bool) -> Snapshot {
+        let mut marked = snapshot;
+        marked.changed = changed;
+        marked.sealed = sealed;
+        marked
+    }
+
+    /// From any state of two slots and of the epoch, with a change to the next under way or not:
+    /// beginning a change is refused while one is under way and in the last epoch, and otherwise
+    /// takes the key of the next epoch and wipes its source; abandoning, only while a change is
+    /// under way, wipes that key, has the platform erase the root made for it and forgets which
+    /// sets were wrapped for the next epoch; committing is refused without a change, while
+    /// a set changed in this epoch has not been wrapped for the next since, and when the platform
+    /// does not switch the root, and then changes nothing and asks the platform nothing more;
+    /// otherwise the next epoch with its key becomes this one, the old key is gone, every set
+    /// counts as saved and keeps its keys and stages, the platform is asked to switch to the next
+    /// epoch and then to erase the old, and its answer is returned.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn an_epoch_changes_only_in_order() {
+        let mut memory = [any_slot(), any_slot()];
+        let changing = kani::any();
+        let mut epoch = any_epoch(changing);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let before = snapshots(&slots);
+        let (epoch, epoch_key, next_key) = (
+            slots.epoch.number,
+            *slots.epoch.key.bytes(),
+            *slots.epoch.next.bytes(),
+        );
+        let unchanged = |slots: &Slots<'_>| {
+            unchanged_except(slots, &before, 2)
+                && slots.epoch.number == epoch
+                && *slots.epoch.key.bytes() == epoch_key
+                && *slots.epoch.next.bytes() == next_key
+                && slots.epoch.changing == changing
+        };
+        match kani::any::<u8>() % 3 {
+            0 => {
+                let mut source: [u8; 32] = kani::any();
+                let original = source;
+                let result = slots.begin_epoch(&mut source);
+                kani::assert(
+                    if changing {
+                        result == Err(Error::EpochChanging)
+                    } else if epoch == u64::MAX {
+                        result == Err(Error::EpochExhausted)
+                    } else {
+                        result.is_ok()
+                    },
+                    "a change begins unless one is under way or this is the last epoch",
+                );
+                kani::assert(
+                    if result.is_ok() {
+                        slots.epoch.changing
+                            && first_half(&slots.epoch.next) == original
+                            && slots.epoch.next.length() == KeyLength::Bytes32
+                            && source == [0; 32]
+                            && unchanged_except(&slots, &before, 2)
+                            && slots.epoch.number == epoch
+                            && *slots.epoch.key.bytes() == epoch_key
+                    } else {
+                        source == original && unchanged(&slots)
+                    },
+                    "a change takes the key of the next epoch and wipes its source, and a refused \
+                     one changes nothing",
+                );
+                kani::cover!(result.is_ok(), "a change begins");
+            }
+            1 => {
+                let mut root = any_root();
+                let result = slots.abandon_epoch(&mut root);
+                let next = epoch.checked_add(1);
+                kani::assert(
+                    if !changing {
+                        result == Err(Error::NoEpochChange)
+                    } else if next.is_none() {
+                        result == Err(Error::EpochExhausted)
+                    } else {
+                        result == Ok(root.answer)
+                    },
+                    "a change is abandoned only while under way, returning how surely its root is \
+                     erased",
+                );
+                kani::assert(
+                    if result.is_ok() {
+                        !slots.epoch.changing
+                            && *slots.epoch.next.bytes() == [0; 64]
+                            && slots.epoch.number == epoch
+                            && *slots.epoch.key.bytes() == epoch_key
+                            && root.erased == next
+                            && root.switched.is_none()
+                            && (0..2).all(|index| {
+                                snapshot(&slots.memory[index])
+                                    == marked(before[index], before[index].changed, false)
+                            })
+                    } else {
+                        unchanged(&slots) && root.erased.is_none()
+                    },
+                    "abandoning wipes the key of the next epoch, has the platform erase its root, \
+                     forgets what was wrapped for it, and keeps this epoch and every set; a refusal \
+                     changes nothing",
+                );
+                kani::cover!(result.is_ok(), "a change is abandoned");
+            }
+            _ => {
+                let mut root = any_root();
+                let unsaved = before.iter().any(|snapshot| {
+                    snapshot.occupancy == Occupancy::Loaded && snapshot.changed && !snapshot.sealed
+                });
+                let result = slots.commit_epoch(&mut root);
+                let next = epoch.checked_add(1);
+                kani::assert(
+                    if !changing {
+                        result == Err(Error::NoEpochChange) && root.switched.is_none()
+                    } else if next.is_none() {
+                        result == Err(Error::EpochExhausted) && root.switched.is_none()
+                    } else if unsaved {
+                        result == Err(Error::Unsaved) && root.switched.is_none()
+                    } else if !root.switches {
+                        result == Err(Error::RootFailed) && root.switched == next
+                    } else {
+                        result == Ok(root.answer)
+                    },
+                    "a commit is refused without a change, with a set unsaved, and when the root \
+                     is not switched, and otherwise returns how surely the old root is erased",
+                );
+                if result.is_ok() {
+                    kani::assert(
+                        root.switched == next
+                            && root.erased == Some(epoch)
+                            && next == Some(slots.epoch.number)
+                            && *slots.epoch.key.bytes() == next_key
+                            && *slots.epoch.next.bytes() == [0; 64]
+                            && !slots.epoch.changing
+                            && (0..2).all(|index| {
+                                snapshot(&slots.memory[index])
+                                    == marked(before[index], false, false)
+                            }),
+                        "a commit switches the root to the next epoch, erases the old, makes the \
+                         next epoch and its key this one's, and saves every set as it is",
+                    );
+                } else {
+                    kani::assert(
+                        unchanged(&slots) && root.erased.is_none(),
+                        "a refused commit changes nothing and erases nothing",
+                    );
+                }
+                kani::cover!(
+                    result.is_ok() && before.iter().any(|snapshot| snapshot.changed),
+                    "a change of a set is saved"
+                );
+                kani::cover!(result == Err(Error::Unsaved), "a set is not yet wrapped");
+                kani::cover!(result == Err(Error::RootFailed), "the root is not switched");
+            }
+        }
+    }
+
     fn at_length(lengths: &[KeyLength; MEMBERS], position: usize) -> KeyLength {
         at(lengths, position)
     }
 
-    /// An addition through the first slot; with the next, through either slot of two in any state.
+    // One proof for each length of key and each slot, so that each stays well inside its time.
+
+    /// An addition of 32 bytes through the first slot; with the next three, an addition of either
+    /// length through either slot of two in any state.
     #[kani::proof]
     #[kani::unwind(65)]
-    fn an_addition_in_the_first_slot() {
-        add_in([any_slot_in(Occupancy::Loaded), any_slot()], 0);
+    fn a_short_addition_in_the_first_slot() {
+        add_in([any_slot_in(Occupancy::Loaded), any_slot()], 0, add_short);
     }
 
-    /// An addition through the second slot.
+    /// An addition of 64 bytes through the first slot.
     #[kani::proof]
     #[kani::unwind(65)]
-    fn an_addition_in_the_second_slot() {
-        add_in([any_slot(), any_slot_in(Occupancy::Loaded)], 1);
+    fn a_long_addition_in_the_first_slot() {
+        add_in([any_slot_in(Occupancy::Loaded), any_slot()], 0, add_long);
+    }
+
+    /// An addition of 32 bytes through the second slot.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_short_addition_in_the_second_slot() {
+        add_in([any_slot(), any_slot_in(Occupancy::Loaded)], 1, add_short);
+    }
+
+    /// An addition of 64 bytes through the second slot.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_long_addition_in_the_second_slot() {
+        add_in([any_slot(), any_slot_in(Occupancy::Loaded)], 1, add_long);
+    }
+
+    /// From any state of two slots during a change of epoch, for a handle of this set naming any
+    /// slot and generation: every change of stage and every addition, of 32 or 64 bytes or
+    /// generated, is refused, as `EpochChanging` if the handle is live and as `StaleHandle`
+    /// otherwise; the source is left as it was, the platform's source is not asked, and nothing
+    /// changes.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn no_set_changes_during_a_change_of_epoch() {
+        let mut memory = [any_slot(), any_slot()];
+        let id = memory.as_ptr().addr();
+        let mut epoch = any_epoch(true);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let handle = forged(id);
+        let live = live(&slots, id, &handle);
+        let before = snapshots(&slots);
+        let (result, _, _) = any_change(&mut slots, handle, any_position(), &mut Stages::one());
+        let mut source: [u8; 64] = kani::any();
+        let original = source;
+        let mut entropy = Counted { calls: 0 };
+        let added = match kani::any::<u8>() % 3 {
+            0 => {
+                let mut short = [0; 32];
+                short.copy_from_slice(&source[..32]);
+                let added = slots.add32(handle, &mut short);
+                source[..32].copy_from_slice(&short);
+                added
+            }
+            1 => slots.add64(handle, &mut source),
+            _ => slots.add_generated(handle, any_length(), &mut entropy),
+        };
+        let refusal = if live {
+            Error::EpochChanging
+        } else {
+            Error::StaleHandle
+        };
+        kani::assert(
+            result == Err(refusal)
+                && added == Err(refusal)
+                && source == original
+                && entropy.calls == 0
+                && unchanged_except(&slots, &before, 2)
+                && slots.epoch.changing,
+            "during a change of epoch no set changes or takes a key, and nothing changes",
+        );
+        kani::cover!(live, "a live set is refused");
     }
 }
