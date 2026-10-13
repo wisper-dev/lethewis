@@ -528,6 +528,34 @@ pub(crate) mod stack {
     }
 
     #[test]
+    fn adding_a_key_leaves_no_residue() {
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut slots = Slots::new(&mut memory);
+        let set = slots.import32(Purpose::Wrap, &mut [3; 32]).unwrap();
+        let mut long = key_bytes();
+        assert_clean(&pieces(&key_bytes(), KeyLength::Bytes64), || {
+            slots.add64(set, &mut long).unwrap();
+        });
+        let mut short: [u8; 32] = key_bytes()[..32].try_into().unwrap();
+        assert_clean(&pieces(&key_bytes(), KeyLength::Bytes32), || {
+            slots.add32(set, &mut short).unwrap();
+        });
+    }
+
+    #[test]
+    fn adding_a_generated_key_leaves_no_residue() {
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut slots = Slots::new(&mut memory);
+        let set = slots.import32(Purpose::Wrap, &mut [3; 32]).unwrap();
+        let counted = counted::<64>();
+        for length in [KeyLength::Bytes64, KeyLength::Bytes32] {
+            assert_clean(&pieces(&counted, length), || {
+                slots.add_generated(set, length, &mut Counting).unwrap();
+            });
+        }
+    }
+
+    #[test]
     fn generating_a_key_leaves_no_residue() {
         let mut memory = [const { Slot::empty() }; 2];
         let mut slots = Slots::new(&mut memory);

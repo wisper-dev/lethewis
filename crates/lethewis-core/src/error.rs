@@ -29,6 +29,26 @@ pub enum Error {
     /// A key of the set is held here already, or the set holds one key twice: a key is held in one
     /// place only.
     DuplicateKey,
+    /// Every position of the set holds a key.
+    SetFull,
+    /// The change does not apply to the primary key of the set.
+    PrimaryKey,
+    /// The position does not hold a key in the stage the change starts from.
+    WrongStage,
+    /// The set has changed as many times as its counter holds.
+    SetExhausted,
+}
+
+impl From<crate::keyset::Refused> for Error {
+    fn from(refused: crate::keyset::Refused) -> Self {
+        use crate::keyset::Refused;
+        match refused {
+            Refused::Full => Self::SetFull,
+            Refused::Primary => Self::PrimaryKey,
+            Refused::Stage => Self::WrongStage,
+            Refused::Exhausted => Self::SetExhausted,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -44,6 +64,10 @@ impl fmt::Display for Error {
             Self::InvalidContext => "invalid context",
             Self::CipherFailed => "cipher failed",
             Self::DuplicateKey => "duplicate key",
+            Self::SetFull => "key set full",
+            Self::PrimaryKey => "primary key",
+            Self::WrongStage => "wrong stage",
+            Self::SetExhausted => "key set exhausted",
         })
     }
 }
@@ -70,5 +94,9 @@ mod tests {
         assert_eq!(Error::InvalidContext.to_string(), "invalid context");
         assert_eq!(Error::CipherFailed.to_string(), "cipher failed");
         assert_eq!(Error::DuplicateKey.to_string(), "duplicate key");
+        assert_eq!(Error::SetFull.to_string(), "key set full");
+        assert_eq!(Error::PrimaryKey.to_string(), "primary key");
+        assert_eq!(Error::WrongStage.to_string(), "wrong stage");
+        assert_eq!(Error::SetExhausted.to_string(), "key set exhausted");
     }
 }

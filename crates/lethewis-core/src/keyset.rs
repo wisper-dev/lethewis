@@ -36,9 +36,38 @@ pub(crate) struct Stages {
     revision: u64,
 }
 
+/// A position of a key set, each holding at most one key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Position {
+    /// The first position.
+    First,
+    /// The second position.
+    Second,
+    /// The third position.
+    Third,
+}
+
+impl Position {
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::First => 0,
+            Self::Second => 1,
+            Self::Third => 2,
+        }
+    }
+
+    pub(crate) const fn at(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::First),
+            1 => Some(Self::Second),
+            2 => Some(Self::Third),
+            _ => None,
+        }
+    }
+}
+
 /// Why a transition was refused. Nothing has changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(any(test, kani)), expect(dead_code))]
 pub(crate) enum Refused {
     /// Every position holds a key.
     Full,
@@ -90,7 +119,6 @@ impl Stages {
     }
 }
 
-#[cfg_attr(not(any(test, kani)), expect(dead_code))]
 impl Stages {
     /// Adds an enabled key in the first empty position, which is returned. It is not the primary.
     pub(crate) fn add(&mut self) -> Result<usize, Refused> {

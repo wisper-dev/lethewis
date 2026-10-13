@@ -98,6 +98,12 @@ Nothing is published while the version is below 0.1.0.
   `SECURITY.md`.
 - The stack a load of a key used is wiped after it, not only the stack of the derivation of its
   identifier.
+- Changes of a key set in its slot. `Slots::add32`, `Slots::add64` and `Slots::add_generated` add
+  a key, enabled, to the first empty position. `Slots::promote`, `Slots::disable`, `Slots::enable`
+  and `Slots::destroy` change the stage of a key. A destroyed key is wiped with its identifier.
+- `Position` names the three positions of a set. New errors: `SetFull`, `PrimaryKey`,
+  `WrongStage` and `SetExhausted`.
+- Proofs with Kani 0.68.0 for the changes of a set in its slot and for additions of a key.
 - A proof run reads its results from CBMC's own output. On every run the reading is compared with
   Kani's results on a proof with every outcome, failures among them, and on two of the library's
   proofs. A proof is limited to 10 minutes.

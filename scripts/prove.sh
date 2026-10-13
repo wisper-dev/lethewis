@@ -9,6 +9,8 @@
 #   prove.sh run PROOF   runs one proof; its results go to target/proofs/runs/
 #   prove.sh judge       judges the results in target/proofs/runs/ against the declared proofs
 #   prove.sh agree       compares, on a few proofs, Kani's own results with how a run reads them
+#   prove.sh sources     prints a digest of Kani and of every file but the documents; a run
+#                        writes it beside its results if the files did not change while it ran
 #
 # A run reads its results from CBMC's plain output with scripts/cbmc-results.py: Kani's own results
 # have CBMC build a trace for every region coverage reaches, which costs most of the time. Kani
@@ -83,15 +85,32 @@ read_run() {
   mv "$file.part" "$file"
 }
 
+sources() {
+  {
+    cargo kani --version
+    git ls-files --cached --others --exclude-standard -- ':!*.md' | while IFS= read -r name; do
+      if [ -f "$name" ]; then
+        printf '%s %s\n' "$(git hash-object -- "$name")" "$name"
+      fi
+    done
+  } | git hash-object --stdin
+}
+
 run_proof() {
-  local proof=$1
+  local proof=$1 file before
+  file=$(run_file "$proof")
   mkdir -p "$runs"
+  rm -f "${file%.json}.sources"
+  before=$(sources)
   # Kani names its coverage output by the minute, so proofs that run at once build apart.
   if [ -n "${PROVE_SLOT:-}" ]; then
     export CARGO_TARGET_DIR=$out/slot-$PROVE_SLOT
   fi
   rm -rf "${CARGO_TARGET_DIR:-target}"/kani/*/kanicov_*
-  read_run Cargo.toml "$proof" "$(run_file "$proof")"
+  read_run Cargo.toml "$proof" "$file"
+  if [ "$(sources)" = "$before" ]; then
+    printf '%s\n' "$before" >"${file%.json}.sources"
+  fi
 }
 
 # Kani's own results against the reading of the same run: a proof with every outcome, failures
@@ -327,8 +346,9 @@ case "${1:-}" in
     ;;
   judge) judge ;;
   agree) agree ;;
+  sources) sources ;;
   *)
-    echo "usage: prove.sh [list | run PROOF | judge | agree]" >&2
+    echo "usage: prove.sh [list | run PROOF | judge | agree | sources]" >&2
     exit 2
     ;;
 esac

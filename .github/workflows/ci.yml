@@ -575,9 +575,9 @@ jobs:
         run: scripts/prove.sh agree
 
       - name: Every proof holds and every cover property is reached
-        # Three at a time on the runner's four processors: none needs more than 3 GB.
+        # One per processor of the runner: none needs more than 3 GB of its 16.
         env:
-          LETHEWIS_PROOF_JOBS: 3
+          LETHEWIS_PROOF_JOBS: 4
         run: scripts/prove.sh
 
       - name: Keep the results and the manifest

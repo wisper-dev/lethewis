@@ -68,6 +68,8 @@ def properties(text: str) -> list[dict[str, str]]:
             continue
         match = PROPERTY.fullmatch(record)
         if match is None:
+            if group is None and re.match(r"\[[a-z][a-z_-]*\.\d+\] ", record):
+                refuse(f"a check without a place in the code, which the judge refuses: {record!r}")
             if re.search(r": " + STATUS, record):
                 refuse(f"not a property: {record!r}")
             continue

@@ -87,6 +87,10 @@ what the record decrypts to. The wipe on release and on creating the slots, and 
 released or foreign handle, are proven for two slots; the statements and their limits are in
 [proofs.md](proofs.md).
 
+A key is added to a set enabled, and only a disabled key that is not the primary is destroyed. A
+destroyed key is wiped with its identifier, and a record of its set wrapped afterwards does not hold
+it. A record wrapped before the destruction still does.
+
 **Intended.** Drop keys from memory when the device locks.
 
 **Not defended.** Copies left by a value move, a buffer reallocation, a CPU register, swap, or a

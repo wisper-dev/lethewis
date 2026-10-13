@@ -8,7 +8,7 @@ use crate::{
     entropy::{Entropy, EntropyError},
     error::Error,
     key::{Key, KeyBytes, KeyLength, wipe},
-    keyset::{self, Header, MEMBERS, Stages},
+    keyset::{self, Header, MEMBERS, Position, Refused, Stages},
     record::{AssociatedData, PLAINTEXT_LEN, Purpose, RECORD_LEN, Status},
     seal::{self, KEY_LEN as CIPHER_KEY_LEN, NONCE_LEN, Rejected, TAG_LEN},
 };
@@ -79,6 +79,25 @@ impl Slot {
         let at =
             |position: usize, held: &KeyId| self.stages.stage(position).is_some() && held.same(id);
         self.occupancy == Occupancy::Loaded && (at(0, first) || at(1, second) || at(2, third))
+    }
+
+    fn key(&self, at: Position) -> &Key {
+        let [first, second, third] = &self.keys;
+        match at {
+            Position::First => first,
+            Position::Second => second,
+            Position::Third => third,
+        }
+    }
+
+    fn member(&mut self, at: Position) -> (&mut Key, &mut KeyId) {
+        let [first, second, third] = &mut self.keys;
+        let [first_id, second_id, third_id] = &mut self.ids;
+        match at {
+            Position::First => (first, first_id),
+            Position::Second => (second, second_id),
+            Position::Third => (third, third_id),
+        }
     }
 
     /// The primary key of the set and its identifier.
@@ -207,8 +226,8 @@ impl<'a> Slots<'a> {
     ///
     /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole load, are
-    /// each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate but not the hash code it
-    /// calls has to set that flag.
+    /// each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate
+    /// but not the hash code it calls has to set that flag.
     ///
     /// # Errors
     ///
@@ -233,8 +252,8 @@ impl<'a> Slots<'a> {
     ///
     /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole load, are
-    /// each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate but not the hash code it
-    /// calls has to set that flag.
+    /// each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate
+    /// but not the hash code it calls has to set that flag.
     ///
     /// # Errors
     ///
@@ -261,8 +280,8 @@ impl<'a> Slots<'a> {
     ///
     /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole load, are
-    /// each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate but not the hash code it
-    /// calls has to set that flag.
+    /// each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate
+    /// but not the hash code it calls has to set that flag.
     ///
     /// # Errors
     ///
@@ -579,7 +598,7 @@ impl<'a> Slots<'a> {
         stages: &Stages,
     ) -> Result<[KeyId; MEMBERS], Error> {
         let slot = self.slots.get(index).ok_or(Error::NoFreeSlot)?;
-        let derive = |position: usize, key: &Key, id: &mut KeyId| {
+        let derive = |position: usize, key: &Key, id: &mut KeyId| -> Result<(), Error> {
             if stages.stage(position).is_some() {
                 derive_key_id(key, purpose, id).map_err(|_| Error::DerivationFailed)?;
             }
@@ -604,6 +623,200 @@ impl<'a> Slots<'a> {
             return Err(Error::DuplicateKey);
         }
         Ok(ids)
+    }
+
+    /// Takes a 32-byte key from `source` into the first empty position of the set that `set` refers
+    /// to, enabled and not the primary, and wipes `source`. Returns the position.
+    ///
+    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole
+    /// addition, are each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises
+    /// this crate but not the hash code it calls has to set that flag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now, [`Error::SetFull`] if
+    /// every position holds a key, [`Error::SetExhausted`] if the set has changed as many times as
+    /// its counter holds, [`Error::DerivationFailed`] if the identifier of the key cannot be
+    /// derived, and [`Error::DuplicateKey`] if these slots hold the key already. `source` is then
+    /// left as it was, and nothing changes.
+    pub fn add32(&mut self, set: Handle<'a>, source: &mut [u8; 32]) -> Result<Position, Error> {
+        let at = self.add(set, |key| {
+            key.copy32(source);
+            Ok(())
+        })?;
+        wipe(source);
+        Ok(at)
+    }
+
+    /// Takes a 64-byte key from `source` into the first empty position of the set that `set` refers
+    /// to, enabled and not the primary, and wipes `source`. Returns the position.
+    ///
+    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole
+    /// addition, are each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises
+    /// this crate but not the hash code it calls has to set that flag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now, [`Error::SetFull`] if
+    /// every position holds a key, [`Error::SetExhausted`] if the set has changed as many times as
+    /// its counter holds, [`Error::DerivationFailed`] if the identifier of the key cannot be
+    /// derived, and [`Error::DuplicateKey`] if these slots hold the key already. `source` is then
+    /// left as it was, and nothing changes.
+    pub fn add64(&mut self, set: Handle<'a>, source: &mut [u8; 64]) -> Result<Position, Error> {
+        let at = self.add(set, |key| {
+            key.copy64(source);
+            Ok(())
+        })?;
+        wipe(source);
+        Ok(at)
+    }
+
+    /// Creates a key of `length` random bytes from `entropy` in the first empty position of the set
+    /// that `set` refers to, enabled and not the primary, and returns the position. The bytes are
+    /// written straight into the slot. `entropy` is asked once, and only when a position is empty.
+    ///
+    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole
+    /// addition, are each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises
+    /// this crate but not the hash code it calls has to set that flag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now, [`Error::SetFull`] if
+    /// every position holds a key, [`Error::SetExhausted`] if the set has changed as many times as
+    /// its counter holds, [`Error::DerivationFailed`] if the identifier of the key cannot be
+    /// derived, [`Error::EntropyFailed`] if `entropy` fails, and [`Error::DuplicateKey`] if these
+    /// slots hold the key already. Nothing changes then.
+    ///
+    /// # Panics
+    ///
+    /// Only if `entropy` panics. The panic passes through, and the position stays empty and wiped.
+    pub fn add_generated(
+        &mut self,
+        set: Handle<'a>,
+        length: KeyLength,
+        entropy: &mut (impl Entropy + ?Sized),
+    ) -> Result<Position, Error> {
+        self.add(set, |key| {
+            key.fill(length, entropy)
+                .map_err(|EntropyError| Error::EntropyFailed)
+        })
+    }
+
+    /// Makes the enabled key at `at` the primary of the set that `set` refers to. The former primary
+    /// stays enabled.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now, [`Error::PrimaryKey`]
+    /// if the key at `at` is the primary already, [`Error::WrongStage`] if `at` does not hold an
+    /// enabled key, and [`Error::SetExhausted`] if the set has changed as many times as its counter
+    /// holds. Nothing changes then.
+    pub fn promote(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
+        self.change(set, at, Stages::promote).map(|_| ())
+    }
+
+    /// Disables the enabled key at `at` of the set that `set` refers to: it unwraps nothing until it
+    /// is enabled again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now, [`Error::PrimaryKey`]
+    /// if the key at `at` is the primary, [`Error::WrongStage`] if `at` does not hold an enabled
+    /// key, and [`Error::SetExhausted`] if the set has changed as many times as its counter holds.
+    /// Nothing changes then.
+    pub fn disable(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
+        self.change(set, at, Stages::disable).map(|_| ())
+    }
+
+    /// Enables the disabled key at `at` of the set that `set` refers to again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now, [`Error::PrimaryKey`]
+    /// if `at` is the primary position, [`Error::WrongStage`] if `at` does not hold a disabled key,
+    /// and [`Error::SetExhausted`] if the set has changed as many times as its counter holds.
+    /// Nothing changes then.
+    pub fn enable(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
+        self.change(set, at, Stages::enable).map(|_| ())
+    }
+
+    /// Wipes the disabled key at `at` of the set that `set` refers to, with its identifier, and
+    /// empties the position. A record of the set wrapped afterwards does not hold the key.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now, [`Error::PrimaryKey`]
+    /// if `at` is the primary position, [`Error::WrongStage`] if `at` does not hold a disabled key,
+    /// and [`Error::SetExhausted`] if the set has changed as many times as its counter holds.
+    /// Nothing changes then.
+    pub fn destroy(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
+        let (key, id) = self.change(set, at, Stages::destroy)?.member(at);
+        key.wipe();
+        id.wipe();
+        Ok(())
+    }
+
+    /// Applies `transition` at `at` to the stages of the set that `set` refers to, and returns its
+    /// slot if it applies.
+    fn change(
+        &mut self,
+        set: Handle<'a>,
+        at: Position,
+        transition: impl FnOnce(&mut Stages, usize) -> Result<(), Refused>,
+    ) -> Result<&mut Slot, Error> {
+        let index = self.loaded(set)?;
+        let slot = self.slots.get_mut(index).ok_or(Error::StaleHandle)?;
+        let mut stages = slot.stages;
+        transition(&mut stages, at.index())?;
+        slot.stages = stages;
+        Ok(slot)
+    }
+
+    /// Puts a key into the first empty position of the set that `set` refers to with `fill`,
+    /// derives its identifier, and keeps the key enabled if these slots do not hold it already,
+    /// with data-independent timing on. On failure the position is left empty and wiped. The stack
+    /// the addition used is wiped after it.
+    fn add(
+        &mut self,
+        set: Handle<'a>,
+        fill: impl FnOnce(&mut Key) -> Result<(), Error>,
+    ) -> Result<Position, Error> {
+        let added = lethewis_dit::with(|| self.add_in_slot(set, fill));
+        wipe_stack();
+        added
+    }
+
+    fn add_in_slot(
+        &mut self,
+        set: Handle<'a>,
+        fill: impl FnOnce(&mut Key) -> Result<(), Error>,
+    ) -> Result<Position, Error> {
+        let index = self.loaded(set)?;
+        let slot = self.slots.get_mut(index).ok_or(Error::StaleHandle)?;
+        let (mut stages, purpose) = (slot.stages, slot.purpose);
+        let at = Position::at(stages.add()?).ok_or(Error::SetFull)?;
+        let filled = fill(slot.member(at).0);
+        let mut id = KeyId::empty();
+        let identified = filled.and_then(|()| {
+            let key = self.slots.get(index).ok_or(Error::StaleHandle)?.key(at);
+            derive_key_id(key, purpose, &mut id).map_err(|_| Error::DerivationFailed)?;
+            if self.slots.iter().any(|other| other.holds(&id)) {
+                return Err(Error::DuplicateKey);
+            }
+            Ok(())
+        });
+        let slot = self.slots.get_mut(index).ok_or(Error::StaleHandle)?;
+        let (key, held) = slot.member(at);
+        if let Err(error) = identified {
+            key.wipe();
+            return Err(error);
+        }
+        held.take(&mut id);
+        slot.stages = stages;
+        Ok(at)
     }
 
     /// Wipes every key of the set that `handle` refers to and frees its slot.
@@ -696,8 +909,8 @@ mod tests {
 
     use super::{
         AssociatedData, CIPHER_KEY_LEN, Entropy, EntropyError, Error, Handle, Header, KeyLength,
-        MEMBERS, Occupancy, PLAINTEXT_LEN, Purpose, RECORD_LEN, Slot, Slots, Stages, Status,
-        derive_wrap_key, keyset, seal, write_record,
+        MEMBERS, Occupancy, PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Slot, Slots, Stages,
+        Status, derive_wrap_key, keyset, seal, write_record,
     };
     use crate::derive::{CIPHER_STACK_WIPE, KeyId, STACK_WIPE, derive_key_id};
     use crate::key::{
@@ -731,7 +944,18 @@ mod tests {
             .unwrap();
         assert_eq!(seen(), Some(true));
         slots.release(key).unwrap();
-        slots.unwrap(parent, b"context", &record).unwrap();
+        let set = slots.unwrap(parent, b"context", &record).unwrap();
+        assert_eq!(seen(), Some(true));
+        slots.add32(set, &mut [3; 32]).unwrap();
+        assert_eq!(seen(), Some(true));
+        slots.add64(set, &mut [4; 64]).unwrap();
+        assert_eq!(seen(), Some(true));
+        slots.release(set).unwrap();
+        let set = slots.import32(Purpose::Wrap, &mut [5; 32]).unwrap();
+        let _ = seen();
+        slots
+            .add_generated(set, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
         assert_eq!(seen(), Some(true));
     }
 
@@ -769,6 +993,9 @@ mod tests {
             ("import32", loads),
             ("import64", loads),
             ("generate", loads),
+            ("add32", loads),
+            ("add64", loads),
+            ("add_generated", loads),
             ("wrap", wraps),
             ("unwrap", wraps),
         ] {
@@ -780,6 +1007,248 @@ mod tests {
                 assert!(text.contains(&stated), "{call}: {stated}");
             }
         }
+    }
+
+    #[test]
+    fn keys_are_added_enabled_in_the_first_empty_position() {
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut slots = Slots::new(&mut memory);
+        let set = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
+        let mut long = [5; 64];
+        assert_eq!(slots.add64(set, &mut long), Ok(Position::Second));
+        assert_eq!(long, [0; 64]);
+        let added = slots.add_generated(set, KeyLength::Bytes32, &mut Counting);
+        assert_eq!(added, Ok(Position::Third));
+        let generated = counted::<32>();
+        assert_holds(
+            &slots,
+            set,
+            [
+                Some((Status::Enabled, &secret())),
+                Some((Status::Enabled, &[5; 64])),
+                Some((Status::Enabled, &generated)),
+            ],
+            0,
+        );
+        let mut more = [6; 32];
+        assert_eq!(slots.add32(set, &mut more), Err(Error::SetFull));
+        assert_eq!(more, [6; 32]);
+    }
+
+    #[test]
+    fn a_generated_key_is_written_straight_into_its_position() {
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut slots = Slots::new(&mut memory);
+        let set = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
+        let mut source = Recording::default();
+        let added = slots.add_generated(set, KeyLength::Bytes64, &mut source);
+        assert_eq!(added, Ok(Position::Second));
+        assert_eq!((source.calls, source.asked), (1, 64));
+        assert_eq!(source.at, slots.slots[0].keys[1].bytes().as_ptr().addr());
+        let mut full = Recording::default();
+        slots
+            .add_generated(set, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let refused = slots.add_generated(set, KeyLength::Bytes32, &mut full);
+        assert_eq!((refused, full.calls), (Err(Error::SetFull), 0));
+    }
+
+    #[test]
+    fn a_key_held_anywhere_is_not_added() {
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut slots = Slots::new(&mut memory);
+        let first = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        let second = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
+        for (set, bytes) in [(second, [1; 32]), (second, [2; 32]), (first, [1; 32])] {
+            let mut source = bytes;
+            assert_eq!(slots.add32(set, &mut source), Err(Error::DuplicateKey));
+            assert_eq!(source, bytes);
+        }
+        assert_holds(
+            &slots,
+            first,
+            [Some((Status::Enabled, &[1; 32])), None, None],
+            0,
+        );
+        assert_holds(
+            &slots,
+            second,
+            [Some((Status::Enabled, &[2; 32])), None, None],
+            0,
+        );
+    }
+
+    #[test]
+    fn a_failed_addition_leaves_the_position_empty_and_wiped() {
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut slots = Slots::new(&mut memory);
+        let set = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
+        let failed = slots.add_generated(set, KeyLength::Bytes64, &mut Failing);
+        assert_eq!(failed, Err(Error::EntropyFailed));
+        assert_holds(
+            &slots,
+            set,
+            [Some((Status::Enabled, &secret())), None, None],
+            0,
+        );
+    }
+
+    #[test]
+    fn the_stages_change_only_as_the_set_allows() {
+        use Position::{First, Second, Third};
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut slots = Slots::new(&mut memory);
+        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        assert_eq!(slots.promote(set, Second), Err(Error::WrongStage));
+        assert_eq!(slots.add32(set, &mut [2; 32]), Ok(Second));
+        assert_eq!(slots.promote(set, First), Err(Error::PrimaryKey));
+        assert_eq!(slots.disable(set, First), Err(Error::PrimaryKey));
+        assert_eq!(slots.destroy(set, Second), Err(Error::WrongStage));
+        assert_eq!(slots.promote(set, Second), Ok(()));
+        assert_eq!(slots.disable(set, First), Ok(()));
+        assert_eq!(slots.disable(set, First), Err(Error::WrongStage));
+        assert_eq!(slots.enable(set, First), Ok(()));
+        assert_eq!(slots.disable(set, First), Ok(()));
+        assert_holds(
+            &slots,
+            set,
+            [
+                Some((Status::Disabled, &[1; 32])),
+                Some((Status::Enabled, &[2; 32])),
+                None,
+            ],
+            1,
+        );
+        assert_eq!(slots.destroy(set, Second), Err(Error::PrimaryKey));
+        assert_eq!(slots.destroy(set, Third), Err(Error::WrongStage));
+        assert_eq!(slots.destroy(set, First), Ok(()));
+        assert_eq!(slots.destroy(set, First), Err(Error::WrongStage));
+        assert_holds(
+            &slots,
+            set,
+            [None, Some((Status::Enabled, &[2; 32])), None],
+            1,
+        );
+        assert_eq!(slots.add32(set, &mut [3; 32]), Ok(First));
+    }
+
+    #[test]
+    fn an_exhausted_set_changes_no_more() {
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut slots = Slots::new(&mut memory);
+        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        slots.add32(set, &mut [2; 32]).unwrap();
+        let members = [Some(Status::Enabled), Some(Status::Enabled), None];
+        slots.slots[0].stages = Stages::from_parts(members, 0, u64::MAX);
+        let mut source = [3; 32];
+        assert_eq!(slots.add32(set, &mut source), Err(Error::SetExhausted));
+        assert_eq!(source, [3; 32]);
+        let added = slots.add_generated(set, KeyLength::Bytes32, &mut Untouched);
+        assert_eq!(added, Err(Error::SetExhausted));
+        assert_eq!(
+            slots.promote(set, Position::Second),
+            Err(Error::SetExhausted)
+        );
+        assert_eq!(
+            slots.disable(set, Position::Second),
+            Err(Error::SetExhausted)
+        );
+        assert_holds(
+            &slots,
+            set,
+            [
+                Some((Status::Enabled, &[1; 32])),
+                Some((Status::Enabled, &[2; 32])),
+                None,
+            ],
+            0,
+        );
+    }
+
+    #[test]
+    fn a_panic_in_the_source_of_an_addition_leaves_the_position_empty_and_wiped() {
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut slots = Slots::new(&mut memory);
+        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = slots.add_generated(set, KeyLength::Bytes64, &mut Panicking);
+        }));
+        assert!(outcome.is_err());
+        assert_holds(
+            &slots,
+            set,
+            [Some((Status::Enabled, &[1; 32])), None, None],
+            0,
+        );
+    }
+
+    #[test]
+    fn a_stale_handle_changes_nothing() {
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut slots = Slots::new(&mut memory);
+        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        slots.release(set).unwrap();
+        let mut source = [2; 32];
+        assert_eq!(slots.add32(set, &mut source), Err(Error::StaleHandle));
+        assert_eq!(source, [2; 32]);
+        assert_eq!(slots.promote(set, Position::First), Err(Error::StaleHandle));
+        assert_eq!(
+            slots.disable(set, Position::Second),
+            Err(Error::StaleHandle)
+        );
+        assert_eq!(slots.enable(set, Position::Second), Err(Error::StaleHandle));
+        assert_eq!(
+            slots.destroy(set, Position::Second),
+            Err(Error::StaleHandle)
+        );
+        let added = slots.add_generated(set, KeyLength::Bytes32, &mut Untouched);
+        assert_eq!(added, Err(Error::StaleHandle));
+        assert_eq!(slots.slots[0].occupancy, Occupancy::Free);
+    }
+
+    /// A destroyed key is in no record of its set wrapped afterwards, and a disabled key unwraps
+    /// nothing until it is enabled again.
+    #[test]
+    fn keys_rotate_from_added_to_destroyed() {
+        use Position::{First, Second};
+        let mut memory = [const { Slot::empty() }; 3];
+        let mut slots = Slots::new(&mut memory);
+        let root = slots.import64(Purpose::Wrap, &mut [9; 64]).unwrap();
+        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        let child = slots.import32(Purpose::Wrap, &mut [5; 32]).unwrap();
+        let mut under_old = [0; RECORD_LEN];
+        slots
+            .wrap(child, set, b"chat", &mut Counting, &mut under_old)
+            .unwrap();
+        slots.release(child).unwrap();
+        assert_eq!(slots.add32(set, &mut [2; 32]), Ok(Second));
+        slots.promote(set, Second).unwrap();
+        slots.disable(set, First).unwrap();
+        assert_eq!(
+            slots.unwrap(set, b"chat", &under_old),
+            Err(Error::KeyDisabled)
+        );
+        slots.enable(set, First).unwrap();
+        let child = slots.unwrap(set, b"chat", &under_old).unwrap();
+        slots.release(child).unwrap();
+        slots.disable(set, First).unwrap();
+        slots.destroy(set, First).unwrap();
+        let mut record = [0; RECORD_LEN];
+        slots
+            .wrap(set, root, b"set", &mut Counting, &mut record)
+            .unwrap();
+        slots.release(set).unwrap();
+        let back = slots.unwrap(root, b"set", &record).unwrap();
+        assert_holds(
+            &slots,
+            back,
+            [None, Some((Status::Enabled, &[2; 32])), None],
+            1,
+        );
+        assert_eq!(
+            slots.unwrap(back, b"chat", &under_old),
+            Err(Error::RecordRejected)
+        );
     }
 
     /// Fails the test if it is ever asked for bytes.
@@ -2559,6 +3028,14 @@ mod stack {
                 let generated = slots.generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting);
                 black_box(generated.unwrap());
             }),
+            depth_changed(|| {
+                let mut long: [u8; 64] = pattern(11, 11, 64, 0).try_into().unwrap();
+                black_box(slots.add64(key, &mut long).unwrap());
+            }),
+            depth_changed(|| {
+                let added = slots.add_generated(key, KeyLength::Bytes32, &mut Counting);
+                black_box(added.unwrap());
+            }),
         ];
         for depth in loads {
             assert!(depth <= LOAD_STACK, "{depth} bytes reached");
@@ -2573,7 +3050,8 @@ mod proofs {
 
     use super::{
         CIPHER_KEY_LEN, Entropy, EntropyError, Error, Handle, Key, KeyId, KeyLength, MEMBERS,
-        Occupancy, PLAINTEXT_LEN, Purpose, RECORD_LEN, Rejected, Slot, Slots, Stages, Status,
+        Occupancy, PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Rejected, Slot, Slots, Stages,
+        Status,
     };
     use crate::derive::{
         model::{any_failed, failed, id_bytes, id_from_bytes},
@@ -3833,5 +4311,287 @@ mod proofs {
             result == Err(Error::DerivationFailed),
             "the derivation fails"
         );
+    }
+
+    fn any_position() -> Position {
+        match kani::any::<u8>() % 3 {
+            0 => Position::First,
+            1 => Position::Second,
+            _ => Position::Third,
+        }
+    }
+
+    /// Promotes, disables, enables or destroys the key at any position through `handle`, and returns
+    /// what the call gave, what the transition of the stages gave, and whether it destroyed.
+    fn any_change(
+        slots: &mut Slots<'_>,
+        handle: Handle<'static>,
+        chosen: Position,
+        expected: &mut Stages,
+    ) -> (Result<(), Error>, Result<(), Error>, bool) {
+        let destroying = kani::any::<u8>() % 4 == 3;
+        let (result, outcome) = match kani::any::<u8>() % 3 {
+            _ if destroying => (
+                slots.destroy(handle, chosen),
+                expected.destroy(chosen.index()),
+            ),
+            0 => (
+                slots.promote(handle, chosen),
+                expected.promote(chosen.index()),
+            ),
+            1 => (
+                slots.disable(handle, chosen),
+                expected.disable(chosen.index()),
+            ),
+            _ => (
+                slots.enable(handle, chosen),
+                expected.enable(chosen.index()),
+            ),
+        };
+        (result, outcome.map_err(Error::from), destroying)
+    }
+
+    /// From `memory`, with the slot `index` loaded and any position: promoting, disabling, enabling
+    /// and destroying through the live handle of that slot change its stages exactly as the
+    /// transition of the stages gives, and a refusal is that transition's and changes nothing; a
+    /// destroy wipes the key and the identifier at the position and leaves every other key as it
+    /// was; the slot keeps its generation and purpose, and no other slot changes.
+    fn change_in(mut memory: [Slot; 2], index: usize) {
+        let id = memory.as_ptr().addr();
+        let mut slots = Slots { slots: &mut memory };
+        let before = snapshots(&slots);
+        let named = snapshot_at(&before, index);
+        let handle = Handle {
+            slots: id,
+            index,
+            generation: named.generation,
+            memory: PhantomData,
+        };
+        let chosen = any_position();
+        let mut expected = named.stages;
+        let (result, outcome, destroying) = any_change(&mut slots, handle, chosen, &mut expected);
+        kani::assert(
+            result == outcome,
+            "a change succeeds exactly when the transition of the stages does, or fails as it does",
+        );
+        let now = snapshot(slot_at(&slots, index));
+        kani::assert(
+            now.stages == expected
+                && now.occupancy == Occupancy::Loaded
+                && now.generation == named.generation
+                && now.purpose == named.purpose,
+            "the set keeps its slot, generation and purpose, and its stages change as the \
+             transition gives",
+        );
+        let wiped = destroying && result.is_ok();
+        for position in 0..MEMBERS {
+            kani::assert(
+                if wiped && position == chosen.index() {
+                    pick(&now.keys, position) == [0; 64]
+                        && at(&now.lengths, position) == KeyLength::Bytes32
+                        && pick(&now.ids, position) == [0; ID_LEN]
+                } else {
+                    pick(&now.keys, position) == pick(&named.keys, position)
+                        && at(&now.lengths, position) == at(&named.lengths, position)
+                        && pick(&now.ids, position) == pick(&named.ids, position)
+                },
+                "a destroy wipes the key and identifier at its position, and no other key changes",
+            );
+        }
+        kani::assert(
+            unchanged_except(&slots, &before, index),
+            "a change touches no other slot",
+        );
+        kani::cover!(
+            wiped && chosen == Position::Third,
+            "a key at the last position is destroyed"
+        );
+        kani::cover!(
+            !destroying && result.is_ok() && now.stages.primary() == chosen.index(),
+            "a key is promoted"
+        );
+        kani::cover!(
+            result == Err(Error::PrimaryKey),
+            "a change is refused for the primary"
+        );
+        kani::cover!(
+            result == Err(Error::WrongStage),
+            "a change finds the wrong stage"
+        );
+    }
+
+    /// A change through the first slot; with the next, through either slot of two in any state.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_change_of_stage_in_the_first_slot() {
+        change_in([any_slot_in(Occupancy::Loaded), any_slot()], 0);
+    }
+
+    /// A change through the second slot.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_change_of_stage_in_the_second_slot() {
+        change_in([any_slot(), any_slot_in(Occupancy::Loaded)], 1);
+    }
+
+    /// From any state of two slots, a handle of this set that names no loaded slot with its
+    /// generation is refused by every change of stage, at any position, and no slot changes.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_change_of_stage_with_a_stale_handle_changes_nothing() {
+        let mut memory = [any_slot(), any_slot()];
+        let id = memory.as_ptr().addr();
+        let mut slots = Slots { slots: &mut memory };
+        let handle = forged(id);
+        kani::assume(!live(&slots, id, &handle));
+        let before = snapshots(&slots);
+        let (result, _, _) = any_change(&mut slots, handle, any_position(), &mut Stages::one());
+        let mut source: [u8; 32] = kani::any();
+        let original = source;
+        let added = slots.add32(handle, &mut source);
+        kani::assert(
+            result == Err(Error::StaleHandle)
+                && added == Err(Error::StaleHandle)
+                && source == original
+                && unchanged_except(&slots, &before, 2),
+            "a stale handle is refused by every change and addition, and changes nothing",
+        );
+        kani::cover!(
+            handle.index < 2 && slot_at(&slots, handle.index).occupancy == Occupancy::Loaded,
+            "the stale handle names a loaded slot"
+        );
+    }
+
+    /// Imports one key of either length with any bytes through `handle`. Returns the outcome and
+    /// the bytes and length the position must hold on success. An import wipes its source exactly
+    /// when it succeeds. A generation fills a key as a load does, which the proofs of a load cover.
+    fn add_any(
+        slots: &mut Slots<'_>,
+        handle: Handle<'static>,
+    ) -> (Result<Position, Error>, Bytes, KeyLength) {
+        if kani::any() {
+            let mut source: [u8; 32] = kani::any();
+            let original = source;
+            let result = slots.add32(handle, &mut source);
+            kani::assert(
+                source == if result.is_ok() { [0; 32] } else { original },
+                "an addition wipes its source exactly when it succeeds",
+            );
+            let mut bytes = [0; 64];
+            bytes[..32].copy_from_slice(&original);
+            (result, bytes, KeyLength::Bytes32)
+        } else {
+            let mut source: [u8; 64] = kani::any();
+            let original = source;
+            let result = slots.add64(handle, &mut source);
+            kani::assert(
+                source == if result.is_ok() { [0; 64] } else { original },
+                "an addition wipes its source exactly when it succeeds",
+            );
+            (result, original, KeyLength::Bytes64)
+        }
+    }
+
+    /// From `memory`, with the slot `index` loaded: adding a key through its live handle puts it
+    /// into the first empty position of the set, enabled, with the identifier derived from its
+    /// bytes, its length and the set's purpose, and changes nothing else; it fails as the
+    /// transition of the stages does when no position is empty or the set is exhausted, and
+    /// otherwise with DerivationFailed when the derivation fails and with DuplicateKey exactly when
+    /// a loaded slot holds a key with that identifier; a failed addition changes no slot.
+    fn add_in(mut memory: [Slot; 2], index: usize) {
+        let id = memory.as_ptr().addr();
+        let mut slots = Slots { slots: &mut memory };
+        let before = snapshots(&slots);
+        let named = snapshot_at(&before, index);
+        let handle = Handle {
+            slots: id,
+            index,
+            generation: named.generation,
+            memory: PhantomData,
+        };
+        let mut expected = named.stages;
+        let position = expected.add();
+        let (result, bytes, length) = add_any(&mut slots, handle);
+        let key_id = expected_key_id(&bytes, length, named.purpose);
+        kani::assert(
+            match position {
+                Err(refused) => result == Err(Error::from(refused)),
+                Ok(at) => {
+                    if failed() {
+                        result == Err(Error::DerivationFailed)
+                    } else if held(&before, &key_id) {
+                        result == Err(Error::DuplicateKey)
+                    } else {
+                        result.ok() == Position::at(at)
+                    }
+                }
+            },
+            "an addition fails as the stages refuse it, then with DerivationFailed when the \
+             derivation fails, with DuplicateKey when the key is held, and otherwise succeeds at \
+             the first empty position",
+        );
+        if let (Ok(added), Ok(at)) = (result, position) {
+            let now = snapshot(slot_at(&slots, index));
+            kani::assert(
+                added.index() == at
+                    && now.stages == expected
+                    && now.occupancy == Occupancy::Loaded
+                    && now.generation == named.generation
+                    && now.purpose == named.purpose,
+                "the set keeps its slot, generation and purpose, and its stages gain the key",
+            );
+            for position in 0..MEMBERS {
+                kani::assert(
+                    if position == at {
+                        pick(&now.keys, position) == bytes
+                            && at_length(&now.lengths, position) == length
+                            && pick(&now.ids, position) == key_id
+                    } else {
+                        pick(&now.keys, position) == pick(&named.keys, position)
+                            && at_length(&now.lengths, position)
+                                == at_length(&named.lengths, position)
+                            && pick(&now.ids, position) == pick(&named.ids, position)
+                    },
+                    "the added key and its identifier are at its position, and no other key changes",
+                );
+            }
+            kani::assert(
+                unchanged_except(&slots, &before, index),
+                "an addition touches no other slot",
+            );
+            kani::cover!(
+                at == 2 && length == KeyLength::Bytes64,
+                "a long key is added last"
+            );
+        } else {
+            kani::assert(
+                unchanged_except(&slots, &before, 2),
+                "a failed addition changes no slot",
+            );
+        }
+        kani::cover!(result == Err(Error::DuplicateKey), "the added key is held");
+        kani::cover!(result == Err(Error::SetFull), "the set is full");
+        kani::cover!(
+            result == Err(Error::DerivationFailed),
+            "the derivation fails"
+        );
+    }
+
+    fn at_length(lengths: &[KeyLength; MEMBERS], position: usize) -> KeyLength {
+        at(lengths, position)
+    }
+
+    /// An addition through the first slot; with the next, through either slot of two in any state.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn an_addition_in_the_first_slot() {
+        add_in([any_slot_in(Occupancy::Loaded), any_slot()], 0);
+    }
+
+    /// An addition through the second slot.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn an_addition_in_the_second_slot() {
+        add_in([any_slot(), any_slot_in(Occupancy::Loaded)], 1);
     }
 }

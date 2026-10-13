@@ -55,6 +55,7 @@ mod slots;
 pub use entropy::{Entropy, EntropyError};
 pub use error::Error;
 pub use key::KeyLength;
+pub use keyset::Position;
 pub use record::{Purpose, RECORD_LEN};
 pub use slots::{Handle, Slot, Slots};
 
