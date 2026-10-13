@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# A proof with every outcome Kani reports, failures among them, on which the proof script's reading
+# of CBMC's output is compared with Kani's own.
+
+[package]
+name = "kani-reading"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# A workspace of its own: its proof fails on purpose.
+[workspace]
+
+[lints.rust]
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(kani)"] }

@@ -56,12 +56,14 @@ A proof covers one named statement under named assumptions. Keeping the claims a
 file is what keeps the distance between them visible.
 
 The build accepts a proof run only if the pinned Kani ran, every declared proof ran by itself and
-succeeded within 30 minutes, every proof lives in a module `proofs`, has a cover property and
+succeeded within 10 minutes, every proof lives in a module `proofs`, has a cover property and
 reached all of them, every proof checks this repository's code, every `kani::assert(` and
 `kani::cover!(` written out in the source is in the run, some proof reaches every region that Kani
 compiled of the code in the modules `proofs`, and Kani reported no check in this repository's code
-as unreachable. Each check is judged by itself, and an unknown status is a failure. The build keeps
-the results and a manifest of the run with the tool versions.
+as unreachable. Each check is judged by itself, and an unknown status is a failure. The results are
+read from CBMC's own output as Kani reads it; on every run, the reading is compared with Kani's own
+results on a proof with every outcome, failures among them, and on two of these proofs. The build
+keeps the results and a manifest of the run with the tool versions.
 
 ## Checked against deliberate errors
 
@@ -230,5 +232,14 @@ compile error.
 | a `kani::assert` in a proof branch that is never reached | the run: Kani reports it unreachable, and no proof reaches the branch |
 | a `kani::assert` in a closure that never runs | the run: the assertion is not in it |
 | a proof outside a module `proofs` | the run, before Kani starts |
+| a reading of the results that takes a failed check for one that holds | the comparison with Kani's results |
+| a reading that takes a reached cover property for one never reached | the comparison with Kani's results |
+| a reading that takes covered code for uncovered | the comparison with Kani's results |
+| a reading that ignores which checks are unreachable | the comparison with Kani's results |
+| a reading that leaves out checks Kani reports | the comparison with Kani's results |
+| a reading that places a check in the file of its function rather than its own | the comparison with Kani's results |
+| a reading that does not count the properties, so a lost line of the results goes unnoticed | the comparison with Kani's results |
+| a proof with every outcome that no longer reaches a branch it never runs, or no longer has a check placed in a file other than its function's | the comparison with Kani's results: it requires every outcome |
+| a proof that must panic, which the reading of the results does not support | the run, before Kani starts |
 | an `assert!` or an `unwrap` in a proof branch that is never reached | the run: no proof reaches the branch |
 | an `assert!` in a method of a type in a module `proofs`, in a branch that is never reached | the run: no proof reaches the branch |

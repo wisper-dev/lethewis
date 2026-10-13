@@ -19,6 +19,10 @@ const VERSION: u8 = 1;
 /// Prefix (8), version, purpose, key length, output length (2), name length, and a name of up to
 /// 16 bytes.
 const LABEL_CAPACITY: usize = 30;
+/// The part of a label before the name.
+const HEAD_LEN: usize = 14;
+const KEY_ID: &[u8; 6] = b"key id";
+const WRAP_KEY: &[u8; 8] = b"wrap key";
 /// How many bytes of stack a derivation is followed by a wipe of: at least twice what it uses, as a
 /// test measures in each build and with each SHA-256 back end. Without optimisation it uses far
 /// more.
@@ -40,15 +44,6 @@ pub(crate) enum Branch {
     KeyId,
     /// The key that encrypts the records a wrapping key wraps.
     WrapKey,
-}
-
-impl Branch {
-    const fn name(self) -> &'static [u8] {
-        match self {
-            Self::KeyId => b"key id",
-            Self::WrapKey => b"wrap key",
-        }
-    }
 }
 
 /// The derivation could not run: the output asked for is longer than HKDF-SHA-256 gives, 255
@@ -583,7 +578,7 @@ use model::hkdf;
 pub(crate) mod model {
     use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-    use super::{DerivationFailed, KeyId, LABEL_CAPACITY};
+    use super::{DerivationFailed, KeyId};
     use crate::record::ID_LEN;
 
     /// Whether the last derivation failed, so a proof can tell a failure of the derivation from one
@@ -593,8 +588,8 @@ pub(crate) mod model {
     static FAILURES: AtomicU8 = AtomicU8::new(0);
 
     /// HKDF-SHA-256 is beyond Kani. The model fails at will, after writing into `out`, and records
-    /// whether it failed; otherwise `out` takes the first bytes of the key with the key's length
-    /// and the label folded in, so equal inputs give equal outputs, and the output depends on those
+    /// whether it failed; otherwise `out` takes the first bytes of the key, or zeros for a key
+    /// shorter than `out`, with the key's length and the label folded in, so equal inputs give equal outputs, and the output depends on those
     /// bytes, that length and the label. Folding every byte of the key would be too slow for the
     /// solver; that HKDF uses the whole key and the output length, the unit tests check.
     pub(super) fn hkdf(
@@ -626,34 +621,58 @@ pub(crate) mod model {
         FAILURES.load(Ordering::Relaxed) != 0
     }
 
-    // Byte by byte through `get`, never indexing: a path that never derives would leave a check
-    // unreached, and Kani 0.68.0 reads stale bytes in a slice copy of unknown length.
+    // Never indexing: a path that never derives would leave a check unreached. Copies have lengths
+    // known at each call: Kani 0.68.0 reads stale bytes in a slice copy of unknown length. The two
+    // lengths derived are folded as numbers: byte by byte costs the proofs many times more.
     pub(crate) fn fold(material: &[u8], info: &[u8], out: &mut [u8]) {
-        let length = out.len();
-        for (index, byte) in out.iter_mut().enumerate() {
-            *byte = material.get(index).copied().unwrap_or(0);
+        let mut label = [0; 32];
+        if let Some(to) = label.get_mut(..info.len()) {
+            to.copy_from_slice(info);
+        }
+        let (low, high) = label
+            .split_first_chunk::<16>()
+            .map_or((0, 0), |(low, high)| {
+                let high = high
+                    .first_chunk::<16>()
+                    .map_or(0, |high| u128::from_ne_bytes(*high));
+                (u128::from_ne_bytes(*low), high)
+            });
+        let head = |bytes: &[u8; 16]| u128::from_ne_bytes(*bytes);
+        if let Ok(out) = <&mut [u8; 16]>::try_from(&mut *out) {
+            let key = material.first_chunk::<16>().map_or(0, head);
+            *out = (key ^ low ^ high).to_ne_bytes();
+        } else if let Ok(out) = <&mut [u8; 32]>::try_from(&mut *out) {
+            let (first, second) = material
+                .first_chunk::<32>()
+                .and_then(|key| key.split_first_chunk::<16>())
+                .map_or((0, 0), |(first, second)| {
+                    (head(first), second.first_chunk::<16>().map_or(0, head))
+                });
+            if let Some((to_first, to_second)) = out.split_first_chunk_mut::<16>() {
+                *to_first = (first ^ low).to_ne_bytes();
+                to_second.copy_from_slice(&(second ^ high).to_ne_bytes());
+            }
+        } else {
+            match material.get(..out.len()) {
+                Some(head) => out.copy_from_slice(head),
+                None => out.fill(0),
+            }
+            for piece in info.chunks(out.len().max(1)) {
+                for (target, &byte) in out.iter_mut().zip(piece) {
+                    *target ^= byte;
+                }
+            }
         }
         if let Some(first) = out.first_mut() {
             *first ^= u8::try_from(material.len()).unwrap_or(u8::MAX);
         }
-        // Up to the longest label rather than up to this one: a loop whose end the solver does not
-        // know unrolls to the whole bound of the proof.
-        for index in 0..LABEL_CAPACITY {
-            let target = index.checked_rem(length).and_then(|at| out.get_mut(at));
-            if let (Some(&byte), Some(target)) = (info.get(index), target) {
-                *target ^= byte;
-            }
-        }
     }
 
-    /// What stands in for the constant-time comparison of identifiers. Byte by byte: comparing the
-    /// arrays whole reads bytes from before the latest write in Kani 0.68.0.
+    /// What stands in for the constant-time comparison of identifiers. As two numbers: comparing the
+    /// arrays whole reads bytes from before the latest write in Kani 0.68.0, and byte by byte costs
+    /// many times more.
     pub(crate) fn same_id(a: &[u8; ID_LEN], b: &[u8; ID_LEN]) -> bool {
-        let mut same = true;
-        for index in 0..ID_LEN {
-            same &= a.get(index) == b.get(index);
-        }
-        same
+        u128::from_ne_bytes(*a) == u128::from_ne_bytes(*b)
     }
 
     pub(crate) const fn id_bytes(id: &KeyId) -> &[u8; ID_LEN] {
@@ -674,27 +693,50 @@ fn label(
     branch: Branch,
     out_len: usize,
 ) -> Result<([u8; LABEL_CAPACITY], usize), DerivationFailed> {
-    let out_len = u16::try_from(out_len).map_err(|_| DerivationFailed)?;
-    let name = branch.name();
-    let name_len = u8::try_from(name.len()).map_err(|_| DerivationFailed)?;
-    let fixed = [VERSION, purpose as u8, length_to_byte(length)];
-    let mut label = [0; LABEL_CAPACITY];
-    let mut used: usize = 0;
-    for part in [
-        &PREFIX[..],
-        &fixed,
-        &out_len.to_le_bytes(),
-        &[name_len],
-        name,
-    ] {
-        let end = used.checked_add(part.len()).ok_or(DerivationFailed)?;
-        label
-            .get_mut(used..end)
-            .ok_or(DerivationFailed)?
-            .copy_from_slice(part);
-        used = end;
+    let [low, high] = u16::try_from(out_len)
+        .map_err(|_| DerivationFailed)?
+        .to_le_bytes();
+    let [p0, p1, p2, p3, p4, p5, p6, p7] = *PREFIX;
+    let head = |name_len| {
+        [
+            p0,
+            p1,
+            p2,
+            p3,
+            p4,
+            p5,
+            p6,
+            p7,
+            VERSION,
+            purpose as u8,
+            length_to_byte(length),
+            low,
+            high,
+            name_len,
+        ]
+    };
+    match branch {
+        Branch::KeyId => joined(head, KEY_ID),
+        Branch::WrapKey => joined(head, WRAP_KEY),
     }
-    Ok((label, used))
+}
+
+/// A label of `head` and `name`, and how many of its bytes are used.
+// Placed at fixed offsets rather than appended piece by piece: under the proofs a piece of a length
+// known only at run time costs many times its bytes.
+fn joined<const N: usize>(
+    head: impl FnOnce(u8) -> [u8; HEAD_LEN],
+    name: &[u8; N],
+) -> Result<([u8; LABEL_CAPACITY], usize), DerivationFailed> {
+    let name_len = u8::try_from(N).map_err(|_| DerivationFailed)?;
+    let mut label = [0; LABEL_CAPACITY];
+    let (first, rest) = label
+        .split_first_chunk_mut::<HEAD_LEN>()
+        .ok_or(DerivationFailed)?;
+    *first = head(name_len);
+    let (second, _) = rest.split_first_chunk_mut::<N>().ok_or(DerivationFailed)?;
+    *second = *name;
+    Ok((label, HEAD_LEN.checked_add(N).ok_or(DerivationFailed)?))
 }
 
 #[cfg(test)]
@@ -706,7 +748,7 @@ mod tests {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
-    use super::{Branch, DerivationFailed, KeyId, derive, derive_key_id, label};
+    use super::{Branch, DerivationFailed, KEY_ID, KeyId, WRAP_KEY, derive, derive_key_id, label};
     use crate::key::{Key, KeyLength};
     use crate::record::Purpose;
 
@@ -889,7 +931,11 @@ mod tests {
     fn every_branch_has_a_label() {
         for branch in [Branch::KeyId, Branch::WrapKey] {
             let (_, used) = label(Purpose::Wrap, KeyLength::Bytes64, branch, 32).unwrap();
-            assert_eq!(used, 14 + branch.name().len());
+            let name = match branch {
+                Branch::KeyId => KEY_ID.len(),
+                Branch::WrapKey => WRAP_KEY.len(),
+            };
+            assert_eq!(used, 14 + name);
         }
     }
 

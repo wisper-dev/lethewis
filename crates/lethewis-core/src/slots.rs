@@ -2682,20 +2682,14 @@ mod proofs {
     }
 
     fn any_key(key: &mut Key) {
-        if kani::any() {
-            key.load32(&mut kani::any());
-        } else {
-            key.load64(&mut kani::any());
-        }
+        key.fill_any();
     }
 
     /// The first `length` bytes of `bytes`, followed by zeros.
     fn padded(bytes: Bytes, length: KeyLength) -> Bytes {
-        let mut out = [0; 64];
-        for index in 0..64 {
-            if index < length.bytes() {
-                out[index] = bytes[index];
-            }
+        let mut out = bytes;
+        if length == KeyLength::Bytes32 {
+            out[32..].copy_from_slice(&[0; 32]);
         }
         out
     }
@@ -3367,13 +3361,8 @@ mod proofs {
         } else {
             KeyLength::Bytes64
         };
-        let mut key = [0; 64];
-        for index in 0..64 {
-            if index < length.bytes() {
-                key[index] = plaintext[start + 2 + index];
-            }
-        }
-        (key, length)
+        let key: Bytes = plaintext[start + 2..start + 66].try_into().unwrap();
+        (padded(key, length), length)
     }
 
     /// Admitting any 233 bytes of plaintext into `memory`: the set it holds goes into the first

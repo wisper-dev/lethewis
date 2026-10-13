@@ -555,6 +555,8 @@ jobs:
     needs: lockfile
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
+    # A proof that grows past its budget fails the job rather than slowing every pull request.
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -569,23 +571,13 @@ jobs:
       - name: Install Kani
         run: scripts/install-kani.sh
 
-      - name: Swap for the proofs
-        # Kani's driver keeps every trace the solver prints: up to 47 GB for one proof, on a runner
-        # with 16 GB of memory.
-        run: |
-          df -h /mnt
-          sudo swapoff -a
-          sudo rm -f /mnt/swapfile
-          sudo fallocate -l 48G /mnt/swapfile
-          sudo chmod 600 /mnt/swapfile
-          sudo mkswap /mnt/swapfile
-          sudo swapon /mnt/swapfile
-          free -g
+      - name: The results are read as Kani reads them
+        run: scripts/prove.sh agree
 
       - name: Every proof holds and every cover property is reached
-        # One at a time: two of the largest do not fit together even with the swap.
+        # Three at a time on the runner's four processors: none needs more than 3 GB.
         env:
-          LETHEWIS_PROOF_JOBS: 1
+          LETHEWIS_PROOF_JOBS: 3
         run: scripts/prove.sh
 
       - name: Keep the results and the manifest

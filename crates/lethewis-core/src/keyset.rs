@@ -283,8 +283,9 @@ fn parse_member(
         return Err(Malformed);
     };
     if stage == 0 {
-        let seen = key.iter().fold(length, |seen, &byte| seen | byte);
-        return if seen == 0 {
+        let empty = crate::record::lanes(key)
+            .is_some_and(|[a, b, c, d]| u128::from(length) | a | b | c | d == 0);
+        return if empty {
             Ok((None, None))
         } else {
             Err(Malformed)
@@ -615,6 +616,27 @@ mod tests {
         assert_eq!(parse(&bytes).err(), Some(Malformed));
         let mut bytes = gap();
         bytes[103..167].fill(0xff);
+        assert_eq!(parse(&bytes).err(), Some(Malformed));
+        // The length and the first key byte, and the first bytes of neighbouring 16-byte pieces.
+        for (first, second) in [(102, 103), (103, 119), (119, 135), (135, 151)] {
+            let mut bytes = gap();
+            bytes[first] = 0x5a;
+            bytes[second] = 0x5a;
+            assert_eq!(
+                parse(&bytes).err(),
+                Some(Malformed),
+                "bytes {first} and {second}"
+            );
+        }
+    }
+
+    /// Bytes past a short key that would cancel out if the tail were checked by anything but whether
+    /// every byte is zero.
+    #[test]
+    fn a_short_key_with_a_tail_that_cancels_out_is_refused() {
+        let mut bytes = full();
+        bytes[135] = 0x5a;
+        bytes[151] = 0x5a;
         assert_eq!(parse(&bytes).err(), Some(Malformed));
     }
 

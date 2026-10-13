@@ -14,6 +14,8 @@ pub(crate) const MAX_CONTEXT: usize = 255;
 const AAD_LABEL: &[u8; 19] = b"lethewis key record";
 /// The label, the version, the length of the context and the longest context.
 const AAD_CAPACITY: usize = 276;
+/// The label and the two bytes after it.
+const AAD_HEAD: usize = AAD_LABEL.len() + 2;
 /// The size of a key identifier in bytes.
 pub(crate) const ID_LEN: usize = 16;
 /// The version of the record format, in the associated data and in the plaintext.
@@ -97,16 +99,19 @@ impl AssociatedData {
             .ok()
             .filter(|&len| len != 0)
             .ok_or(InvalidContext)?;
+        // The fixed part at fixed offsets: under the proofs a piece of a length known only at run
+        // time costs many times its bytes.
         let mut bytes = [0; AAD_CAPACITY];
-        let mut len: usize = 0;
-        for part in [&AAD_LABEL[..], &[VERSION, context_len], context] {
-            let end = len.checked_add(part.len()).ok_or(InvalidContext)?;
-            bytes
-                .get_mut(len..end)
-                .ok_or(InvalidContext)?
-                .copy_from_slice(part);
-            len = end;
-        }
+        let (label, rest) = bytes
+            .split_first_chunk_mut::<{ AAD_LABEL.len() }>()
+            .ok_or(InvalidContext)?;
+        *label = *AAD_LABEL;
+        let (head, rest) = rest.split_first_chunk_mut::<2>().ok_or(InvalidContext)?;
+        *head = [VERSION, context_len];
+        rest.get_mut(..context.len())
+            .ok_or(InvalidContext)?
+            .copy_from_slice(context);
+        let len = context.len().checked_add(AAD_HEAD).ok_or(InvalidContext)?;
         Ok(Self { bytes, len })
     }
 
@@ -118,14 +123,22 @@ impl AssociatedData {
 /// Whether the bytes past the key's length are zero. Reads the whole tail, with no early exit.
 pub(crate) fn tail_is_zero(key: &[u8; CAPACITY], length: KeyLength) -> bool {
     match length {
-        KeyLength::Bytes32 => {
-            key.iter()
-                .skip(KeyLength::Bytes32.bytes())
-                .fold(0, |seen, &byte| seen | byte)
-                == 0
-        }
+        KeyLength::Bytes32 => lanes(key).is_some_and(|[_, _, third, fourth]| third | fourth == 0),
         KeyLength::Bytes64 => true,
     }
+}
+
+/// A key buffer as four numbers of sixteen bytes each.
+// Under the proofs a number costs many times less than its bytes one at a time.
+pub(crate) fn lanes(key: &[u8; CAPACITY]) -> Option<[u128; 4]> {
+    let pieces: &[[u8; 16]; 4] = key.as_chunks::<16>().0.try_into().ok()?;
+    let [first, second, third, fourth] = *pieces;
+    Some([
+        u128::from_ne_bytes(first),
+        u128::from_ne_bytes(second),
+        u128::from_ne_bytes(third),
+        u128::from_ne_bytes(fourth),
+    ])
 }
 
 #[cfg(test)]
