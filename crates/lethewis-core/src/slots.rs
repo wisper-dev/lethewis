@@ -4,7 +4,7 @@
 use core::{fmt, marker::PhantomData};
 
 use crate::{
-    derive::{KeyId, derive_key_id, derive_wrap_key, wipe_cipher_stack},
+    derive::{KeyId, derive_key_id, derive_wrap_key, wipe_cipher_stack, wipe_stack},
     entropy::{Entropy, EntropyError},
     error::Error,
     key::{Key, KeyBytes, KeyLength, wipe},
@@ -206,8 +206,8 @@ impl<'a> Slots<'a> {
     /// is the primary, and wipes `source`.
     ///
     /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier is followed by a wipe
-    /// of 8 KiB, or 64 KiB, below it. A build that optimises this crate but not the hash code it
+    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole load, are
+    /// each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate but not the hash code it
     /// calls has to set that flag.
     ///
     /// # Errors
@@ -232,8 +232,8 @@ impl<'a> Slots<'a> {
     /// is the primary, and wipes `source`.
     ///
     /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier is followed by a wipe
-    /// of 8 KiB, or 64 KiB, below it. A build that optimises this crate but not the hash code it
+    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole load, are
+    /// each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate but not the hash code it
     /// calls has to set that flag.
     ///
     /// # Errors
@@ -260,8 +260,8 @@ impl<'a> Slots<'a> {
     /// used is wiped after it. `entropy` is asked once, and only when a slot is free.
     ///
     /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier is followed by a wipe
-    /// of 8 KiB, or 64 KiB, below it. A build that optimises this crate but not the hash code it
+    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole load, are
+    /// each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate but not the hash code it
     /// calls has to set that flag.
     ///
     /// # Errors
@@ -514,13 +514,17 @@ impl<'a> Slots<'a> {
     /// Puts the keys of a set for `purpose` with `stages` into the first free slot with `fill`,
     /// derives their identifiers, and issues a handle if that succeeds, no key is held already and
     /// none twice, with data-independent timing on. On failure the slot is left free and wiped.
+    /// The stack the load used is wiped after it.
     fn load(
         &mut self,
         purpose: Purpose,
         stages: Stages,
         fill: impl FnOnce(&mut [Key; MEMBERS]) -> Result<(), Error>,
     ) -> Result<Handle<'a>, Error> {
-        lethewis_dit::with(|| self.load_in_slot(purpose, stages, fill))
+        // The copy of the key and the checks after its derivation run above the derivation's wipe.
+        let loaded = lethewis_dit::with(|| self.load_in_slot(purpose, stages, fill));
+        wipe_stack();
+        loaded
     }
 
     fn load_in_slot(

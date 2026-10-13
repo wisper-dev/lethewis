@@ -96,6 +96,8 @@ Nothing is published while the version is below 0.1.0.
 - Dependency review recorded with cargo-vet in `supply-chain/`: a crate that handles key material is
   read in full, and the continuous integration check fails on a version without a record. See
   `SECURITY.md`.
+- The stack a load of a key used is wiped after it, not only the stack of the derivation of its
+  identifier.
 - A proof run reads its results from CBMC's own output. On every run the reading is compared with
   Kani's results on a proof with every outcome, failures among them, and on two of the library's
   proofs. A proof is limited to 10 minutes.

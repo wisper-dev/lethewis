@@ -49,7 +49,7 @@ password and the hardware secret at each unlock, and neither alone is enough.
   unaffected by it.
 - **Wiping a value from memory does not reach every copy.** A copy left by a value move, a buffer
   reallocation, a CPU register, swap, or a crash dump is outside what this library clears. The stack
-  a key derivation, a wrap or an unwrap used is wiped after it, as far as that can go without
+  a key derivation, a load of a key, a wrap or an unwrap used is wiped after it, as far as that can go without
   touching registers, and so far this is measured on x86-64 and aarch64 Linux only.
 - **The stack a call needs is not measured on microcontrollers.** On a target such as Cortex-M a
   call needs at least as much stack as the wipe after it reaches, 24 KiB after a wrap or an unwrap
