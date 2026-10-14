@@ -53,9 +53,10 @@ surely it was erased.
 
 **Intended.** A platform layer whose root the hardware erases.
 
-**Not defended.** Whether a chip really erases its key cannot be checked from outside. On a device
-without an erasable root, old records stay readable to whoever holds the password and the flash, and
-so they do if a platform gives two epochs the same key.
+**Not defended.** Whether a chip really erases a key, and whether the keys it uses to wrap its own
+keys stay inside it, cannot be checked from outside. On a device without an erasable root, or where
+a platform gives two epochs the same key, old records stay readable to whoever holds the password
+and the flash.
 
 ### 4. An attacker on the same device
 

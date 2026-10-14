@@ -17,7 +17,7 @@ Suggestions for functionality not listed here are accepted as issues.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/rustc-1.99.0-orange.svg)
-![Readiness](https://img.shields.io/badge/readiness-15%25-red.svg)
+![Readiness](https://img.shields.io/badge/readiness-18%25-red.svg)
 
 ## How the keys relate
 
@@ -44,9 +44,10 @@ password and the hardware secret at each unlock, and neither alone is enough.
 
 ## What is not guaranteed
 
-- **Destroying a key is "most likely gone", never "certainly gone."** The key sits on flash memory as
-  a file, and flash is not overwritten in place. A copy of the device made before the destruction is
-  unaffected by it.
+- **A destroyed key is gone once the epoch change is committed and the hardware erases the old
+  root.** Records of the old epoch, on flash or in an earlier copy of the device, then no longer open,
+  unless the hardware's own keys leak. Without such a root a destroyed key is most likely gone, not
+  certainly.
 - **Wiping a value from memory does not reach every copy.** A copy left by a value move, a buffer
   reallocation, a CPU register, swap, or a crash dump is outside what this library clears. The stack
   a key derivation, a load of a key, a wrap or an unwrap used is wiped after it, as far as that can go without
