@@ -7,7 +7,16 @@
 #   prove.sh             runs every proof, two at a time or LETHEWIS_PROOF_JOBS, then judges them
 #   prove.sh list        writes the declared proofs and prints their names as a JSON array
 #   prove.sh run PROOF   runs one proof; its results go to target/proofs/runs/
+#   prove.sh part K N    runs the K-th of N parts of the proofs, for N machines at once
 #   prove.sh judge       judges the results in target/proofs/runs/ against the declared proofs
+#   prove.sh agree       compares, on a few proofs, Kani's own results with how a run reads them
+#   prove.sh sources     prints a digest of Kani and of every file but the documents; a run
+#                        writes it beside its results if the files did not change while it ran
+#
+# A run reads its results from CBMC's plain output with scripts/cbmc-results.py: Kani's own results
+# have CBMC build a trace for every region coverage reaches, which costs most of the time. Kani
+# itself stops at the end of such a run, on coverage it cannot read; the reading refuses anything
+# incomplete, and `agree` holds it to Kani's results on proofs with every outcome.
 #
 # The judgement accepts the results only if each file holds the one proof it is named after, all of
 # them come from the same tools, the pinned Kani ran, every declared proof ran and succeeded, every
@@ -28,6 +37,11 @@ results=$out/results.json
 
 placed() {
   local misplaced
+  # The reading of the results knows nothing of a proof that must panic.
+  if git grep -q 'kani::should_panic' -- '*.rs' ':!checks/'; then
+    echo "prove: a proof that must panic, which the reading of the results does not support" >&2
+    exit 1
+  fi
   misplaced=$(jq -r '.["standard-harnesses"][]?[]' "$out/declared.json" |
     grep -vE '(^|::)proofs::[^:]+$' || true)
   if [ -n "$misplaced" ]; then
@@ -54,19 +68,96 @@ run_file() {
   printf '%s/%s.json' "$runs" "${1//::/.}"
 }
 
+# Runs PROOF of the crates of MANIFEST and reads its results into FILE.
+read_run() {
+  local manifest=$1 proof=$2 file=$3 started
+  rm -f "$file" "$file.part"
+  started=${EPOCHREALTIME//[^0-9]/}
+  # In a crate without the standard library Kani reports an assert! or unwrap that is never reached
+  # as a success; line coverage shows it.
+  cargo kani --manifest-path "$manifest" --harness "$proof" --exact --output-format old \
+    --harness-timeout 10m --coverage -Z source-coverage -Z unstable-options >"${file%.json}.txt" 2>&1 ||
+    true
+  if ! scripts/cbmc-results.py read "$proof" "${file%.json}.txt" \
+    $(((${EPOCHREALTIME//[^0-9]/} - started) / 1000)) >"$file.part"; then
+    echo "prove: the results of $proof could not be read" >&2
+    return 1
+  fi
+  mv "$file.part" "$file"
+}
+
+sources() {
+  {
+    cargo kani --version
+    git ls-files --cached --others --exclude-standard -- ':!*.md' | while IFS= read -r name; do
+      if [ -f "$name" ]; then
+        printf '%s %s\n' "$(git hash-object -- "$name")" "$name"
+      fi
+    done
+  } | git hash-object --stdin
+}
+
 run_proof() {
-  local proof=$1
+  local proof=$1 file before
+  file=$(run_file "$proof")
   mkdir -p "$runs"
-  rm -f "$(run_file "$proof")"
+  rm -f "${file%.json}.sources"
+  before=$(sources)
   # Kani names its coverage output by the minute, so proofs that run at once build apart.
   if [ -n "${PROVE_SLOT:-}" ]; then
     export CARGO_TARGET_DIR=$out/slot-$PROVE_SLOT
   fi
   rm -rf "${CARGO_TARGET_DIR:-target}"/kani/*/kanicov_*
-  # In a crate without the standard library Kani reports an assert! or unwrap that is never reached
-  # as a success; line coverage shows it.
-  cargo kani --harness "$proof" --exact --output-format terse --harness-timeout 20m --coverage \
-    -Z source-coverage -Z unstable-options --export-json "$(run_file "$proof")"
+  read_run Cargo.toml "$proof" "$file"
+  if [ "$(sources)" = "$before" ]; then
+    printf '%s\n' "$before" >"${file%.json}.sources"
+  fi
+}
+
+# Kani's own results against the reading of the same run: a proof with every outcome, failures
+# among them, and two of this repository's.
+agree() {
+  local manifest_proof manifest proof file
+  for manifest_proof in checks/kani-reading/Cargo.toml:proofs::every_outcome \
+    Cargo.toml:keyset::proofs::a_transition_keeps_the_set_whole \
+    Cargo.toml:slots::proofs::creating_slots_wipes_every_key; do
+    manifest=${manifest_proof%%:*}
+    proof=${manifest_proof#*:}
+    file=$PWD/$out/agree/${proof//::/.}
+    mkdir -p "$out/agree"
+    rm -f "$file.kani.json"
+    cargo kani --manifest-path "$manifest" --harness "$proof" --exact --output-format terse \
+      --harness-timeout 10m --coverage -Z source-coverage -Z unstable-options \
+      --export-json "$file.kani.json" >&2 || true
+    [ -f "$file.kani.json" ] || { echo "prove: Kani gave no results for $proof" >&2; exit 1; }
+    read_run "$manifest" "$proof" "$file.read.json"
+    scripts/cbmc-results.py agree "$file.kani.json" "$file.read.json" ||
+      { echo "prove: Kani's results and their reading differ for $proof" >&2; exit 1; }
+    if [ "$proof" = proofs::every_outcome ]; then
+      # Every outcome is there to compare, and a check placed in a file other than its function's.
+      outcomes=$(jq -r '[.verification_results.results[0].checks[]
+        | "\(.category):\(.status)"] | unique | join(" ")' "$file.kani.json")
+      for outcome in assertion:Failure assertion:Success assertion:Unreachable cover:Satisfied \
+        cover:Unsatisfiable code_coverage:Covered code_coverage:Uncovered; do
+        [[ " $outcomes " == *" $outcome "* ]] ||
+          { echo "prove: $proof no longer gives $outcome" >&2; exit 1; }
+      done
+      grep -q '^\[.*\] file [^ ]* line ' "$file.read.txt" ||
+        { echo "prove: $proof no longer gives a check placed in another file" >&2; exit 1; }
+    fi
+    # A run cut short, or with a line of its results lost, is refused, not read as far as it goes.
+    awk '/^\*\* Results:$/ { at = NR } at && NR > at + 10 { exit } { print }' \
+      "$file.read.txt" >"$file.cut.txt"
+    awk '/^\*\* Results:$/ { at = NR } !(at && /\.code_coverage\.[0-9]+\] / && !lost++) { print }' \
+      "$file.read.txt" >"$file.lost.txt"
+    for broken in cut lost; do
+      if scripts/cbmc-results.py read "$proof" "$file.$broken.txt" 0 >/dev/null 2>&1; then
+        echo "prove: the reading accepts a run with its results $broken" >&2
+        exit 1
+      fi
+    done
+  done
+  echo "prove: Kani's results and their reading agree"
 }
 
 prove_all() {
@@ -83,6 +174,22 @@ prove_all() {
     exit 1
   fi
   judge
+}
+
+# Every N-th declared proof, from the K-th on, in the order of their names.
+prove_part() {
+  local part=$1 parts=$2
+  if ! [[ $part =~ ^[1-9][0-9]*$ && $parts =~ ^[1-9][0-9]*$ ]] || ((part > parts)); then
+    echo "usage: prove.sh part K N, with 1 <= K <= N" >&2
+    exit 2
+  fi
+  rm -rf "$runs"
+  declare_proofs
+  jq -r --argjson part "$part" --argjson parts "$parts" '
+    [.["standard-harnesses"][]?[]] | sort | to_entries[]
+    | select(.key % $parts == $part - 1) | .value' "$out/declared.json" |
+    xargs -r -d '\n' -n 1 -P "${LETHEWIS_PROOF_JOBS:-2}" --process-slot-var=PROVE_SLOT \
+      scripts/prove.sh run
 }
 
 judge() {
@@ -227,13 +334,14 @@ judge() {
   fi
   ((fail == 0)) || exit 1
 
-  jq '. as $root | {
-    target: .metadata.target,
+  jq --arg target "$(rustc -vV | sed -n 's/^host: //p')" \
+    --slurpfile declared "$out/declared.json" '{
+    target: $target,
     tools,
     proofs: [.verification_results.results[] as $r | {
       proof: $r.harness_id,
-      sources: [$root.harness_metadata[] | select(.pretty_name == $r.harness_id)
-        | {crate: .crate_name, file: .source.file, line: .source.start_line}],
+      sources: [$declared[0]["standard-harnesses"] | to_entries[]
+        | select(.value | index($r.harness_id)) | {file: .key}],
       status: $r.status,
       duration_ms: $r.duration_ms,
       covers_reached:
@@ -253,9 +361,15 @@ case "${1:-}" in
     [ $# -eq 2 ] || { echo "usage: prove.sh run PROOF" >&2; exit 2; }
     run_proof "$2"
     ;;
+  part)
+    [ $# -eq 3 ] || { echo "usage: prove.sh part K N" >&2; exit 2; }
+    prove_part "$2" "$3"
+    ;;
   judge) judge ;;
+  agree) agree ;;
+  sources) sources ;;
   *)
-    echo "usage: prove.sh [list | run PROOF | judge]" >&2
+    echo "usage: prove.sh [list | run PROOF | part K N | judge | agree | sources]" >&2
     exit 2
     ;;
 esac

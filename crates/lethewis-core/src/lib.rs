@@ -42,8 +42,10 @@ use {aes as _, polyval as _};
 
 mod derive;
 mod entropy;
+mod epoch;
 mod error;
 mod key;
+mod keyset;
 mod record;
 #[cfg(test)]
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -52,8 +54,10 @@ mod seal;
 mod slots;
 
 pub use entropy::{Entropy, EntropyError};
+pub use epoch::{Epoch, Erasure, Root, RootFailed};
 pub use error::Error;
 pub use key::KeyLength;
+pub use keyset::Position;
 pub use record::{Purpose, RECORD_LEN};
 pub use slots::{Handle, Slot, Slots};
 

@@ -12,6 +12,8 @@ cap_lints = true
 # which are tested.
 # Code under cfg(kani), the modules `proofs` and `model`, is compiled only by Kani, which a mutant run
 # does not invoke. The proofs are checked against deliberate errors instead.
+# A derivation of a record's cipher key fails only for an output longer than HKDF-SHA-256 gives, so
+# no test can fail it; the proofs fail it through the model of the derivation.
 # lethewis-dit acts only on aarch64 where the system reports data-independent timing: the mutants of
 # its detection on Linux run on aarch64 Linux, the others of its aarch64 code and of its guard on
 # macOS, and those of its inert code here.
@@ -20,4 +22,5 @@ exclude_re = [
   '^crates/lethewis-core/src/key\.rs:[0-9]+:[0-9]+: replace <impl Drop for Key>::drop with \(\)$',
   '^crates/lethewis-core/src/derive\.rs:[0-9]+:[0-9]+: replace <impl Drop for KeyId>::drop with \(\)$',
   '^crates/lethewis-core/src/[a-z_]+\.rs:[0-9]+:[0-9]+: .* (proofs|model)::',
+  "^crates/lethewis-core/src/slots\\.rs:[0-9]+:[0-9]+: replace \\|= with &= in Slots<'a>::open_under$",
 ]

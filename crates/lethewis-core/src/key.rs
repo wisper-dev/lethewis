@@ -186,6 +186,28 @@ pub(crate) fn wipe<const N: usize>(bytes: &mut [u8; N]) {
     }
 }
 
+#[cfg(kani)]
+pub(crate) mod model {
+    use super::{Key, KeyLength};
+
+    impl Key {
+        /// Any bytes of either length, zero past it, for the proofs.
+        pub(crate) fn fill_any(&mut self) {
+            self.bytes = kani::any();
+            self.length = if kani::any() {
+                KeyLength::Bytes32
+            } else {
+                KeyLength::Bytes64
+            };
+            if self.length == KeyLength::Bytes32
+                && let Some((_, tail)) = self.bytes.split_first_chunk_mut::<32>()
+            {
+                tail.fill(0);
+            }
+        }
+    }
+}
+
 impl Drop for Key {
     fn drop(&mut self) {
         self.wipe();
