@@ -2774,6 +2774,7 @@ mod tests {
         assert_eq!(format!("{handle:?}"), "Handle { .. }");
         assert_eq!(format!("{:?}", slots.memory[0]), "Slot { .. }");
         assert_eq!(format!("{slots:?}"), "Slots { .. }");
+        assert_eq!(format!("{:?}", slots.epoch), "Epoch { .. }");
     }
 
     /// Random bytes from a fixed seed, so that a failing round repeats.
@@ -2928,12 +2929,17 @@ mod tests {
         plaintext
     }
 
-    /// The keys of `plaintext` by position, if the layout accepts it: version 1, purpose 1, each
-    /// position zero throughout or stage 1 or 2 with length 32 or 64 and zeros past the key, and
-    /// an enabled key at the primary position. Read from the layout, not by the parser.
+    /// The keys of `plaintext` by position, if slots in the epoch `EPOCH` accept it: version 1,
+    /// purpose 1, that epoch, each position zero throughout or stage 1 or 2 with length 32 or 64
+    /// and zeros past the key, and an enabled key at the primary position. Read from the layout,
+    /// not by the parser.
     fn accepted_keys(plaintext: &[u8; PLAINTEXT_LEN]) -> Option<[Option<Vec<u8>>; MEMBERS]> {
         let primary = usize::from(plaintext[2]);
-        if plaintext[..2] != [1, 1] || primary >= MEMBERS || plaintext[35 + 66 * primary] != 1 {
+        if plaintext[..2] != [1, 1]
+            || plaintext[19..27] != EPOCH.to_le_bytes()
+            || primary >= MEMBERS
+            || plaintext[35 + 66 * primary] != 1
+        {
             return None;
         }
         let mut keys: [Option<Vec<u8>>; MEMBERS] = Default::default();
@@ -3890,24 +3896,8 @@ mod proofs {
             self.written[..dest.len()].copy_from_slice(dest);
             self.failed = kani::any();
             if self.failed {
-                kani::cover!(
-                    self.written.iter().any(|&byte| byte != 0),
-                    "the source fails after writing bytes"
-                );
                 return Err(EntropyError);
             }
-            Ok(())
-        }
-    }
-
-    /// A platform source that only counts how often it was asked.
-    struct Counted {
-        calls: u8,
-    }
-
-    impl Entropy for Counted {
-        fn fill(&mut self, _: &mut [u8]) -> Result<(), EntropyError> {
-            self.calls = self.calls.saturating_add(1);
             Ok(())
         }
     }
@@ -3982,6 +3972,10 @@ mod proofs {
         kani::cover!(
             result == Err(Error::EntropyFailed),
             "the platform source fails"
+        );
+        kani::cover!(
+            entropy.failed && entropy.written.iter().any(|&byte| byte != 0),
+            "the source fails after writing bytes"
         );
         kani::cover!(
             result.is_ok() && length == KeyLength::Bytes32,
@@ -5057,6 +5051,10 @@ mod proofs {
             result == Err(Error::Unsaved),
             "a changed set is not wrapped in its epoch"
         );
+        kani::cover!(
+            entropy.failed && entropy.written.iter().any(|&byte| byte != 0),
+            "the source fails after writing bytes"
+        );
         kani::cover!(result == Err(Error::CipherFailed), "the cipher fails");
         kani::cover!(
             result == Err(Error::DerivationFailed),
@@ -5632,7 +5630,7 @@ mod proofs {
         let (result, _, _) = any_change(&mut slots, handle, any_position(), &mut Stages::one());
         let mut source: [u8; 64] = kani::any();
         let original = source;
-        let mut entropy = Counted { calls: 0 };
+        let mut entropy = AnyEntropy::new();
         let added = match kani::any::<u8>() % 3 {
             0 => {
                 let mut short = [0; 32];
