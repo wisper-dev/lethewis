@@ -3658,6 +3658,7 @@ mod proofs {
         proofs::{expected_key_id, expected_wrap_key},
     };
     use crate::keyset::proofs::any_whole_stages;
+    use crate::password::{MemoryBlock, model::argon2_failed, proofs::any_params};
     use crate::record::ID_LEN;
 
     type Bytes = [u8; 64];
@@ -4429,6 +4430,110 @@ mod proofs {
     #[kani::unwind(65)]
     fn a_load_past_a_retired_slot() {
         let result = past_a(Occupancy::Retired, load_from);
+        kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
+    }
+
+    /// A derivation from a password, from `memory`, with any parameters within the bounds, any
+    /// password of up to two bytes and any working memory: an empty password, and memory too small
+    /// for the parameters, are refused before anything else; a failing Argon2 is `DerivationFailed`,
+    /// never the failure of a platform source; the password is wiped exactly when the derivation
+    /// succeeds; a failed derivation changes no slot, and one that succeeds loads the first free
+    /// slot with a 32-byte key and the identifier derived from it. The rest is the load of a
+    /// generation, proven above for a source that writes any bytes and may fail.
+    fn derivation_from(mut memory: [Slot; 2]) -> Result<Handle<'static>, Error> {
+        let mut epoch = any_epoch(false);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let before = snapshots(&slots);
+        let params = any_params();
+        let mut password: [u8; 2] = kani::any();
+        let original = password;
+        let length: usize = kani::any();
+        kani::assume(length <= 2);
+        let mut blocks = [MemoryBlock; 2_097_152];
+        let count: usize = kani::any();
+        kani::assume(count <= blocks.len());
+        let result = slots.derive_from_password(
+            Purpose::Wrap,
+            &mut password[..length],
+            &params,
+            &mut blocks[..count],
+        );
+        kani::assert(
+            if length == 0 {
+                result == Err(Error::InvalidPassword)
+            } else if count < params.memory_blocks() {
+                result == Err(Error::NotEnoughMemory)
+            } else {
+                result != Err(Error::EntropyFailed)
+            },
+            "an empty password and too little memory are refused first, and Argon2 never \
+             fails as a platform source does",
+        );
+        kani::assert(
+            !argon2_failed() || result == Err(Error::DerivationFailed),
+            "a failure of Argon2id is DerivationFailed",
+        );
+        let wiped: [u8; 2] = core::array::from_fn(|at| if at < length { 0 } else { original[at] });
+        kani::assert(
+            password == if result.is_ok() { wiped } else { original },
+            "the password is wiped exactly when the derivation succeeds",
+        );
+        if let Ok(handle) = result {
+            let now = snapshot(slot_at(&slots, handle.index));
+            kani::assert(
+                first_free(&before) == Some(handle.index)
+                    && now.occupancy == Occupancy::Loaded
+                    && now.lengths[0] == KeyLength::Bytes32
+                    && now.keys.0[32..] == [0; 32]
+                    && now.ids.0 == expected_key_id(&now.keys.0, KeyLength::Bytes32, Purpose::Wrap)
+                    && now.stages == Stages::one(),
+                "the first free slot holds a 32-byte key and the identifier derived from it",
+            );
+            kani::assert(
+                unchanged_except(&slots, &before, handle.index),
+                "a derivation changes no other slot",
+            );
+        } else {
+            kani::assert(
+                unchanged_except(&slots, &before, 2),
+                "a failed derivation changes no slot",
+            );
+        }
+        kani::cover!(result.is_ok(), "a key is derived from a password");
+        kani::cover!(result == Err(Error::InvalidPassword), "an empty password");
+        kani::cover!(result == Err(Error::NotEnoughMemory), "too little memory");
+        kani::cover!(argon2_failed(), "Argon2 fails");
+        result.map(widen)
+    }
+
+    /// A derivation from a password with the first slot free.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_derivation_from_a_password_into_the_first_slot() {
+        let _ = into_the_first(derivation_from);
+    }
+
+    /// A derivation from a password with the first slot loaded.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_derivation_from_a_password_past_a_loaded_slot() {
+        let result = past_a(Occupancy::Loaded, derivation_from);
+        kani::cover!(
+            result == Err(Error::DuplicateKey),
+            "a derivation finds its key held"
+        );
+        kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
+    }
+
+    /// A derivation from a password with the first slot retired, where no key is held beside a
+    /// free slot.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_derivation_from_a_password_past_a_retired_slot() {
+        let result = past_a(Occupancy::Retired, derivation_from);
         kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
     }
 

@@ -116,5 +116,21 @@ Nothing is published while the version is below 0.1.0.
   how surely a root is erased (`Erasure`).
 - New errors: `Unsaved`, `EpochChanging`, `NoEpochChange`, `EpochExhausted` and `RootFailed`.
 - Proofs with Kani 0.68.0 for the change of epoch and for the refusals of an unsaved set.
+- Derivation from a password: `Slots::derive_from_password` derives a 32-byte key with Argon2id,
+  version 0x13, in one lane, straight into a free slot. It takes its working memory from the caller
+  (`MemoryBlock`), wipes the blocks it used whether it succeeds or not, and wipes the password when
+  it succeeds.
+- `PasswordParams` holds the memory, the passes and a 16-byte salt from the platform's random
+  source, kept as `PASSWORD_PARAMS_LEN` bytes, 25. Only memory from 64 MiB to 2 GiB, at least 3
+  passes and memory times passes up to 8 GiB are made or read.
+- New errors: `InvalidParams`, `InvalidPassword` and `NotEnoughMemory`.
+- The stack a derivation from a password used is wiped after it: 32 KiB, or 192 KiB without
+  optimisation; it needs 33 KiB of stack, or 196 KiB. Tests read the stack back, and check the key
+  against vectors of the reference implementation and against an independent implementation.
+- Dependencies: `argon2` 0.6.0 and `blake2` 0.11.0 or later compatible versions, without default
+  features and with their `zeroize` features; `base64ct` comes with `argon2`.
+- Proofs with Kani 0.68.0 for the parameters of a derivation from a password, read exactly as
+  written and made or read only within the bounds, and for the derivation into a slot, with a model
+  of Argon2id.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

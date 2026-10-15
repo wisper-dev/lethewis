@@ -36,9 +36,9 @@ macro_rules! assert_not_impl {
 // Under Kani the wipe is plain stores and the derivation and the cipher are models, so these go
 // unused there.
 #[cfg(kani)]
-use {aes_gcm_siv as _, ctutils as _, hkdf as _, sha2 as _, zeroize as _};
+use {aes_gcm_siv as _, argon2 as _, ctutils as _, hkdf as _, sha2 as _, zeroize as _};
 // Depended on only for their zeroize feature.
-use {aes as _, polyval as _};
+use {aes as _, blake2 as _, polyval as _};
 
 mod derive;
 mod entropy;
@@ -46,6 +46,7 @@ mod epoch;
 mod error;
 mod key;
 mod keyset;
+mod password;
 mod record;
 #[cfg(test)]
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -58,6 +59,7 @@ pub use epoch::{Epoch, Erasure, Root, RootFailed};
 pub use error::Error;
 pub use key::KeyLength;
 pub use keyset::Position;
+pub use password::{MemoryBlock, PASSWORD_PARAMS_LEN, PasswordParams};
 pub use record::{Purpose, RECORD_LEN};
 pub use slots::{Handle, Slot, Slots};
 
