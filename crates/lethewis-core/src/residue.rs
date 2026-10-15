@@ -16,7 +16,7 @@ use std::vec::Vec;
 /// which runs at the test's depth, does not reach the stack that code used.
 const PAD: usize = 64 * 1024;
 /// How far below the pad the stack is read: deeper than the deepest wipe.
-const SCAN: usize = 128 * 1024;
+const SCAN: usize = 256 * 1024;
 const PAINT: u8 = 0xa7;
 
 /// Runs `code` below the pad, after painting the stack it is about to use when asked to, and

@@ -47,6 +47,13 @@ pub enum Error {
     EpochExhausted,
     /// The platform did not switch the root of the epoch.
     RootFailed,
+    /// The parameters of a derivation from a password are out of bounds, or not ones this version
+    /// of the library writes.
+    InvalidParams,
+    /// The password is empty or longer than 2^32 - 1 bytes.
+    InvalidPassword,
+    /// The working memory holds fewer blocks than the parameters take.
+    NotEnoughMemory,
 }
 
 impl From<crate::keyset::Refused> for Error {
@@ -83,6 +90,9 @@ impl fmt::Display for Error {
             Self::NoEpochChange => "no epoch change",
             Self::EpochExhausted => "epochs exhausted",
             Self::RootFailed => "root not switched",
+            Self::InvalidParams => "invalid password parameters",
+            Self::InvalidPassword => "invalid password",
+            Self::NotEnoughMemory => "not enough memory",
         })
     }
 }
@@ -118,5 +128,11 @@ mod tests {
         assert_eq!(Error::NoEpochChange.to_string(), "no epoch change");
         assert_eq!(Error::EpochExhausted.to_string(), "epochs exhausted");
         assert_eq!(Error::RootFailed.to_string(), "root not switched");
+        assert_eq!(
+            Error::InvalidParams.to_string(),
+            "invalid password parameters"
+        );
+        assert_eq!(Error::InvalidPassword.to_string(), "invalid password");
+        assert_eq!(Error::NotEnoughMemory.to_string(), "not enough memory");
     }
 }

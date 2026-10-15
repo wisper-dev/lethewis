@@ -220,6 +220,123 @@ the buffer contents after a failed decryption. All pass on x86_64 with the hardw
 portable backends.
 """
 
+[[audits.argon2]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.6.0"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/algorithm.rs, src/blake2b_long.rs, src/block.rs, src/error.rs,
+src/memory.rs, src/params.rs, src/version.rs. The archive matches the repository at the commit in
+.cargo_vcs_info.json apart from the files cargo generates.
+
+Unsafe code built here, with default features off and zeroize on: lib.rs:531-537 call a
+target_feature(enable = "avx2") wrapper around the portable Block::compress, on x86 and x86_64
+only, after the cpufeatures token reports AVX2. memory.rs:44 creates one SegmentView at a time, in
+sequence; memory.rs:103 and 106 give Send and Sync to a private pointer wrapper; memory.rs:140 and
+156 dereference base.add(index) after asserting index < block_count and the lane and slice rule.
+Shared references are tied to &self and the mutable one to &mut self, and fill_blocks never holds
+both. The pointer comes from the &mut prefix of block_count blocks, so every index stays inside
+it. With one lane the lane checks always hold. Not built here: block.rs:159-201 (alloc) and
+memory.rs:51-64 (parallel).
+
+No build script (build = false), no procedural macros, no target-specific code but the AVX2 path,
+no access to the system, files, network or environment. The only hardware query is
+cpufeatures::new! (lib.rs:194) on x86 and x86_64. base64ct is used only by KeyId::from_b64,
+AssociatedData::from_b64 (params.rs:309-313) and Error::B64Encoding (error.rs:18, 96-100); nothing
+on the hashing path calls it.
+
+Path used here: Params::new(m, t, 1, Some(32)) (params.rs:123-171) checks m >= 8, 1 <= p < 2^24,
+m >= 8p, t >= 1 and the output length; bounds on m and t are the caller's. Argon2::new and
+hash_password_into_with_memory (lib.rs:307-328) require an output of exactly 32 bytes, a salt of
+at least 8 bytes, and a password and salt of at most 2^32-1 bytes before initial_hash
+(lib.rs:592-615) casts their lengths. fill_blocks (lib.rs:359-362) uses the first 4*floor(m/4)
+blocks of the slice, returns MemoryTooLittle if it is shorter, and never touches the rest;
+finalize (lib.rs:550-577) reads the last block used. With valid parameters no panic or overflow is
+reachable: the reference area is at least 1, (area*map)>>32 < area, the products at lib.rs:490 and
+493 are of two 32-bit values, and the expects at block.rs:67 and blake2b_long.rs:66 cannot fire.
+H0, H' and the address, reference and compression steps were checked against RFC 9106.
+
+Secret-dependent behaviour: in Argon2id, pass 0 slices 0 and 1 take addresses from the public
+counter block only. From block m'/2 of pass 0 on, the reference index comes from word 0 of the
+previous block (lib.rs:456), so the memory address (lib.rs:503-508) and the divisions at
+lib.rs:464, 502 and memory.rs:94, 98 depend on secret data. Block::compress (block.rs:80-114) has
+no secret-dependent branch or index.
+
+Not cleared: zeroize clears only H0 (lib.rs:390) and the final block (lib.rs:572-573), and does not
+turn on blake2's own zeroize, so the BLAKE2b states holding H0 stay unless the dependent turns it
+on. Never cleared: the working memory in the caller's slice, its last block included; the 1 KiB
+hash array (lib.rs:383); last_output (blake2b_long.rs:47); full_out (blake2b_long.rs:31, 68),
+which holds the output; the compress temporaries (block.rs:81, 84, lib.rs:506); copies of H0 left
+by moves (lib.rs:326-327); H0 on the MemoryTooLittle return (lib.rs:362).
+"""
+
+[[audits.base64ct]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "1.8.3"
+notes = """
+Not read in full: src/decoder.rs and src/encoder.rs were searched for unsafe code and system access
+only; src/test_vectors.rs, tests and benches are not built for dependents. Read in full:
+Cargo.toml, Cargo.toml.orig, src/lib.rs, src/encoding.rs, src/alphabet.rs, src/alphabet/*.rs,
+src/errors.rs, src/line_ending.rs. The archive matches the repository at the commit in
+.cargo_vcs_info.json apart from the files cargo generates.
+
+Four unsafe blocks, all in src/encoding.rs. decode_in_place (line 125) reads a [u8; 4] at 4i and
+writes a [u8; 3] at 3i through raw pointers: both stay inside buf, the read ends before the write,
+and a write never reaches the input of a later chunk. decode_in_place (line 155) copies at most two
+bytes from a local array and returns buf.get_unchecked(..dlen) with dlen <= len. encode (line 231)
+calls str::from_utf8_unchecked on bytes each written by encode_3bytes or set to '=', and every
+built-in alphabet maps 0..63 to ASCII; Alphabet is not exported. encode_string (line 245) is built
+only with alloc.
+
+No build script (build = false), no procedural macros, no dependencies, no access to the system,
+files, network or environment; no_std, alloc and std only behind features of those names, both off
+here. The only target-specific code is LineEnding::default.
+
+No secret reaches the crate: argon2 calls it only from KeyId::from_b64 and
+AssociatedData::from_b64, which parse PHC strings, and uses base64ct::Error in its own error type.
+Argon2::new and hash_password_into_with_memory call none of them.
+"""
+
+[[audits.blake2]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.11.0"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!, src/lib.rs:2), src/lib.rs, src/consts.rs, src/simd.rs, src/macros.rs. The archive
+matches the repository at the commit in .cargo_vcs_info.json apart from the files cargo generates.
+
+One unsafe block, src/simd.rs:115: as_bytes views a repr(C) struct of four equal integer words as
+bytes, with no padding, every byte initialised, alignment 1 and the slice borrowing self. It is
+used only at src/macros.rs:102-103, on a to_le() temporary that lives to the end of the statement.
+
+No build script (build = false), no procedural macros, no FFI, assembly, I/O or allocation;
+no_std. The macros are macro_rules and digest::buffer_ct_variable!. The only target-specific code
+is the target_endian cfgs at src/simd.rs:34-67; the simd module is a portable struct of four lanes,
+with no intrinsics and no CPU detection. Of its features only zeroize is on here. blake2 turns on the
+mac feature of digest, which brings in ctutils; nothing here uses the MAC types.
+
+Path argon2 0.6.0 uses: Blake2b512 (src/lib.rs:56-61, 81) and Blake2bVarCore through a
+LazyBuffer. VariableOutputCore::new (src/macros.rs:211-216) rejects sizes above 64 and calls
+new_with_params (27-92) with an empty salt, persona and key. update_blocks (195-200) adds 128 to
+the counter and calls compress (106-180): 12 rounds over SIGMA and BLAKE2B_IV (src/consts.rs:1-25)
+with rotations 32, 24, 16 and 63. The constants, G, the diagonal step and the parameter block were
+checked against the BLAKE2 specification. finalize_variable_core (219-227) adds the buffered length,
+pads the last block with zeros, compresses it with f0 = !0 (94-104) and writes h little-endian. No
+branch or memory index depends on the input or the state; branches depend on lengths only. No panic
+is reachable on this path: the asserts at 33-39 are guarded by 212 and by the empty salt and persona,
+the unwraps at 51-56, 69-74 and 145 convert slices of fixed length, unreachable!() at 153 sits behind
+a constant match, and the counter at 197 and 224 overflows only after 2^64 bytes.
+
+Not cleared: with zeroize, Drop clears h and t (src/macros.rs:255-256) and block-buffer clears the
+buffer; without it the Drop bodies are empty. Never cleared: m and v in compress (142-161), the
+padded final block (225), the to_le temporaries (102-103), moved-from copies of a hasher, and the
+padded_key copies of the MAC types (317, 359, 415). With zeroize and reset, line 463 clears a copy
+of the stored MAC key, not the key; the MAC types are not used here.
+"""
+
 [[audits.block-buffer]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"

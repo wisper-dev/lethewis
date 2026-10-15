@@ -17,7 +17,7 @@ Suggestions for functionality not listed here are accepted as issues.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/rustc-1.99.0-orange.svg)
-![Readiness](https://img.shields.io/badge/readiness-18%25-red.svg)
+![Readiness](https://img.shields.io/badge/readiness-20%25-red.svg)
 
 ## How the keys relate
 
@@ -48,14 +48,17 @@ password and the hardware secret at each unlock, and neither alone is enough.
   root.** Records of the old epoch, on flash or in an earlier copy of the device, then no longer open,
   unless the hardware's own keys leak. Without such a root a destroyed key is most likely gone, not
   certainly.
-- **Wiping a value from memory does not reach every copy.** A copy left by a value move, a buffer
-  reallocation, a CPU register, swap, or a crash dump is outside what this library clears. The stack
-  a key derivation, a load of a key, a wrap or an unwrap used is wiped after it, as far as that can go without
-  touching registers, and so far this is measured on x86-64 and aarch64 Linux only.
+- **Wiping a value from memory does not reach every copy.** Copies left by a value move, a buffer
+  reallocation, a CPU register, swap or a crash dump are outside what this library clears. The stack
+  each derivation, load, wrap and unwrap of a key used is wiped after it, short of registers, as
+  measured on x86-64 and aarch64 Linux only.
 - **The stack a call needs is not measured on microcontrollers.** On a target such as Cortex-M a
-  call needs at least as much stack as the wipe after it reaches, 24 KiB after a wrap or an unwrap
-  and 8 KiB after an import or a generation, or 64 KiB after each without optimisation, and an
-  overflow of an unguarded stack corrupts memory silently.
+  call needs at least the depth of the wipe after it, which its documentation states, and an
+  overflow of an unguarded stack corrupts memory silently. A derivation from a password needs at
+  least 64 MiB of working memory, which few microcontrollers have.
+- **The cost of a derivation from a password is not tuned here.** The library refuses less than 64
+  MiB of memory and fewer than 3 passes. Choosing parameters that take a few seconds on a device is
+  the caller's, and so is bringing a password typed as text into one Unicode form.
 - **Hardware-backed keys are not available everywhere.** A dedicated secure element is absent on a
   large share of Android devices, and our figure for that share is an estimate rather than a
   measurement. Where the element is missing, protection falls back and records the level actually

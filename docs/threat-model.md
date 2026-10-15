@@ -19,9 +19,12 @@ library reports about them. Not the data the keys encrypt.
 **Capability.** Physical possession, commercial forensic tooling, the ability to copy storage and to
 attempt passwords. No knowledge of the password.
 
-**Intended.** Derive the key from the password through a slow transformation tuned to seconds on the
-target device, and have the hardware element wrap the master key, confining attempts to that one
-device. After destruction, no call returns the key.
+**In place, in the library.** A key is derived from a password with Argon2id over 64 MiB to 2 GiB
+of memory and at least 3 passes. Parameters out of these bounds are neither made nor read, and other
+parameters derive another key, under which no record wrapped under the first key opens.
+
+**Intended.** Parameters tuned to seconds on the target device by the platform layer, and the
+hardware element wrapping the master key, confining attempts to that one device. After destruction, no call returns the key.
 
 **Not defended.** A device unlocked once since boot holds keys in memory, lock screen or not. Many
 Android devices lack a dedicated secure element, so the password can be attacked off the device on
@@ -91,6 +94,13 @@ what the record decrypts to. The wipe on release and on creating the slots, and 
 released or foreign handle, are proven for two slots; the statements and their limits are in
 [proofs.md](proofs.md).
 
+After a derivation from a password the stack below the caller is wiped: 32 KiB, or 192 KiB without
+optimisation, twice what it uses or more. Tests read it back and find no 16-byte piece of the
+password, of the hash Argon2id starts from, of the last block of its working memory or of the key.
+
+The working memory a derivation from a password used is wiped whether it succeeded or not, and the
+password only when it succeeded.
+
 A key is added enabled, and only a disabled key other than the primary is destroyed, wiped with its
 identifier. A record of its set wrapped afterwards does not hold it; one wrapped before still does,
 and opens until the next epoch is committed, then only while the platform keeps the old root.
@@ -117,6 +127,11 @@ in two places, no set is wrapped under one of its own keys. Longer cycles, such 
 under another that is wrapped under the first, and a key whose bytes begin with the bytes of the key
 it is wrapped under, are not detected. Two sets of slots alive at once may hold the same key; the
 one-place rule holds within each.
+
+A derivation from a password does not reach copies of the password made before the call, such as an
+immutable string, or working memory the system swaps out. Its wipe reaches 32 KiB, or 192 KiB
+without optimisation, and it needs 64 MiB of working memory, more than a microcontroller usually
+has.
 
 ### 5. The supply chain
 
@@ -159,13 +174,19 @@ the tool, its version, the compiler version and the coverage will be stated in
 [proofs.md](proofs.md). The available tools are statistical and detect only pronounced leaks, and
 compiler optimisation can reintroduce a leak after a check has passed.
 
+From the middle of its first pass on, Argon2id reads its memory at addresses that depend on the
+password and divides values that depend on it, so whoever watches the cache of the same device, or
+times the derivation, learns something about the password.
+
 ## Assumptions
 
 1. The device's hardware element behaves as documented by its manufacturer. An application cannot
    verify this.
 2. The operating system is not already compromised when the library runs.
 3. The owner's password is not known to the adversary and is not trivially guessable. Password
-   strength is the application's responsibility; the library only makes guessing slow.
+   strength is the application's responsibility; the library only makes guessing slow. Bringing a
+   password typed as text into one Unicode form, NFC, before it reaches the library is the
+   application's as well.
 4. The third-party cryptographic primitives are sound. They are not proven here.
 5. The platform's random source is cryptographically secure. The library does not test its
    output.

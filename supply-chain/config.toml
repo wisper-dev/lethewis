@@ -4,6 +4,9 @@
 [cargo-vet]
 version = "0.10"
 
+[policy.argon2]
+dependency-criteria = { base64ct = "safe-to-deploy" }
+
 [policy.cpufeatures]
 dependency-criteria = { libc = "safe-to-deploy" }
 
