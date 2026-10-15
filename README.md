@@ -17,7 +17,7 @@ Suggestions for functionality not listed here are accepted as issues.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/rustc-1.99.0-orange.svg)
-![Readiness](https://img.shields.io/badge/readiness-20%25-red.svg)
+![Readiness](https://img.shields.io/badge/readiness-24%25-red.svg)
 
 ## How the keys relate
 
@@ -48,6 +48,8 @@ password and the hardware secret at each unlock, and neither alone is enough.
   root.** Records of the old epoch, on flash or in an earlier copy of the device, then no longer open,
   unless the hardware's own keys leak. Without such a root a destroyed key is most likely gone, not
   certainly.
+- **A key derived from a password or from twelve words comes back from them.** Destroying it does
+  not reach the password or the words.
 - **Wiping a value from memory does not reach every copy.** Copies left by a value move, a buffer
   reallocation, a CPU register, swap or a crash dump are outside what this library clears. The stack
   each derivation, load, wrap and unwrap of a key used is wiped after it, short of registers, as
@@ -59,6 +61,10 @@ password and the hardware secret at each unlock, and neither alone is enough.
 - **The cost of a derivation from a password is not tuned here.** The library refuses less than 64
   MiB of memory and fewer than 3 passes. Choosing parameters that take a few seconds on a device is
   the caller's, and so is bringing a password typed as text into one Unicode form.
+- **Twelve words are as safe as the place they are kept.** Whoever reads them derives the key. The
+  library writes them once, from the English list of BIP 39; keeping them off screenshots, the
+  clipboard, the keyboard's memory and backups is the caller's. About one changed word in sixteen
+  passes the checksum, and its key opens no record.
 - **Hardware-backed keys are not available everywhere.** A dedicated secure element is absent on a
   large share of Android devices, and our figure for that share is an estimate rather than a
   measurement. Where the element is missing, protection falls back and records the level actually
@@ -110,7 +116,9 @@ How dependencies are reviewed, and which versions a dependent receives:
 
 ## Licence
 
-[GNU AGPL v3 only](LICENSE).
+[GNU AGPL v3 only](LICENSE). The English word list of BIP 39 in
+`crates/lethewis-core/src/words/english.txt` is under the
+[MIT licence](crates/lethewis-core/LICENSE-MIT), and its notice goes with any build that holds it.
 
 **A commercial licence without the AGPL's obligations is available.** Write to
 <hi@alanwisper.com>.

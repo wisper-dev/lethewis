@@ -54,6 +54,10 @@ pub enum Error {
     InvalidPassword,
     /// The working memory holds fewer blocks than the parameters take.
     NotEnoughMemory,
+    /// A word is not one of the list.
+    UnknownWord,
+    /// The words are of the list, but their checksum does not hold.
+    InvalidChecksum,
 }
 
 impl From<crate::keyset::Refused> for Error {
@@ -93,6 +97,8 @@ impl fmt::Display for Error {
             Self::InvalidParams => "invalid password parameters",
             Self::InvalidPassword => "invalid password",
             Self::NotEnoughMemory => "not enough memory",
+            Self::UnknownWord => "unknown word",
+            Self::InvalidChecksum => "invalid checksum",
         })
     }
 }
@@ -134,5 +140,7 @@ mod tests {
         );
         assert_eq!(Error::InvalidPassword.to_string(), "invalid password");
         assert_eq!(Error::NotEnoughMemory.to_string(), "not enough memory");
+        assert_eq!(Error::UnknownWord.to_string(), "unknown word");
+        assert_eq!(Error::InvalidChecksum.to_string(), "invalid checksum");
     }
 }

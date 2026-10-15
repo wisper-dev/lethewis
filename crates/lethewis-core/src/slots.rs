@@ -564,7 +564,7 @@ impl<'a> Slots<'a> {
         })
     }
 
-    fn has_free(&self) -> bool {
+    pub(crate) fn has_free(&self) -> bool {
         self.memory
             .iter()
             .any(|slot| slot.occupancy == Occupancy::Free)
@@ -1103,7 +1103,9 @@ mod tests {
     use crate::derive::{CIPHER_STACK_WIPE, KeyId, STACK_WIPE, derive_key_id};
     use crate::key::{
         Key,
-        tests::{Counting, Failing, Panicking, Recording, counted, padded},
+        tests::{
+            Counting, Failing, Panicking, Random, Recording, counted, from_environment, padded,
+        },
     };
     use crate::record::MAX_CONTEXT;
 
@@ -1138,8 +1140,9 @@ mod tests {
     assert_not_impl!(Slot: Clone, PartialEq, Default);
     assert_not_impl!(Epoch: Clone, PartialEq, Default);
 
-    /// Every import, generation, wrap and unwrap derives with data-independent timing on, where the
-    /// processor and the operating system offer it.
+    /// Every import, generation, wrap and unwrap derives, and every call on words reads and writes
+    /// them, with data-independent timing on, where the processor and the operating system offer
+    /// it.
     #[test]
     fn every_call_that_derives_holds_data_independent_timing() {
         use crate::derive::timing::seen;
@@ -1176,6 +1179,16 @@ mod tests {
         slots
             .add_generated(set, KeyLength::Bytes32, &mut Counting)
             .unwrap();
+        assert_eq!(seen(), Some(true));
+        slots.settle();
+        slots.release(set).unwrap();
+        let mut words = [[0; 8]; 12];
+        let set = slots
+            .generate_words(Purpose::Wrap, &mut Counting, &mut words)
+            .unwrap();
+        assert_eq!(seen(), Some(true));
+        slots.release(set).unwrap();
+        slots.derive_from_words(Purpose::Wrap, &mut words).unwrap();
         assert_eq!(seen(), Some(true));
     }
 
@@ -2777,30 +2790,7 @@ mod tests {
         assert_eq!(format!("{:?}", slots.epoch), "Epoch { .. }");
     }
 
-    /// Random bytes from a fixed seed, so that a failing round repeats.
-    struct Random(u64);
-
     impl Random {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut mixed = self.0;
-            mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            mixed ^ (mixed >> 31)
-        }
-
-        fn below(&mut self, bound: usize) -> usize {
-            usize::try_from(self.next() % u64::try_from(bound).unwrap()).unwrap()
-        }
-
-        fn bytes<const N: usize>(&mut self) -> [u8; N] {
-            let mut out = [0; N];
-            for chunk in out.chunks_mut(8) {
-                chunk.copy_from_slice(&self.next().to_le_bytes()[..chunk.len()]);
-            }
-            out
-        }
-
         fn key(&mut self) -> Vec<u8> {
             if self.below(2) == 0 {
                 self.bytes::<32>().to_vec()
@@ -3104,16 +3094,9 @@ mod tests {
     #[test]
     #[ignore = "long; the rounds and the seed come from the environment"]
     fn many_random_records_unwrap_as_their_plaintext_says() {
-        let read = |name: &str, default: u64| {
-            std::env::var(name).map_or(default, |value| {
-                value
-                    .parse()
-                    .unwrap_or_else(|_| panic!("{name} is not a number: {value}"))
-            })
-        };
         unwrap_random_records(
-            read("LETHEWIS_RANDOM_ROUNDS", 100_000),
-            read("LETHEWIS_RANDOM_SEED", 2),
+            from_environment("LETHEWIS_RANDOM_ROUNDS", 100_000),
+            from_environment("LETHEWIS_RANDOM_SEED", 2),
         );
     }
 }
@@ -3655,11 +3638,15 @@ mod proofs {
     };
     use crate::derive::{
         model::{any_failed, failed, id_bytes, id_from_bytes},
-        proofs::{expected_key_id, expected_wrap_key},
+        proofs::{expected_key_id, expected_words_key, expected_wrap_key},
     };
     use crate::keyset::proofs::any_whole_stages;
     use crate::password::{MemoryBlock, model::argon2_failed, proofs::any_params};
     use crate::record::ID_LEN;
+    use crate::words::{
+        Words, bits_of,
+        proofs::{any_list, expected_words},
+    };
 
     type Bytes = [u8; 64];
     type Id = [u8; ID_LEN];
@@ -4535,6 +4522,262 @@ mod proofs {
     fn a_derivation_from_a_password_past_a_retired_slot() {
         let result = past_a(Occupancy::Retired, derivation_from);
         kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
+    }
+
+    /// A derivation from any bytes that twelve words stand for, from `memory`: a failure of a
+    /// derivation is `DerivationFailed`, and nothing else is, never the failure of a platform
+    /// source; a failed derivation changes no slot, and one that succeeds loads the first free slot
+    /// with the 32-byte key derived from the bytes and the identifier derived from it. The rest is
+    /// the load of a generation, proven above for a source that writes any bytes and may fail.
+    fn derivation_from_words(mut memory: [Slot; 2]) -> Result<Handle<'static>, Error> {
+        let mut epoch = any_epoch(false);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let before = snapshots(&slots);
+        let bytes: [u8; 16] = kani::any();
+        let result = slots.derive_into(Purpose::Wrap, &bytes);
+        kani::assert(
+            (result == Err(Error::DerivationFailed)) == any_failed(),
+            "a failure of a derivation is DerivationFailed, and nothing else is",
+        );
+        if let Ok(handle) = result {
+            let now = snapshot(slot_at(&slots, handle.index));
+            let key = expected_words_key(&bytes, Purpose::Wrap);
+            kani::assert(
+                first_free(&before) == Some(handle.index)
+                    && now.occupancy == Occupancy::Loaded
+                    && now.lengths[0] == KeyLength::Bytes32
+                    && now.keys.0[..32] == key
+                    && now.keys.0[32..] == [0; 32]
+                    && now.ids.0 == expected_key_id(&now.keys.0, KeyLength::Bytes32, Purpose::Wrap)
+                    && now.stages == Stages::one(),
+                "the first free slot holds the key of the bytes and the identifier derived from it",
+            );
+            kani::assert(
+                unchanged_except(&slots, &before, handle.index),
+                "a derivation changes no other slot",
+            );
+        } else {
+            kani::assert(
+                unchanged_except(&slots, &before, 2),
+                "a failed derivation changes no slot",
+            );
+        }
+        kani::cover!(result.is_ok(), "a key is derived from words");
+        kani::cover!(
+            result == Err(Error::DerivationFailed),
+            "the derivation fails"
+        );
+        result.map(widen)
+    }
+
+    /// A derivation from words with the first slot free.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_derivation_from_words_into_the_first_slot() {
+        let _ = into_the_first(derivation_from_words);
+    }
+
+    /// A derivation from words with the first slot loaded.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_derivation_from_words_past_a_loaded_slot() {
+        let result = past_a(Occupancy::Loaded, derivation_from_words);
+        kani::cover!(
+            result == Err(Error::DuplicateKey),
+            "a derivation finds its key held"
+        );
+        kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
+    }
+
+    /// A derivation from words with the first slot retired.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_derivation_from_words_past_a_retired_slot() {
+        let result = past_a(Occupancy::Retired, derivation_from_words);
+        kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
+    }
+
+    /// Whether two sets of words are the same, compared word by word.
+    fn same_words(a: &Words, b: &Words) -> bool {
+        a.iter().zip(b).all(|(x, y)| x == y)
+    }
+
+    /// Any twelve words of any list of three, with the first slot free: words the list refuses
+    /// change no slot and derive nothing; the words are wiped exactly when the derivation succeeds;
+    /// a failure of the platform source is never reported; a failed derivation changes no slot.
+    /// Where the key goes, the derivations from words above prove.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn words_are_wiped_exactly_when_their_key_is_derived() {
+        into_the_first(|mut memory| {
+            let mut epoch = any_epoch(false);
+            let mut slots = Slots {
+                memory: &mut memory,
+                epoch: &mut epoch,
+            };
+            let before = snapshots(&slots);
+            let list = any_list();
+            let mut words: Words = kani::any();
+            let original = words;
+            let result = slots.derive_from_words_in(&list, Purpose::Wrap, &mut words);
+            let refused = matches!(result, Err(Error::UnknownWord | Error::InvalidChecksum));
+            kani::assert(!refused || !any_failed(), "refused words derive nothing");
+            kani::assert(
+                result != Err(Error::EntropyFailed),
+                "no platform source is asked",
+            );
+            kani::assert(
+                same_words(
+                    &words,
+                    &if result.is_ok() {
+                        [[0; 8]; 12]
+                    } else {
+                        original
+                    },
+                ),
+                "the words are wiped exactly when the derivation succeeds",
+            );
+            if result.is_ok() {
+                let numbers: [u16; 12] = core::array::from_fn(|at| {
+                    let word = u64::from_le_bytes(original[at]);
+                    if word == list[1] {
+                        1
+                    } else if word == list[2] {
+                        2
+                    } else {
+                        0
+                    }
+                });
+                let (read, _) = bits_of(&numbers);
+                kani::assert(
+                    snapshot(&slots.memory[0]).keys.0[..32]
+                        == expected_words_key(&read, Purpose::Wrap),
+                    "the key in the slot is the one the bytes the words stand for derive",
+                );
+            } else {
+                kani::assert(
+                    unchanged_except(&slots, &before, 2),
+                    "a failed derivation changes no slot",
+                );
+            }
+            kani::cover!(result.is_ok(), "a key is derived from words");
+            kani::cover!(result == Err(Error::UnknownWord), "an unknown word");
+            kani::cover!(
+                result == Err(Error::InvalidChecksum),
+                "a checksum that does not hold"
+            );
+            kani::cover!(
+                result == Err(Error::DuplicateKey),
+                "valid words whose key is held"
+            );
+            kani::cover!(
+                result == Err(Error::DerivationFailed),
+                "valid words whose derivation fails"
+            );
+        });
+    }
+
+    /// Generation with any list of three, with the first slot free: the source is asked once for
+    /// 16 bytes, its failure is `EntropyFailed`, and the words of its bytes are written exactly
+    /// when the key is derived; a failed generation changes neither the words nor any slot.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn words_are_written_exactly_when_their_key_is_generated() {
+        into_the_first(|mut memory| {
+            let mut epoch = any_epoch(false);
+            let mut slots = Slots {
+                memory: &mut memory,
+                epoch: &mut epoch,
+            };
+            let before = snapshots(&slots);
+            let list = any_list();
+            let mut source = AnyEntropy::new();
+            let mut words: Words = kani::any();
+            let original = words;
+            let result = slots.generate_words_from(&list, Purpose::Wrap, &mut source, &mut words);
+            kani::assert(
+                source.calls == 1 && source.requested == 16,
+                "the source is asked once for 16 bytes",
+            );
+            kani::assert(
+                source.failed == (result == Err(Error::EntropyFailed)),
+                "a failure of the source is EntropyFailed, and nothing else is",
+            );
+            let mut bytes = [0; 16];
+            bytes.copy_from_slice(&source.written[..16]);
+            let expected = if result.is_ok() {
+                expected_words(&list, &bytes)
+            } else {
+                original
+            };
+            kani::assert(
+                same_words(&words, &expected),
+                "the words of the bytes are written exactly when the key is derived",
+            );
+            if result.is_ok() {
+                let now = snapshot(&slots.memory[0]);
+                kani::assert(
+                    now.keys.0[..32] == expected_words_key(&bytes, Purpose::Wrap),
+                    "the key in the slot is the one the source's bytes derive",
+                );
+            } else {
+                kani::assert(
+                    unchanged_except(&slots, &before, 2),
+                    "a failed generation changes no slot",
+                );
+            }
+            kani::cover!(result.is_ok(), "words are generated");
+            kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
+            kani::cover!(
+                result == Err(Error::DuplicateKey),
+                "the key generated is held"
+            );
+            kani::cover!(
+                result == Err(Error::DerivationFailed),
+                "the derivation fails"
+            );
+        });
+    }
+
+    /// Without a free slot, from `memory`, generation asks nothing of the source and changes
+    /// neither the words nor any slot.
+    fn generation_without_a_free_slot(mut memory: [Slot; 2]) {
+        let mut epoch = any_epoch(false);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let before = snapshots(&slots);
+        let mut source = AnyEntropy::new();
+        let mut words: Words = kani::any();
+        let original = words;
+        let result = slots.generate_words_from(&any_list(), Purpose::Wrap, &mut source, &mut words);
+        kani::assert(
+            result == Err(Error::NoFreeSlot) && source.calls == 0,
+            "without a free slot nothing is asked",
+        );
+        kani::assert(
+            same_words(&words, &original) && unchanged_except(&slots, &before, 2),
+            "nothing changes",
+        );
+    }
+
+    /// The same in each of the four ways two slots can be taken.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn no_words_are_generated_without_a_free_slot() {
+        let (loaded, retired) = (Occupancy::Loaded, Occupancy::Retired);
+        let layout = kani::any::<u8>() % 4;
+        match layout {
+            0 => generation_without_a_free_slot([any_slot_in(loaded), any_slot_in(loaded)]),
+            1 => generation_without_a_free_slot([any_slot_in(loaded), any_slot_in(retired)]),
+            2 => generation_without_a_free_slot([any_slot_in(retired), any_slot_in(loaded)]),
+            _ => generation_without_a_free_slot([any_slot_in(retired), any_slot_in(retired)]),
+        }
+        kani::cover!(layout == 3, "both slots retired");
     }
 
     /// From any state of two slots and any generation, which includes every state a load leaves: a

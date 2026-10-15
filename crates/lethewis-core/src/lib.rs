@@ -53,6 +53,7 @@ mod record;
 mod residue;
 mod seal;
 mod slots;
+mod words;
 
 pub use entropy::{Entropy, EntropyError};
 pub use epoch::{Epoch, Erasure, Root, RootFailed};
@@ -62,6 +63,7 @@ pub use keyset::Position;
 pub use password::{MemoryBlock, PASSWORD_PARAMS_LEN, PasswordParams};
 pub use record::{Purpose, RECORD_LEN};
 pub use slots::{Handle, Slot, Slots};
+pub use words::{WORD_COUNT, WORD_LEN, Words};
 
 #[cfg(test)]
 mod tests {

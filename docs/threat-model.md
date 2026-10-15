@@ -23,6 +23,10 @@ attempt passwords. No knowledge of the password.
 of memory and at least 3 passes. Parameters out of these bounds are neither made nor read, and other
 parameters derive another key, under which no record wrapped under the first key opens.
 
+A key is also derived from twelve words of the English list of BIP 39. The words a generation
+writes stand for 128 bits of the platform's random source and cannot be guessed. Other words derive
+another key, under which no record wrapped under the first key opens.
+
 **Intended.** Parameters tuned to seconds on the target device by the platform layer, and the
 hardware element wrapping the master key, confining attempts to that one device. After destruction, no call returns the key.
 
@@ -101,6 +105,14 @@ password, of the hash Argon2id starts from, of the last block of its working mem
 The working memory a derivation from a password used is wiped whether it succeeded or not, and the
 password only when it succeeded.
 
+After each call on words that returns, the stack below the caller is wiped: 8 KiB, or 64 KiB without
+optimisation. Tests read it back and find no 16-byte piece of the bytes in either
+byte order, of the numbers or of the words laid out together, of the checksum's hash, of the
+derivation or of the key.
+
+The words are wiped when their key is derived, and left as they were when it is not. A generation
+of words is the one call that gives out what a key derives from: its twelve words, once.
+
 A key is added enabled, and only a disabled key other than the primary is destroyed, wiped with its
 identifier. A record of its set wrapped afterwards does not hold it; one wrapped before still does,
 and opens until the next epoch is committed, then only while the platform keeps the old root.
@@ -132,6 +144,10 @@ A derivation from a password does not reach copies of the password made before t
 immutable string, or working memory the system swaps out. Its wipe reaches 32 KiB, or 192 KiB
 without optimisation, and it needs 64 MiB of working memory, more than a microcontroller usually
 has.
+
+The words a generation writes are the caller's to show once and to wipe, and copies of words made
+before a derivation are not reached. Whoever reads the words holds the key. A call on words needs at
+least the 8 KiB, or 64 KiB, its wipe reaches.
 
 ### 5. The supply chain
 
@@ -178,6 +194,10 @@ From the middle of its first pass on, Argon2id reads its memory at addresses tha
 password and divides values that depend on it, so whoever watches the cache of the same device, or
 times the derivation, learns something about the password.
 
+A word is looked up by comparing it with every word of the list, and written by reading every word,
+in steps whose machine code the same build step checks on the same four targets. `lethewis-dit`
+switches the mode on around reading and writing words as well.
+
 ## Assumptions
 
 1. The device's hardware element behaves as documented by its manufacturer. An application cannot
@@ -190,6 +210,8 @@ times the derivation, learns something about the password.
 4. The third-party cryptographic primitives are sound. They are not proven here.
 5. The platform's random source is cryptographically secure. The library does not test its
    output.
+6. The twelve words are kept where only the owner reads them. Bringing typed words into twelve
+   fields of 8 bytes, lowercase ASCII followed by zeros, is the application's.
 
 ## Known gaps
 
