@@ -312,9 +312,9 @@ mod tests {
     use crate::slots::{Slot, Slots};
 
     fn hex(text: &str) -> Vec<u8> {
-        (0..text.len())
-            .step_by(2)
-            .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+        text.as_bytes()
+            .chunks(2)
+            .map(|pair| u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
     }
 
