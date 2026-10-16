@@ -137,8 +137,8 @@ fn within(memory: u32, passes: u32) -> bool {
 }
 
 impl<'a> Slots<'a> {
-    /// Derives a 32-byte key for `purpose` from `password` with `params` into a free slot, as a set
-    /// of one whose key is the primary, and wipes `password`. The key is written straight into the
+    /// Derives a 32-byte wrapping key from `password` with `params` into a free slot, as a set of
+    /// one whose key is the primary, and wipes `password`. The key is written straight into the
     /// slot. `memory` is the working memory, of at least [`PasswordParams::memory_blocks`] blocks;
     /// the blocks the derivation used are wiped after it, whether it succeeded or not.
     ///
@@ -164,7 +164,6 @@ impl<'a> Slots<'a> {
     /// memory used are wiped; the stack and `password` are not.
     pub fn derive_from_password(
         &mut self,
-        purpose: Purpose,
         password: &mut [u8],
         params: &PasswordParams,
         memory: &mut [MemoryBlock],
@@ -176,7 +175,7 @@ impl<'a> Slots<'a> {
             .get_mut(..params.memory_blocks())
             .ok_or(Error::NotEnoughMemory)?;
         let derived = self.generate(
-            purpose,
+            Purpose::Wrap,
             KeyLength::Bytes32,
             &mut Stretch {
                 password,
@@ -402,7 +401,7 @@ mod tests {
         let mut password = *b"correct horse battery staple";
         let mut working = blocks(params.memory_blocks());
         slots
-            .derive_from_password(Purpose::Wrap, &mut password, &params, &mut working)
+            .derive_from_password(&mut password, &params, &mut working)
             .unwrap();
         let mut expected: [u8; 32] =
             hex("5f56b5f3d09ba3aeac81089cbd7ce7ff10a41406518a7017e9977ca393a02ac4")
@@ -485,20 +484,20 @@ mod tests {
         let mut working = blocks(256);
         assert_eq!(
             slots
-                .derive_from_password(Purpose::Wrap, &mut [], &params, &mut working)
+                .derive_from_password(&mut [], &params, &mut working)
                 .err(),
             Some(Error::InvalidPassword)
         );
         let mut password = *b"password";
         assert_eq!(
             slots
-                .derive_from_password(Purpose::Wrap, &mut password, &params, &mut working[..255])
+                .derive_from_password(&mut password, &params, &mut working[..255])
                 .err(),
             Some(Error::NotEnoughMemory)
         );
         assert_eq!(&password, b"password");
         slots
-            .derive_from_password(Purpose::Wrap, &mut password, &params, &mut working)
+            .derive_from_password(&mut password, &params, &mut working)
             .unwrap();
         assert_eq!(password, [0; 8], "the one slot was still free");
     }
@@ -511,13 +510,13 @@ mod tests {
         let mut working = blocks(256);
         let mut password = *b"password";
         slots
-            .derive_from_password(Purpose::Wrap, &mut password, &small(1), &mut working)
+            .derive_from_password(&mut password, &small(1), &mut working)
             .unwrap();
         assert_eq!(password, [0; 8]);
         let mut password = *b"password";
         assert_eq!(
             slots
-                .derive_from_password(Purpose::Wrap, &mut password, &small(2), &mut working)
+                .derive_from_password(&mut password, &small(2), &mut working)
                 .err(),
             Some(Error::NoFreeSlot)
         );
@@ -537,8 +536,7 @@ mod tests {
                 block.as_mut().fill(7);
             }
             let mut password = *b"password";
-            let derived =
-                slots.derive_from_password(Purpose::Wrap, &mut password, &small(1), &mut working);
+            let derived = slots.derive_from_password(&mut password, &small(1), &mut working);
             assert_eq!(derived.map(|_| ()), outcome);
             assert!(
                 working[..256]
@@ -696,13 +694,12 @@ mod stack {
         let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut [9; 32]);
         let mut working = std::vec![MemoryBlock::new(); 256];
         slots
-            .derive_from_password(Purpose::Wrap, &mut password(), &params(), &mut working)
+            .derive_from_password(&mut password(), &params(), &mut working)
             .unwrap();
         // A failure leaves the password as it was, in the caller's buffer, above what is read.
         let mut kept = password();
         assert_clean(&pieces, || {
-            let derived =
-                slots.derive_from_password(Purpose::Wrap, &mut kept, &params(), &mut working);
+            let derived = slots.derive_from_password(&mut kept, &params(), &mut working);
             assert_eq!(black_box(derived).err(), Some(Error::DuplicateKey));
         });
         assert_eq!(kept, password());
@@ -718,7 +715,7 @@ mod stack {
         assert_clean(&pieces, || {
             let mut password = password();
             slots
-                .derive_from_password(Purpose::Wrap, &mut password, &params(), &mut working)
+                .derive_from_password(&mut password, &params(), &mut working)
                 .unwrap();
             black_box(&password);
         });
@@ -736,12 +733,7 @@ mod stack {
         for outcome in [None, Some(Error::DuplicateKey)] {
             let wiped = depth_changed(|| {
                 let mut password = password();
-                let derived = slots.derive_from_password(
-                    Purpose::Wrap,
-                    &mut password,
-                    &params(),
-                    &mut working,
-                );
+                let derived = slots.derive_from_password(&mut password, &params(), &mut working);
                 assert_eq!(black_box(derived).err(), outcome);
             });
             assert!(wiped >= STACK_WIPE, "{wiped} bytes wiped");

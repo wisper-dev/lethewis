@@ -58,6 +58,10 @@ pub enum Error {
     UnknownWord,
     /// The words are of the list, but their checksum does not hold.
     InvalidChecksum,
+    /// The key set serves a purpose the call does not take.
+    WrongPurpose,
+    /// The purpose takes no key of this length.
+    WrongLength,
 }
 
 impl From<crate::keyset::Refused> for Error {
@@ -99,6 +103,8 @@ impl fmt::Display for Error {
             Self::NotEnoughMemory => "not enough memory",
             Self::UnknownWord => "unknown word",
             Self::InvalidChecksum => "invalid checksum",
+            Self::WrongPurpose => "wrong purpose",
+            Self::WrongLength => "wrong key length",
         })
     }
 }
@@ -142,5 +148,7 @@ mod tests {
         assert_eq!(Error::NotEnoughMemory.to_string(), "not enough memory");
         assert_eq!(Error::UnknownWord.to_string(), "unknown word");
         assert_eq!(Error::InvalidChecksum.to_string(), "invalid checksum");
+        assert_eq!(Error::WrongPurpose.to_string(), "wrong purpose");
+        assert_eq!(Error::WrongLength.to_string(), "wrong key length");
     }
 }

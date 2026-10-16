@@ -65,10 +65,10 @@ const fn numbers_of(text: &[u8]) -> [u64; LIST_LEN] {
 }
 
 impl<'a> Slots<'a> {
-    /// Creates a 32-byte key for `purpose` from 16 random bytes from `entropy` in a free slot, as a
-    /// set of one whose key is the primary, and writes the twelve words of those bytes into
-    /// `words`, as BIP 39 has them. [`Self::derive_from_words`] derives the same key from the
-    /// words; nothing else gives them again. `entropy` is asked once, and only when a slot is free.
+    /// Creates a 32-byte wrapping key from 16 random bytes from `entropy` in a free slot, as a set
+    /// of one whose key is the primary, and writes the twelve words of those bytes into `words`, as
+    /// BIP 39 has them. [`Self::derive_from_words`] derives the same key from the words; nothing
+    /// else gives them again. `entropy` is asked once, and only when a slot is free.
     ///
     /// Needs 10 KiB of stack, or 72 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the derivation of the key, the derivation of its identifier,
@@ -88,11 +88,10 @@ impl<'a> Slots<'a> {
     /// stack is not, and no slot changes.
     pub fn generate_words(
         &mut self,
-        purpose: Purpose,
         entropy: &mut (impl Entropy + ?Sized),
         words: &mut Words,
     ) -> Result<Handle<'a>, Error> {
-        self.generate_words_from(&LIST, purpose, entropy, words)
+        self.generate_words_from(&LIST, entropy, words)
     }
 
     /// Derives the key [`Self::generate_words`] created with `words` into a free slot, as a set of
@@ -114,25 +113,20 @@ impl<'a> Slots<'a> {
     /// free, [`Error::DerivationFailed`] if the key or its identifier cannot be derived, and
     /// [`Error::DuplicateKey`] if these slots hold the key already. `words` is then left as it
     /// was, and no slot changes.
-    pub fn derive_from_words(
-        &mut self,
-        purpose: Purpose,
-        words: &mut Words,
-    ) -> Result<Handle<'a>, Error> {
-        self.derive_from_words_in(&LIST, purpose, words)
+    pub fn derive_from_words(&mut self, words: &mut Words) -> Result<Handle<'a>, Error> {
+        self.derive_from_words_in(&LIST, words)
     }
 
     pub(crate) fn generate_words_from<const N: usize>(
         &mut self,
         list: &[u64; N],
-        purpose: Purpose,
         entropy: &mut (impl Entropy + ?Sized),
         words: &mut Words,
     ) -> Result<Handle<'a>, Error> {
         if !self.has_free() {
             return Err(Error::NoFreeSlot);
         }
-        let generated = self.generate_words_on_stack(list, purpose, entropy, words);
+        let generated = self.generate_words_on_stack(list, entropy, words);
         wipe_stack();
         generated
     }
@@ -143,7 +137,6 @@ impl<'a> Slots<'a> {
     fn generate_words_on_stack<const N: usize>(
         &mut self,
         list: &[u64; N],
-        purpose: Purpose,
         entropy: &mut (impl Entropy + ?Sized),
         words: &mut Words,
     ) -> Result<Handle<'a>, Error> {
@@ -151,7 +144,7 @@ impl<'a> Slots<'a> {
         let generated = entropy
             .fill(&mut bytes.0)
             .map_err(|EntropyError| Error::EntropyFailed)
-            .and_then(|()| self.derive_into(purpose, &bytes.0));
+            .and_then(|()| self.derive_into(&bytes.0));
         if generated.is_ok() {
             lethewis_dit::with(|| encode(list, &bytes.0, words));
         }
@@ -161,10 +154,9 @@ impl<'a> Slots<'a> {
     pub(crate) fn derive_from_words_in<const N: usize>(
         &mut self,
         list: &[u64; N],
-        purpose: Purpose,
         words: &mut Words,
     ) -> Result<Handle<'a>, Error> {
-        let derived = self.derive_from_words_on_stack(list, purpose, words);
+        let derived = self.derive_from_words_on_stack(list, words);
         wipe_stack();
         if derived.is_ok() {
             for word in words.iter_mut() {
@@ -180,42 +172,35 @@ impl<'a> Slots<'a> {
     fn derive_from_words_on_stack<const N: usize>(
         &mut self,
         list: &[u64; N],
-        purpose: Purpose,
         words: &Words,
     ) -> Result<Handle<'a>, Error> {
         let mut bytes = WipeOnDrop([0; WORDS_ENTROPY_LEN]);
         lethewis_dit::with(|| decode(list, words, &mut bytes.0))
-            .and_then(|()| self.derive_into(purpose, &bytes.0))
+            .and_then(|()| self.derive_into(&bytes.0))
     }
 
-    /// Loads the key that `bytes`, which twelve words stand for, derive for `purpose` into a free
-    /// slot: a key from words is loaded as a generated one is.
+    /// Loads the wrapping key that `bytes`, which twelve words stand for, derive into a free slot:
+    /// a key from words is loaded as a generated one is.
     pub(crate) fn derive_into(
         &mut self,
-        purpose: Purpose,
         bytes: &[u8; WORDS_ENTROPY_LEN],
     ) -> Result<Handle<'a>, Error> {
-        self.generate(
-            purpose,
-            KeyLength::Bytes32,
-            &mut FromWords { bytes, purpose },
-        )
-        .map_err(|error| match error {
-            Error::EntropyFailed => Error::DerivationFailed,
-            other => other,
-        })
+        self.generate(Purpose::Wrap, KeyLength::Bytes32, &mut FromWords { bytes })
+            .map_err(|error| match error {
+                Error::EntropyFailed => Error::DerivationFailed,
+                other => other,
+            })
     }
 }
 
 /// The derivation from words as the source of a key's bytes.
 struct FromWords<'b> {
     bytes: &'b [u8; WORDS_ENTROPY_LEN],
-    purpose: Purpose,
 }
 
 impl Entropy for FromWords<'_> {
     fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
-        derive_from_words(self.bytes, self.purpose, dest).map_err(|_| EntropyError)
+        derive_from_words(self.bytes, dest).map_err(|_| EntropyError)
     }
 }
 
@@ -694,7 +679,7 @@ pub(crate) mod tests {
             let mut epoch = Epoch::empty();
             let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut [9; 32]);
             let mut words = words_for(&unhex(bytes));
-            slots.derive_from_words(Purpose::Wrap, &mut words).unwrap();
+            slots.derive_from_words(&mut words).unwrap();
             assert_eq!(
                 slots.import32(Purpose::Wrap, &mut unhex(key)).err(),
                 Some(Error::DuplicateKey),
@@ -709,9 +694,7 @@ pub(crate) mod tests {
         let mut epoch = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut [9; 32]);
         let mut words = [[7; WORD_LEN]; WORD_COUNT];
-        let generated = slots
-            .generate_words(Purpose::Wrap, &mut Counting, &mut words)
-            .unwrap();
+        let generated = slots.generate_words(&mut Counting, &mut words).unwrap();
         let counted: [u8; 16] = core::array::from_fn(|at| u8::try_from(at + 1).unwrap());
         assert_eq!(
             reading(&words),
@@ -720,12 +703,12 @@ pub(crate) mod tests {
         );
         let mut again = words;
         assert_eq!(
-            slots.derive_from_words(Purpose::Wrap, &mut again).err(),
+            slots.derive_from_words(&mut again).err(),
             Some(Error::DuplicateKey),
             "the key the words derive is the one generated"
         );
         slots.release(generated).unwrap();
-        slots.derive_from_words(Purpose::Wrap, &mut again).unwrap();
+        slots.derive_from_words(&mut again).unwrap();
         assert_eq!(again, [[0; WORD_LEN]; WORD_COUNT]);
     }
 
@@ -736,16 +719,12 @@ pub(crate) mod tests {
         let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut [9; 32]);
         let mut source = Recording::default();
         let mut words = [[0; WORD_LEN]; WORD_COUNT];
-        slots
-            .generate_words(Purpose::Wrap, &mut source, &mut words)
-            .unwrap();
+        slots.generate_words(&mut source, &mut words).unwrap();
         assert_eq!((source.calls, source.asked), (1, 16));
         assert_eq!(words, words_for(&[3; 16]));
         let before = words;
         assert_eq!(
-            slots
-                .generate_words(Purpose::Wrap, &mut source, &mut words)
-                .err(),
+            slots.generate_words(&mut source, &mut words).err(),
             Some(Error::NoFreeSlot)
         );
         assert_eq!(
@@ -762,15 +741,11 @@ pub(crate) mod tests {
         let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut [9; 32]);
         let mut words = [[7; WORD_LEN]; WORD_COUNT];
         assert_eq!(
-            slots
-                .generate_words(Purpose::Wrap, &mut Failing, &mut words)
-                .err(),
+            slots.generate_words(&mut Failing, &mut words).err(),
             Some(Error::EntropyFailed)
         );
         assert_eq!(words, [[7; WORD_LEN]; WORD_COUNT]);
-        slots
-            .generate_words(Purpose::Wrap, &mut Counting, &mut words)
-            .unwrap();
+        slots.generate_words(&mut Counting, &mut words).unwrap();
     }
 
     #[test]
@@ -787,23 +762,20 @@ pub(crate) mod tests {
             (unsummed, Error::InvalidChecksum),
         ] {
             let before = words;
-            assert_eq!(
-                slots.derive_from_words(Purpose::Wrap, &mut words).err(),
-                Some(error)
-            );
+            assert_eq!(slots.derive_from_words(&mut words).err(), Some(error));
             assert_eq!(words, before);
         }
         let mut words = words_for(&[1; 16]);
-        slots.derive_from_words(Purpose::Wrap, &mut words).unwrap();
+        slots.derive_from_words(&mut words).unwrap();
         assert_eq!(words, [[0; WORD_LEN]; WORD_COUNT]);
         let mut words = words_for(&[2; 16]);
         assert_eq!(
-            slots.derive_from_words(Purpose::Wrap, &mut words).err(),
+            slots.derive_from_words(&mut words).err(),
             Some(Error::NoFreeSlot)
         );
         assert_eq!(words, words_for(&[2; 16]));
         assert_eq!(
-            slots.derive_from_words(Purpose::Wrap, &mut unknown).err(),
+            slots.derive_from_words(&mut unknown).err(),
             Some(Error::UnknownWord),
             "the words are read before a slot is looked for"
         );
@@ -833,7 +805,6 @@ mod stack {
     use crate::epoch::Epoch;
     use crate::error::Error;
     use crate::key::KeyLength;
-    use crate::record::Purpose;
     use crate::residue::{assert_clean, below_pad, depth_changed, key_dependent, residue};
     use crate::slots::{Slot, Slots};
 
@@ -904,7 +875,7 @@ mod stack {
         found.extend(checksum_secrets(bytes));
         found.extend(secrets_of(bytes, SALT, Branch::FromWords));
         let mut key = [0; 64];
-        derive_from_words(bytes, Purpose::Wrap, &mut key[..32]).unwrap();
+        derive_from_words(bytes, &mut key[..32]).unwrap();
         found.extend(secrets(&key, SALT, KeyLength::Bytes32, Branch::KeyId));
         found
     }
@@ -952,7 +923,7 @@ mod stack {
         let given = words_for(&bytes());
         assert_clean(&pieces, || {
             let mut words = given;
-            slots.derive_from_words(Purpose::Wrap, &mut words).unwrap();
+            slots.derive_from_words(&mut words).unwrap();
             black_box(&words);
         });
     }
@@ -964,13 +935,11 @@ mod stack {
         let mut memory = [const { Slot::empty() }; 2];
         let mut epoch = Epoch::empty();
         let mut slots = slots_of(&mut memory, &mut epoch);
-        slots
-            .derive_from_words(Purpose::Wrap, &mut words_for(&bytes()))
-            .unwrap();
+        slots.derive_from_words(&mut words_for(&bytes())).unwrap();
         // A failure leaves the words as they were, in the caller's buffer, above what is read.
         let mut kept = words_for(&bytes());
         assert_clean(&pieces, || {
-            let derived = slots.derive_from_words(Purpose::Wrap, &mut kept);
+            let derived = slots.derive_from_words(&mut kept);
             assert_eq!(black_box(derived).err(), Some(Error::DuplicateKey));
         });
     }
@@ -998,7 +967,7 @@ mod stack {
         let mut epoch = Epoch::empty();
         let mut slots = slots_of(&mut memory, &mut epoch);
         assert_clean(&pieces, || {
-            let derived = slots.derive_from_words(Purpose::Wrap, &mut swapped);
+            let derived = slots.derive_from_words(&mut swapped);
             assert_eq!(black_box(derived).err(), Some(Error::InvalidChecksum));
         });
     }
@@ -1012,9 +981,7 @@ mod stack {
         // The words are the caller's to keep, above what is read.
         let mut words = [[0; 8]; 12];
         assert_clean(&pieces, || {
-            slots
-                .generate_words(Purpose::Wrap, &mut Fixed, &mut words)
-                .unwrap();
+            slots.generate_words(&mut Fixed, &mut words).unwrap();
         });
         assert_eq!(words, words_for(&bytes()));
     }
@@ -1041,14 +1008,12 @@ mod stack {
         let mut words = [[0; 8]; 12];
         assert_clean(&pieces, || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = slots.generate_words(Purpose::Wrap, &mut Panicking, &mut words);
+                let _ = slots.generate_words(&mut Panicking, &mut words);
             }));
             assert!(outcome.is_err());
         });
         assert_eq!(words, [[0; 8]; 12]);
-        slots
-            .generate_words(Purpose::Wrap, &mut Fixed, &mut words)
-            .unwrap();
+        slots.generate_words(&mut Fixed, &mut words).unwrap();
     }
 
     /// The wipe that follows a derivation from words and a generation of words reaches as deep as
@@ -1062,16 +1027,14 @@ mod stack {
         let needs = 1024 * NEEDS[usize::from(cfg!(lethewis_unoptimised))];
         let mut words = [[0; 8]; 12];
         let wiped = depth_changed(|| {
-            slots
-                .generate_words(Purpose::Wrap, &mut Fixed, &mut words)
-                .unwrap();
+            slots.generate_words(&mut Fixed, &mut words).unwrap();
         });
         assert!(wiped >= STACK_WIPE, "{wiped} bytes wiped");
         assert!(wiped <= needs, "{wiped} bytes reached");
         for outcome in [None, Some(Error::DuplicateKey)] {
             let wiped = depth_changed(|| {
                 let mut words = words_for(&other_bytes());
-                let derived = slots.derive_from_words(Purpose::Wrap, &mut words);
+                let derived = slots.derive_from_words(&mut words);
                 assert_eq!(black_box(derived).err(), outcome);
             });
             assert!(wiped >= STACK_WIPE, "{wiped} bytes wiped");

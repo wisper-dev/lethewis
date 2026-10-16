@@ -17,7 +17,7 @@ Suggestions for functionality not listed here are accepted as issues.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/rustc-1.99.0-orange.svg)
-![Readiness](https://img.shields.io/badge/readiness-24%25-red.svg)
+![Readiness](https://img.shields.io/badge/readiness-27%25-orange.svg)
 
 ## How the keys relate
 
@@ -51,9 +51,9 @@ password and the hardware secret at each unlock, and neither alone is enough.
 - **A key derived from a password or from twelve words comes back from them.** Destroying it does
   not reach the password or the words.
 - **Wiping a value from memory does not reach every copy.** Copies left by a value move, a buffer
-  reallocation, a CPU register, swap or a crash dump are outside what this library clears. The stack
-  each derivation, load, wrap and unwrap of a key used is wiped after it, short of registers, as
-  measured on x86-64 and aarch64 Linux only.
+  reallocation, a CPU register, swap or a crash dump are outside what this library clears. Each
+  load, addition, derivation, reveal, wrap and unwrap wipes the stack it used, short of registers,
+  as measured on x86-64 and aarch64 Linux only.
 - **The stack a call needs is not measured on microcontrollers.** On a target such as Cortex-M a
   call needs at least the depth of the wipe after it, which its documentation states, and an
   overflow of an unguarded stack corrupts memory silently. A derivation from a password needs at
@@ -61,6 +61,10 @@ password and the hardware secret at each unlock, and neither alone is enough.
 - **The cost of a derivation from a password is not tuned here.** The library refuses less than 64
   MiB of memory and fewer than 3 passes. Choosing parameters that take a few seconds on a device is
   the caller's, and so is bringing a password typed as text into one Unicode form.
+- **A key handed out is the caller's to wipe.** A key for external data, such as a database key,
+  leaves the library in the clear only through `Slots::reveal32`, into the caller's buffer. The
+  library does not reach that copy, nor what the engine it goes to keeps. Keys for wrapping leave in
+  the clear only as the words of a generation.
 - **Twelve words are as safe as the place they are kept.** Whoever reads them derives the key. The
   library writes them once, from the English list of BIP 39; keeping them off screenshots, the
   clipboard, the keyboard's memory and backups is the caller's. About one changed word in sixteen

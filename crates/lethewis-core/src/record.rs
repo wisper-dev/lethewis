@@ -30,16 +30,30 @@ const _: () = assert!(AAD_LABEL.len() + 2 + MAX_CONTEXT == AAD_CAPACITY);
 #[non_exhaustive]
 #[repr(u8)]
 pub enum Purpose {
-    /// Wraps other keys. Leaves the library only as a record wrapped by another key, or as the
-    /// words [`Slots::generate_words`](crate::Slots::generate_words) writes once.
+    /// A key of 32 or 64 bytes that wraps other keys. Leaves the library only as a record wrapped
+    /// by another key, or as the words [`Slots::generate_words`](crate::Slots::generate_words)
+    /// writes once.
     Wrap = 1,
+    /// A key of 32 bytes for data an engine outside the library encrypts, such as a database. It
+    /// wraps no key, and leaves the library only as a record wrapped by another key or through
+    /// [`Slots::reveal32`](crate::Slots::reveal32) naming this purpose.
+    ExternalData = 2,
 }
 
 impl Purpose {
     pub(crate) const fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             1 => Some(Self::Wrap),
+            2 => Some(Self::ExternalData),
             _ => None,
+        }
+    }
+
+    /// Whether a key of `length` may serve this purpose.
+    pub(crate) const fn takes(self, length: KeyLength) -> bool {
+        match self {
+            Self::Wrap => true,
+            Self::ExternalData => matches!(length, KeyLength::Bytes32),
         }
     }
 }
