@@ -24,8 +24,9 @@ of memory and at least 3 passes. Parameters out of these bounds are neither made
 parameters derive another key, under which no record wrapped under the first key opens.
 
 A key is also derived from twelve words of the English list of BIP 39. The words a generation
-writes stand for 128 bits of the platform's random source and cannot be guessed. Other words derive
-another key, under which no record wrapped under the first key opens.
+writes stand for 128 bits of the platform's random source, hedged with the key of the epoch, and
+cannot be guessed. Other words derive another key, under which no record wrapped under the first
+key opens.
 
 **Intended.** Parameters tuned to seconds on the target device by the platform layer, and the
 hardware element wrapping the master key, confining attempts to that one device. After destruction, no call returns the key.
@@ -73,9 +74,9 @@ and the flash.
 set of up to three keys. A key is held in one place only, whatever purpose it serves: a load of a key
 the slots already hold, or of a set that holds one key twice, is refused.
 
-A new key is written straight into its slot from the platform's random source, and the library's own
-code makes no copy of it; if the source fails or panics halfway, the slot is wiped. The keys of a set
-are wiped when it is released, and every key is wiped when its slots are dropped.
+A new key is the hedge of the platform's random bytes under the key of the epoch, written straight
+into its slot; the bytes drawn are wiped, and if the source fails or panics, so is the slot. The
+keys of a set are wiped when it is released, and every key is wiped when its slots are dropped.
 
 Only a key for external data is returned, to a call that names its purpose, into the caller's
 buffer. The stack below the call is wiped after it, 8 KiB, or 64 KiB without optimisation, and a
@@ -140,25 +141,39 @@ and opens until the next epoch is committed, then only while the platform keeps 
 **Intended.** Drop keys from memory when the device locks.
 
 **Not defended.** Copies left by a value move, a buffer reallocation, a CPU register, swap, or a
-crash dump. The stack wipe is best effort: it does not reach registers, it relies on the compiler
-keeping the derivation, the wrap and the unwrap out of their caller's frame, its depth follows the
-optimisation of this crate, so a build that optimises this crate but not the hash and cipher code it
-calls has to set `--cfg lethewis_unoptimised`, and it is measured only where the tests run, so far
-x86-64 and aarch64 Linux. On a microcontroller such as Cortex-M the stack these calls use is not
-measured; a call needs at least as much as the wipe after it reaches, 24 KiB after a wrap or an
-unwrap and 8 KiB after an import or a generation, or 64 KiB after each without optimisation, and
-without a guard on the stack, an MPU region or a layout that puts the stack below all other data, an
-overflow corrupts memory silently. A set of slots leaked instead of dropped keeps its keys in
-memory. A copy of a new key kept by the platform's random source. A system component with elevated
-privileges is outside what process isolation provides. The AES round keys of the software AES are
-bitsliced and are not looked for in that form. A record is not bound to one key in the strict sense:
-whoever chooses two keys can cheaply build bytes the cipher accepts under both. For such bytes to
-unwrap under both keys they must also name each key's identifier, which raises the work to no less
-than about 2^64 by estimate; this is not proven. A set cannot wrap itself, and since no key is held
-in two places, no set is wrapped under one of its own keys. Longer cycles, such as one set wrapped
-under another that is wrapped under the first, and a key whose bytes begin with the bytes of the key
-it is wrapped under, are not detected. Two sets of slots alive at once may hold the same key; the
-one-place rule holds within each.
+crash dump. A set of slots leaked instead of dropped keeps its keys in memory. A system component
+with elevated privileges is outside what process isolation provides.
+
+The stack wipe is best effort. It does not reach registers, and it relies on the compiler keeping
+the derivation, the hedge, the reveal, the wrap and the unwrap out of their caller's frame. Its depth
+follows the optimisation of this crate: a build that optimises it but not the hash and cipher code
+sets `--cfg lethewis_unoptimised`.
+
+The wipe is measured only where the tests run, so far x86-64 and aarch64 Linux, not on a
+microcontroller such as Cortex-M. A call needs at least the stack its documentation states, as
+deep as the wipe after it.
+
+Without a guard on the stack, an MPU region or a layout that puts the stack below all other data, an
+overflow corrupts memory silently.
+
+The hedge does not cover a key of the epoch made by the same broken source, or a process or machine
+copied with its state. Nor does it cover a source that repeats itself in another `Slots` under the
+same key of the epoch, such as after a restart: the count of draws starts again with each `Slots`.
+
+The salt of password parameters is not hedged: a broken source makes it predictable, and work done
+in advance against a password then serves every device with that source.
+
+The AES round keys of the software AES are bitsliced and are not looked for in that form. A record
+is not bound to one key in the strict sense: whoever chooses two keys can cheaply build bytes the
+cipher accepts under both.
+
+For such bytes to unwrap under both keys they must also name each key's identifier, which raises the
+work to no less than about 2^64 by estimate; this is not proven. A set cannot wrap itself, and since
+no key is held in two places, no set is wrapped under one of its own keys.
+
+Longer cycles, such as one set wrapped under another that is wrapped under the first, and a key whose
+bytes begin with the bytes of the key it is wrapped under, are not detected. Two sets of slots alive
+at once may hold the same key; the one-place rule holds within each.
 
 The copy a reveal writes, and what the engine it goes to keeps, are the caller's to wipe; a key
 revealed before a record of its set is stored is lost with the slots. The wipe after a reveal relies
@@ -232,8 +247,9 @@ switches the mode on around reading and writing words as well.
    password typed as text into one Unicode form, NFC, before it reaches the library is the
    application's as well.
 4. The third-party cryptographic primitives are sound. They are not proven here.
-5. The platform's random source is cryptographically secure. The library does not test its
-   output.
+5. The platform's random source is unpredictable to the adversary, or the key of the epoch that
+   keys, words and nonces drawn from it are hedged with is, provided the source does not repeat its
+   bytes in another `Slots` under that key. The library does not test the source's output.
 6. The twelve words are kept where only the owner reads them. Bringing typed words into twelve
    fields of 8 bytes, lowercase ASCII followed by zeros, is the application's.
 

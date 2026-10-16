@@ -4,7 +4,9 @@
 use core::{fmt, marker::PhantomData};
 
 use crate::{
-    derive::{KeyId, derive_key_id, derive_wrap_key, wipe_cipher_stack, wipe_stack},
+    derive::{
+        Branch, Hedged, KeyId, derive_key_id, derive_wrap_key, wipe_cipher_stack, wipe_stack,
+    },
     entropy::{Entropy, EntropyError},
     epoch::{Epoch, Erasure, Root, RootFailed},
     error::Error,
@@ -268,7 +270,7 @@ impl<'a> Slots<'a> {
         purpose: Purpose,
         source: &mut [u8; 32],
     ) -> Result<Handle<'a>, Error> {
-        let handle = self.load_new(purpose, KeyLength::Bytes32, |first| {
+        let handle = self.load_new(purpose, KeyLength::Bytes32, |first, _| {
             first.copy32(source);
             Ok(())
         })?;
@@ -295,7 +297,7 @@ impl<'a> Slots<'a> {
         purpose: Purpose,
         source: &mut [u8; 64],
     ) -> Result<Handle<'a>, Error> {
-        let handle = self.load_new(purpose, KeyLength::Bytes64, |first| {
+        let handle = self.load_new(purpose, KeyLength::Bytes64, |first, _| {
             first.copy64(source);
             Ok(())
         })?;
@@ -304,21 +306,21 @@ impl<'a> Slots<'a> {
     }
 
     /// Creates a key for `purpose` of `length` random bytes from `entropy` in a free slot, as a set
-    /// of one whose key is the primary. The bytes are written straight into the slot, and the
-    /// library's own code makes no copy of them; the stack the derivation of the key's identifier
-    /// used is wiped after it. `entropy` is asked once, and only when `purpose` takes `length` and
-    /// a slot is free.
+    /// of one whose key is the primary. The bytes are hedged with the key of the epoch, as RFC 8937
+    /// has it, and the key derived from them is written straight into the slot; the bytes `entropy`
+    /// gave are wiped, and so is the stack the derivations used. `entropy` is asked once, and only
+    /// when `purpose` takes `length` and a slot is free.
     ///
     /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole load, are
-    /// each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate
-    /// but not the hash code it calls has to set that flag.
+    /// `--cfg lethewis_unoptimised`: the hedge, the derivation of the key's identifier, and the
+    /// whole load, are each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that
+    /// optimises this crate but not the hash code it calls has to set that flag.
     ///
     /// # Errors
     ///
     /// [`Error::WrongLength`] if `purpose` takes no key of `length`, [`Error::NoFreeSlot`] if no
     /// slot is free, [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if
-    /// the identifier of the key cannot be derived, and [`Error::DuplicateKey`] if these slots hold
+    /// the key or its identifier cannot be derived, and [`Error::DuplicateKey`] if these slots hold
     /// the key already. No slot changes then.
     ///
     /// # Panics
@@ -330,9 +332,34 @@ impl<'a> Slots<'a> {
         length: KeyLength,
         entropy: &mut (impl Entropy + ?Sized),
     ) -> Result<Handle<'a>, Error> {
-        self.load_new(purpose, length, |first| {
+        self.load_new(purpose, length, |first, epoch| {
+            hedged_fill(first, length, entropy, epoch)
+        })
+    }
+
+    /// Fills `dest` from `entropy`, the platform's source, hedged with the key of this epoch under
+    /// `branch`.
+    pub(crate) fn draw(
+        &mut self,
+        entropy: &mut (impl Entropy + ?Sized),
+        branch: Branch,
+        dest: &mut [u8],
+    ) -> Result<(), Error> {
+        let Epoch { key, drawn, .. } = &mut *self.epoch;
+        hedged_draw(entropy, key, drawn, branch, dest)
+    }
+
+    /// Loads a key of `length` for `purpose` whose bytes `source` derives, from a password or from
+    /// words, as a set of one: not hedged, so that the same input gives the same key.
+    pub(crate) fn load_derived(
+        &mut self,
+        purpose: Purpose,
+        length: KeyLength,
+        source: &mut (impl Entropy + ?Sized),
+    ) -> Result<Handle<'a>, Error> {
+        self.load_new(purpose, length, |first, _| {
             first
-                .fill(length, entropy)
+                .fill(length, source)
                 .map_err(|EntropyError| Error::EntropyFailed)
         })
     }
@@ -395,10 +422,10 @@ impl<'a> Slots<'a> {
 
     /// Wraps the key set that `set` refers to under the primary key of the set that `parent` refers
     /// to and writes the record into `record`, in this epoch, or in the next while a change to it
-    /// is under way. The record holds every key of the set, its stage and
-    /// which key is the primary, and opens only with that key of the parent and the same `context`,
-    /// which names the place the record is kept, from 1 to 255 bytes. The nonce comes from
-    /// `entropy`.
+    /// is under way. The record holds every key of the set, its stage and which key is the primary,
+    /// and opens only with that key of the parent and the same `context`, which names the place the
+    /// record is kept, from 1 to 255 bytes. The nonce comes from
+    /// `entropy`, hedged with the key of the epoch the record is wrapped in.
     ///
     /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
@@ -413,7 +440,8 @@ impl<'a> Slots<'a> {
     /// `parent` refers to does not serve [`Purpose::Wrap`], [`Error::Unsaved`] if the set `set`
     /// refers to has changed in this epoch and no change to the next is under way,
     /// [`Error::EntropyFailed`] if `entropy` fails,
-    /// [`Error::DerivationFailed`] if the key that encrypts the record cannot be derived, and
+    /// [`Error::DerivationFailed`] if the nonce cannot be hedged or the key that encrypts the record
+    /// cannot be derived, and
     /// [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or fails. `record`
     /// is then left as it was.
     pub fn wrap(
@@ -456,22 +484,21 @@ impl<'a> Slots<'a> {
         if child.changed && !self.epoch.changing {
             return Err(Error::Unsaved);
         }
-        let (epoch, epoch_key) = if self.epoch.changing {
-            (
-                self.epoch
-                    .number
-                    .checked_add(1)
-                    .ok_or(Error::EpochExhausted)?,
-                &self.epoch.next,
-            )
+        let Epoch {
+            number,
+            key,
+            next,
+            changing,
+            drawn,
+        } = &mut *self.epoch;
+        let (epoch, epoch_key) = if *changing {
+            (number.checked_add(1).ok_or(Error::EpochExhausted)?, &*next)
         } else {
-            (self.epoch.number, &self.epoch.key)
+            (*number, &*key)
         };
         let (parent_key, parent_id) = wrapping.primary();
         let mut nonce = [0; NONCE_LEN];
-        entropy
-            .fill(&mut nonce)
-            .map_err(|EntropyError| Error::EntropyFailed)?;
+        hedged_draw(entropy, epoch_key, drawn, Branch::HedgeNonce, &mut nonce)?;
         let mut cipher_key = [0; CIPHER_KEY_LEN];
         if derive_wrap_key(parent_key, epoch_key, &mut cipher_key).is_err() {
             wipe(&mut cipher_key);
@@ -618,7 +645,7 @@ impl<'a> Slots<'a> {
         if header.epoch != self.epoch.number {
             return Err(Error::RecordRejected);
         }
-        self.load(header.purpose, stages, |[first, second, third]| {
+        self.load(header.purpose, stages, |[first, second, third], _| {
             let [first_bytes, second_bytes, third_bytes] = keys;
             let load = |key: &mut Key, bytes: Option<KeyBytes<'_>>| {
                 if let Some(bytes) = bytes {
@@ -658,12 +685,14 @@ impl<'a> Slots<'a> {
         &mut self,
         purpose: Purpose,
         length: KeyLength,
-        fill: impl FnOnce(&mut Key) -> Result<(), Error>,
+        fill: impl FnOnce(&mut Key, &mut Epoch) -> Result<(), Error>,
     ) -> Result<Handle<'a>, Error> {
         if !purpose.takes(length) {
             return Err(Error::WrongLength);
         }
-        self.load(purpose, Stages::one(), |[first, ..]| fill(first))
+        self.load(purpose, Stages::one(), |[first, ..], epoch| {
+            fill(first, epoch)
+        })
     }
 
     /// Puts the keys of a set for `purpose` with `stages` into the first free slot with `fill`,
@@ -674,7 +703,7 @@ impl<'a> Slots<'a> {
         &mut self,
         purpose: Purpose,
         stages: Stages,
-        fill: impl FnOnce(&mut [Key; MEMBERS]) -> Result<(), Error>,
+        fill: impl FnOnce(&mut [Key; MEMBERS], &mut Epoch) -> Result<(), Error>,
     ) -> Result<Handle<'a>, Error> {
         // The copy of the key and the checks after its derivation run above the derivation's wipe.
         let loaded = lethewis_dit::with(|| self.load_in_slot(purpose, stages, fill));
@@ -686,7 +715,7 @@ impl<'a> Slots<'a> {
         &mut self,
         purpose: Purpose,
         stages: Stages,
-        fill: impl FnOnce(&mut [Key; MEMBERS]) -> Result<(), Error>,
+        fill: impl FnOnce(&mut [Key; MEMBERS], &mut Epoch) -> Result<(), Error>,
     ) -> Result<Handle<'a>, Error> {
         let slots = self.id();
         let index = self
@@ -697,7 +726,9 @@ impl<'a> Slots<'a> {
         let filled = self
             .memory
             .get_mut(index)
-            .map_or(Err(Error::NoFreeSlot), |slot| fill(&mut slot.keys));
+            .map_or(Err(Error::NoFreeSlot), |slot| {
+                fill(&mut slot.keys, &mut *self.epoch)
+            });
         let identified = filled.and_then(|()| self.identify(index, &stages));
         let slot = self.memory.get_mut(index).ok_or(Error::NoFreeSlot)?;
         let mut ids = match identified {
@@ -774,7 +805,7 @@ impl<'a> Slots<'a> {
     /// [`Error::DuplicateKey`] if these slots hold the key already. `source` is then left as it
     /// was, and nothing changes.
     pub fn add32(&mut self, set: Handle<'a>, source: &mut [u8; 32]) -> Result<Position, Error> {
-        let at = self.add(set, KeyLength::Bytes32, |key| {
+        let at = self.add(set, KeyLength::Bytes32, |key, _| {
             key.copy32(source);
             Ok(())
         })?;
@@ -801,7 +832,7 @@ impl<'a> Slots<'a> {
     /// [`Error::DuplicateKey`] if these slots hold the key already. `source` is then left as it
     /// was, and nothing changes.
     pub fn add64(&mut self, set: Handle<'a>, source: &mut [u8; 64]) -> Result<Position, Error> {
-        let at = self.add(set, KeyLength::Bytes64, |key| {
+        let at = self.add(set, KeyLength::Bytes64, |key, _| {
             key.copy64(source);
             Ok(())
         })?;
@@ -811,13 +842,14 @@ impl<'a> Slots<'a> {
 
     /// Creates a key of `length` random bytes from `entropy` in the first empty position of the set
     /// that `set` refers to, enabled and not the primary, and returns the position. The bytes are
+    /// hedged with the key of the epoch, as RFC 8937 has it, and the key derived from them is
     /// written straight into the slot. `entropy` is asked once, and only when the set's purpose
     /// takes `length` and a position is empty.
     ///
     /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole
-    /// addition, are each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises
-    /// this crate but not the hash code it calls has to set that flag.
+    /// `--cfg lethewis_unoptimised`: the hedge, the derivation of the key's identifier, and the
+    /// whole addition, are each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that
+    /// optimises this crate but not the hash code it calls has to set that flag.
     ///
     /// # Errors
     ///
@@ -826,9 +858,9 @@ impl<'a> Slots<'a> {
     /// the set has changed in this epoch, [`Error::WrongLength`] if its purpose takes no key of
     /// `length`, [`Error::SetFull`] if every position holds a key,
     /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds,
-    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if the identifier
-    /// of the key cannot be derived, and [`Error::DuplicateKey`] if these slots hold the key
-    /// already. Nothing changes then.
+    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if the key or its
+    /// identifier cannot be derived, and [`Error::DuplicateKey`] if these slots hold the key
+    /// already. No slot changes then.
     ///
     /// # Panics
     ///
@@ -839,9 +871,8 @@ impl<'a> Slots<'a> {
         length: KeyLength,
         entropy: &mut (impl Entropy + ?Sized),
     ) -> Result<Position, Error> {
-        self.add(set, length, |key| {
-            key.fill(length, entropy)
-                .map_err(|EntropyError| Error::EntropyFailed)
+        self.add(set, length, |key, epoch| {
+            hedged_fill(key, length, entropy, epoch)
         })
     }
 
@@ -938,7 +969,7 @@ impl<'a> Slots<'a> {
         &mut self,
         set: Handle<'a>,
         length: KeyLength,
-        fill: impl FnOnce(&mut Key) -> Result<(), Error>,
+        fill: impl FnOnce(&mut Key, &mut Epoch) -> Result<(), Error>,
     ) -> Result<Position, Error> {
         let added = lethewis_dit::with(|| self.add_in_slot(set, length, fill));
         wipe_stack();
@@ -949,7 +980,7 @@ impl<'a> Slots<'a> {
         &mut self,
         set: Handle<'a>,
         length: KeyLength,
-        fill: impl FnOnce(&mut Key) -> Result<(), Error>,
+        fill: impl FnOnce(&mut Key, &mut Epoch) -> Result<(), Error>,
     ) -> Result<Position, Error> {
         let index = self.loaded(set)?;
         if self.epoch.changing {
@@ -964,7 +995,7 @@ impl<'a> Slots<'a> {
         }
         let mut stages = slot.stages;
         let at = Position::at(stages.add()?).ok_or(Error::SetFull)?;
-        let filled = fill(slot.member(at).0);
+        let filled = fill(slot.member(at).0, &mut *self.epoch);
         let mut id = KeyId::empty();
         let identified = filled.and_then(|()| {
             let key = self.memory.get(index).ok_or(Error::StaleHandle)?.key(at);
@@ -1122,6 +1153,60 @@ impl<'a> Slots<'a> {
             }
         }
     }
+}
+
+/// Fills `key` with `length` bytes from `entropy`, the platform's source, hedged with the key of
+/// `epoch`. A failed hedge is `DerivationFailed`, a failed source `EntropyFailed`.
+fn hedged_fill(
+    key: &mut Key,
+    length: KeyLength,
+    entropy: &mut (impl Entropy + ?Sized),
+    epoch: &mut Epoch,
+) -> Result<(), Error> {
+    let Epoch {
+        key: epoch_key,
+        drawn,
+        ..
+    } = epoch;
+    let mut hedged = Hedged {
+        source: entropy,
+        epoch: epoch_key,
+        drawn,
+        branch: Branch::HedgeKey,
+        failed: false,
+    };
+    key.fill(length, &mut hedged).map_err(|EntropyError| {
+        if hedged.failed {
+            Error::DerivationFailed
+        } else {
+            Error::EntropyFailed
+        }
+    })
+}
+
+/// Fills `dest` from `entropy`, the platform's source, hedged with `epoch` under `branch` and the
+/// next count of `drawn`. A failed hedge is `DerivationFailed`, a failed source `EntropyFailed`.
+fn hedged_draw(
+    entropy: &mut (impl Entropy + ?Sized),
+    epoch: &Key,
+    drawn: &mut u64,
+    branch: Branch,
+    dest: &mut [u8],
+) -> Result<(), Error> {
+    let mut hedged = Hedged {
+        source: entropy,
+        epoch,
+        drawn,
+        branch,
+        failed: false,
+    };
+    hedged.fill(dest).map_err(|EntropyError| {
+        if hedged.failed {
+            Error::DerivationFailed
+        } else {
+            Error::EntropyFailed
+        }
+    })
 }
 
 /// The nonce, the encrypted plaintext and the tag of a record.
@@ -1339,7 +1424,7 @@ mod tests {
         let added = slots.add_generated(set, KeyLength::Bytes32, &mut Counting);
         assert_eq!(added, Ok(Position::Third));
         slots.settle();
-        let generated = counted::<32>();
+        let generated = hedged(0, b"hedge key", &counted::<32>(), 32);
         assert_holds(
             &slots,
             set,
@@ -1355,8 +1440,10 @@ mod tests {
         assert_eq!(more, [6; 32]);
     }
 
+    /// A generated key is the hedge of the source's bytes, in its position: the source writes into a
+    /// buffer of the library's, not into the slot.
     #[test]
-    fn a_generated_key_is_written_straight_into_its_position() {
+    fn a_generated_key_is_the_hedge_of_the_source_in_its_position() {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
@@ -1365,7 +1452,11 @@ mod tests {
         let added = slots.add_generated(set, KeyLength::Bytes64, &mut source);
         assert_eq!(added, Ok(Position::Second));
         assert_eq!((source.calls, source.asked), (1, 64));
-        assert_eq!(source.at, slots.memory[0].keys[1].bytes().as_ptr().addr());
+        assert_ne!(source.at, slots.memory[0].keys[1].bytes().as_ptr().addr());
+        assert_eq!(
+            slots.memory[0].keys[1].bytes()[..],
+            hedged(0, b"hedge key", &[3; 64], 64)[..]
+        );
         let mut full = Recording::default();
         slots.settle();
         slots
@@ -1917,9 +2008,15 @@ mod tests {
             .generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting)
             .unwrap();
         assert_eq!((short.index, long.index), (0, 1));
-        assert_eq!(slots.memory[0].keys[0].bytes(), &padded(&counted::<32>()));
+        assert_eq!(
+            slots.memory[0].keys[0].bytes(),
+            &padded(&hedged(0, b"hedge key", &counted::<32>(), 32))
+        );
         assert_eq!(slots.memory[0].keys[0].length(), KeyLength::Bytes32);
-        assert_eq!(slots.memory[1].keys[0].bytes(), &counted::<64>());
+        assert_eq!(
+            slots.memory[1].keys[0].bytes()[..],
+            hedged(1, b"hedge key", &counted::<64>(), 64)[..]
+        );
         assert_eq!(slots.memory[1].keys[0].length(), KeyLength::Bytes64);
         assert_eq!(slots.memory[1].occupancy, Occupancy::Loaded);
     }
@@ -1948,7 +2045,7 @@ mod tests {
             .generate(Purpose::Wrap, KeyLength::Bytes64, &mut source)
             .unwrap();
         assert_eq!((source.calls, source.asked), (1, 64));
-        assert_eq!(source.at, slots.memory[0].keys[0].bytes().as_ptr().addr());
+        assert_ne!(source.at, slots.memory[0].keys[0].bytes().as_ptr().addr());
     }
 
     #[test]
@@ -1960,7 +2057,10 @@ mod tests {
         slots
             .generate(Purpose::Wrap, KeyLength::Bytes32, source)
             .unwrap();
-        assert_eq!(slots.memory[0].keys[0].bytes(), &padded(&counted::<32>()));
+        assert_eq!(
+            slots.memory[0].keys[0].bytes(),
+            &padded(&hedged(0, b"hedge key", &counted::<32>(), 32))
+        );
     }
 
     #[test]
@@ -2011,7 +2111,11 @@ mod tests {
         let mut short = Key::empty();
         short.load32(&mut secret());
         let mut long = Key::empty();
-        long.load64(&mut counted::<64>());
+        long.load64(
+            &mut hedged(0, b"hedge key", &counted::<64>(), 64)
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(slots.memory[0].purpose, Purpose::Wrap);
         assert_eq!(slots.memory[1].purpose, Purpose::Wrap);
         assert_eq!(slots.memory[0].stages.stage(0), Some(Status::Enabled));
@@ -2236,6 +2340,13 @@ mod tests {
         })
     }
 
+    /// What the slots make of `drawn`, the bytes a source gave, at `count` draws since they were
+    /// created, for the use `name`: HKDF-SHA-256 called directly, with the key of the test epoch as
+    /// the salt and the label written out by hand.
+    pub(super) fn hedged(count: u64, name: &[u8], drawn: &[u8], length: usize) -> Vec<u8> {
+        crate::derive::direct::hedged_directly(&epoch_key(), count, name, drawn, length)
+    }
+
     fn hex(text: &str) -> [u8; RECORD_LEN] {
         core::array::from_fn(|at| u8::from_str_radix(&text[2 * at..2 * at + 2], 16).unwrap())
     }
@@ -2245,51 +2356,51 @@ mod tests {
     /// 64-byte parent, a set of one 32-byte key in "profile"; under the 32-byte parent, in
     /// "archive", a full set at revision 9: a disabled 64-byte key, an enabled 32-byte key, and the
     /// primary, an enabled 64-byte key; and under the 32-byte parent, in "chat 9", a set of one
-    /// 32-byte key for external data.
+    /// 32-byte key for external data. They are wrapped in this order in one set of slots, the
+    /// nonce `NONCE` the source gave each hedged as the next draw.
     const KNOWN_RECORDS: [&str; 4] = [
         concat!(
-            "05162738495a6b7c8d9eafc0eb50267ae349b829c8ece083eb0f7a28ff696da5",
-            "40a96675b5f6375a3549b5710c2bcc8faa5246d8b7b8d668b389528642214fde",
-            "e17bca874d4840deeaeaa96e4efdcad7887458922999689c5fbd98bcccc927e3",
-            "d6903b52afc7b3ea149bc74e86d6ef619b535490e6ae52e6c569ab3b4d11020f",
-            "64b1de90702a5092a1ea963bcd92b13dce761e5b1ef483edcdb1a2184460c7d9",
-            "4ae78d1de546008f7b3e40b7986c964bb3606203b5b20e6e8bcf09e2d6f805ea",
-            "b85ec3ebc9de29db24462e81654723faa35cdf2e41275d3f2e058808c859ac13",
-            "3333452d7609930f692a7c675233d9622e03c57b9e99a3b1b5fba97120b54061",
-            "ac8d7883c8",
+            "c7a1550603080bf1aa1c5192b2c14a7179b3e5605c7b0c02d744bf9c4338da1c",
+            "30548bbbdf84ce9527b227f52a4e88bde05cf620e8d387c7a99b0d5bcf7a7bbf",
+            "b188ba652e54feb8bb154aa6f70797b908e419a1f359c93c12522c2d093043a2",
+            "a57f8a1ff63c50f91a28d5f28c858e0c33d22f778ea9aab3a853ae0cbc22739a",
+            "14a4e58f023f6fb5f6e364c20932c489c890eb8df50d698fe5665269bf759f01",
+            "da4485c06f28036765694e3dca5b70b582f500619964851743e44b074f1de1df",
+            "59932ac2775a95a5d2e03951a76ee77a03ff9866b41dc1e1402519f3ea0571b1",
+            "664372052d3ee9d47b317b855bd2618e490a19dd31c68e99fb6ffced11e382dd",
+            "355d498ca0",
         ),
         concat!(
-            "05162738495a6b7c8d9eafc03f08e9a864d39c3563feac95f39c44982c14f084",
-            "217b3f676806111c32fccce5bffdd09f9deb4ea83a4390dab38ce4698fc1f894",
-            "caea3fcc9f991354529f3a320bcc94767466a9c6bbb8290c0cdebd2b38c6eeef",
-            "c25eab3ab1bf584148f1fa946329563c52b06789888b1bb8d5bcaed5f0b7cce5",
-            "c7d3c9b0f2f192acf6275591785006c6ff70f1feaafd9bd35e2ab03bf5e36b4b",
-            "593a0af9f0a3833d896248123f3760997c8f460d8a00ab9d59de800787b18b11",
-            "29c3f694654b2a5de22d4686c2b1880eaa9fd67b9f8126382cbd9e56a88d459a",
-            "12633eb550fc732f4b67d344f59ed711e0bb61a3f8886a8c35c9bbe8d12ccba4",
-            "eb7ca69ae1",
+            "2d7fafac78ba33a2056ef2aec24c3b6c91aaa1be2c9a42dfb72e1a1ea27a4abd",
+            "0d62d217af2d5976e9e8f565d616c12f5a57bdbc41a863f84094e3ce4faa4bb9",
+            "83a179e95665649907328914ed0d068a0f9c9cf2e3c417ffaad2b9ab888217d2",
+            "93404dccfdb2babf34507a2f4845e7ba6f853d7dc9d0e97b91050c5b8031ec2f",
+            "fd54fbc10fd9c0ad4c2c8dd8d8098b211623b4fba75d39a28b2ff693537759f2",
+            "5e266558bf0ddd0c680cfe2846d1e69632ae96c3f24e094266a96b3720793c36",
+            "0b050d464abc4560d188abf7d4dcb911a06bbde22f9df162b5d364971a64f7a3",
+            "e20d32d93f061ab487d350898725e09f88cb35147d6e13528892c230283d3257",
+            "7393d0fbab",
         ),
         concat!(
-            "05162738495a6b7c8d9eafc0377e2388d230ee8657ff0593582c0b801a0536c7",
-            "e07ac2b5bdc6446d2233741aaa1796acafcbbd5b8a0b168eba14b88eb5fcd352",
-            "1d3173110ab2616229fee317e3814e0a93edc0e061589403adb132daf0b3df01",
-            "e9727ec5e8034e9e7d58584e10532163c21e0583da03310f2dc5837ce37b3b57",
-            "598389837d21965bc8e16e71babe33789c4c651051520dfa1358b3f7bb247271",
-            "95f7348d1aa6db34a90524dc58aee960e3525f9aa093076a3e6a0955ed42128c",
-            "231bc6b24d45d104eb7da05515a4bb5821a13e1d52592f41f61a02fd6ffe89bf",
-            "b1b23a8355424f14a737a56ce0df04988e276d6f622cf8de4ab7d12a23a0e451",
-            "2b265202c0",
+            "27bae2fc323c379d396cc79b05186f957f0af4c8783b4042756d536a4cc90b04",
+            "04873bd5ed6a1d6b7c4335ab1e376c5e9d8a94501fd56ab11d4d874cd24e56c6",
+            "33640a7bdd9775ac67e17257003282fcf0524dab4e0c3e57b6fb1e1f20b25a0b",
+            "743556d687edcdec705dbef5bde79dd04a70907a4f44d2eba1481d39736c2552",
+            "5cf914b717791194e3cba5d85ada7ce79f55ec551d7239277c610a532abb1503",
+            "abf42cb438e2ab1f601382464f2408bf85bbc27180c482c976eb690a6a246a41",
+            "5e017f5eb75e5c871f1c3ad7e79f3541d98afac5a79f8ed55e78a86feb7ca0d7",
+            "7d9e296d87063b3822aa3a4a2a5de32a9a99e01a17b756f997eb426348205eb9",
+            "04740df31c",
         ),
         concat!(
-            "05162738495a6b7c8d9eafc020f138bb19e9c82f5816ebc72ea7d93b72204b8d",
-            "79be2ea5fcf5205a94cd90af839db28a42b0121d35eacac24f00cb9445c6b170",
-            "18b1770d2c2134fdfa1329b2f7baddef342f7768891780c80e9bc97b3be2801c",
-            "c534179731e37a087abe96b087b440ba0b295b4a2c29676b9364197c41fa58ed",
-            "fb6bb42f81b045d38ea9052e7016169444b8a7d56dad78d9874db38c8fdd2e20",
-            "6827a8131f081bbee16f2a02c5512ac78c8e47cc4ed1090ac58b95530e19e9b7",
-            "c7662e156255f222a0e619c4354801ca8cff261e738fda349d6c3f0f824b4fb6",
-            "38bf29af666b988e0cc07db3f0ba49a8fe4dc9025ece2c7731372fa815503d27",
-            "e77a0e1dd9",
+            "5afbf61400553277f85274b8cf589a20b2b6c44f60caf44bc2b69991bbb9c902",
+            "1a6ddacba0fe92ed7b293f852da687bf321fe697a3ca282a3a25c4ffad716d08",
+            "86c37776ada8bd246a59a3ee4837a58bf9748120fcc4d1fab9e7880e39aedb2c",
+            "2546fc8e077f95e332571e4e1dea1546a4a62f5d6be0698071c7e77dca8a3c01",
+            "fef375c848fbc36eb1e25ece07970b0ccef12adf089ec95222b74eaab6ef3706",
+            "0e27f6da61d5e68c1ed74bfd5197bfdd25fe98e0272b13146ed3f6a29f13ec47",
+            "3cb9b060c43840609d75f10583eccc3fb01abad65fa3525cb1c3ae92f3895217",
+            "461eb95042e54b5cb839485ff508dbacbbb9344df038b62a5b93f3b71168c84329275caf14",
         ),
     ];
 
@@ -2715,14 +2826,6 @@ mod tests {
             Err(Error::DuplicateKey)
         );
         assert_eq!(again, held);
-        let generated = slots
-            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
-            .unwrap();
-        assert_eq!(
-            slots.generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting),
-            Err(Error::DuplicateKey)
-        );
-        slots.release(generated).unwrap();
         let other = pattern::<64>(5, 6);
         for members in [
             [
@@ -2977,7 +3080,98 @@ mod tests {
         slots
             .wrap(set, root, b"chat 7", &mut Fixed(&NONCE), &mut out)
             .unwrap();
-        assert_eq!(out, record);
+        let slot = &slots.memory[root.index];
+        let plaintext = set_plaintext(members, 0, slot.ids[0].bytes());
+        let nonce = hedged(0, b"hedge nonce", &NONCE, 12).try_into().unwrap();
+        assert_eq!(
+            out,
+            seal_plaintext(&slot.keys[0], &plaintext, b"chat 7", &nonce)
+        );
+    }
+
+    /// During a change of epoch the nonce of a record is hedged with the key of the next epoch, the
+    /// key the record is wrapped in.
+    #[test]
+    fn a_nonce_during_a_change_is_hedged_with_the_next_key() {
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
+        let set = slots.import32(Purpose::Wrap, &mut pattern(5, 2)).unwrap();
+        let next = flipped_epoch_key(0x5a);
+        slots.begin_epoch(&mut next.clone()).unwrap();
+        let mut record = [0; RECORD_LEN];
+        slots
+            .wrap(set, root, b"x", &mut Fixed(&NONCE), &mut record)
+            .unwrap();
+        let nonce = crate::derive::direct::hedged_directly(&next, 0, b"hedge nonce", &NONCE, 12);
+        assert_eq!(record[..12], nonce[..]);
+    }
+
+    /// The count of draws moves by one with each draw the source answers, and neither with a failed
+    /// draw nor with an import, a release, an unwrap or a change of epoch, begun, committed or
+    /// abandoned.
+    #[test]
+    fn the_count_moves_only_with_answered_draws() {
+        let mut memory = [const { Slot::empty() }; 3];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
+        let set = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        assert_eq!(slots.epoch.drawn, 1);
+        let failed = slots.generate(Purpose::Wrap, KeyLength::Bytes32, &mut Failing);
+        assert_eq!(failed, Err(Error::EntropyFailed));
+        assert_eq!(slots.epoch.drawn, 1);
+        let mut record = [0; RECORD_LEN];
+        slots
+            .wrap(set, root, b"x", &mut Counting, &mut record)
+            .unwrap();
+        assert_eq!(slots.epoch.drawn, 2);
+        slots.release(set).unwrap();
+        let set = slots.unwrap(root, b"x", &record).unwrap();
+        slots.begin_epoch(&mut flipped_epoch_key(1)).unwrap();
+        assert_eq!(slots.epoch.drawn, 2);
+        slots
+            .wrap(set, root, b"x", &mut Counting, &mut record)
+            .unwrap();
+        let _ = slots.commit_epoch(&mut Platform::default()).unwrap();
+        assert_eq!(slots.epoch.drawn, 3);
+        slots.begin_epoch(&mut flipped_epoch_key(2)).unwrap();
+        let _ = slots.abandon_epoch(&mut Platform::default()).unwrap();
+        assert_eq!(slots.epoch.drawn, 3);
+    }
+
+    /// A source that gives the same bytes every time still gives different keys, words and nonces:
+    /// each draw is hedged with its own count.
+    #[test]
+    fn a_source_that_repeats_itself_gives_different_bytes() {
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let first = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let second = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        assert_ne!(
+            slots.memory[first.index].keys[0].bytes(),
+            slots.memory[second.index].keys[0].bytes()
+        );
+        let (mut one, mut two) = ([0; RECORD_LEN], [0; RECORD_LEN]);
+        slots
+            .wrap(second, first, b"x", &mut Counting, &mut one)
+            .unwrap();
+        slots
+            .wrap(second, first, b"x", &mut Counting, &mut two)
+            .unwrap();
+        assert_ne!(one[..12], two[..12]);
+        let (mut words, mut more) = ([[0; 8]; 12], [[0; 8]; 12]);
+        slots.generate_words(&mut Counting, &mut words).unwrap();
+        slots.generate_words(&mut Counting, &mut more).unwrap();
+        assert_ne!(words, more);
     }
 
     #[test]
@@ -3747,6 +3941,7 @@ mod stack {
         slots
             .wrap(child, parent, CONTEXT, &mut Fixed, &mut record)
             .unwrap();
+        let nonce: [u8; 12] = record[..NONCE.len()].try_into().unwrap();
         let tag: [u8; 16] = record[NONCE.len() + PLAINTEXT_LEN..].try_into().unwrap();
         let ciphertext = &record[NONCE.len()..NONCE.len() + PLAINTEXT_LEN];
         let parent_keys = parent_keys(flip);
@@ -3756,7 +3951,7 @@ mod stack {
             let key = key_from(bytes);
             let mut cipher_key = [0; 32];
             derive_wrap_key(&key, &flipped_epoch(flip), &mut cipher_key).unwrap();
-            let (mac_key, enc_key) = message_keys(&cipher_key, &NONCE);
+            let (mac_key, enc_key) = message_keys(&cipher_key, &nonce);
             let stream = keystream(&enc_key, &tag);
             let decrypted = ciphertext.iter().zip(&stream).map(|(c, k)| c ^ k).collect();
             handled.extend(secrets(
@@ -4038,8 +4233,9 @@ mod proofs {
         Root, RootFailed, Slot, Slots, Stages, Status,
     };
     use crate::derive::{
+        Branch,
         model::{any_failed, failed, id_bytes, id_from_bytes},
-        proofs::{expected_key_id, expected_words_key, expected_wrap_key},
+        proofs::{expected_hedge, expected_key_id, expected_words_key, expected_wrap_key},
     };
     use crate::keyset::proofs::{allowed, any_purpose, any_whole_stages};
     use crate::password::{MemoryBlock, model::argon2_failed, proofs::any_params};
@@ -4209,8 +4405,8 @@ mod proofs {
         slot
     }
 
-    /// Any epoch with any key, and, if `changing`, with a change to the next under way and any key
-    /// for it.
+    /// Any epoch with any key and any count of draws, and, if `changing`, with a change to the next
+    /// under way and any key for it.
     fn any_epoch(changing: bool) -> Epoch {
         let mut epoch = Epoch::empty();
         epoch.number = kani::any();
@@ -4219,6 +4415,7 @@ mod proofs {
             epoch.next.load32(&mut kani::any());
         }
         epoch.changing = changing;
+        epoch.drawn = kani::any();
         epoch
     }
 
@@ -4361,6 +4558,7 @@ mod proofs {
         }
         let mut entropy = AnyEntropy::new();
         let length = any_length();
+        let (epoch_key, count) = (first_half(&slots.epoch.key), slots.epoch.drawn);
         let result = slots.generate(purpose, length, &mut entropy);
         let unasked = result == Err(Error::NoFreeSlot) || result == Err(Error::WrongLength);
         kani::assert(
@@ -4376,12 +4574,35 @@ mod proofs {
             unasked || (result == Err(Error::EntropyFailed)) == entropy.failed,
             "a generation fails with EntropyFailed exactly when the source fails",
         );
+        kani::assert(
+            slots.epoch.drawn
+                == if unasked || entropy.failed {
+                    count
+                } else {
+                    count.wrapping_add(1)
+                },
+            "a draw the source answers is counted once",
+        );
         if let Ok(handle) = result {
             let buffer = slot_at(slots, handle.index).keys[0].bytes().as_ptr().addr();
             kani::assert(
-                entropy.at == buffer,
-                "the source writes straight into the buffer of the slot",
+                entropy.at != buffer,
+                "the source writes into a buffer of the library's, not into the slot",
             );
+        }
+        // What the slot must hold: the hedge of what the source wrote, worked out from the model.
+        let mut hedged = [0; 64];
+        if length == KeyLength::Bytes32 {
+            let mut drawn = [0; 32];
+            drawn.copy_from_slice(&entropy.written[..32]);
+            hedged[..32].copy_from_slice(&expected_hedge(
+                &epoch_key,
+                count,
+                Branch::HedgeKey,
+                &drawn,
+            ));
+        } else {
+            hedged = expected_hedge(&epoch_key, count, Branch::HedgeKey, &entropy.written);
         }
         kani::cover!(
             result == Err(Error::EntropyFailed),
@@ -4399,12 +4620,11 @@ mod proofs {
             result.is_ok() && length == KeyLength::Bytes64,
             "a long key is generated"
         );
-        (
-            result.map(widen),
-            padded(entropy.written, length),
-            length,
-            entropy.failed,
-        )
+        kani::cover!(
+            result.is_ok() && slots.epoch.changing,
+            "a key is generated during a change of epoch"
+        );
+        (result.map(widen), hedged, length, entropy.failed)
     }
 
     /// Whether `handle`, issued for a set whose key at `position` is `expected` of `length`,
@@ -4752,7 +4972,7 @@ mod proofs {
     /// asks the source; no load panics or overflows. Returns the outcome, and whether a slot for
     /// another purpose holds the key.
     fn load_from(mut memory: [Slot; 2]) -> (Result<Handle<'static>, Error>, bool) {
-        let mut epoch = any_epoch(false);
+        let mut epoch = any_epoch(kani::any());
         let mut slots = Slots {
             memory: &mut memory,
             epoch: &mut epoch,
@@ -5124,13 +5344,15 @@ mod proofs {
     }
 
     /// Generation with any list of three, with the first slot free: the source is asked once for
-    /// 16 bytes, its failure is `EntropyFailed`, and the words of its bytes are written exactly
-    /// when the key is derived; a failed generation changes neither the words nor any slot.
+    /// 16 bytes, its failure is `EntropyFailed`, the count of draws grows exactly when it answers,
+    /// and the words of its bytes hedged with the key of this epoch are written exactly when the key
+    /// is derived; a failed generation changes neither the words nor any slot. During a change of
+    /// epoch or not.
     #[kani::proof]
     #[kani::unwind(65)]
     fn words_are_written_exactly_when_their_key_is_generated() {
         into_the_first(|mut memory| {
-            let mut epoch = any_epoch(false);
+            let mut epoch = any_epoch(kani::any());
             let mut slots = Slots {
                 memory: &mut memory,
                 epoch: &mut epoch,
@@ -5138,6 +5360,7 @@ mod proofs {
             let before = snapshots(&slots);
             let list = any_list();
             let mut source = AnyEntropy::new();
+            let (epoch_key, count) = (first_half(&slots.epoch.key), slots.epoch.drawn);
             let mut words: Words = kani::any();
             let original = words;
             let result = slots.generate_words_from(&list, &mut source, &mut words);
@@ -5149,8 +5372,13 @@ mod proofs {
                 source.failed == (result == Err(Error::EntropyFailed)),
                 "a failure of the source is EntropyFailed, and nothing else is",
             );
-            let mut bytes = [0; 16];
-            bytes.copy_from_slice(&source.written[..16]);
+            kani::assert(
+                slots.epoch.drawn == count.wrapping_add(u64::from(!source.failed)),
+                "the count of draws grows by one exactly when the source answers",
+            );
+            let mut drawn = [0; 16];
+            drawn.copy_from_slice(&source.written[..16]);
+            let bytes = expected_hedge(&epoch_key, count, Branch::HedgeWords, &drawn);
             let expected = if result.is_ok() {
                 expected_words(&list, &bytes)
             } else {
@@ -5158,13 +5386,13 @@ mod proofs {
             };
             kani::assert(
                 same_words(&words, &expected),
-                "the words of the bytes are written exactly when the key is derived",
+                "the words of the hedged bytes are written exactly when the key is derived",
             );
             if result.is_ok() {
                 let now = snapshot(&slots.memory[0]);
                 kani::assert(
                     now.keys.0[..32] == expected_words_key(&bytes),
-                    "the key in the slot is the one the source's bytes derive",
+                    "the key in the slot is the one the hedged bytes derive",
                 );
             } else {
                 kani::assert(
@@ -5173,6 +5401,10 @@ mod proofs {
                 );
             }
             kani::cover!(result.is_ok(), "words are generated");
+            kani::cover!(
+                result.is_ok() && slots.epoch.changing,
+                "words are generated during a change of epoch"
+            );
             kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
             kani::cover!(
                 result == Err(Error::DuplicateKey),
@@ -5188,7 +5420,7 @@ mod proofs {
     /// Without a free slot, from `memory`, generation asks nothing of the source and changes
     /// neither the words nor any slot.
     fn generation_without_a_free_slot(mut memory: [Slot; 2]) {
-        let mut epoch = any_epoch(false);
+        let mut epoch = any_epoch(kani::any());
         let mut slots = Slots {
             memory: &mut memory,
             epoch: &mut epoch,
@@ -5866,9 +6098,9 @@ mod proofs {
     /// and any record buffer, whatever the platform's source and the cipher do: wrapping changes no
     /// key, stage or epoch, and marks the set wrapped for the next epoch only when it succeeds
     /// during a change; it writes the record only when it succeeds, starting with the nonce the
-    /// source gave; it refuses an empty context, a stale handle, a set wrapped under itself, a
-    /// parent that does not serve wrapping, a set changed in this epoch outside a change, and a
-    /// failed source.
+    /// source gave hedged with the key the record is wrapped in; it refuses an empty context, a
+    /// stale handle, a set wrapped under itself, a parent that does not serve wrapping, a set
+    /// changed in this epoch outside a change, and a failed source.
     #[kani::proof]
     #[kani::unwind(234)]
     fn a_wrap_changes_no_slot_and_writes_only_when_it_succeeds() {
@@ -5891,6 +6123,7 @@ mod proofs {
         let live = names_loaded(&before, &set) && names_loaded(&before, &parent);
 
         let (epoch_key, next_key) = (*slots.epoch.key.bytes(), *slots.epoch.next.bytes());
+        let count = slots.epoch.drawn;
         let result = slots.wrap(set, parent, context, &mut entropy, &mut record);
         let sealing = result.is_ok() && changing;
         kani::assert(
@@ -5910,6 +6143,15 @@ mod proofs {
                 && *slots.epoch.key.bytes() == epoch_key
                 && *slots.epoch.next.bytes() == next_key,
             "a wrap changes no epoch and no key of one",
+        );
+        kani::assert(
+            slots.epoch.drawn
+                == if entropy.calls == 1 && !entropy.failed {
+                    count.wrapping_add(1)
+                } else {
+                    count
+                },
+            "a draw the source answers is counted once",
         );
         kani::assert(
             if context.is_empty() {
@@ -5944,11 +6186,16 @@ mod proofs {
         );
         kani::assert(
             if result.is_ok() {
-                record[..12] == entropy.written[..12]
+                let mut drawn = [0; 12];
+                drawn.copy_from_slice(&entropy.written[..12]);
+                let mut salt = [0; 32];
+                salt.copy_from_slice(&if changing { next_key } else { epoch_key }[..32]);
+                record[..12] == expected_hedge(&salt, count, Branch::HedgeNonce, &drawn)
             } else {
                 same(&record, &original)
             },
-            "a wrap writes the record only when it succeeds, starting with the nonce",
+            "a wrap writes the record only when it succeeds, starting with the nonce hedged from \
+             the source's bytes",
         );
         kani::cover!(result.is_ok(), "a set is wrapped");
         kani::cover!(
