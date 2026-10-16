@@ -16,7 +16,8 @@ Nothing is published while the version is below 0.1.0.
 - Documents: licence, security policy, contribution rules, code of conduct, threat model, proof
   register.
 - `lethewis-core`: keys held in slots whose memory the caller provides (`Slot`, `Slots`) and
-  referred to by handles (`Handle`). No call returns a key. The keys of a set are wiped when it is
+  referred to by handles (`Handle`). No call returns a key; a generation of words writes the words
+  its key derives from. The keys of a set are wiped when it is
   released, and every key is wiped when its `Slots` is created or dropped.
 - Dependency: `zeroize` 1.9.0 or a later compatible version, without default features.
 - Dependencies: `hkdf` 0.13.0 and `sha2` 0.11.0 or later compatible versions, without default
@@ -29,7 +30,7 @@ Nothing is published while the version is below 0.1.0.
   sequence of imports and releases of any length; creating the slots wipes the keys left in their
   memory, a release with a handle from other slots is refused, a release advances the generation, no
   call panics unless the caller's random source does. Run on every change; see `docs/proofs.md`.
-- Proof with Kani 0.68.0 that the labels built for two key derivations which differ in key
+- Proof with Kani 0.68.0 that the labels built for two key derivations which differ in input
   length, branch or output length are different.
 - `Purpose`: what a key may be used for, given when the key is loaded and never changed. One purpose
   so far, wrapping other keys. `Slots::import32`, `Slots::import64` and `Slots::generate` take it.
@@ -58,7 +59,7 @@ Nothing is published while the version is below 0.1.0.
   `InvalidContext`, `CipherFailed`, and `DuplicateKey`: a key is held in one place only, and a load
   of a key the slots already hold, or of a set that holds one key twice, is refused.
 - Dependency: `ctutils` 0.4.2 or a later compatible version, without default features, to compare
-  a record's parent identifier in constant time.
+  a record's parent identifier, and words with the list, in constant time.
 - The stack a wrap or an unwrap used is wiped after it, also when it fails: 24 KiB, or 64 KiB when
   this crate is built without optimisation or with `--cfg lethewis_unoptimised`, which a build that
   optimises this crate but not the hash and cipher code it calls has to set. Wrapping and unwrapping
@@ -132,5 +133,20 @@ Nothing is published while the version is below 0.1.0.
 - Proofs with Kani 0.68.0 for the parameters of a derivation from a password, read exactly as
   written and made or read only within the bounds, and for the derivation into a slot, with a model
   of Argon2id.
+- Twelve words of the English list of BIP 39: `Slots::generate_words` creates a 32-byte key from
+  16 random bytes of the platform's source and writes their words (`Words`, `WORD_COUNT` words of
+  `WORD_LEN` bytes); `Slots::derive_from_words` derives the same key from the words into a free
+  slot and wipes them. The key is HKDF-SHA-256 of the 16 bytes, so it does not depend on the list.
+- Each word is compared with every word of the list, and a word is chosen by its number reading
+  every word, in steps with no branch on the words; a build step checks the machine code of both
+  steps on four targets.
+- New errors: `UnknownWord` and `InvalidChecksum`.
+- Words are read and written with data-independent timing on, where it is offered.
+- The stack is wiped after both calls: 8 KiB, or 64 KiB without optimisation; they need 10 KiB of
+  stack, or 72 KiB. Tests read the stack back, and check the words against the vectors of the
+  reference implementation and the key against an independent implementation.
+- Proofs with Kani 0.68.0 for the lookup of a word, the numbers of the words and their checksum,
+  the reading of any twelve words, and the derivation and the generation into a slot.
+- `lethewis-core` holds the English word list of BIP 39, under the MIT licence.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

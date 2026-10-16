@@ -14,6 +14,8 @@ cap_lints = true
 # does not invoke. The proofs are checked against deliberate errors instead.
 # A derivation of a record's cipher key fails only for an output longer than HKDF-SHA-256 gives, so
 # no test can fail it; the proofs fail it through the model of the derivation.
+# The low 4 bits of the last number of words are zero before the checksum goes in, so the `|` that
+# puts it there is a `^`.
 # lethewis-dit acts only on aarch64 where the system reports data-independent timing: the mutants of
 # its detection on Linux run on aarch64 Linux, the others of its aarch64 code and of its guard on
 # macOS, and those of its inert code here.
@@ -23,4 +25,5 @@ exclude_re = [
   '^crates/lethewis-core/src/derive\.rs:[0-9]+:[0-9]+: replace <impl Drop for KeyId>::drop with \(\)$',
   '^crates/lethewis-core/src/[a-z_]+\.rs:[0-9]+:[0-9]+: .* (proofs|model)::',
   "^crates/lethewis-core/src/slots\\.rs:[0-9]+:[0-9]+: replace \\|= with &= in Slots<'a>::open_under$",
+  '^crates/lethewis-core/src/words\.rs:[0-9]+:[0-9]+: replace \| with \^ in numbers$',
 ]

@@ -7,7 +7,7 @@ description = "Key derivation, hierarchy, lifecycle and destruction. Pure logic:
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "AGPL-3.0-only AND MIT"
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -20,10 +20,10 @@ publish = false
 
 # The licence travels with the crate: a published AGPL crate without its licence text would be an
 # empty gesture. LICENSE here is a symlink to the one at the workspace root, so there is one source
-# of truth; cargo resolves it when packaging.
+# of truth; cargo resolves it when packaging. LICENSE-MIT is the licence of the word list.
 # Only what belongs to the crate. The lint, dependency and toolchain settings live at the workspace
 # root, outside this directory, and are read from the repository rather than from the package.
-include = ["src/**/*", "build.rs", "README.md", "LICENSE"]
+include = ["src/**/*", "build.rs", "README.md", "LICENSE", "LICENSE-MIT"]
 
 [dependencies]
 # Default features bring in `alloc`.
@@ -38,7 +38,8 @@ aes-gcm-siv = { version = "0.12.1", default-features = false, features = [
 ] }
 # Default features bring in `alloc`, `getrandom` and `password-hash`.
 argon2 = { version = "0.6.0", default-features = false, features = ["zeroize"] }
-# Compares a record's parent identifier with the unwrapping key's in constant time.
+# Compares a record's parent identifier with the unwrapping key's, and words with the list, in
+# constant time.
 ctutils = { version = "0.4.2", default-features = false }
 # Data-independent timing on aarch64 around the derivation and the cipher.
 lethewis-dit = { path = "../lethewis-dit", version = "0.0.0" }

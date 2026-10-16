@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""The comparison of key identifiers runs straight through on every target below: no branch, no call
-and no write of the program counter.
+"""The comparison of key identifiers, and each step of the lookup of a word in the list and of the
+choice of a word by its number, run straight through on every target below: no branch, no call and
+no write of the program counter.
 
 The core is compiled to assembly as a library, optimised, before any link-time optimisation, for
-each target, and the body of `KeyId::is` is read out of it. Every instruction in the body has to be
-one of a set known not to move control, and on every target but WebAssembly, whose functions end
-without one, the last has to be an unconditional return. An instruction outside that set fails the
+each target, and the bodies of `KeyId::is`, `find_step` and `select_step` are read out of it.
+Every instruction in each body has to be one of a set known not to move control, and on every
+target but WebAssembly, whose functions end without one, the last has to be an unconditional
+return. An instruction outside that set fails the
 check, whatever it does, as do a directive other than those that only describe the code and a body
 that cannot be found or holds no instruction. Before that, the rules are run on known instructions.
 This shows how this compiler laid out the code; it says nothing about how long each instruction
@@ -22,6 +24,12 @@ import sys
 from pathlib import Path
 
 SYMBOL = re.compile(r"^(_RNv\S*13lethewis_core6derive\S*5KeyId2is):\s*$")
+FUNCTIONS = {
+    "the comparison of key identifiers": SYMBOL,
+    "a step of the lookup of a word": re.compile(r"^(_RNv\S*13lethewis_core5words9find_step):\s*$"),
+    "a step of the choice of a word": re.compile(
+        r"^(_RNv\S*13lethewis_core5words11select_step):\s*$"),
+}
 # A name of that shape, for the listings the rules are run on.
 NAME = "_RNvMNtCs0_13lethewis_core6deriveNtB2_5KeyId2is"
 END = re.compile(r"^\s*(\.Lfunc_end\d+:|end_function\b|\.size\b)")
@@ -96,10 +104,10 @@ KNOWN_ENDS = {
 }
 
 
-def body(target: str, assembly: str) -> list[str]:
+def body(target: str, assembly: str, symbol: re.Pattern[str] = SYMBOL) -> list[str]:
     lines = assembly.split("\n")
     for start, line in enumerate(lines):
-        if SYMBOL.match(line):
+        if symbol.match(line):
             break
     else:
         return []
@@ -187,14 +195,16 @@ def main() -> int:
         if not assembly.is_file():
             problems.append(f"{target}: no assembly was written")
             continue
-        instructions = body(target, assembly.read_text())
-        if not instructions:
-            problems.append(f"{target}: the comparison of key identifiers is not in the assembly")
-            continue
-        found = sorted(set(refused(target, instructions)))
-        problems.extend(f"{target}: {instruction}" for instruction in found)
-        print(f"constant-time: {target}: {len(instructions)} instructions, "
-              f"{len(found) or 'none'} refused")
+        text = assembly.read_text()
+        for function, symbol in FUNCTIONS.items():
+            instructions = body(target, text, symbol)
+            if not instructions:
+                problems.append(f"{target}: {function} is not in the assembly")
+                continue
+            found = sorted(set(refused(target, instructions)))
+            problems.extend(f"{target}: {function}: {instruction}" for instruction in found)
+            print(f"constant-time: {target}: {function}: {len(instructions)} instructions, "
+                  f"{len(found) or 'none'} refused")
     for problem in problems:
         print(f"constant-time: {problem}", file=sys.stderr)
     return 1 if problems else 0

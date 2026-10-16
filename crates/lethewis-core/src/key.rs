@@ -232,6 +232,41 @@ pub(crate) mod tests {
     assert_not_impl!(Key: Clone, PartialEq, Hash, Default, fmt::Display);
     assert_not_impl!(KeyBytes<'static>: Clone, PartialEq, Hash, fmt::Debug, fmt::Display);
 
+    /// Random bytes from a fixed seed, so that a failing round repeats.
+    pub(crate) struct Random(pub(crate) u64);
+
+    impl Random {
+        pub(crate) fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut mixed = self.0;
+            mixed = (mixed ^ mixed.wrapping_shr(30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            mixed = (mixed ^ mixed.wrapping_shr(27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            mixed ^ mixed.wrapping_shr(31)
+        }
+
+        pub(crate) fn below(&mut self, bound: usize) -> usize {
+            let bound = u64::try_from(bound).unwrap();
+            usize::try_from(self.next().checked_rem(bound).unwrap()).unwrap()
+        }
+
+        pub(crate) fn bytes<const N: usize>(&mut self) -> [u8; N] {
+            let mut out = [0; N];
+            for chunk in out.chunks_mut(8) {
+                chunk.copy_from_slice(&self.next().to_le_bytes()[..chunk.len()]);
+            }
+            out
+        }
+    }
+
+    /// The number the environment variable `name` holds, or `default` when it is not set.
+    pub(crate) fn from_environment(name: &str, default: u64) -> u64 {
+        std::env::var(name).map_or(default, |value| {
+            value
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} is not a number: {value}"))
+        })
+    }
+
     /// Writes 1, 2, 3, ... into every buffer it fills.
     pub(crate) struct Counting;
 

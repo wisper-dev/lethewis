@@ -30,7 +30,8 @@ const _: () = assert!(AAD_LABEL.len() + 2 + MAX_CONTEXT == AAD_CAPACITY);
 #[non_exhaustive]
 #[repr(u8)]
 pub enum Purpose {
-    /// Wraps other keys. Leaves the library only as a record wrapped by another key.
+    /// Wraps other keys. Leaves the library only as a record wrapped by another key, or as the
+    /// words [`Slots::generate_words`](crate::Slots::generate_words) writes once.
     Wrap = 1,
 }
 
