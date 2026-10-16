@@ -65,6 +65,10 @@ password and the hardware secret at each unlock, and neither alone is enough.
   leaves the library in the clear only through `Slots::reveal32`, into the caller's buffer. The
   library does not reach that copy, nor what the engine it goes to keeps. Keys for wrapping leave in
   the clear only as the words of a generation.
+- **A broken random source is covered only in part.** Keys, words and nonces are hedged with the
+  key of the epoch, as RFC 8937 has it: within one `Slots`, a broken source alone makes none
+  predictable. Not covered: a key of the epoch from that source, a copied process or machine,
+  repeated bytes in another `Slots`, and password salts.
 - **Twelve words are as safe as the place they are kept.** Whoever reads them derives the key. The
   library writes them once, from the English list of BIP 39; keeping them off screenshots, the
   clipboard, the keyboard's memory and backups is the caller's. About one changed word in sixteen

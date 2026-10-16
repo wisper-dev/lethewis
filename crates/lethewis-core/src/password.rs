@@ -174,7 +174,7 @@ impl<'a> Slots<'a> {
         let memory = memory
             .get_mut(..params.memory_blocks())
             .ok_or(Error::NotEnoughMemory)?;
-        let derived = self.generate(
+        let derived = self.load_derived(
             Purpose::Wrap,
             KeyLength::Bytes32,
             &mut Stretch {

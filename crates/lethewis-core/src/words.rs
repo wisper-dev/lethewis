@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use crate::derive::{WORDS_ENTROPY_LEN, derive_from_words, wipe_stack};
+use crate::derive::{Branch, WORDS_ENTROPY_LEN, derive_from_words, wipe_stack};
 use crate::entropy::{Entropy, EntropyError};
 use crate::error::Error;
 use crate::key::{KeyLength, wipe};
@@ -65,15 +65,17 @@ const fn numbers_of(text: &[u8]) -> [u64; LIST_LEN] {
 }
 
 impl<'a> Slots<'a> {
-    /// Creates a 32-byte wrapping key from 16 random bytes from `entropy` in a free slot, as a set
-    /// of one whose key is the primary, and writes the twelve words of those bytes into `words`, as
-    /// BIP 39 has them. [`Self::derive_from_words`] derives the same key from the words; nothing
-    /// else gives them again. `entropy` is asked once, and only when a slot is free.
+    /// Creates a 32-byte wrapping key from 16 random bytes from `entropy`, hedged with the key of
+    /// the epoch, in a free slot, as a set of one whose key is the primary, and writes the twelve
+    /// words of the hedged bytes into `words`, as BIP 39 has them. [`Self::derive_from_words`]
+    /// derives the same key from the words; nothing else gives them again. `entropy` is asked once,
+    /// and only when a slot is free.
     ///
     /// Needs 10 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation of the key, the derivation of its identifier,
-    /// the whole load and the whole call are each followed by a wipe of 8 KiB, or 64 KiB, below
-    /// them. A build that optimises this crate but not the hash code it calls has to set that flag.
+    /// `--cfg lethewis_unoptimised`: the hedge, the derivation of the key, the derivation of its
+    /// identifier, the whole load and the whole call are each followed by a wipe of 8 KiB, or 64
+    /// KiB, below them. A build that optimises this crate but not the hash code it calls has to set
+    /// that flag.
     ///
     /// # Errors
     ///
@@ -140,13 +142,11 @@ impl<'a> Slots<'a> {
         entropy: &mut (impl Entropy + ?Sized),
         words: &mut Words,
     ) -> Result<Handle<'a>, Error> {
-        let mut bytes = WipeOnDrop([0; WORDS_ENTROPY_LEN]);
-        let generated = entropy
-            .fill(&mut bytes.0)
-            .map_err(|EntropyError| Error::EntropyFailed)
-            .and_then(|()| self.derive_into(&bytes.0));
+        let mut bytes = [0; WORDS_ENTROPY_LEN];
+        let generated = lethewis_dit::with(|| self.draw(entropy, Branch::HedgeWords, &mut bytes))
+            .and_then(|()| self.derive_into(&bytes));
         if generated.is_ok() {
-            lethewis_dit::with(|| encode(list, &bytes.0, words));
+            lethewis_dit::with(|| encode(list, &bytes, words));
         }
         generated
     }
@@ -174,9 +174,9 @@ impl<'a> Slots<'a> {
         list: &[u64; N],
         words: &Words,
     ) -> Result<Handle<'a>, Error> {
-        let mut bytes = WipeOnDrop([0; WORDS_ENTROPY_LEN]);
-        lethewis_dit::with(|| decode(list, words, &mut bytes.0))
-            .and_then(|()| self.derive_into(&bytes.0))
+        let mut bytes = [0; WORDS_ENTROPY_LEN];
+        lethewis_dit::with(|| decode(list, words, &mut bytes))
+            .and_then(|()| self.derive_into(&bytes))
     }
 
     /// Loads the wrapping key that `bytes`, which twelve words stand for, derive into a free slot:
@@ -185,7 +185,7 @@ impl<'a> Slots<'a> {
         &mut self,
         bytes: &[u8; WORDS_ENTROPY_LEN],
     ) -> Result<Handle<'a>, Error> {
-        self.generate(Purpose::Wrap, KeyLength::Bytes32, &mut FromWords { bytes })
+        self.load_derived(Purpose::Wrap, KeyLength::Bytes32, &mut FromWords { bytes })
             .map_err(|error| match error {
                 Error::EntropyFailed => Error::DerivationFailed,
                 other => other,
@@ -201,15 +201,6 @@ struct FromWords<'b> {
 impl Entropy for FromWords<'_> {
     fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
         derive_from_words(self.bytes, dest).map_err(|_| EntropyError)
-    }
-}
-
-/// Wipes the bytes when dropped, so that the wipe also runs when the source of random bytes panics.
-struct WipeOnDrop([u8; WORDS_ENTROPY_LEN]);
-
-impl Drop for WipeOnDrop {
-    fn drop(&mut self) {
-        wipe(&mut self.0);
     }
 }
 
@@ -408,6 +399,7 @@ pub(crate) mod tests {
     use super::{
         LIST, LIST_LEN, LIST_TEXT, WORD_COUNT, WORD_LEN, Words, decode, encode, find_in, select_in,
     };
+    use crate::derive::direct::hedged_directly;
     use crate::epoch::Epoch;
     use crate::error::Error;
     use crate::key::tests::{Counting, Failing, Random, Recording, from_environment};
@@ -696,10 +688,11 @@ pub(crate) mod tests {
         let mut words = [[7; WORD_LEN]; WORD_COUNT];
         let generated = slots.generate_words(&mut Counting, &mut words).unwrap();
         let counted: [u8; 16] = core::array::from_fn(|at| u8::try_from(at + 1).unwrap());
+        let hedged = hedged_directly(&[9; 32], 0, b"hedge words", &counted, 16);
         assert_eq!(
-            reading(&words),
-            Ok(counted),
-            "the words of the source's bytes"
+            reading(&words).map(|bytes| bytes.to_vec()),
+            Ok(hedged),
+            "the words of the source's bytes, hedged"
         );
         let mut again = words;
         assert_eq!(
@@ -721,7 +714,8 @@ pub(crate) mod tests {
         let mut words = [[0; WORD_LEN]; WORD_COUNT];
         slots.generate_words(&mut source, &mut words).unwrap();
         assert_eq!((source.calls, source.asked), (1, 16));
-        assert_eq!(words, words_for(&[3; 16]));
+        let hedged = hedged_directly(&[9; 32], 0, b"hedge words", &[3; 16], 16);
+        assert_eq!(words, words_for(&hedged.try_into().unwrap()));
         let before = words;
         assert_eq!(
             slots.generate_words(&mut source, &mut words).err(),
@@ -797,8 +791,9 @@ mod stack {
 
     use super::tests::words_for;
     use super::{LIST, Words, bits_of, decode, encode, find_in};
+    use crate::derive::direct::hedged_directly;
     use crate::derive::stack::{
-        block_forms, hash_forms, secrets, secrets_of, state_after, state_forms,
+        block_forms, epoch_bytes, hash_forms, secrets, secrets_of, state_after, state_forms,
     };
     use crate::derive::{Branch, SALT, STACK_WIPE, derive_from_words};
     use crate::entropy::{Entropy, EntropyError};
@@ -888,7 +883,7 @@ mod stack {
     }
 
     fn slots_of<'a>(memory: &'a mut [Slot], epoch: &'a mut Epoch) -> Slots<'a> {
-        Slots::new(memory, epoch, 1, &mut [9; 32])
+        Slots::new(memory, epoch, 1, &mut epoch_bytes(0))
     }
 
     /// The test can see residue: reading words without a wipe leaves some.
@@ -974,7 +969,25 @@ mod stack {
 
     #[test]
     fn a_generation_of_words_leaves_no_residue() {
-        let pieces = pieces();
+        let hedged = |bytes: &[u8; 16], epoch: &[u8; 32]| -> [u8; 16] {
+            hedged_directly(epoch, 0, b"hedge words", bytes, 16)
+                .try_into()
+                .unwrap()
+        };
+        // What the source gave, what the words stand for once it is hedged, and the hedge itself,
+        // the key of the epoch among its secrets.
+        let found = |bytes: &[u8; 16], epoch: &[u8; 32]| {
+            let mut material = bytes.to_vec();
+            material.extend_from_slice(&0_u64.to_le_bytes());
+            let mut found = derivation_secrets(&hedged(bytes, epoch));
+            found.extend(secrets_of(&material, epoch, Branch::HedgeWords));
+            found.push(bytes.to_vec());
+            found
+        };
+        let pieces = key_dependent(
+            &found(&bytes(), &epoch_bytes(0)),
+            &found(&other_bytes(), &epoch_bytes(0xff)),
+        );
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch = Epoch::empty();
         let mut slots = slots_of(&mut memory, &mut epoch);
@@ -983,7 +996,7 @@ mod stack {
         assert_clean(&pieces, || {
             slots.generate_words(&mut Fixed, &mut words).unwrap();
         });
-        assert_eq!(words, words_for(&bytes()));
+        assert_eq!(words, words_for(&hedged(&bytes(), &epoch_bytes(0))));
     }
 
     /// Writes [`BYTES`], then panics.

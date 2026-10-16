@@ -14,6 +14,9 @@ pub struct Epoch {
     pub(crate) key: Key,
     pub(crate) next: Key,
     pub(crate) changing: bool,
+    /// How many draws the platform's source has answered since the slots were created: each draw
+    /// is hedged with its own count.
+    pub(crate) drawn: u64,
 }
 
 impl Epoch {
@@ -25,14 +28,16 @@ impl Epoch {
             key: Key::empty(),
             next: Key::empty(),
             changing: false,
+            drawn: 0,
         }
     }
 
-    /// Wipes both keys and forgets any change under way.
+    /// Wipes both keys, forgets any change under way and starts the count of draws again.
     pub(crate) fn wipe(&mut self) {
         self.key.wipe();
         self.next.wipe();
         self.changing = false;
+        self.drawn = 0;
     }
 }
 

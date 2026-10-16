@@ -54,7 +54,10 @@ private report before publication.
   not reach.
 - The copy of a key for external data that `Slots::reveal32` writes, and what the engine it goes to
   keeps.
-- A weak random source supplied by the caller, and copies of its output that the source keeps.
+- A weak random source together with a key of the epoch made by it, or a process or machine
+  copied with its state.
+- A weak random source that repeats its bytes in another `Slots` under the same key of the epoch,
+  and the salt of password parameters it gives.
 - Weaknesses in third-party dependencies. Report those to their maintainers, and here as well, so
   the dependency can be updated or replaced.
 

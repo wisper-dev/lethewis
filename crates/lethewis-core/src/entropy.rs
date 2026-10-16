@@ -5,8 +5,10 @@ use core::fmt;
 
 /// A source of cryptographically secure random bytes, provided by the platform.
 ///
-/// The bytes become key material. An implementation writes them straight into `dest` and keeps no
-/// copy of what it wrote, including in a buffer of its own.
+/// The bytes go into keys, words and nonces hedged with the key of the epoch, as RFC 8937 has it,
+/// so that within one `Slots` a broken source alone does not make them predictable, and into the
+/// salt of password parameters as they are. An implementation writes them straight into `dest` and
+/// keeps no copy of what it wrote, including in a buffer of its own.
 pub trait Entropy {
     /// Fills `dest` entirely with random bytes.
     ///

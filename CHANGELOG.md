@@ -25,7 +25,7 @@ Nothing is published while the version is below 0.1.0.
 - Builds without the standard library and without a memory allocator.
 - Keys of 32 or 64 bytes: `Slots::import32`, `Slots::import64`, and `Slots::generate`, which
   writes a key straight into its slot from the platform's random source, given through the
-  `Entropy` trait; the library's own code makes no copy of it. `KeyLength` names the two lengths.
+  `Entropy` trait. `KeyLength` names the two lengths.
 - Proofs with Kani 0.68.0 for the slots: a released set is wiped and its handle refused, after any
   sequence of imports and releases of any length; creating the slots wipes the keys left in their
   memory, a release with a handle from other slots is refused, a release advances the generation, no
@@ -136,7 +136,7 @@ Nothing is published while the version is below 0.1.0.
   written and made or read only within the bounds, and for the derivation into a slot, with a model
   of Argon2id.
 - Twelve words of the English list of BIP 39: `Slots::generate_words` creates a 32-byte key for
-  wrapping from 16 random bytes of the platform's source and writes their words (`Words`,
+  wrapping from 16 random bytes and writes their words (`Words`,
   `WORD_COUNT` words of `WORD_LEN` bytes); `Slots::derive_from_words` derives the same key from the
   words into a free slot and wipes them. The key is HKDF-SHA-256 of the 16 bytes, so it does not
   depend on the list.
@@ -159,5 +159,11 @@ Nothing is published while the version is below 0.1.0.
 - Proofs with Kani 0.68.0 for the purposes. Wrapping and unwrapping refuse a parent of another
   purpose; loads, additions and records refuse a length the purpose does not take; a load finds a
   key held for another purpose. A reveal writes exactly an enabled key for external data.
+- Keys, words and nonces from the platform's source are hedged with the key of the epoch, as RFC
+  8937 has it: HKDF-SHA-256 of the bytes drawn and a count of draws, with that key as the salt.
+  Within one `Slots`, a broken source alone no longer makes them predictable, and a repeating source
+  gives different bytes. Password salts are not hedged.
+- Proofs with Kani 0.68.0 that keys, words and nonces are the hedge of the source's bytes, and that
+  the count of draws grows once for each draw the source answers.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

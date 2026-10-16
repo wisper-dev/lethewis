@@ -6,7 +6,8 @@ use hkdf::Hkdf;
 #[cfg(not(kani))]
 use sha2::Sha256;
 
-use crate::key::{Key, wipe};
+use crate::entropy::{Entropy, EntropyError};
+use crate::key::{CAPACITY, Key, wipe};
 use crate::record::{ID_LEN, Purpose, length_to_byte};
 use crate::seal::KEY_LEN as CIPHER_KEY_LEN;
 
@@ -23,6 +24,11 @@ const HEAD_LEN: usize = 14;
 const KEY_ID: &[u8; 6] = b"key id";
 const WRAP_KEY: &[u8; 8] = b"wrap key";
 const FROM_WORDS: &[u8; 10] = b"from words";
+const HEDGE_KEY: &[u8; 9] = b"hedge key";
+const HEDGE_WORDS: &[u8; 11] = b"hedge words";
+const HEDGE_NONCE: &[u8; 11] = b"hedge nonce";
+/// The count of a draw, after the bytes the source gave, in the material a hedge extracts.
+const COUNT_LEN: usize = 8;
 /// How many bytes twelve words stand for.
 pub(crate) const WORDS_ENTROPY_LEN: usize = 16;
 /// How many bytes of stack a derivation is followed by a wipe of: at least twice what it uses, as a
@@ -48,14 +54,54 @@ pub(crate) enum Branch {
     WrapKey,
     /// A key from the bytes twelve words stand for.
     FromWords,
+    /// The bytes of a new key, hedged.
+    HedgeKey,
+    /// The bytes that new words stand for, hedged.
+    HedgeWords,
+    /// The nonce of a record, hedged.
+    HedgeNonce,
 }
 
 /// The purpose each branch is derived for.
 #[cfg(test)]
 pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
     match branch {
-        Branch::KeyId => None,
         Branch::WrapKey | Branch::FromWords => Some(Purpose::Wrap),
+        Branch::KeyId | Branch::HedgeKey | Branch::HedgeWords | Branch::HedgeNonce => None,
+    }
+}
+
+/// Hedges worked out apart from [`hedge`], for the tests.
+#[cfg(test)]
+pub(crate) mod direct {
+    extern crate std;
+
+    use std::vec::Vec;
+
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    /// What a hedge makes of `drawn` under the epoch key `epoch` at `count`, for the use `name`:
+    /// HKDF-SHA-256 called directly, with the label written out by hand.
+    pub(crate) fn hedged_directly(
+        epoch: &[u8; 32],
+        count: u64,
+        name: &[u8],
+        drawn: &[u8],
+        length: usize,
+    ) -> Vec<u8> {
+        let mut material = drawn.to_vec();
+        material.extend_from_slice(&count.to_le_bytes());
+        let mut info = b"lethewis".to_vec();
+        info.extend_from_slice(&[1, 0, u8::try_from(material.len()).unwrap()]);
+        info.extend_from_slice(&u16::try_from(length).unwrap().to_le_bytes());
+        info.push(u8::try_from(name.len()).unwrap());
+        info.extend_from_slice(name);
+        let mut out = std::vec![0; length];
+        Hkdf::<Sha256>::new(Some(epoch), &material)
+            .expand(&info, &mut out)
+            .unwrap();
+        out
     }
 }
 
@@ -180,6 +226,113 @@ pub(crate) fn derive(
     derived
 }
 
+/// Fills `out` from the bytes the platform's source gave, `drawn`, hedged with the key of the epoch
+/// as RFC 8937 has it: HKDF-Extract, with that key as the salt, takes the bytes and then `count`,
+/// least significant byte first, and HKDF-Expand takes the label of `branch`. While that key is
+/// secret, the output cannot be told from random bytes unless the bytes drawn and the count repeat
+/// together, which they do not within one set of slots. Then the stack the hedge used is wiped,
+/// whether it succeeded or not.
+pub(crate) fn hedge(
+    epoch: &Key,
+    count: u64,
+    branch: Branch,
+    drawn: &[u8],
+    out: &mut [u8],
+) -> Result<(), DerivationFailed> {
+    #[cfg(test)]
+    timing::note();
+    let hedged = hedge_on_stack(epoch, count, branch, drawn, out);
+    wipe_stack();
+    hedged
+}
+
+/// The hedge itself, in a frame of its own.
+#[inline(never)]
+fn hedge_on_stack(
+    epoch: &Key,
+    count: u64,
+    branch: Branch,
+    drawn: &[u8],
+    out: &mut [u8],
+) -> Result<(), DerivationFailed> {
+    let salt = epoch.material().ok_or(DerivationFailed)?;
+    let count = count.to_le_bytes();
+    let mut material = [0; CAPACITY + COUNT_LEN];
+    // Copies of a length fixed at each arm: under the proofs a copy of a length known only at run
+    // time reads stale bytes.
+    let placed = match drawn.len() {
+        12 => place::<12>(&mut material, drawn, count),
+        16 => place::<16>(&mut material, drawn, count),
+        32 => place::<32>(&mut material, drawn, count),
+        CAPACITY => place::<CAPACITY>(&mut material, drawn, count),
+        _ => None,
+    };
+    let used = placed.ok_or(DerivationFailed)?;
+    let length = u8::try_from(used).map_err(|_| DerivationFailed)?;
+    let hedged = label(None, length, branch, out.len()).and_then(|(label, label_used)| {
+        let info = label.get(..label_used).ok_or(DerivationFailed)?;
+        let material = material.get(..used).ok_or(DerivationFailed)?;
+        hkdf(salt, material, info, out)
+    });
+    wipe(&mut material);
+    hedged
+}
+
+/// Puts the `N` bytes drawn and then the count at the start of `material`, and returns how many
+/// bytes that is.
+fn place<const N: usize>(
+    material: &mut [u8; CAPACITY + COUNT_LEN],
+    drawn: &[u8],
+    count: [u8; COUNT_LEN],
+) -> Option<usize> {
+    let drawn = <&[u8; N]>::try_from(drawn).ok()?;
+    let (head, rest) = material.split_first_chunk_mut::<N>()?;
+    *head = *drawn;
+    let (tail, _) = rest.split_first_chunk_mut::<COUNT_LEN>()?;
+    *tail = count;
+    N.checked_add(COUNT_LEN)
+}
+
+/// The platform's source hedged with the key of the epoch: what the source writes goes through
+/// [`hedge`] before it reaches the buffer given, under the next count of draws. It remembers
+/// whether the hedge failed, so that the failure is told from the source's.
+pub(crate) struct Hedged<'h, E: ?Sized> {
+    pub(crate) source: &'h mut E,
+    pub(crate) epoch: &'h Key,
+    pub(crate) drawn: &'h mut u64,
+    pub(crate) branch: Branch,
+    pub(crate) failed: bool,
+}
+
+impl<E: Entropy + ?Sized> Entropy for Hedged<'_, E> {
+    fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
+        let mut raw = WipeOnDrop([0; CAPACITY]);
+        let drawn = match raw.0.get_mut(..dest.len()) {
+            Some(drawn) if matches!(drawn.len(), 12 | 16 | 32 | CAPACITY) => drawn,
+            _ => {
+                self.failed = true;
+                return Err(EntropyError);
+            }
+        };
+        self.source.fill(drawn)?;
+        let count = *self.drawn;
+        *self.drawn = count.wrapping_add(1);
+        hedge(self.epoch, count, self.branch, drawn, dest).map_err(|DerivationFailed| {
+            self.failed = true;
+            EntropyError
+        })
+    }
+}
+
+/// Wipes the bytes when dropped, so that the wipe also runs when the source panics.
+struct WipeOnDrop([u8; CAPACITY]);
+
+impl Drop for WipeOnDrop {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
 /// Whether every derivation on this thread since the last look ran with data-independent timing
 /// on where it is offered: every call that derives holds the mode.
 #[cfg(test)]
@@ -256,7 +409,11 @@ pub(crate) mod stack {
     use hkdf::Hkdf;
     use sha2::{Digest, Sha256, block_api::compress256};
 
-    use super::{Branch, SALT, STACK_WIPE, derive, derive_on_stack, label, purpose_of};
+    use super::{
+        Branch, Hedged, SALT, STACK_WIPE, derive, derive_on_stack, hedge, hedge_on_stack, label,
+        purpose_of,
+    };
+    use crate::entropy::{Entropy, EntropyError};
     use crate::epoch::Epoch;
     use crate::key::{
         Key, KeyLength,
@@ -455,9 +612,16 @@ pub(crate) mod stack {
         secrets_of(&key[..length.bytes()], salt, branch)
     }
 
-    /// The same for a derivation of `branch` from the whole of `key`, of 16, 32 or 64 bytes.
+    /// The same for a derivation of `branch` from the whole of `key`: a key of 16, 32 or 64 bytes,
+    /// or the material of a hedge.
     pub(crate) fn secrets_of(key: &[u8], salt: &[u8], branch: Branch) -> Vec<Vec<u8>> {
-        let out_len = if branch == Branch::KeyId { 16 } else { 32 };
+        // A hedge takes the bytes drawn and an 8-byte count, and gives as many bytes as were drawn.
+        let out_len = match branch {
+            Branch::KeyId | Branch::HedgeWords => 16,
+            Branch::HedgeNonce => 12,
+            Branch::HedgeKey => key.len() - 8,
+            Branch::WrapKey | Branch::FromWords => 32,
+        };
         let length = u8::try_from(key.len()).unwrap();
         let (label, used) = label(purpose_of(branch), length, branch, out_len).unwrap();
         let info = &label[..used];
@@ -469,7 +633,7 @@ pub(crate) mod stack {
         let key_block_of_message: [u8; 64] = if key.len() < 64 {
             final_block(key)
         } else {
-            key.try_into().unwrap()
+            key[..64].try_into().unwrap()
         };
         let extract_inner = Sha256::new()
             .chain_update(salt_inner)
@@ -484,11 +648,9 @@ pub(crate) mod stack {
             .finalize();
 
         let mut secrets = std::vec![key.to_vec(), output[1..].to_vec()];
-        // The salt of a wrap key is the key of an epoch.
-        if branch == Branch::WrapKey {
-            secrets.push(salt.to_vec());
-            secrets.extend(state_forms(state_after(&[salt_inner])));
-            secrets.extend(block_forms(&salt_inner));
+        // The salt of a wrap key and of a hedge is the key of an epoch.
+        if branch != Branch::KeyId && branch != Branch::FromWords {
+            secrets.extend(salt_secrets(salt));
         }
         secrets.extend(hash_forms(&prk));
         // Every form of the output but, for an identifier, the plain one, whose first 16 bytes are
@@ -515,6 +677,17 @@ pub(crate) mod stack {
             final_block(&extract_inner),
             final_block(&expand_inner),
         ] {
+            secrets.extend(block_forms(&block));
+        }
+        secrets
+    }
+
+    /// What HMAC keyed with `salt` works with: the salt, its blocks padded for the inner and the
+    /// outer hash, and the state after each.
+    pub(crate) fn salt_secrets(salt: &[u8]) -> Vec<Vec<u8>> {
+        let mut secrets = std::vec![salt.to_vec()];
+        for block in [key_block(salt, 0x36), key_block(salt, 0x5c)] {
+            secrets.extend(state_forms(state_after(&[block])));
             secrets.extend(block_forms(&block));
         }
         secrets
@@ -557,6 +730,107 @@ pub(crate) mod stack {
             derive(&key, SALT, None, Branch::KeyId, &mut id).unwrap();
             black_box(&id);
         });
+    }
+
+    /// The key of the epoch these tests run under, with every bit of `flip` flipped in each byte;
+    /// its bytes vary, so that the tests look for it.
+    pub(crate) fn epoch_bytes(flip: u8) -> [u8; 32] {
+        core::array::from_fn(|at| {
+            u8::try_from(at)
+                .unwrap()
+                .wrapping_mul(53)
+                .wrapping_add(0x6b)
+                ^ flip
+        })
+    }
+
+    fn hedge_epoch() -> Key {
+        let mut key = Key::empty();
+        key.load32(&mut epoch_bytes(0));
+        key
+    }
+
+    /// The pieces of what a hedge of 32 bytes at count 3 works with that depend on those bytes:
+    /// the bytes themselves and the secrets of their derivation.
+    fn hedge_pieces() -> Vec<Vec<u8>> {
+        let material = |drawn: &[u8]| {
+            let mut material = drawn.to_vec();
+            material.extend_from_slice(&3_u64.to_le_bytes());
+            material
+        };
+        let drawn = key_bytes()[..32].to_vec();
+        let other: Vec<u8> = drawn.iter().map(|byte| byte ^ 0xff).collect();
+        let mut secrets = secrets_of(&material(&drawn), &epoch_bytes(0), Branch::HedgeKey);
+        secrets.push(drawn);
+        let mut others = secrets_of(&material(&other), &epoch_bytes(0xff), Branch::HedgeKey);
+        others.push(other);
+        key_dependent(&secrets, &others)
+    }
+
+    /// The test can see residue: a hedge without the wipe leaves some.
+    #[test]
+    fn a_hedge_without_the_wipe_leaves_residue() {
+        let (epoch, drawn) = (hedge_epoch(), key_bytes());
+        let mut out = [0; 32];
+        let range = below_pad(false, || {
+            hedge_on_stack(&epoch, 3, Branch::HedgeKey, &drawn[..32], &mut out).unwrap();
+            black_box(&out);
+        });
+        assert!(residue(range, &hedge_pieces()) > 0);
+    }
+
+    /// The bytes drawn and the output are the caller's, above what is read.
+    #[test]
+    fn a_hedge_leaves_no_residue() {
+        let (epoch, drawn) = (hedge_epoch(), key_bytes());
+        let mut out = [0; 32];
+        assert_clean(&hedge_pieces(), || {
+            hedge(&epoch, 3, Branch::HedgeKey, &drawn[..32], &mut out).unwrap();
+            black_box(&out);
+        });
+    }
+
+    /// The bytes a panicking source writes, from a static, so that the source keeps no copy of them
+    /// on the stack.
+    static PANICKED: [u8; 32] = [
+        0x8c, 0x31, 0xe7, 0x05, 0x6a, 0xd2, 0x49, 0xb0, 0x17, 0xfe, 0x63, 0x9a, 0x2d, 0xc4, 0x58,
+        0x0b, 0x76, 0xe1, 0x3f, 0xa8, 0x92, 0x14, 0xcd, 0x60, 0xbb, 0x27, 0xf5, 0x4e, 0x81, 0x3a,
+        0xdc, 0x99,
+    ];
+
+    struct Panicking;
+
+    impl Entropy for Panicking {
+        fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
+            dest.copy_from_slice(&PANICKED[..dest.len()]);
+            panic!("the source broke after writing")
+        }
+    }
+
+    /// A source that panics after writing leaves none of its bytes in the hedge's buffer: the panic
+    /// unwinds past a wipe of it. With optimisation the unwinding itself overwrites that place, so
+    /// only a build without it can tell.
+    #[test]
+    fn a_panicking_source_leaves_no_bytes_in_the_hedge() {
+        let other: Vec<u8> = PANICKED.iter().map(|byte| byte ^ 0xff).collect();
+        let pieces = key_dependent(&[PANICKED.to_vec()], &[other]);
+        let epoch = hedge_epoch();
+        let mut drawn = 0;
+        let mut out = [0; 32];
+        assert_clean(&pieces, || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut hedged = Hedged {
+                    source: &mut Panicking,
+                    epoch: &epoch,
+                    drawn: &mut drawn,
+                    branch: Branch::HedgeKey,
+                    failed: false,
+                };
+                let _ = hedged.fill(&mut out);
+            }));
+            assert!(outcome.is_err());
+        });
+        assert_eq!(drawn, 0, "a draw the source does not answer is not counted");
     }
 
     /// An output longer than HKDF gives fails after Extract, with the extracted key on the stack.
@@ -613,25 +887,47 @@ pub(crate) mod stack {
     fn adding_a_generated_key_leaves_no_residue() {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
-        let mut slots = Slots::new(&mut memory, &mut epoch_memory, 1, &mut [9; 32]);
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, 1, &mut epoch_bytes(0));
         let set = slots.import32(Purpose::Wrap, &mut [3; 32]).unwrap();
-        let counted = counted::<64>();
-        for length in [KeyLength::Bytes64, KeyLength::Bytes32] {
-            assert_clean(&pieces(&counted, length), || {
+        for (count, length) in [(0, KeyLength::Bytes64), (1, KeyLength::Bytes32)] {
+            assert_clean(&generation_pieces(count, length), || {
                 slots.add_generated(set, length, &mut Counting).unwrap();
             });
             slots.settle();
         }
     }
 
+    /// What a generation from `drawn`, the bytes the source gave, at `count` under the epoch key
+    /// `epoch` works with: those bytes, the key their hedge gives and the secrets of its
+    /// identifier, and the secrets of the hedge itself, the key of the epoch among them.
+    fn generation_secrets(drawn: &[u8], count: u64, epoch: &[u8; 32]) -> Vec<Vec<u8>> {
+        let key = super::direct::hedged_directly(epoch, count, b"hedge key", drawn, drawn.len());
+        let mut found = secrets_of(&key, SALT, Branch::KeyId);
+        let mut material = drawn.to_vec();
+        material.extend_from_slice(&count.to_le_bytes());
+        found.extend(secrets_of(&material, epoch, Branch::HedgeKey));
+        found.push(drawn.to_vec());
+        found
+    }
+
+    /// The pieces of a generation by [`Counting`] under the epoch key of these tests that depend on
+    /// the source and on that key.
+    fn generation_pieces(count: u64, length: KeyLength) -> Vec<Vec<u8>> {
+        let drawn = &counted::<64>()[..length.bytes()];
+        let other: Vec<u8> = drawn.iter().map(|byte| byte ^ 0xff).collect();
+        key_dependent(
+            &generation_secrets(drawn, count, &epoch_bytes(0)),
+            &generation_secrets(&other, count, &epoch_bytes(0xff)),
+        )
+    }
+
     #[test]
     fn generating_a_key_leaves_no_residue() {
         let mut memory = [const { Slot::empty() }; 2];
         let mut epoch_memory = Epoch::empty();
-        let mut slots = Slots::new(&mut memory, &mut epoch_memory, 1, &mut [9; 32]);
-        let counted = counted::<64>();
-        for length in [KeyLength::Bytes64, KeyLength::Bytes32] {
-            assert_clean(&pieces(&counted, length), || {
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, 1, &mut epoch_bytes(0));
+        for (count, length) in [(0, KeyLength::Bytes64), (1, KeyLength::Bytes32)] {
+            assert_clean(&generation_pieces(count, length), || {
                 slots
                     .generate(Purpose::Wrap, length, &mut Counting)
                     .unwrap();
@@ -688,9 +984,9 @@ pub(crate) mod model {
     /// HKDF-SHA-256 is beyond Kani. The model fails at will, after writing into `out`, and records
     /// whether it failed; otherwise `out` takes the first bytes of the key, or zeros for a key
     /// shorter than `out`, with the key's length, the label and the first bytes of the salt folded
-    /// in, so equal inputs give equal outputs, and the output depends on those bytes, that length
-    /// and the label. Folding every byte of the key would be too slow for the solver; that HKDF
-    /// uses the whole key and the output length, the unit tests check.
+    /// in, so equal inputs give equal outputs, and the output depends on those bytes, that length,
+    /// the label and the salt. Folding every byte of the key would be too slow for the solver; that
+    /// HKDF uses the whole key and the output length, the unit tests check.
     pub(super) fn hkdf(
         salt: &[u8],
         material: &[u8],
@@ -733,7 +1029,7 @@ pub(crate) mod model {
     }
 
     // Never indexing: a path that never derives would leave a check unreached. Copies have lengths
-    // known at each call: Kani 0.68.0 reads stale bytes in a slice copy of unknown length. The two
+    // known at each call: Kani 0.68.0 reads stale bytes in a slice copy of unknown length. The
     // lengths derived are folded as numbers: byte by byte costs the proofs many times more.
     pub(crate) fn fold(salt: &[u8], material: &[u8], info: &[u8], out: &mut [u8]) {
         let mut label = [0; 32];
@@ -768,12 +1064,41 @@ pub(crate) mod model {
                 *to_first = (first ^ low ^ salt_low).to_ne_bytes();
                 to_second.copy_from_slice(&(second ^ high ^ salt_high).to_ne_bytes());
             }
+        } else if let Ok(out) = <&mut [u8; 64]>::try_from(&mut *out) {
+            // Taken apart rather than indexed: a bounds check on a path a proof never takes would be
+            // a check it never reaches.
+            let [first, second, third, fourth] =
+                material.first_chunk::<64>().map_or([0; 4], |key| {
+                    let (lanes, _) = key.as_chunks::<16>();
+                    core::array::from_fn(|at| lanes.get(at).map_or(0, head))
+                });
+            let folded = [
+                first ^ low ^ salt_low,
+                second ^ high ^ salt_high,
+                third ^ low ^ salt_low,
+                fourth ^ high ^ salt_high,
+            ];
+            for (to, lane) in out.as_chunks_mut::<16>().0.iter_mut().zip(folded) {
+                *to = lane.to_ne_bytes();
+            }
+        } else if let Ok(out) = <&mut [u8; 12]>::try_from(&mut *out) {
+            let mut key = [0; 16];
+            if let (Some(to), Some(drawn)) = (key.first_chunk_mut::<12>(), material.first_chunk()) {
+                *to = *drawn;
+            }
+            let folded = head(&key) ^ low ^ high ^ salt_low;
+            if let Some(folded) = (folded ^ folded.wrapping_shr(96))
+                .to_ne_bytes()
+                .first_chunk::<12>()
+            {
+                *out = *folded;
+            }
         } else {
             match material.get(..out.len()) {
                 Some(head) => out.copy_from_slice(head),
                 None => out.fill(0),
             }
-            for piece in info.chunks(out.len().max(1)) {
+            for piece in info.chunks(out.len().max(1)).chain([salt]) {
                 for (target, &byte) in out.iter_mut().zip(piece) {
                     *target ^= byte;
                 }
@@ -839,6 +1164,9 @@ fn label(
         Branch::KeyId => joined(head, KEY_ID),
         Branch::WrapKey => joined(head, WRAP_KEY),
         Branch::FromWords => joined(head, FROM_WORDS),
+        Branch::HedgeKey => joined(head, HEDGE_KEY),
+        Branch::HedgeWords => joined(head, HEDGE_WORDS),
+        Branch::HedgeNonce => joined(head, HEDGE_NONCE),
     }
 }
 
@@ -870,9 +1198,10 @@ mod tests {
     use sha2::Sha256;
 
     use super::{
-        Branch, DerivationFailed, FROM_WORDS, KEY_ID, KeyId, SALT, WRAP_KEY, derive,
-        derive_from_words, derive_key_id, label, purpose_of,
+        Branch, DerivationFailed, FROM_WORDS, HEDGE_KEY, HEDGE_NONCE, HEDGE_WORDS, Hedged, KEY_ID,
+        KeyId, SALT, WRAP_KEY, derive, derive_from_words, derive_key_id, hedge, label, purpose_of,
     };
+    use crate::entropy::{Entropy, EntropyError};
     use crate::key::{Key, KeyLength};
     use crate::record::Purpose;
 
@@ -1034,6 +1363,116 @@ mod tests {
         }
     }
 
+    /// A length no hedge takes fails as a hedge, before the source is asked and with no draw
+    /// counted.
+    #[test]
+    fn a_length_no_hedge_takes_asks_nothing_of_the_source() {
+        struct Asked(bool);
+
+        impl Entropy for Asked {
+            fn fill(&mut self, _: &mut [u8]) -> Result<(), EntropyError> {
+                self.0 = true;
+                Ok(())
+            }
+        }
+
+        let epoch = hedge_epoch();
+        for length in [0, 8, 20, 33, 65] {
+            let (mut source, mut drawn) = (Asked(false), 0);
+            let mut hedged = Hedged {
+                source: &mut source,
+                epoch: &epoch,
+                drawn: &mut drawn,
+                branch: Branch::HedgeKey,
+                failed: false,
+            };
+            assert!(hedged.fill(&mut std::vec![0; length]).is_err());
+            assert!(hedged.failed, "{length} bytes");
+            assert!(!source.0 && drawn == 0, "{length} bytes");
+        }
+    }
+
+    /// The key of an epoch whose bytes are 0x40, 0x41, ... 0x5f.
+    fn hedge_epoch() -> Key {
+        let mut key = Key::empty();
+        key.load32(&mut core::array::from_fn(|i| {
+            0x40_u8.wrapping_add(u8::try_from(i).unwrap())
+        }));
+        key
+    }
+
+    /// Hedges computed by an independent implementation of HKDF-SHA-256 from the documented salt,
+    /// material and label, for each use and length the library draws.
+    #[test]
+    fn hedges_match_known_answers() {
+        let cases = [
+            (
+                Branch::HedgeKey,
+                32,
+                5,
+                "e4214206964aa889fb9173f1e5a20087076969a7660f4857e0cfc1343a1294ab",
+            ),
+            (
+                Branch::HedgeKey,
+                64,
+                0,
+                "c7efe2d49ed202b046efad802c86c22d3e47e7509b63fd4808702229057b458a\
+                 b529952b1792bff31ec14992d6338c97452ce2990eb2764f9d5148c7059c33ce",
+            ),
+            (
+                Branch::HedgeWords,
+                16,
+                1,
+                "657df1779625afcaef46cc1c9357c837",
+            ),
+            (Branch::HedgeNonce, 12, 2, "a6ebbfae7d7b819bd43e7836"),
+        ];
+        for (branch, length, count, expected) in cases {
+            let drawn: [u8; 64] = core::array::from_fn(|i| u8::try_from(i).unwrap());
+            let mut out = [0; 64];
+            hedge(
+                &hedge_epoch(),
+                count,
+                branch,
+                &drawn[..length],
+                &mut out[..length],
+            )
+            .unwrap();
+            assert_eq!(hex(&out[..length]), expected, "{branch:?}");
+        }
+    }
+
+    /// A hedge is HKDF with the key of the epoch as the salt, the bytes drawn followed by the count
+    /// as the material, and the label written out by hand; another count, use or epoch key gives
+    /// another value.
+    #[test]
+    fn a_hedge_is_hkdf_of_the_bytes_and_the_count_under_the_key_of_the_epoch() {
+        let drawn = [7; 32];
+        let mut ours = [0; 32];
+        hedge(&hedge_epoch(), 9, Branch::HedgeKey, &drawn, &mut ours).unwrap();
+        let mut material = drawn.to_vec();
+        material.extend_from_slice(&9_u64.to_le_bytes());
+        let mut info = b"lethewis".to_vec();
+        info.extend_from_slice(&[1, 0, 40, 32, 0, 9]);
+        info.extend_from_slice(b"hedge key");
+        let salt: [u8; 32] =
+            core::array::from_fn(|i| 0x40_u8.wrapping_add(u8::try_from(i).unwrap()));
+        let mut direct = [0; 32];
+        Hkdf::<Sha256>::new(Some(&salt), &material)
+            .expand(&info, &mut direct)
+            .unwrap();
+        assert_eq!(ours, direct);
+        let mut other = [0; 32];
+        hedge(&hedge_epoch(), 10, Branch::HedgeKey, &drawn, &mut other).unwrap();
+        assert_ne!(other, ours, "another count");
+        hedge(&hedge_epoch(), 9, Branch::HedgeWords, &drawn, &mut other).unwrap();
+        assert_ne!(other, ours, "another use");
+        let mut epoch = Key::empty();
+        epoch.load32(&mut [3; 32]);
+        hedge(&epoch, 9, Branch::HedgeKey, &drawn, &mut other).unwrap();
+        assert_ne!(other, ours, "another key of the epoch");
+    }
+
     #[test]
     fn branches_and_output_lengths_give_unrelated_values() {
         let mut key = Key::empty();
@@ -1082,12 +1521,22 @@ mod tests {
 
     #[test]
     fn every_branch_has_a_label() {
-        for branch in [Branch::KeyId, Branch::WrapKey, Branch::FromWords] {
+        for branch in [
+            Branch::KeyId,
+            Branch::WrapKey,
+            Branch::FromWords,
+            Branch::HedgeKey,
+            Branch::HedgeWords,
+            Branch::HedgeNonce,
+        ] {
             let (_, used) = label(purpose_of(branch), 64, branch, 32).unwrap();
             let name = match branch {
                 Branch::KeyId => KEY_ID.len(),
                 Branch::WrapKey => WRAP_KEY.len(),
                 Branch::FromWords => FROM_WORDS.len(),
+                Branch::HedgeKey => HEDGE_KEY.len(),
+                Branch::HedgeWords => HEDGE_WORDS.len(),
+                Branch::HedgeNonce => HEDGE_NONCE.len(),
             };
             assert_eq!(used, 14 + name);
         }
@@ -1176,8 +1625,30 @@ pub(crate) mod proofs {
         match kani::any::<u8>() {
             0 => Branch::KeyId,
             1 => Branch::WrapKey,
-            _ => Branch::FromWords,
+            2 => Branch::FromWords,
+            3 => Branch::HedgeKey,
+            4 => Branch::HedgeWords,
+            _ => Branch::HedgeNonce,
         }
+    }
+
+    /// What the model of HKDF gives a hedge of the `N` bytes `drawn` under the epoch key `epoch` at
+    /// `count`, for `branch`: the bytes and then the count, eight bytes, least significant first,
+    /// as the material, worked out in the same way.
+    pub(crate) fn expected_hedge<const N: usize>(
+        epoch: &[u8; 32],
+        count: u64,
+        branch: Branch,
+        drawn: &[u8; N],
+    ) -> [u8; N] {
+        let mut material = [0; 72];
+        material[..N].copy_from_slice(drawn);
+        material[N..N + 8].copy_from_slice(&count.to_le_bytes());
+        let mut out = [0; N];
+        let _ = label(None, (N + 8) as u8, branch, N).map(|(label, used)| {
+            fold(epoch, &material[..N + 8], &label[..used], &mut out);
+        });
+        out
     }
 
     /// Either purpose, or none.
