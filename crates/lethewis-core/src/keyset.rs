@@ -254,7 +254,8 @@ pub(crate) fn parent_of(bytes: &[u8; PLAINTEXT_LEN]) -> &[u8; ID_LEN] {
 pub(crate) type Parsed<'a> = (Header, Stages, [Option<KeyBytes<'a>>; MEMBERS]);
 
 /// Reads the plaintext of a set. Anything [`build`] cannot write is refused, and so is a set whose
-/// primary position does not hold an enabled key.
+/// primary position does not hold an enabled key, or that holds a key of a length its purpose does
+/// not take.
 pub(crate) fn parse(bytes: &[u8; PLAINTEXT_LEN]) -> Result<Parsed<'_>, Malformed> {
     let Some((&[version, purpose, primary], rest)) = bytes.split_first_chunk::<3>() else {
         return Err(Malformed);
@@ -280,9 +281,9 @@ pub(crate) fn parse(bytes: &[u8; PLAINTEXT_LEN]) -> Result<Parsed<'_>, Malformed
     let ([], Some(purpose)) = (rest, Purpose::from_byte(purpose)) else {
         return Err(Malformed);
     };
-    let (first_stage, first_key) = parse_member(first)?;
-    let (second_stage, second_key) = parse_member(second)?;
-    let (third_stage, third_key) = parse_member(third)?;
+    let (first_stage, first_key) = parse_member(first, purpose)?;
+    let (second_stage, second_key) = parse_member(second, purpose)?;
+    let (third_stage, third_key) = parse_member(third, purpose)?;
     let stages = Stages {
         members: [first_stage, second_stage, third_stage],
         primary: usize::from(primary),
@@ -299,10 +300,11 @@ pub(crate) fn parse(bytes: &[u8; PLAINTEXT_LEN]) -> Result<Parsed<'_>, Malformed
     Ok((header, stages, [first_key, second_key, third_key]))
 }
 
-/// The stage and the key of one position. An empty position is zero throughout; reading it has no
-/// early exit.
+/// The stage and the key of one position of a set for `purpose`. An empty position is zero
+/// throughout; reading it has no early exit.
 fn parse_member(
     bytes: &[u8; MEMBER_LEN],
+    purpose: Purpose,
 ) -> Result<(Option<Status>, Option<KeyBytes<'_>>), Malformed> {
     let Some((&[stage, length], key)) = bytes.split_first_chunk::<2>() else {
         return Err(Malformed);
@@ -322,7 +324,7 @@ fn parse_member(
     let (Some(status), Some(length)) = (Status::from_byte(stage), length_from_byte(length)) else {
         return Err(Malformed);
     };
-    if !crate::record::tail_is_zero(key, length) {
+    if !purpose.takes(length) || !crate::record::tail_is_zero(key, length) {
         return Err(Malformed);
     }
     Ok((Some(status), Some(KeyBytes::new(key, length))))
@@ -536,15 +538,22 @@ mod tests {
         }
     }
 
+    /// The version is 1; the purpose is one of the two, and a set of external data holds only
+    /// 32-byte keys, as [`gap`] does and [`full`] does not.
     #[test]
-    fn the_version_and_the_purpose_accept_only_one() {
-        for position in [0, 1] {
+    fn the_version_is_one_and_the_purpose_takes_its_lengths() {
+        for (position, bytes, accepted) in [
+            (0, full(), &[1][..]),
+            (0, gap(), &[1][..]),
+            (1, full(), &[1][..]),
+            (1, gap(), &[1, 2][..]),
+        ] {
             for value in 0..=u8::MAX {
-                let mut bytes = full();
-                bytes[position] = value;
+                let mut changed = bytes;
+                changed[position] = value;
                 assert_eq!(
-                    parse(&bytes).is_ok(),
-                    value == 1,
+                    parse(&changed).is_ok(),
+                    accepted.contains(&value),
                     "byte {position}, value {value}"
                 );
             }
@@ -815,26 +824,29 @@ pub(crate) mod proofs {
         seen == 0
     }
 
-    /// Whether the position starting at `at` is one `build` can write.
-    fn writable_position(bytes: &[u8; PLAINTEXT_LEN], at: usize) -> bool {
+    /// Whether the position starting at `at` is one `build` can write for the purpose `purpose`:
+    /// keys of 32 or 64 bytes for 1, of 32 for 2.
+    fn writable_position(bytes: &[u8; PLAINTEXT_LEN], at: usize, purpose: u8) -> bool {
         let stage = bytes[at];
         let length = bytes[at + 1];
         if stage == 0 {
             return zero(bytes, at, at + MEMBER_LEN);
         }
         (stage == 1 || stage == 2)
-            && (length == 64 || (length == 32 && zero(bytes, at + 34, at + MEMBER_LEN)))
+            && ((length == 64 && purpose == 1)
+                || (length == 32 && zero(bytes, at + 34, at + MEMBER_LEN)))
     }
 
     /// Whether `build` can write `bytes` for stages that are whole, decided from the layout alone,
     /// not from `parse`.
     fn writable(bytes: &[u8; PLAINTEXT_LEN]) -> bool {
         let primary = bytes[2];
+        let purpose = bytes[1];
         bytes[0] == 1
-            && bytes[1] == 1
-            && writable_position(bytes, POSITIONS[0])
-            && writable_position(bytes, POSITIONS[1])
-            && writable_position(bytes, POSITIONS[2])
+            && (purpose == 1 || purpose == 2)
+            && writable_position(bytes, POSITIONS[0], purpose)
+            && writable_position(bytes, POSITIONS[1], purpose)
+            && writable_position(bytes, POSITIONS[2], purpose)
             && ((primary == 0 && bytes[POSITIONS[0]] == 1)
                 || (primary == 1 && bytes[POSITIONS[1]] == 1)
                 || (primary == 2 && bytes[POSITIONS[2]] == 1))
@@ -873,8 +885,13 @@ pub(crate) mod proofs {
             "only the version is refused"
         );
         kani::cover!(
-            !accepted && with(&bytes, 1, 1),
+            !accepted && bytes[1] > 2 && with(&bytes, 1, 1),
             "only the purpose is refused"
+        );
+        kani::cover!(accepted && bytes[1] == 2, "a set of external data");
+        kani::cover!(
+            !accepted && bytes[1] == 2 && with(&bytes, 1, 1),
+            "only a key too long for external data is refused"
         );
         kani::cover!(
             !accepted && bytes[2] == 0 && first == 2 && with(&bytes, POSITIONS[0], 1),
@@ -928,6 +945,15 @@ pub(crate) mod proofs {
         stages
     }
 
+    /// Either purpose.
+    pub(crate) fn any_purpose() -> Purpose {
+        if kani::any() {
+            Purpose::Wrap
+        } else {
+            Purpose::ExternalData
+        }
+    }
+
     fn any_key() -> Key {
         let mut key = Key::empty();
         if kani::any() {
@@ -938,25 +964,47 @@ pub(crate) mod proofs {
         key
     }
 
-    /// For any header, any whole stages and any keys of either length, building puts every field
-    /// where the layout says, empty positions zero, and parsing gives back the same header, stages
-    /// and keys. The offsets and values are written from the layout, independently of the builder
-    /// and the parser.
+    /// Whether `purpose` takes a key of `length`, as the documentation of `Purpose` states it: any
+    /// length for wrapping, 32 bytes for external data. Written apart from the code.
+    pub(crate) fn allowed(purpose: Purpose, length: KeyLength) -> bool {
+        purpose == Purpose::Wrap || length == KeyLength::Bytes32
+    }
+
+    /// Any key of a length `purpose` takes.
+    fn any_key_for(purpose: Purpose) -> Key {
+        let key = any_key();
+        kani::assume(allowed(purpose, key.length()));
+        key
+    }
+
+    /// For any header of either purpose, any whole stages and any keys of a length the purpose
+    /// takes, building puts every field where the layout says, empty positions zero, and parsing
+    /// gives back the same header, stages and keys. The offsets and values are written from the
+    /// layout, independently of the builder and the parser.
     #[kani::proof]
     #[kani::unwind(67)]
     fn building_then_parsing_gives_back_the_set() {
         let header = Header {
-            purpose: Purpose::Wrap,
+            purpose: any_purpose(),
             parent: kani::any(),
             epoch: kani::any(),
         };
         let stages = any_whole_stages();
-        let keys = [any_key(), any_key(), any_key()];
+        let keys = [
+            any_key_for(header.purpose),
+            any_key_for(header.purpose),
+            any_key_for(header.purpose),
+        ];
         let mut out: [u8; PLAINTEXT_LEN] = kani::any();
         build(&header, &stages, [&keys[0], &keys[1], &keys[2]], &mut out);
 
+        let purpose = if header.purpose == Purpose::Wrap {
+            1
+        } else {
+            2
+        };
         kani::assert(
-            out[0] == 1 && out[1] == 1 && usize::from(out[2]) == stages.primary,
+            out[0] == 1 && out[1] == purpose && usize::from(out[2]) == stages.primary,
             "the control bytes are written as the layout says",
         );
         kani::assert(out[3..19] == header.parent, "the parent is at its offset");
@@ -1034,6 +1082,10 @@ pub(crate) mod proofs {
             "a full set"
         );
         kani::cover!(stages.revision == u64::MAX, "the last revision");
+        kani::cover!(
+            header.purpose == Purpose::ExternalData && stages.members[0].is_some(),
+            "a set of external data"
+        );
     }
 
     /// For any 233 bytes that parse, loading the keys and building again gives the same bytes: a

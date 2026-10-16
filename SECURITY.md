@@ -38,7 +38,8 @@ private report before publication.
 **In scope:** the crates in this repository.
 
 - A key that survives destruction.
-- A key that leaves the library in the clear.
+- A key for wrapping that leaves the library in the clear, or a key for external data returned to
+  a call that does not name its purpose.
 - A path that opens two-tier access from a single password.
 - A replacement key created without the caller being told.
 - A counterexample to any property listed as proven in [docs/proofs.md](docs/proofs.md).
@@ -49,7 +50,10 @@ private report before publication.
 - Residue in flash memory readable only by desoldering the chip.
 - Any device whose keys are already in memory because it was unlocked after boot.
 - Copies of a secret left by a value move, a buffer reallocation, a register, swap or a crash dump,
-  and copies on the stack that the wipe after a key derivation, a wrap or an unwrap does not reach.
+  and copies on the stack that the wipe after a key derivation, a reveal, a wrap or an unwrap does
+  not reach.
+- The copy of a key for external data that `Slots::reveal32` writes, and what the engine it goes to
+  keeps.
 - A weak random source supplied by the caller, and copies of its output that the source keeps.
 - Weaknesses in third-party dependencies. Report those to their maintainers, and here as well, so
   the dependency can be updated or replaced.

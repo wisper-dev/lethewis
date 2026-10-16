@@ -70,33 +70,53 @@ and the flash.
 **Capability.** Another application, possibly with elevated privileges.
 
 **In place.** Keys are held only in fixed-size slots whose memory the caller provides, each slot a
-set of up to three keys, and no call returns a key. A key is held in one place only: a load of a key
-the slots already hold, or of a set that holds one key twice, is refused. A new key is written
-straight into its slot from the platform's random source, and the library's own code makes no copy
-of it; if the source fails or panics halfway, the slot is wiped. The keys of a set are wiped when it
-is released, and every key is wiped when its slots are dropped. A set leaves its slot only as one
-record of all its keys, encrypted with AES-256-GCM-SIV under a key derived from the primary key of
-the set that wraps it, bound to a context the caller names; before every wrap the cipher encrypts a
-known input of the shape of a record and must give the answer an independent implementation gives,
-or nothing is written. A record is unwrapped into a slot only after its tag, its layout and the
-identifier of the key that wraps it are checked; every key of the parent set is tried, also after
-one has opened the record. Every such failure is the same error, except a record wrapped under a
-disabled key of the parent, which is reported as such and loads nothing. After each key derivation,
-whether it succeeded or not, the stack below the caller is wiped: 8 KiB, or 64 KiB in a build
-without optimisation. Tests read the memory of their own process back, with and without optimisation
-and with the hardware and the software SHA-256, and check that the wipe reaches that depth, that the
-derivation uses less than half of it and more than a sixteenth, and that no 16-byte piece is left of
-the key, the extracted key, the HMAC key blocks, the SHA-256 states, inner hashes and message
-schedules, or the output beyond the identifier, in the byte orders and arrangements the two SHA-256
-paths use. After a wrap and an unwrap the stack below the caller is wiped as well: 24 KiB, or 64 KiB
-without optimisation, at least twice what the cipher uses at every level of optimisation by the same
-measurement; tests read the stack back after a wrap, an unwrap and an unwrap whose record fails its
-tag, with sets of three keys on both sides, and look for pieces of every key, and, for each key of
-the parent that is tried, the derived cipher key, the message keys, the AES round keys of the
-derived key and of the message encryption key as laid out by the instructions, the keystream and
-what the record decrypts to. The wipe on release and on creating the slots, and the refusal of a
-released or foreign handle, are proven for two slots; the statements and their limits are in
-[proofs.md](proofs.md).
+set of up to three keys. A key is held in one place only, whatever purpose it serves: a load of a key
+the slots already hold, or of a set that holds one key twice, is refused.
+
+A new key is written straight into its slot from the platform's random source, and the library's own
+code makes no copy of it; if the source fails or panics halfway, the slot is wiped. The keys of a set
+are wiped when it is released, and every key is wiped when its slots are dropped.
+
+Only a key for external data is returned, to a call that names its purpose, into the caller's
+buffer. The stack below the call is wiped after it, 8 KiB, or 64 KiB without optimisation, and a
+test reads it back for the key.
+
+Apart from a reveal, a set leaves its slot only as one record of all its keys, encrypted with
+AES-256-GCM-SIV under a key derived from the primary key of the set that wraps it, bound to a
+context the caller names. Only a key for wrapping wraps and unwraps.
+
+Before every wrap the cipher encrypts a known input of the shape of a record and must give the answer
+an independent implementation gives, or nothing is written.
+
+A record is unwrapped into a slot only after its tag, its layout and the identifier of the key that
+wraps it are checked; every key of the parent set is tried, also after one has opened the record.
+
+Every failure of an unwrap is the same error, except a record wrapped under a disabled key of the
+parent, which is reported as such and loads nothing.
+
+After each key derivation, whether it succeeded or not, the stack below the caller is wiped: 8 KiB,
+or 64 KiB in a build without optimisation. Tests read the memory of their own process back, with and
+without optimisation and with the hardware and the software SHA-256, and check that the wipe reaches
+that depth.
+
+They also check that the derivation uses less than half of it and more than a sixteenth. They find
+no 16-byte piece of the key, the extracted key, the HMAC key blocks, the SHA-256 states, inner hashes
+and message schedules, or the output beyond the identifier, in the byte orders and arrangements the
+two SHA-256 paths use.
+
+After a wrap and an unwrap the stack below the caller is wiped as well: 24 KiB, or 64 KiB without
+optimisation, at least twice what the cipher uses at every level of optimisation by the same
+measurement.
+
+Tests read the stack back after a wrap, an unwrap and an unwrap whose record fails its tag, with sets
+of three keys on both sides. They look for pieces of every key and, for each key of the parent that
+is tried, of the derived cipher key and the message keys.
+
+They also look for the AES round keys of the derived key and of the message encryption key as laid
+out by the instructions, the keystream and what the record decrypts to.
+
+The wipe on release and on creating the slots, and the refusal of a released or foreign handle, are
+proven for two slots; the statements and their limits are in [proofs.md](proofs.md).
 
 After a derivation from a password the stack below the caller is wiped: 32 KiB, or 192 KiB without
 optimisation, twice what it uses or more. Tests read it back and find no 16-byte piece of the
@@ -139,6 +159,10 @@ in two places, no set is wrapped under one of its own keys. Longer cycles, such 
 under another that is wrapped under the first, and a key whose bytes begin with the bytes of the key
 it is wrapped under, are not detected. Two sets of slots alive at once may hold the same key; the
 one-place rule holds within each.
+
+The copy a reveal writes, and what the engine it goes to keeps, are the caller's to wipe; a key
+revealed before a record of its set is stored is lost with the slots. The wipe after a reveal relies
+on the reveal staying out of its caller's frame, and the call needs at least the stack it wipes.
 
 A derivation from a password does not reach copies of the password made before the call, such as an
 immutable string, or working memory the system swaps out. Its wipe reaches 32 KiB, or 192 KiB

@@ -50,6 +50,15 @@ pub(crate) enum Branch {
     FromWords,
 }
 
+/// The purpose each branch is derived for.
+#[cfg(test)]
+pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
+    match branch {
+        Branch::KeyId => None,
+        Branch::WrapKey | Branch::FromWords => Some(Purpose::Wrap),
+    }
+}
+
 /// The derivation could not run: the output asked for is longer than HKDF-SHA-256 gives, 255
 /// blocks of 32 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,38 +115,33 @@ impl Drop for KeyId {
     }
 }
 
-/// Derives the identifier of `key`, which serves `purpose`, straight into `id`.
-pub(crate) fn derive_key_id(
-    key: &Key,
-    purpose: Purpose,
-    id: &mut KeyId,
-) -> Result<(), DerivationFailed> {
-    derive(key, SALT, purpose, Branch::KeyId, &mut id.0)
+/// Derives the identifier of `key` straight into `id`. The purpose is not part of it: the same
+/// bytes have one identifier whatever they serve.
+pub(crate) fn derive_key_id(key: &Key, id: &mut KeyId) -> Result<(), DerivationFailed> {
+    derive(key, SALT, None, Branch::KeyId, &mut id.0)
 }
 
-/// Derives the key that encrypts the records `key`, which serves `purpose`, wraps in the epoch whose
-/// key is `epoch`.
+/// Derives the key that encrypts the records the wrapping key `key` wraps in the epoch whose key is
+/// `epoch`.
 pub(crate) fn derive_wrap_key(
     key: &Key,
     epoch: &Key,
-    purpose: Purpose,
     out: &mut [u8; CIPHER_KEY_LEN],
 ) -> Result<(), DerivationFailed> {
     let salt = epoch.material().ok_or(DerivationFailed)?;
-    derive(key, salt, purpose, Branch::WrapKey, out)
+    derive(key, salt, Some(Purpose::Wrap), Branch::WrapKey, out)
 }
 
-/// Fills `out` with the key for `purpose` that the bytes twelve words stand for, `entropy`, derive:
+/// Fills `out` with the wrapping key that the bytes twelve words stand for, `entropy`, derive:
 /// HKDF-Extract with the salt of identifiers, then HKDF-Expand with a label of its own. Then the
 /// stack the derivation used is wiped, whether it succeeded or not.
 pub(crate) fn derive_from_words(
     entropy: &[u8; WORDS_ENTROPY_LEN],
-    purpose: Purpose,
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
     #[cfg(test)]
     timing::note();
-    let derived = words_on_stack(entropy, purpose, out);
+    let derived = words_on_stack(entropy, out);
     wipe_stack();
     derived
 }
@@ -146,11 +150,10 @@ pub(crate) fn derive_from_words(
 #[inline(never)]
 fn words_on_stack(
     entropy: &[u8; WORDS_ENTROPY_LEN],
-    purpose: Purpose,
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
     let length = u8::try_from(WORDS_ENTROPY_LEN).map_err(|_| DerivationFailed)?;
-    let (label, used) = label(purpose, length, Branch::FromWords, out.len())?;
+    let (label, used) = label(Some(Purpose::Wrap), length, Branch::FromWords, out.len())?;
     let info = label.get(..used).ok_or(DerivationFailed)?;
     // The model of HKDF fills a 32-byte output from the first 32 bytes of the key.
     #[cfg(kani)]
@@ -160,13 +163,13 @@ fn words_on_stack(
     hkdf(SALT, entropy, info, out)
 }
 
-/// Fills `out` with the value of `branch` derived from `key`, which serves `purpose`. The key goes
-/// through HKDF-Extract with `salt`, and HKDF-Expand takes the label. Then the stack the derivation
-/// used is wiped, whether it succeeded or not.
+/// Fills `out` with the value of `branch` derived from `key` for `purpose`, or for none. The key
+/// goes through HKDF-Extract with `salt`, and HKDF-Expand takes the label. Then the stack the
+/// derivation used is wiped, whether it succeeded or not.
 pub(crate) fn derive(
     key: &Key,
     salt: &[u8],
-    purpose: Purpose,
+    purpose: Option<Purpose>,
     branch: Branch,
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
@@ -219,7 +222,7 @@ pub(crate) fn wipe_cipher_stack() {
 fn derive_on_stack(
     key: &Key,
     salt: &[u8],
-    purpose: Purpose,
+    purpose: Option<Purpose>,
     branch: Branch,
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
@@ -253,7 +256,7 @@ pub(crate) mod stack {
     use hkdf::Hkdf;
     use sha2::{Digest, Sha256, block_api::compress256};
 
-    use super::{Branch, SALT, STACK_WIPE, derive, derive_on_stack, label};
+    use super::{Branch, SALT, STACK_WIPE, derive, derive_on_stack, label, purpose_of};
     use crate::epoch::Epoch;
     use crate::key::{
         Key, KeyLength,
@@ -456,7 +459,7 @@ pub(crate) mod stack {
     pub(crate) fn secrets_of(key: &[u8], salt: &[u8], branch: Branch) -> Vec<Vec<u8>> {
         let out_len = if branch == Branch::KeyId { 16 } else { 32 };
         let length = u8::try_from(key.len()).unwrap();
-        let (label, used) = label(Purpose::Wrap, length, branch, out_len).unwrap();
+        let (label, used) = label(purpose_of(branch), length, branch, out_len).unwrap();
         let info = &label[..used];
         let (prk, expander) = Hkdf::<Sha256>::extract(Some(salt), key);
         let mut output = [0; 32];
@@ -540,7 +543,7 @@ pub(crate) mod stack {
         let key = loaded_key();
         let range = below_pad(false, || {
             let mut id = [0; 16];
-            derive_on_stack(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
+            derive_on_stack(&key, SALT, None, Branch::KeyId, &mut id).unwrap();
             black_box(&id);
         });
         assert!(residue(range, &pieces) > 0);
@@ -551,7 +554,7 @@ pub(crate) mod stack {
         let key = loaded_key();
         assert_clean(&pieces(&key_bytes(), KeyLength::Bytes64), || {
             let mut id = [0; 16];
-            derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
+            derive(&key, SALT, None, Branch::KeyId, &mut id).unwrap();
             black_box(&id);
         });
     }
@@ -563,13 +566,13 @@ pub(crate) mod stack {
         let key = loaded_key();
         let unwiped = below_pad(false, || {
             let mut out = [0; 8161];
-            assert!(derive_on_stack(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut out).is_err());
+            assert!(derive_on_stack(&key, SALT, None, Branch::KeyId, &mut out).is_err());
             black_box(&out);
         });
         assert!(residue(unwiped, &pieces) > 0);
         assert_clean(&pieces, || {
             let mut out = [0; 8161];
-            assert!(derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut out).is_err());
+            assert!(derive(&key, SALT, None, Branch::KeyId, &mut out).is_err());
             black_box(&out);
         });
     }
@@ -642,7 +645,7 @@ pub(crate) mod stack {
         let key = loaded_key();
         let wiped = depth_changed(|| {
             let mut id = [0; 16];
-            derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
+            derive(&key, SALT, None, Branch::KeyId, &mut id).unwrap();
             black_box(&id);
         });
         assert!(wiped >= STACK_WIPE, "{wiped} bytes wiped");
@@ -654,7 +657,7 @@ pub(crate) mod stack {
         let key = loaded_key();
         let used = depth_changed(|| {
             let mut id = [0; 16];
-            derive_on_stack(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
+            derive_on_stack(&key, SALT, None, Branch::KeyId, &mut id).unwrap();
             black_box(&id);
         });
         std::println!("a derivation uses {used} bytes of stack");
@@ -799,9 +802,10 @@ pub(crate) mod model {
 
 /// The label of one derivation from `length` bytes, and how many of its bytes are used. Every
 /// field but the name has a fixed width, and the name, which comes last, is preceded by its length,
-/// so two different derivations never share a label.
+/// so two different derivations never share a label. A derivation for no purpose has zero there,
+/// which no purpose is.
 fn label(
-    purpose: Purpose,
+    purpose: Option<Purpose>,
     length: u8,
     branch: Branch,
     out_len: usize,
@@ -821,7 +825,10 @@ fn label(
             p6,
             p7,
             VERSION,
-            purpose as u8,
+            match purpose {
+                Some(purpose) => purpose as u8,
+                None => 0,
+            },
             length,
             low,
             high,
@@ -864,7 +871,7 @@ mod tests {
 
     use super::{
         Branch, DerivationFailed, FROM_WORDS, KEY_ID, KeyId, SALT, WRAP_KEY, derive,
-        derive_from_words, derive_key_id, label,
+        derive_from_words, derive_key_id, label, purpose_of,
     };
     use crate::key::{Key, KeyLength};
     use crate::record::Purpose;
@@ -918,19 +925,25 @@ mod tests {
 
     #[test]
     fn the_label_is_laid_out_as_documented() {
-        let (bytes, used) = label(Purpose::Wrap, 32, Branch::KeyId, 16).unwrap();
+        let (bytes, used) = label(None, 32, Branch::KeyId, 16).unwrap();
         let mut expected = b"lethewis".to_vec();
-        expected.extend_from_slice(&[1, 1, 32, 16, 0, 6]);
+        expected.extend_from_slice(&[1, 0, 32, 16, 0, 6]);
         expected.extend_from_slice(b"key id");
         assert_eq!(&bytes[..used], &expected[..]);
 
-        let (bytes, used) = label(Purpose::Wrap, 64, Branch::WrapKey, 32).unwrap();
+        let (bytes, used) = label(Some(Purpose::Wrap), 64, Branch::WrapKey, 32).unwrap();
         let mut expected = b"lethewis".to_vec();
         expected.extend_from_slice(&[1, 1, 64, 32, 0, 8]);
         expected.extend_from_slice(b"wrap key");
         assert_eq!(&bytes[..used], &expected[..]);
 
-        let (bytes, used) = label(Purpose::Wrap, 16, Branch::FromWords, 32).unwrap();
+        let (bytes, used) = label(Some(Purpose::ExternalData), 32, Branch::WrapKey, 32).unwrap();
+        let mut expected = b"lethewis".to_vec();
+        expected.extend_from_slice(&[1, 2, 32, 32, 0, 8]);
+        expected.extend_from_slice(b"wrap key");
+        assert_eq!(&bytes[..used], &expected[..]);
+
+        let (bytes, used) = label(Some(Purpose::Wrap), 16, Branch::FromWords, 32).unwrap();
         let mut expected = b"lethewis".to_vec();
         expected.extend_from_slice(&[1, 1, 16, 32, 0, 10]);
         expected.extend_from_slice(b"from words");
@@ -955,12 +968,12 @@ mod tests {
         for (length, length_byte) in [(KeyLength::Bytes32, 32_u8), (KeyLength::Bytes64, 64)] {
             let key = counted_key(length);
             let mut ours = [0; 16];
-            derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut ours).unwrap();
+            derive(&key, SALT, None, Branch::KeyId, &mut ours).unwrap();
 
             let ikm: [u8; 64] = core::array::from_fn(|i| u8::try_from(i).unwrap());
             let ikm = &ikm[..usize::from(length_byte)];
             let mut info = b"lethewis".to_vec();
-            info.extend_from_slice(&[1, 1, length_byte, 16, 0, 6]);
+            info.extend_from_slice(&[1, 0, length_byte, 16, 0, 6]);
             info.extend_from_slice(b"key id");
             let mut direct = [0; 16];
             Hkdf::<Sha256>::new(Some(b"lethewis derivation salt v1"), ikm)
@@ -976,7 +989,7 @@ mod tests {
     fn a_derivation_from_words_is_hkdf_with_the_salt_and_its_label() {
         let entropy: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).unwrap());
         let mut ours = [0; 32];
-        derive_from_words(&entropy, Purpose::Wrap, &mut ours).unwrap();
+        derive_from_words(&entropy, &mut ours).unwrap();
         let mut info = b"lethewis".to_vec();
         info.extend_from_slice(&[1, 1, 16, 32, 0, 10]);
         info.extend_from_slice(b"from words");
@@ -995,7 +1008,7 @@ mod tests {
             (
                 KeyLength::Bytes32,
                 Branch::KeyId,
-                "588cab681d064e3003f3d416fb3bdaeb",
+                "68bb1b8348618f0510f27a95ebd2376e",
             ),
             (
                 KeyLength::Bytes32,
@@ -1005,7 +1018,7 @@ mod tests {
             (
                 KeyLength::Bytes64,
                 Branch::KeyId,
-                "83d471771a447746682fcf57c3e7b7e2",
+                "f0bd9ee5de83598fb6cff4f1989a7823",
             ),
             (
                 KeyLength::Bytes64,
@@ -1016,7 +1029,7 @@ mod tests {
         for (length, branch, expected) in cases {
             let mut out = [0; 32];
             let out = &mut out[..expected.len().checked_div(2).unwrap()];
-            derive(&counted_key(length), SALT, Purpose::Wrap, branch, out).unwrap();
+            derive(&counted_key(length), SALT, purpose_of(branch), branch, out).unwrap();
             assert_eq!(hex(out), expected, "{length:?} {branch:?}");
         }
     }
@@ -1028,9 +1041,9 @@ mod tests {
         let mut id = [0; 32];
         let mut wrap = [0; 32];
         let mut short = [0; 16];
-        derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut id).unwrap();
-        derive(&key, SALT, Purpose::Wrap, Branch::WrapKey, &mut wrap).unwrap();
-        derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut short).unwrap();
+        derive(&key, SALT, None, Branch::KeyId, &mut id).unwrap();
+        derive(&key, SALT, Some(Purpose::Wrap), Branch::WrapKey, &mut wrap).unwrap();
+        derive(&key, SALT, None, Branch::KeyId, &mut short).unwrap();
         assert_ne!(id, wrap);
         assert_ne!(id[..16], short);
     }
@@ -1048,8 +1061,8 @@ mod tests {
         long.load64(&mut padded);
         let mut from_short = [0; 16];
         let mut from_long = [0; 16];
-        derive(&short, SALT, Purpose::Wrap, Branch::KeyId, &mut from_short).unwrap();
-        derive(&long, SALT, Purpose::Wrap, Branch::KeyId, &mut from_long).unwrap();
+        derive(&short, SALT, None, Branch::KeyId, &mut from_short).unwrap();
+        derive(&long, SALT, None, Branch::KeyId, &mut from_long).unwrap();
         assert_ne!(from_short, from_long);
     }
 
@@ -1057,9 +1070,9 @@ mod tests {
     fn take_moves_the_identifier_and_wipes_the_source() {
         let key = counted_key(KeyLength::Bytes64);
         let mut expected = KeyId::empty();
-        derive_key_id(&key, Purpose::Wrap, &mut expected).unwrap();
+        derive_key_id(&key, &mut expected).unwrap();
         let mut source = KeyId::empty();
-        derive_key_id(&key, Purpose::Wrap, &mut source).unwrap();
+        derive_key_id(&key, &mut source).unwrap();
         let mut target = KeyId::empty();
         target.take(&mut source);
         assert_eq!(target, expected);
@@ -1070,7 +1083,7 @@ mod tests {
     #[test]
     fn every_branch_has_a_label() {
         for branch in [Branch::KeyId, Branch::WrapKey, Branch::FromWords] {
-            let (_, used) = label(Purpose::Wrap, 64, branch, 32).unwrap();
+            let (_, used) = label(purpose_of(branch), 64, branch, 32).unwrap();
             let name = match branch {
                 Branch::KeyId => KEY_ID.len(),
                 Branch::WrapKey => WRAP_KEY.len(),
@@ -1082,17 +1095,17 @@ mod tests {
 
     #[test]
     fn a_label_states_any_output_length_of_two_bytes() {
-        assert!(label(Purpose::Wrap, 32, Branch::KeyId, 65_535).is_ok());
-        assert!(label(Purpose::Wrap, 32, Branch::KeyId, 65_536).is_err());
+        assert!(label(None, 32, Branch::KeyId, 65_535).is_ok());
+        assert!(label(None, 32, Branch::KeyId, 65_536).is_err());
     }
 
     #[test]
     fn an_output_longer_than_hkdf_gives_is_refused() {
         let key = counted_key(KeyLength::Bytes32);
-        assert!(derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut [0; 8160]).is_ok());
+        assert!(derive(&key, SALT, None, Branch::KeyId, &mut [0; 8160]).is_ok());
         let mut out = [9; 8161];
         assert_eq!(
-            derive(&key, SALT, Purpose::Wrap, Branch::KeyId, &mut out),
+            derive(&key, SALT, None, Branch::KeyId, &mut out),
             Err(DerivationFailed)
         );
         assert!(out.iter().all(|&byte| byte == 9));
@@ -1118,46 +1131,42 @@ pub(crate) mod proofs {
     use crate::record::{ID_LEN, Purpose, length_to_byte};
 
     /// The identifier the model of HKDF gives for the first `length` bytes of `key`, worked out
-    /// from the label alone, without a `Key` and without `derive`.
-    pub(crate) fn expected_key_id(
-        key: &[u8; 64],
-        length: KeyLength,
-        purpose: Purpose,
-    ) -> [u8; ID_LEN] {
+    /// from the label alone, without a `Key` and without `derive`: the same for every purpose.
+    pub(crate) fn expected_key_id(key: &[u8; 64], length: KeyLength) -> [u8; ID_LEN] {
         let mut id = [0; ID_LEN];
-        let _ =
-            label(purpose, length_to_byte(length), Branch::KeyId, ID_LEN).map(|(label, used)| {
-                fold(SALT, &key[..length.bytes()], &label[..used], &mut id);
-            });
+        let _ = label(None, length_to_byte(length), Branch::KeyId, ID_LEN).map(|(label, used)| {
+            fold(SALT, &key[..length.bytes()], &label[..used], &mut id);
+        });
         id
     }
 
-    /// The key the model of HKDF gives a record's cipher from the first `length` bytes of `key` in
-    /// the epoch whose key is `epoch`, worked out in the same way.
+    /// The key the model of HKDF gives a record's cipher from the first `length` bytes of the
+    /// wrapping key `key` in the epoch whose key is `epoch`, worked out in the same way.
     pub(crate) fn expected_wrap_key(
         key: &[u8; 64],
         length: KeyLength,
         epoch: &[u8; 32],
-        purpose: Purpose,
     ) -> [u8; CIPHER_KEY_LEN] {
         let mut out = [0; CIPHER_KEY_LEN];
         let length_byte = length_to_byte(length);
-        let _ =
-            label(purpose, length_byte, Branch::WrapKey, CIPHER_KEY_LEN).map(|(label, used)| {
-                fold(epoch, &key[..length.bytes()], &label[..used], &mut out);
-            });
+        let _ = label(
+            Some(Purpose::Wrap),
+            length_byte,
+            Branch::WrapKey,
+            CIPHER_KEY_LEN,
+        )
+        .map(|(label, used)| {
+            fold(epoch, &key[..length.bytes()], &label[..used], &mut out);
+        });
         out
     }
 
-    /// The key the model of HKDF gives for `purpose` from the bytes twelve words stand for, worked
-    /// out in the same way.
-    pub(crate) fn expected_words_key(
-        bytes: &[u8; WORDS_ENTROPY_LEN],
-        purpose: Purpose,
-    ) -> [u8; 32] {
+    /// The wrapping key the model of HKDF gives from the bytes twelve words stand for, worked out
+    /// in the same way.
+    pub(crate) fn expected_words_key(bytes: &[u8; WORDS_ENTROPY_LEN]) -> [u8; 32] {
         let mut out = [0; 32];
         let length = WORDS_ENTROPY_LEN as u8;
-        let _ = label(purpose, length, Branch::FromWords, 32).map(|(label, used)| {
+        let _ = label(Some(Purpose::Wrap), length, Branch::FromWords, 32).map(|(label, used)| {
             fold(SALT, &twice(bytes), &label[..used], &mut out);
         });
         out
@@ -1171,28 +1180,45 @@ pub(crate) mod proofs {
         }
     }
 
+    /// Either purpose, or none.
+    fn any_purpose() -> Option<Purpose> {
+        match kani::any::<u8>() {
+            0 => None,
+            1 => Some(Purpose::Wrap),
+            _ => Some(Purpose::ExternalData),
+        }
+    }
+
     /// Two derivations that differ in anything the label states never share a label.
     #[kani::proof]
     #[kani::unwind(32)]
     fn different_derivations_have_different_labels() {
-        let (length_a, branch_a, out_a): (u8, Branch, u16) =
-            (kani::any(), any_branch(), kani::any());
-        let (length_b, branch_b, out_b): (u8, Branch, u16) =
-            (kani::any(), any_branch(), kani::any());
-        let a = label(Purpose::Wrap, length_a, branch_a, usize::from(out_a));
-        let b = label(Purpose::Wrap, length_b, branch_b, usize::from(out_b));
+        let (purpose_a, length_a, branch_a, out_a): (Option<Purpose>, u8, Branch, u16) =
+            (any_purpose(), kani::any(), any_branch(), kani::any());
+        let (purpose_b, length_b, branch_b, out_b): (Option<Purpose>, u8, Branch, u16) =
+            (any_purpose(), kani::any(), any_branch(), kani::any());
+        let a = label(purpose_a, length_a, branch_a, usize::from(out_a));
+        let b = label(purpose_b, length_b, branch_b, usize::from(out_b));
         kani::assert(
             a.is_ok() && b.is_ok(),
             "a label of an output length that fits in two bytes is always built",
         );
         if let (Ok((bytes_a, used_a)), Ok((bytes_b, used_b))) = (a, b)
-            && (length_a, branch_a, out_a) != (length_b, branch_b, out_b)
+            && (purpose_a, length_a, branch_a, out_a) != (purpose_b, length_b, branch_b, out_b)
         {
             kani::assert(
                 used_a != used_b || bytes_a[..used_a] != bytes_b[..used_b],
                 "different derivations have different labels",
             );
         }
+        kani::cover!(
+            purpose_a != purpose_b && purpose_a.is_some() && purpose_b.is_some(),
+            "two purposes"
+        );
+        kani::cover!(
+            purpose_a.is_none() && purpose_b.is_some() && branch_a == branch_b,
+            "a purpose and none"
+        );
         kani::cover!(branch_a != branch_b, "two branches");
         kani::cover!(
             length_a != length_b && branch_a == branch_b,
