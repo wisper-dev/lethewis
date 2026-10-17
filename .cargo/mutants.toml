@@ -6,6 +6,7 @@ all_features = true
 # A denied lint would turn a mutant into a build failure, and a mutant that does not build is not
 # counted as missed.
 cap_lints = true
+profile = "mutants"
 
 # A wipe on drop can be observed only through the memory of a value already dropped, which takes
 # unsafe code, and unsafe code is forbidden here. The drops call `Key::wipe` and `KeyId::wipe`,

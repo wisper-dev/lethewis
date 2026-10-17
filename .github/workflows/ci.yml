@@ -531,13 +531,21 @@ jobs:
           jq -e '.caught > 0' mutants.out/outcomes.json >/dev/null ||
             { echo "::error::no mutant was caught, so nothing was tested"; exit 1; }
 
-  mutants:
-    name: Every mutant is caught
+  mutant-parts:
+    name: Mutants, part ${{ matrix.part }} of ${{ strategy.job-total }}
     needs: lockfile
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
     permissions:
       contents: read
+    env:
+      # Every mutant rebuilds the core, and most of it is unchanged.
+      CARGO_INCREMENTAL: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -550,14 +558,85 @@ jobs:
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked --version 27.0.0
 
-      - name: Mutation testing
+      - name: The mutants of this part
+        env:
+          PART: ${{ strategy.job-index }}
+          PARTS: ${{ strategy.job-total }}
         run: |
-          cargo mutants --workspace
-          # cargo-mutants succeeds when it finds no mutant, or when no mutant builds.
-          if ! jq -e '.caught > 0' mutants.out/outcomes.json > /dev/null; then
-            echo "::error::no mutant was caught, so nothing was tested"
+          echo "$PARTS" >parts
+          cargo mutants --workspace --list --json >listed.json
+          cargo mutants --workspace --shard "$PART/$PARTS"
+          # A mutant whose build fails for any reason counts as unviable and goes untested: only a
+          # compiler that reported errors and exited with 1 marks a mutant that does not build.
+          crashed='internal compiler error|unexpectedly panicked|unexpectedly overflowed its stack|/rust(c|doc) .*\(signal:'
+          if grep -rlE "$crashed" mutants.out/log/; then
+            echo "::error::the compiler failed on a mutant"
             exit 1
           fi
+          jq -r '.outcomes[] | select(.summary == "Unviable") | .log_path' mutants.out/outcomes.json |
+            while read -r log; do
+              ended=$(grep "didn't exit successfully: " "mutants.out/$log" | grep -o '([^()]*)$' |
+                sort -u || true)
+              [ "$ended" = "(exit status: 1)" ] ||
+                { echo "::error::$log: the build ended with ${ended:-no error}"; exit 1; }
+            done
+
+      - name: Keep the results
+        # Also after a missed mutant, whose results explain it.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutants-part-${{ matrix.part }}
+          path: |
+            parts
+            listed.json
+            mutants.out/
+          if-no-files-found: error
+          # A job run again replaces its results.
+          overwrite: true
+
+  mutants:
+    name: Every mutant is caught
+    needs: mutant-parts
+    # Runs after a failed or cancelled part too: a required check that is skipped counts as passed.
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Every part succeeded
+        if: needs.mutant-parts.result != 'success'
+        env:
+          RESULT: ${{ needs.mutant-parts.result }}
+        run: |
+          echo "::error::a part of the mutants did not succeed: $RESULT"
+          exit 1
+
+      - name: The results of every part
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mutants-part-*
+          path: parts/
+
+      - name: The parts together tested every mutant, and every mutant is caught
+        # cargo-mutants succeeds when it finds no mutant, or when no mutant builds.
+        run: |
+          shopt -s nullglob
+          parts=$(sort -u parts/*/parts)
+          lists=(parts/*/listed.json)
+          results=(parts/*/mutants.out/outcomes.json)
+          [[ "$parts" =~ ^[0-9]+$ && "${#lists[@]}" = "$parts" && "${#results[@]}" = "$parts" ]] ||
+            { echo "::error::${#results[@]} results of parts: $parts"; exit 1; }
+          jq -se 'map(map(.name) | sort) | unique | length == 1' "${lists[@]}" >/dev/null ||
+            { echo "::error::the parts listed different mutants"; exit 1; }
+          jq -se --slurpfile listed "${lists[0]}" '
+            [.[].outcomes[] | select(.scenario != "Baseline")] as $tested
+            | ($tested | map(.scenario.Mutant.name) | sort) == ($listed[0] | map(.name) | sort)
+              and all($tested[]; .summary == "CaughtMutant" or .summary == "Unviable")
+              and any($tested[]; .summary == "CaughtMutant")' "${results[@]}" >/dev/null ||
+            { echo "::error::the parts did not test each listed mutant once, all caught"; exit 1; }
+          jq -sr '"\(map(.total_mutants) | add) mutants: \(map(.caught) | add) caught, \(map(.unviable) | add) unviable"' "${results[@]}"
 
   proof-parts:
     name: Proofs, part ${{ matrix.part }} of 3
@@ -616,7 +695,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Every part ran to the end
+      - name: Every part succeeded
         if: needs.proof-parts.result != 'success'
         env:
           RESULT: ${{ needs.proof-parts.result }}
