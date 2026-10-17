@@ -85,3 +85,15 @@ strip = "symbols"
 [profile.dev]
 panic = "abort"
 overflow-checks = true
+
+[profile.mutants]
+# Every mutant is a build of its own. The derivation from a password, the slowest test by far, runs
+# optimised; the other dependencies are built as for the tests, whose stack depths depend on them.
+inherits = "test"
+debug = "none"
+
+[profile.mutants.package.argon2]
+opt-level = 3
+
+[profile.mutants.package.blake2]
+opt-level = 3
