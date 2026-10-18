@@ -111,15 +111,12 @@ impl Slot {
         }
     }
 
-    /// The primary key of the set and its identifier.
-    fn primary(&self) -> (&Key, &KeyId) {
-        let [first, second, third] = &self.keys;
-        let [first_id, second_id, third_id] = &self.ids;
-        match self.stages.primary() {
-            0 => (first, first_id),
-            1 => (second, second_id),
-            _ => (third, third_id),
-        }
+    /// The key of a set for wrapping, which holds it alone at the first position, and its
+    /// identifier.
+    fn wrapping_key(&self) -> (&Key, &KeyId) {
+        let [first, ..] = &self.keys;
+        let [first_id, ..] = &self.ids;
+        (first, first_id)
     }
 }
 
@@ -420,11 +417,11 @@ impl<'a> Slots<'a> {
         Ok(())
     }
 
-    /// Wraps the key set that `set` refers to under the primary key of the set that `parent` refers
-    /// to and writes the record into `record`, in this epoch, or in the next while a change to it
-    /// is under way. The record holds every key of the set, its stage and which key is the primary,
-    /// and opens only with that key of the parent and the same `context`, which names the place the
-    /// record is kept, from 1 to 255 bytes. The nonce comes from
+    /// Wraps the key set that `set` refers to under the key of the set that `parent` refers to and
+    /// writes the record into `record`, in this epoch, or in the next while a change to it is under
+    /// way. The record holds every key of the set, its stage and which key is the primary, and
+    /// opens only with that key and the same `context`, which names the place the record is kept,
+    /// from 1 to 255 bytes. The nonce comes from
     /// `entropy`, hedged with the key of the epoch the record is wrapped in.
     ///
     /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
@@ -496,7 +493,7 @@ impl<'a> Slots<'a> {
         } else {
             (*number, &*key)
         };
-        let (parent_key, parent_id) = wrapping.primary();
+        let (parent_key, parent_id) = wrapping.wrapping_key();
         let mut nonce = [0; NONCE_LEN];
         hedged_draw(entropy, epoch_key, drawn, Branch::HedgeNonce, &mut nonce)?;
         let mut cipher_key = [0; CIPHER_KEY_LEN];
@@ -524,9 +521,9 @@ impl<'a> Slots<'a> {
         Ok(())
     }
 
-    /// Unwraps `record` with the set that `parent` refers to and the `context` it was wrapped for,
-    /// into a free slot. Every key of the parent set is tried, whichever opens the record; the set
-    /// comes out with the purpose, keys, stages and primary the record holds.
+    /// Unwraps `record` with the key of the set that `parent` refers to and the `context` it was
+    /// wrapped for, into a free slot. The set comes out with the purpose, keys, stages and primary
+    /// the record holds.
     ///
     /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
@@ -539,12 +536,12 @@ impl<'a> Slots<'a> {
     /// [`Error::StaleHandle`] if `parent` does not refer to a set held here now,
     /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Wrap`],
     /// [`Error::NoFreeSlot`] if no slot is free, [`Error::DerivationFailed`] if a value cannot be
-    /// derived from a key, [`Error::RecordRejected`] if the record does not open with a key of the
-    /// parent, this context and the key of this epoch, names a key other than the one that opens
-    /// it or another epoch, or holds a plaintext this version of the library cannot read,
-    /// [`Error::KeyDisabled`] if only a disabled key of
-    /// the parent opens it, and [`Error::DuplicateKey`] if these slots hold a key of the set already
-    /// or the set holds one key twice. No slot changes then.
+    /// derived from a key, [`Error::RecordRejected`] if the record does not open with the key of
+    /// the parent, this context and the key of this epoch, names a key other than the one that
+    /// opens it or another epoch, holds a set for wrapping other than a set of one that has never
+    /// changed, or holds a plaintext this version of the library cannot read, and
+    /// [`Error::DuplicateKey`] if these slots hold a key of the set already or the set holds one
+    /// key twice. No slot changes then.
     pub fn unwrap(
         &mut self,
         parent: Handle<'a>,
@@ -583,10 +580,8 @@ impl<'a> Slots<'a> {
         admitted
     }
 
-    /// Tries every key of the set in slot `parent` on `record`, without stopping at the first that
-    /// opens it. Keeps in `found` the plaintext of the first key that opens the record and whose
-    /// identifier the plaintext names as the parent's, and refuses it as `KeyDisabled` if that key
-    /// is disabled.
+    /// Opens `record` under the key of the set in slot `parent`, and keeps the plaintext in `found`
+    /// if it names that key's identifier as the parent's.
     fn open_under(
         &self,
         parent: usize,
@@ -595,43 +590,28 @@ impl<'a> Slots<'a> {
         found: &mut [u8; PLAINTEXT_LEN],
         open: &mut impl Open,
     ) -> Result<(), Error> {
-        let set = self.memory.get(parent).ok_or(Error::StaleHandle)?;
-        let (nonce, mut sealed, tag) = split_record(record);
-        // The winner in two plain values: Kani 0.68.0 decodes values packed around `Status`, such as
-        // `Result<Status, Error>`, wrongly.
-        let mut won = false;
-        let mut won_stage = Status::Enabled;
-        let mut failed = false;
-        let mut try_key = |stage: Option<Status>, key: &Key, id: &KeyId| {
-            let Some(stage) = stage else {
-                return;
-            };
-            let mut cipher_key = [0; CIPHER_KEY_LEN];
-            failed |= derive_wrap_key(key, &self.epoch.key, &mut cipher_key).is_err();
-            let mut trial = sealed;
-            let opened = open(&cipher_key, &nonce, aad, &mut trial, &tag).is_ok();
+        let (key, id) = self
+            .memory
+            .get(parent)
+            .ok_or(Error::StaleHandle)?
+            .wrapping_key();
+        let mut cipher_key = [0; CIPHER_KEY_LEN];
+        if derive_wrap_key(key, &self.epoch.key, &mut cipher_key).is_err() {
             wipe(&mut cipher_key);
-            if opened && id.is(keyset::parent_of(&trial)) && !won {
-                *found = trial;
-                won = true;
-                won_stage = stage;
-            }
-            wipe(&mut trial);
-        };
-        let [first, second, third] = &set.keys;
-        let [first_id, second_id, third_id] = &set.ids;
-        try_key(set.stages.stage(0), first, first_id);
-        try_key(set.stages.stage(1), second, second_id);
-        try_key(set.stages.stage(2), third, third_id);
+            return Err(Error::DerivationFailed);
+        }
+        let (nonce, mut sealed, tag) = split_record(record);
+        let opened = open(&cipher_key, &nonce, aad, &mut sealed, &tag).is_ok();
+        wipe(&mut cipher_key);
+        let named = opened && id.is(keyset::parent_of(&sealed));
+        if named {
+            *found = sealed;
+        }
         wipe(&mut sealed);
-        if failed {
-            Err(Error::DerivationFailed)
-        } else if !won {
-            Err(Error::RecordRejected)
-        } else if won_stage == Status::Disabled {
-            Err(Error::KeyDisabled)
-        } else {
+        if named {
             Ok(())
+        } else {
+            Err(Error::RecordRejected)
         }
     }
 
@@ -642,7 +622,9 @@ impl<'a> Slots<'a> {
             return Err(Error::NoFreeSlot);
         }
         let (header, stages, keys) = keyset::parse(plaintext).map_err(|_| Error::RecordRejected)?;
-        if header.epoch != self.epoch.number {
+        if header.epoch != self.epoch.number
+            || (header.purpose == Purpose::Wrap && !stages.is_one())
+        {
             return Err(Error::RecordRejected);
         }
         self.load(header.purpose, stages, |[first, second, third], _| {
@@ -798,6 +780,7 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
     /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
     /// the set has changed in this epoch, [`Error::SetFull`] if every position holds a key,
     /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds,
@@ -807,33 +790,6 @@ impl<'a> Slots<'a> {
     pub fn add32(&mut self, set: Handle<'a>, source: &mut [u8; 32]) -> Result<Position, Error> {
         let at = self.add(set, KeyLength::Bytes32, |key, _| {
             key.copy32(source);
-            Ok(())
-        })?;
-        wipe(source);
-        Ok(at)
-    }
-
-    /// Takes a 64-byte key from `source` into the first empty position of the set that `set` refers
-    /// to, enabled and not the primary, and wipes `source`. Returns the position.
-    ///
-    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole
-    /// addition, are each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises
-    /// this crate but not the hash code it calls has to set that flag.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
-    /// the set has changed in this epoch, [`Error::WrongLength`] if its purpose takes no 64-byte
-    /// key, [`Error::SetFull`] if every position holds a key,
-    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds,
-    /// [`Error::DerivationFailed`] if the identifier of the key cannot be derived, and
-    /// [`Error::DuplicateKey`] if these slots hold the key already. `source` is then left as it
-    /// was, and nothing changes.
-    pub fn add64(&mut self, set: Handle<'a>, source: &mut [u8; 64]) -> Result<Position, Error> {
-        let at = self.add(set, KeyLength::Bytes64, |key, _| {
-            key.copy64(source);
             Ok(())
         })?;
         wipe(source);
@@ -854,6 +810,7 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
     /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
     /// the set has changed in this epoch, [`Error::WrongLength`] if its purpose takes no key of
     /// `length`, [`Error::SetFull`] if every position holds a key,
@@ -882,6 +839,7 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
     /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
     /// the set has changed in this epoch, [`Error::PrimaryKey`] if the key at `at` is the primary
     /// already, [`Error::WrongStage`] if `at` does not hold an enabled key, and
@@ -891,12 +849,13 @@ impl<'a> Slots<'a> {
         self.change(set, at, Stages::promote).map(|_| ())
     }
 
-    /// Disables the enabled key at `at` of the set that `set` refers to: it unwraps nothing until it
+    /// Disables the enabled key at `at` of the set that `set` refers to: it is not revealed until it
     /// is enabled again.
     ///
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
     /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
     /// the set has changed in this epoch, [`Error::PrimaryKey`] if the key at `at` is the primary,
     /// [`Error::WrongStage`] if `at` does not hold an enabled key, and [`Error::SetExhausted`] if
@@ -910,6 +869,7 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
     /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
     /// the set has changed in this epoch, [`Error::PrimaryKey`] if `at` is the primary position,
     /// [`Error::WrongStage`] if `at` does not hold a disabled key, and [`Error::SetExhausted`] if
@@ -926,6 +886,7 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
     /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
     /// the set has changed in this epoch, [`Error::PrimaryKey`] if `at` is the primary position,
     /// [`Error::WrongStage`] if `at` does not hold a disabled key, and [`Error::SetExhausted`] if
@@ -946,6 +907,9 @@ impl<'a> Slots<'a> {
         transition: impl FnOnce(&mut Stages, usize) -> Result<(), Refused>,
     ) -> Result<&mut Slot, Error> {
         let index = self.loaded(set)?;
+        if self.memory.get(index).map(|slot| slot.purpose) == Some(Purpose::Wrap) {
+            return Err(Error::WrongPurpose);
+        }
         if self.epoch.changing {
             return Err(Error::EpochChanging);
         }
@@ -983,6 +947,9 @@ impl<'a> Slots<'a> {
         fill: impl FnOnce(&mut Key, &mut Epoch) -> Result<(), Error>,
     ) -> Result<Position, Error> {
         let index = self.loaded(set)?;
+        if self.memory.get(index).map(|slot| slot.purpose) == Some(Purpose::Wrap) {
+            return Err(Error::WrongPurpose);
+        }
         if self.epoch.changing {
             return Err(Error::EpochChanging);
         }
@@ -1323,7 +1290,7 @@ mod tests {
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let parent = slots.import64(Purpose::Wrap, &mut [7; 64]).unwrap();
         assert_eq!(seen(), Some(true));
-        let key = slots.import32(Purpose::Wrap, &mut [9; 32]).unwrap();
+        let key = slots.import32(Purpose::ExternalData, &mut [9; 32]).unwrap();
         assert_eq!(seen(), Some(true));
         slots
             .generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting)
@@ -1340,11 +1307,8 @@ mod tests {
         slots.add32(set, &mut [3; 32]).unwrap();
         assert_eq!(seen(), Some(true));
         slots.settle();
-        slots.add64(set, &mut [4; 64]).unwrap();
-        assert_eq!(seen(), Some(true));
-        slots.settle();
         slots.release(set).unwrap();
-        let set = slots.import32(Purpose::Wrap, &mut [5; 32]).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut [5; 32]).unwrap();
         let _ = seen();
         slots
             .add_generated(set, KeyLength::Bytes32, &mut Counting)
@@ -1395,7 +1359,6 @@ mod tests {
             ("import64", loads),
             ("generate", loads),
             ("add32", loads),
-            ("add64", loads),
             ("add_generated", loads),
             ("reveal32", loads),
             ("wrap", wraps),
@@ -1416,10 +1379,12 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let set = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
-        let mut long = [5; 64];
-        assert_eq!(slots.add64(set, &mut long), Ok(Position::Second));
-        assert_eq!(long, [0; 64]);
+        let set = slots
+            .import32(Purpose::ExternalData, &mut secret())
+            .unwrap();
+        let mut short = [5; 32];
+        assert_eq!(slots.add32(set, &mut short), Ok(Position::Second));
+        assert_eq!(short, [0; 32]);
         slots.settle();
         let added = slots.add_generated(set, KeyLength::Bytes32, &mut Counting);
         assert_eq!(added, Ok(Position::Third));
@@ -1430,7 +1395,7 @@ mod tests {
             set,
             [
                 Some((Status::Enabled, &secret())),
-                Some((Status::Enabled, &[5; 64])),
+                Some((Status::Enabled, &[5; 32])),
                 Some((Status::Enabled, &generated)),
             ],
             0,
@@ -1447,15 +1412,17 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let set = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
+        let set = slots
+            .import32(Purpose::ExternalData, &mut secret())
+            .unwrap();
         let mut source = Recording::default();
-        let added = slots.add_generated(set, KeyLength::Bytes64, &mut source);
+        let added = slots.add_generated(set, KeyLength::Bytes32, &mut source);
         assert_eq!(added, Ok(Position::Second));
-        assert_eq!((source.calls, source.asked), (1, 64));
+        assert_eq!((source.calls, source.asked), (1, 32));
         assert_ne!(source.at, slots.memory[0].keys[1].bytes().as_ptr().addr());
         assert_eq!(
-            slots.memory[0].keys[1].bytes()[..],
-            hedged(0, b"hedge key", &[3; 64], 64)[..]
+            slots.memory[0].keys[1].bytes()[..32],
+            hedged(0, b"hedge key", &[3; 32], 32)[..]
         );
         let mut full = Recording::default();
         slots.settle();
@@ -1473,17 +1440,18 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let first = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
-        let second = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
-        for (set, bytes) in [(second, [1; 32]), (second, [2; 32]), (first, [1; 32])] {
+        let second = slots.import32(Purpose::ExternalData, &mut [2; 32]).unwrap();
+        for bytes in [[1; 32], [2; 32]] {
             let mut source = bytes;
-            assert_eq!(slots.add32(set, &mut source), Err(Error::DuplicateKey));
+            assert_eq!(slots.add32(second, &mut source), Err(Error::DuplicateKey));
             assert_eq!(source, bytes);
         }
-        assert_holds(
+        assert_holds_for(
             &slots,
             first,
             [Some((Status::Enabled, &[1; 32])), None, None],
             0,
+            Purpose::Wrap,
         );
         assert_holds(
             &slots,
@@ -1498,8 +1466,10 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let set = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
-        let failed = slots.add_generated(set, KeyLength::Bytes64, &mut Failing);
+        let set = slots
+            .import32(Purpose::ExternalData, &mut secret())
+            .unwrap();
+        let failed = slots.add_generated(set, KeyLength::Bytes32, &mut Failing);
         assert_eq!(failed, Err(Error::EntropyFailed));
         assert_holds(
             &slots,
@@ -1515,7 +1485,7 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut [1; 32]).unwrap();
         assert_eq!(slots.promote(set, Second), Err(Error::WrongStage));
         assert_eq!(slots.add32(set, &mut [2; 32]), Ok(Second));
         slots.settle();
@@ -1561,7 +1531,7 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut [1; 32]).unwrap();
         slots.add32(set, &mut [2; 32]).unwrap();
         slots.settle();
         let members = [Some(Status::Enabled), Some(Status::Enabled), None];
@@ -1596,9 +1566,9 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut [1; 32]).unwrap();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = slots.add_generated(set, KeyLength::Bytes64, &mut Panicking);
+            let _ = slots.add_generated(set, KeyLength::Bytes32, &mut Panicking);
         }));
         assert!(outcome.is_err());
         assert_holds(
@@ -1614,7 +1584,7 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut [1; 32]).unwrap();
         slots.release(set).unwrap();
         let mut source = [2; 32];
         assert_eq!(slots.add32(set, &mut source), Err(Error::StaleHandle));
@@ -1632,6 +1602,33 @@ mod tests {
         let added = slots.add_generated(set, KeyLength::Bytes32, &mut Untouched);
         assert_eq!(added, Err(Error::StaleHandle));
         assert_eq!(slots.memory[0].occupancy, Occupancy::Free);
+    }
+
+    /// A set for wrapping holds its one key and never changes: every change of stage and every
+    /// addition is refused before anything else, the source is not asked, and nothing changes.
+    #[test]
+    fn a_wrapping_set_takes_no_changes() {
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        slots.begin_epoch(&mut [5; 32]).unwrap();
+        let before = holdings(&slots);
+        let mut source = [2; 32];
+        assert_eq!(slots.add32(set, &mut source), Err(Error::WrongPurpose));
+        assert_eq!(source, [2; 32]);
+        let added = slots.add_generated(set, KeyLength::Bytes32, &mut Untouched);
+        assert_eq!(added, Err(Error::WrongPurpose));
+        for refused in [
+            slots.promote(set, Position::First),
+            slots.disable(set, Position::Second),
+            slots.enable(set, Position::Second),
+            slots.destroy(set, Position::Second),
+        ] {
+            assert_eq!(refused, Err(Error::WrongPurpose));
+        }
+        assert_eq!(holdings(&slots), before);
+        assert!(!slots.memory[0].changed);
     }
 
     /// A platform that records what it is asked, and switches the root unless told to fail.
@@ -1658,75 +1655,45 @@ mod tests {
     }
 
     /// Saves the change of `set` by a new epoch whose key is all `byte`: wraps `set` under `root`
-    /// into `set_record`, and moves `chat`, a record under `set`, into the new epoch.
+    /// into `record`.
     fn save<'a>(
         slots: &mut Slots<'a>,
         platform: &mut Platform,
         (root, set): (Handle<'a>, Handle<'a>),
-        set_record: &mut [u8; RECORD_LEN],
-        chat: &mut [u8; RECORD_LEN],
+        record: &mut [u8; RECORD_LEN],
         byte: u8,
     ) {
         slots.begin_epoch(&mut [byte; 32]).unwrap();
         slots
-            .wrap(set, root, b"set", &mut Counting, set_record)
+            .wrap(set, root, b"set", &mut Counting, record)
             .unwrap();
-        let child = slots.unwrap(set, b"chat", chat).unwrap();
-        slots
-            .wrap(child, set, b"chat", &mut Counting, chat)
-            .unwrap();
-        slots.release(child).unwrap();
         assert_eq!(slots.commit_epoch(platform), Ok(Erasure::Guaranteed));
     }
 
-    /// A key goes from added to destroyed, each change saved by a new epoch with the record under
-    /// its set moved along. The copy of the set that holds the destroyed key does not reach the
-    /// last epoch, and no copy of an epoch past opens.
+    /// A key goes from added to destroyed, each change saved by a new epoch. The copy of the set
+    /// that holds the destroyed key does not reach the last epoch, and no copy of an epoch past
+    /// opens.
     #[test]
     fn keys_rotate_from_added_to_destroyed() {
         use Position::{First, Second};
-        let mut memory = [const { Slot::empty() }; 4];
+        let mut memory = [const { Slot::empty() }; 3];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let mut platform = Platform::default();
         let root = slots.import64(Purpose::Wrap, &mut [9; 64]).unwrap();
-        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
-        let child = slots.import32(Purpose::Wrap, &mut [5; 32]).unwrap();
-        let mut chat = [0; RECORD_LEN];
+        let set = slots.import32(Purpose::ExternalData, &mut [1; 32]).unwrap();
+        let mut record = [0; RECORD_LEN];
         slots
-            .wrap(child, set, b"chat", &mut Counting, &mut chat)
+            .wrap(set, root, b"set", &mut Counting, &mut record)
             .unwrap();
-        slots.release(child).unwrap();
-        let first_chat = chat;
-        let mut set_record = [0; RECORD_LEN];
+        let first = record;
         slots.add32(set, &mut [2; 32]).unwrap();
-        save(
-            &mut slots,
-            &mut platform,
-            (root, set),
-            &mut set_record,
-            &mut chat,
-            2,
-        );
+        save(&mut slots, &mut platform, (root, set), &mut record, 2);
         slots.promote(set, Second).unwrap();
-        save(
-            &mut slots,
-            &mut platform,
-            (root, set),
-            &mut set_record,
-            &mut chat,
-            3,
-        );
+        save(&mut slots, &mut platform, (root, set), &mut record, 3);
         slots.disable(set, First).unwrap();
-        save(
-            &mut slots,
-            &mut platform,
-            (root, set),
-            &mut set_record,
-            &mut chat,
-            4,
-        );
-        let with_disabled = set_record;
+        save(&mut slots, &mut platform, (root, set), &mut record, 4);
+        let with_disabled = record;
         slots.destroy(set, First).unwrap();
         slots.begin_epoch(&mut [5; 32]).unwrap();
         assert_eq!(
@@ -1734,34 +1701,23 @@ mod tests {
             Err(Error::DuplicateKey)
         );
         slots
-            .wrap(set, root, b"set", &mut Counting, &mut set_record)
+            .wrap(set, root, b"set", &mut Counting, &mut record)
             .unwrap();
-        let child = slots.unwrap(set, b"chat", &chat).unwrap();
-        slots
-            .wrap(child, set, b"chat", &mut Counting, &mut chat)
-            .unwrap();
-        slots.release(child).unwrap();
         assert_eq!(slots.commit_epoch(&mut platform), Ok(Erasure::Guaranteed));
         assert_eq!(platform.switched, [2, 3, 4, 5]);
         assert_eq!(platform.erased, [1, 2, 3, 4]);
         slots.release(set).unwrap();
-        let back = slots.unwrap(root, b"set", &set_record).unwrap();
+        let back = slots.unwrap(root, b"set", &record).unwrap();
         assert_holds(
             &slots,
             back,
             [None, Some((Status::Enabled, &[2; 32])), None],
             1,
         );
-        let child = slots.unwrap(back, b"chat", &chat).unwrap();
-        slots.release(child).unwrap();
-        assert_eq!(
-            slots.unwrap(root, b"set", &with_disabled),
-            Err(Error::RecordRejected)
-        );
-        assert_eq!(
-            slots.unwrap(back, b"chat", &first_chat),
-            Err(Error::RecordRejected)
-        );
+        slots.release(back).unwrap();
+        for old in [first, with_disabled] {
+            assert_eq!(slots.unwrap(root, b"set", &old), Err(Error::RecordRejected));
+        }
     }
 
     /// A set changes once in an epoch, and is neither released nor wrapped in it after the
@@ -1775,7 +1731,7 @@ mod tests {
         let mut platform = Platform::default();
         assert_eq!(slots.commit_epoch(&mut platform), Err(Error::NoEpochChange));
         let root = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
-        let set = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut [2; 32]).unwrap();
         slots.add32(set, &mut [3; 32]).unwrap();
         let mut more = [4; 32];
         assert_eq!(slots.add32(set, &mut more), Err(Error::Unsaved));
@@ -1827,7 +1783,7 @@ mod tests {
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let mut platform = Platform::default();
         let root = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
-        let set = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut [2; 32]).unwrap();
         slots.add32(set, &mut [3; 32]).unwrap();
         slots.begin_epoch(&mut [5; 32]).unwrap();
         let mut abandoned = [0; RECORD_LEN];
@@ -1878,7 +1834,7 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let root = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
-        let set = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut [2; 32]).unwrap();
         slots.add32(set, &mut [3; 32]).unwrap();
         slots.settle();
         slots.disable(set, Position::Second).unwrap();
@@ -1920,7 +1876,7 @@ mod tests {
             let mut epoch_memory = Epoch::empty();
             let mut slots = Slots::new(&mut memory, &mut epoch_memory, epoch, &mut key.clone());
             let parent = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
-            let set = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
+            let set = slots.import32(Purpose::ExternalData, &mut [2; 32]).unwrap();
             let mut record = [0; RECORD_LEN];
             slots
                 .wrap(set, parent, b"set", &mut Counting, &mut record)
@@ -2352,57 +2308,60 @@ mod tests {
     }
 
     /// Records computed by an implementation independent of this library, in epoch `EPOCH` with the
-    /// key `epoch_key()`: under a 32-byte parent, a set of one 64-byte key in "chat 7"; under a
-    /// 64-byte parent, a set of one 32-byte key in "profile"; under the 32-byte parent, in
-    /// "archive", a full set at revision 9: a disabled 64-byte key, an enabled 32-byte key, and the
-    /// primary, an enabled 64-byte key; and under the 32-byte parent, in "chat 9", a set of one
-    /// 32-byte key for external data. They are wrapped in this order in one set of slots, the
-    /// nonce `NONCE` the source gave each hedged as the next draw.
-    const KNOWN_RECORDS: [&str; 4] = [
+    /// key `epoch_key()`, of sets for external data: under a 32-byte parent, a set of one key in
+    /// "chat 7"; under a 64-byte parent, a set of one key in "chat 8"; and under the 32-byte parent,
+    /// in "archive", a full set at revision 9: a disabled key, an enabled key, and the primary, an
+    /// enabled key. They are wrapped in this order in one set of slots, the nonce `NONCE` the
+    /// source gave each hedged as the next draw.
+    const KNOWN_RECORDS: [&str; 3] = [
         concat!(
-            "c7a1550603080bf1aa1c5192b2c14a7179b3e5605c7b0c02d744bf9c4338da1c",
-            "30548bbbdf84ce9527b227f52a4e88bde05cf620e8d387c7a99b0d5bcf7a7bbf",
-            "b188ba652e54feb8bb154aa6f70797b908e419a1f359c93c12522c2d093043a2",
-            "a57f8a1ff63c50f91a28d5f28c858e0c33d22f778ea9aab3a853ae0cbc22739a",
-            "14a4e58f023f6fb5f6e364c20932c489c890eb8df50d698fe5665269bf759f01",
-            "da4485c06f28036765694e3dca5b70b582f500619964851743e44b074f1de1df",
-            "59932ac2775a95a5d2e03951a76ee77a03ff9866b41dc1e1402519f3ea0571b1",
-            "664372052d3ee9d47b317b855bd2618e490a19dd31c68e99fb6ffced11e382dd",
-            "355d498ca0",
+            "c7a1550603080bf1aa1c51924a6d5d642a6be55972bad74c1f1853ffffd3f2b6",
+            "87a3db11f39ee38c96dd1b88f187b7947c74e104117dae2f0839925604a70f42",
+            "136a1504e135d2df44843a0151d54fdc5448bb1d12dbd697955817baf260bfb0",
+            "c65cc712c3cb3dfac9453e5da727d5c867d3c450b1c5ee07670856a7904003de",
+            "85ea07617ceaf7793c998afb52974cc920a9b3f2411b7b206d81c3227c78103a",
+            "06d5e1e4de8ff1531a959d6263b93943ccc49c44b46f0624c9d2dda70ea6a3af",
+            "650b7418a669bdd26bfb4f16be562faa9c758f09086397456e405ca8d3ddf4cd",
+            "5ef8162e01b9a27569c34d7ee96bf6e9af1907bc0393da7fa5ea14d702c0b279",
+            "a7e3eb7be7",
         ),
         concat!(
-            "2d7fafac78ba33a2056ef2aec24c3b6c91aaa1be2c9a42dfb72e1a1ea27a4abd",
-            "0d62d217af2d5976e9e8f565d616c12f5a57bdbc41a863f84094e3ce4faa4bb9",
-            "83a179e95665649907328914ed0d068a0f9c9cf2e3c417ffaad2b9ab888217d2",
-            "93404dccfdb2babf34507a2f4845e7ba6f853d7dc9d0e97b91050c5b8031ec2f",
-            "fd54fbc10fd9c0ad4c2c8dd8d8098b211623b4fba75d39a28b2ff693537759f2",
-            "5e266558bf0ddd0c680cfe2846d1e69632ae96c3f24e094266a96b3720793c36",
-            "0b050d464abc4560d188abf7d4dcb911a06bbde22f9df162b5d364971a64f7a3",
-            "e20d32d93f061ab487d350898725e09f88cb35147d6e13528892c230283d3257",
-            "7393d0fbab",
+            "2d7fafac78ba33a2056ef2ae5455cae3d7fdb82cbbbf51f1222c1472afc6c4de",
+            "ad42046c5440e60d9fa207baec952179ee31580ff66dd9b66838e3f0c7ec9a50",
+            "74d27413582decd1b4d69046ca3207fb4a57ad1be9bedb216246b923ff300d50",
+            "e7ba44bf501e5c4d7c0c05bd69bd2d285ca3ad35bc9f2a63b765c21e250e3cad",
+            "e82f2730f0f24e7dc31803e8bcde5af92a02da96af8cdf785df977ad0cc26383",
+            "2642b27e135801595183c6f3bf4563c6d4fe7371563f6d849bdd4765386a7d25",
+            "7298a8bf60a67610af91c3bd96e3da969c17b2a64270b4902c0ce93916591de8",
+            "df1b8cdfdcca9429c254fd60ead1174a20f86d1a05eb7e18b6707518d210c1c7",
+            "ef827ac01a",
         ),
         concat!(
-            "27bae2fc323c379d396cc79b05186f957f0af4c8783b4042756d536a4cc90b04",
-            "04873bd5ed6a1d6b7c4335ab1e376c5e9d8a94501fd56ab11d4d874cd24e56c6",
-            "33640a7bdd9775ac67e17257003282fcf0524dab4e0c3e57b6fb1e1f20b25a0b",
-            "743556d687edcdec705dbef5bde79dd04a70907a4f44d2eba1481d39736c2552",
-            "5cf914b717791194e3cba5d85ada7ce79f55ec551d7239277c610a532abb1503",
-            "abf42cb438e2ab1f601382464f2408bf85bbc27180c482c976eb690a6a246a41",
-            "5e017f5eb75e5c871f1c3ad7e79f3541d98afac5a79f8ed55e78a86feb7ca0d7",
-            "7d9e296d87063b3822aa3a4a2a5de32a9a99e01a17b756f997eb426348205eb9",
-            "04740df31c",
-        ),
-        concat!(
-            "5afbf61400553277f85274b8cf589a20b2b6c44f60caf44bc2b69991bbb9c902",
-            "1a6ddacba0fe92ed7b293f852da687bf321fe697a3ca282a3a25c4ffad716d08",
-            "86c37776ada8bd246a59a3ee4837a58bf9748120fcc4d1fab9e7880e39aedb2c",
-            "2546fc8e077f95e332571e4e1dea1546a4a62f5d6be0698071c7e77dca8a3c01",
-            "fef375c848fbc36eb1e25ece07970b0ccef12adf089ec95222b74eaab6ef3706",
-            "0e27f6da61d5e68c1ed74bfd5197bfdd25fe98e0272b13146ed3f6a29f13ec47",
-            "3cb9b060c43840609d75f10583eccc3fb01abad65fa3525cb1c3ae92f3895217",
-            "461eb95042e54b5cb839485ff508dbacbbb9344df038b62a5b93f3b71168c84329275caf14",
+            "27bae2fc323c379d396cc79bd5267624a92673d4a5922e04131e647e01cb6ee2",
+            "0e3a9f03774451ccad997c3c206b6735e9f01afa797f67fc5d4cb86f9d9e6828",
+            "a88d2d8ffb0f4615acc84e4dcda93b156d9ac1ebdda06befb7752d19f8491ed8",
+            "56b959f216ee2c192241587ef1e5d675df0cb2b03ae3d0e1a7c7167d0cabff9e",
+            "4eafbe6382f73e213ae345b401f2990b5aba7833a0239f6ad4e35f2bdf985d6a",
+            "213bada052007a23fe7ef1aa4ef849cb214c22f77c22fd72d1d017563f44e6fb",
+            "2e0600e2b44e53cec455f1871378c58af221c96a6bf16f2ed6ce9bb60f344c8b",
+            "647b719d659ec6f538d5afcba724a57f498ef11b0cfd16ca88476a1a95827e9a",
+            "573514f847",
         ),
     ];
+
+    /// A record computed by the same implementation, wrapped after those in the same slots: under the
+    /// 32-byte parent, in "profile", a set of one 64-byte key for wrapping.
+    const KNOWN_WRAPPING: &str = concat!(
+        "5afbf61400553277f85274b80d2bb886c1972601ae8523d131352b204c4f051e",
+        "49bb0bb3872a5a92ffb8bd8d68455cfff207f7fbd12b5895b584c0accc713a80",
+        "eba8bebbf5966906810b9d584d9840fad362995ea9d3806aae494b3aede53ad9",
+        "038ea9a1e241b5c291d07967db94f509e28aac802051aff01d297abce843e088",
+        "6da30b118d30fea5c4fcd80300ef1ef855014ce07d9c3947fbb4ef93a0ed65ad",
+        "99be77c87556250a67b06e0fb341bde35146f5ca890812c82ffee4483b1f2dcc",
+        "3eaa6949ab2dd7c9c273b083154ac52cf81a210abf273af6cd49d5ae2c3fc52f",
+        "c0187471a7275744b6a4ab428c3ca3e5a895aaa42b9e2911c715f9d36b72dea6",
+        "57f3116a96",
+    );
 
     fn key_from(bytes: &[u8]) -> Key {
         let mut key = Key::empty();
@@ -2414,19 +2373,19 @@ mod tests {
     }
 
     type Member<'b> = Option<(Status, &'b [u8])>;
-    /// A parent's bytes, a context, the members of a set, its primary and its purpose.
-    type Case<'b> = (&'b [u8], &'b [u8], [Member<'b>; MEMBERS], usize, Purpose);
+    /// A parent's bytes, a context, the members of a set and its primary.
+    type Case<'b> = (&'b [u8], &'b [u8], [Member<'b>; MEMBERS], usize);
 
     /// Asserts that the set `handle` refers to holds `members` at their positions, each with its
     /// stage and the identifier derived from it, with `primary` as the primary, and nothing at an
-    /// empty position, for wrapping.
+    /// empty position, for external data.
     fn assert_holds(
         slots: &Slots<'_>,
         handle: Handle<'_>,
         members: [Member<'_>; MEMBERS],
         primary: usize,
     ) {
-        assert_holds_for(slots, handle, members, primary, Purpose::Wrap);
+        assert_holds_for(slots, handle, members, primary, Purpose::ExternalData);
     }
 
     /// The same, for `purpose`.
@@ -2461,13 +2420,13 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let short_parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
-        let long_key = slots
-            .import64(Purpose::Wrap, &mut pattern(59, 201))
+        let first = slots
+            .import32(Purpose::ExternalData, &mut pattern(59, 201))
             .unwrap();
         let mut record = [0; RECORD_LEN];
         slots
             .wrap(
-                long_key,
+                first,
                 short_parent,
                 b"chat 7",
                 &mut Fixed(&NONCE),
@@ -2477,21 +2436,22 @@ mod tests {
         assert_eq!(record, hex(KNOWN_RECORDS[0]));
 
         let long_parent = slots.import64(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
-        let short_key = slots
-            .import32(Purpose::Wrap, &mut pattern(59, 201))
+        let second = slots
+            .import32(Purpose::ExternalData, &mut pattern(31, 7))
             .unwrap();
         slots
             .wrap(
-                short_key,
+                second,
                 long_parent,
-                b"profile",
+                b"chat 8",
                 &mut Fixed(&NONCE),
                 &mut record,
             )
             .unwrap();
         assert_eq!(record, hex(KNOWN_RECORDS[1]));
 
-        slots.release(long_key).unwrap();
+        slots.release(first).unwrap();
+        slots.release(second).unwrap();
         let full = slots
             .unwrap(short_parent, b"archive", &hex(KNOWN_RECORDS[2]))
             .unwrap();
@@ -2506,65 +2466,84 @@ mod tests {
             .unwrap();
         assert_eq!(record, hex(KNOWN_RECORDS[2]));
 
-        slots.release(short_key).unwrap();
-        let data = slots
-            .import32(Purpose::ExternalData, &mut pattern(59, 201))
+        let wrapping = slots
+            .import64(Purpose::Wrap, &mut pattern(59, 201))
             .unwrap();
         slots
             .wrap(
-                data,
+                wrapping,
                 short_parent,
-                b"chat 9",
+                b"profile",
                 &mut Fixed(&NONCE),
                 &mut record,
             )
             .unwrap();
-        assert_eq!(record, hex(KNOWN_RECORDS[3]));
+        assert_eq!(record, hex(KNOWN_WRAPPING));
+    }
+
+    /// A set for wrapping comes back from its record as the set of one it was, and wraps.
+    #[test]
+    fn a_set_for_wrapping_comes_back_and_wraps() {
+        let mut memory = [const { Slot::empty() }; 3];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
+        let set = slots
+            .unwrap(parent, b"profile", &hex(KNOWN_WRAPPING))
+            .unwrap();
+        let key = pattern::<64>(59, 201);
+        let only = [Some((Status::Enabled, &key[..])), None, None];
+        assert_holds_for(&slots, set, only, 0, Purpose::Wrap);
+        let data = slots
+            .import32(Purpose::ExternalData, &mut pattern(5, 2))
+            .unwrap();
+        let mut record = [0; RECORD_LEN];
+        slots
+            .wrap(data, set, b"chat", &mut Counting, &mut record)
+            .unwrap();
+        slots.release(data).unwrap();
+        let back = slots.unwrap(set, b"chat", &record).unwrap();
+        let data_key = pattern::<32>(5, 2);
+        assert_holds(
+            &slots,
+            back,
+            [Some((Status::Enabled, &data_key[..])), None, None],
+            0,
+        );
     }
 
     #[test]
     fn an_unwrapped_set_is_the_set_that_was_wrapped() {
         let short_parent = pattern::<32>(97, 13);
         let long_parent = pattern::<64>(97, 13);
-        let long_key = pattern::<64>(59, 201);
-        let short_key = pattern::<32>(59, 201);
+        let first = pattern::<32>(59, 201);
         let middle = pattern::<32>(31, 7);
-        let last = pattern::<64>(83, 111);
-        let cases: [Case<'_>; 4] = [
+        let last = pattern::<32>(83, 111);
+        let cases: [Case<'_>; 3] = [
             (
                 &short_parent,
                 b"chat 7",
-                [Some((Status::Enabled, &long_key)), None, None],
+                [Some((Status::Enabled, &first)), None, None],
                 0,
-                Purpose::Wrap,
             ),
             (
                 &long_parent,
-                b"profile",
-                [Some((Status::Enabled, &short_key)), None, None],
+                b"chat 8",
+                [Some((Status::Enabled, &middle)), None, None],
                 0,
-                Purpose::Wrap,
             ),
             (
                 &short_parent,
                 b"archive",
                 [
-                    Some((Status::Disabled, &long_key)),
+                    Some((Status::Disabled, &first)),
                     Some((Status::Enabled, &middle)),
                     Some((Status::Enabled, &last)),
                 ],
                 2,
-                Purpose::Wrap,
-            ),
-            (
-                &short_parent,
-                b"chat 9",
-                [Some((Status::Enabled, &short_key)), None, None],
-                0,
-                Purpose::ExternalData,
             ),
         ];
-        for ((parent_bytes, context, members, primary, purpose), known) in
+        for ((parent_bytes, context, members, primary), known) in
             cases.into_iter().zip(KNOWN_RECORDS)
         {
             let mut memory = [const { Slot::empty() }; 2];
@@ -2576,7 +2555,7 @@ mod tests {
             }
             .unwrap();
             let set = slots.unwrap(parent, context, &hex(known)).unwrap();
-            assert_holds_for(&slots, set, members, primary, purpose);
+            assert_holds(&slots, set, members, primary);
         }
     }
 
@@ -2588,7 +2567,7 @@ mod tests {
         let mut slots = Slots::new(memory, epoch, EPOCH, &mut epoch_key());
         let parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
         let key = slots
-            .import64(Purpose::Wrap, &mut pattern(59, 201))
+            .import32(Purpose::ExternalData, &mut pattern(59, 201))
             .unwrap();
         let mut record = [0; RECORD_LEN];
         slots
@@ -2652,14 +2631,14 @@ mod tests {
         record
     }
 
-    /// The plaintext of the set `members` with `primary`, naming `named` as its parent, built
-    /// without `wrap`.
+    /// The plaintext of the set `members` for external data with `primary`, naming `named` as its
+    /// parent, built without `wrap`.
     fn set_plaintext(
         members: [Member<'_>; MEMBERS],
         primary: usize,
         named: [u8; 16],
     ) -> [u8; PLAINTEXT_LEN] {
-        set_plaintext_for(members, primary, named, Purpose::Wrap)
+        set_plaintext_for(members, primary, named, Purpose::ExternalData)
     }
 
     /// The same, for `purpose`.
@@ -2691,60 +2670,36 @@ mod tests {
         plaintext
     }
 
-    /// The record of the set `members` with `primary`, sealed under the key at `at` of the set
-    /// `parent` refers to and naming that key, for `context`.
+    /// The record of the set `members` with `primary`, sealed under the key of the set `parent`
+    /// refers to and naming that key, for `context`.
     fn sealed_under(
         slots: &Slots<'_>,
         parent: Handle<'_>,
-        at: usize,
         members: [Member<'_>; MEMBERS],
         primary: usize,
         context: &[u8],
     ) -> [u8; RECORD_LEN] {
         let slot = &slots.memory[parent.index];
-        let plaintext = set_plaintext(members, primary, slot.ids[at].bytes());
-        seal_plaintext(&slot.keys[at], &plaintext, context, &NONCE)
+        let plaintext = set_plaintext(members, primary, slot.ids[0].bytes());
+        seal_plaintext(&slot.keys[0], &plaintext, context, &NONCE)
     }
 
-    /// Loads the set `members` with `primary` by unwrapping a record of it under `root`.
-    fn loaded_set<'a>(
-        slots: &mut Slots<'a>,
-        root: Handle<'a>,
-        members: [Member<'_>; MEMBERS],
-        primary: usize,
-    ) -> Handle<'a> {
-        let record = sealed_under(slots, root, 0, members, primary, b"set");
-        slots.unwrap(root, b"set", &record).unwrap()
-    }
-
-    /// A record under any key of the parent set opens; under a disabled one it is refused as
-    /// `KeyDisabled` and loads nothing; every key of the parent is tried each time, and only its
-    /// keys.
+    /// A record opens with one trial, under the key of its parent; naming that parent but sealed under
+    /// another key, it is refused, and nothing is loaded.
     #[test]
-    fn every_key_of_the_parent_is_tried() {
-        let mut memory = [const { Slot::empty() }; 3];
+    fn a_record_opens_under_the_key_of_its_parent_alone() {
+        let mut memory = [const { Slot::empty() }; 2];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
-        let (first, second, third) = (
-            pattern::<32>(5, 2),
-            pattern::<64>(7, 3),
-            pattern::<32>(11, 4),
-        );
-        let parent = loaded_set(
-            &mut slots,
-            root,
-            [
-                Some((Status::Disabled, &first)),
-                Some((Status::Enabled, &second)),
-                Some((Status::Enabled, &third)),
-            ],
-            2,
-        );
-        let child = pattern::<64>(13, 5);
+        let parent = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
+        let child = pattern::<32>(13, 5);
         let only = [Some((Status::Enabled, &child[..])), None, None];
-        for (at, expected) in [(0, Err(Error::KeyDisabled)), (1, Ok(())), (2, Ok(()))] {
-            let record = sealed_under(&slots, parent, at, only, 0, b"chat 7");
+        let plaintext = set_plaintext(only, 0, slots.memory[parent.index].ids[0].bytes());
+        for (sealer, expected) in [
+            (pattern::<32>(3, 1), Ok(())),
+            (pattern::<32>(3, 2), Err(Error::RecordRejected)),
+        ] {
+            let record = seal_plaintext(&key_from(&sealer), &plaintext, b"chat 7", &NONCE);
             let mut tried = 0;
             let result = slots.unwrap_on_stack(
                 parent,
@@ -2755,59 +2710,53 @@ mod tests {
                     seal::open(key, nonce, aad, buffer, tag)
                 },
             );
-            assert_eq!(tried, 3, "position {at}");
-            assert_eq!(result.map(|_| ()), expected, "position {at}");
+            assert_eq!((tried, result.map(|_| ())), (1, expected));
             if let Ok(handle) = result {
                 assert_holds(&slots, handle, only, 0);
                 slots.release(handle).unwrap();
             }
-            assert_eq!(slots.memory[2].occupancy, Occupancy::Free, "position {at}");
-            assert_eq!(
-                slots.memory[2].keys[0].bytes(),
-                &padded(&[]),
-                "position {at}"
-            );
+            assert_eq!(slots.memory[1].occupancy, Occupancy::Free);
+            assert_eq!(slots.memory[1].keys[0].bytes(), &padded(&[]));
         }
-        let record = sealed_under(&slots, root, 0, only, 0, b"chat 7");
-        let mut tried = 0;
-        let result =
-            slots.unwrap_on_stack(root, b"chat 7", &record, |key, nonce, aad, buffer, tag| {
-                tried += 1;
-                seal::open(key, nonce, aad, buffer, tag)
-            });
-        assert_eq!((tried, result.is_ok()), (1, true));
     }
 
-    /// A set is wrapped under the primary key of its parent wherever the primary sits: the record is
-    /// the one computed independently under that key alone.
+    /// A record of a set for wrapping holds its one key, enabled, as the primary of a set that has
+    /// never changed: a record of more keys, or of a set changed since, is refused although it
+    /// opens.
     #[test]
-    fn a_set_is_wrapped_under_the_primary_of_its_parent() {
-        let primary = pattern::<32>(97, 13);
-        let (other, last) = (pattern::<64>(7, 3), pattern::<32>(11, 4));
-        for at in 0..MEMBERS {
-            let mut memory = [const { Slot::empty() }; 3];
-            let mut epoch_memory = Epoch::empty();
-            let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-            let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
-            let mut others =
-                [(Status::Disabled, &other[..]), (Status::Enabled, &last[..])].into_iter();
-            let members: [Member<'_>; MEMBERS] = core::array::from_fn(|position| {
-                if position == at {
-                    Some((Status::Enabled, &primary[..]))
-                } else {
-                    others.next()
-                }
-            });
-            let parent = loaded_set(&mut slots, root, members, at);
-            let child = slots
-                .import64(Purpose::Wrap, &mut pattern(59, 201))
-                .unwrap();
-            let mut record = [0; RECORD_LEN];
-            slots
-                .wrap(child, parent, b"chat 7", &mut Fixed(&NONCE), &mut record)
-                .unwrap();
-            assert_eq!(record, hex(KNOWN_RECORDS[0]), "primary at {at}");
+    fn a_record_of_a_wrapping_set_holds_one_key() {
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let parent = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
+        let named = slots.memory[parent.index].ids[0].bytes();
+        let (first, second) = (pattern::<32>(5, 2), pattern::<64>(7, 3));
+        let one = [Some((Status::Enabled, &first[..])), None, None];
+        let mut changed = set_plaintext_for(one, 0, named, Purpose::Wrap);
+        changed[27] = 1;
+        let two = [
+            Some((Status::Enabled, &first[..])),
+            Some((Status::Enabled, &second[..])),
+            None,
+        ];
+        let elsewhere = [None, Some((Status::Enabled, &second[..])), None];
+        for plaintext in [
+            set_plaintext_for(two, 0, named, Purpose::Wrap),
+            set_plaintext_for(elsewhere, 1, named, Purpose::Wrap),
+            changed,
+        ] {
+            let record =
+                seal_plaintext(&key_from(&pattern::<32>(3, 1)), &plaintext, b"set", &NONCE);
+            assert_eq!(
+                slots.unwrap(parent, b"set", &record),
+                Err(Error::RecordRejected)
+            );
+            assert_eq!(slots.memory[1].occupancy, Occupancy::Free);
         }
+        let plaintext = set_plaintext_for(one, 0, named, Purpose::Wrap);
+        let record = seal_plaintext(&key_from(&pattern::<32>(3, 1)), &plaintext, b"set", &NONCE);
+        let set = slots.unwrap(parent, b"set", &record).unwrap();
+        assert_holds_for(&slots, set, one, 0, Purpose::Wrap);
     }
 
     /// A key is held in one place only: an import of a key held here, and a set that holds such a
@@ -2826,7 +2775,7 @@ mod tests {
             Err(Error::DuplicateKey)
         );
         assert_eq!(again, held);
-        let other = pattern::<64>(5, 6);
+        let other = pattern::<32>(5, 6);
         for members in [
             [
                 Some((Status::Enabled, &other[..])),
@@ -2839,7 +2788,7 @@ mod tests {
                 Some((Status::Disabled, &other[..])),
             ],
         ] {
-            let record = sealed_under(&slots, root, 0, members, 0, b"chat 7");
+            let record = sealed_under(&slots, root, members, 0, b"chat 7");
             let before = holdings(&slots);
             assert_eq!(
                 slots.unwrap(root, b"chat 7", &record),
@@ -2848,10 +2797,10 @@ mod tests {
             assert_eq!(holdings(&slots), before);
         }
         let mut source = other;
-        let long = slots.import64(Purpose::Wrap, &mut source).unwrap();
-        slots.release(long).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut source).unwrap();
+        slots.release(set).unwrap();
         let mut source = other;
-        assert!(slots.import64(Purpose::Wrap, &mut source).is_ok());
+        assert!(slots.import32(Purpose::ExternalData, &mut source).is_ok());
     }
 
     #[test]
@@ -2889,7 +2838,7 @@ mod tests {
         );
         assert_eq!(record, [0x55; RECORD_LEN]);
         assert_eq!(
-            slots.unwrap(data, b"chat 9", &hex(KNOWN_RECORDS[3])),
+            slots.unwrap(data, b"chat 7", &hex(KNOWN_RECORDS[0])),
             Err(Error::WrongPurpose)
         );
         assert_eq!(holdings(&slots), before);
@@ -2925,8 +2874,6 @@ mod tests {
             .import32(Purpose::ExternalData, &mut pattern(97, 13))
             .unwrap();
         let before = holdings(&slots);
-        assert_eq!(slots.add64(data, &mut long), Err(Error::WrongLength));
-        assert_eq!(long, pattern::<64>(5, 2));
         assert_eq!(
             slots.add_generated(data, KeyLength::Bytes64, &mut source),
             Err(Error::WrongLength)
@@ -2937,8 +2884,7 @@ mod tests {
 
         let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
         let named = slots.memory[root.index].ids[0].bytes();
-        let mut plaintext = set_plaintext([Some((Status::Enabled, &long)), None, None], 0, named);
-        plaintext[1] = Purpose::ExternalData as u8;
+        let plaintext = set_plaintext([Some((Status::Enabled, &long)), None, None], 0, named);
         let record = seal_plaintext(&slots.memory[root.index].keys[0], &plaintext, b"x", &NONCE);
         slots.settle();
         let before = holdings(&slots);
@@ -3067,13 +3013,13 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
-        let (first, third) = (pattern::<64>(5, 2), pattern::<32>(11, 4));
+        let (first, third) = (pattern::<32>(5, 2), pattern::<32>(11, 4));
         let members = [
             Some((Status::Enabled, &first[..])),
             None,
             Some((Status::Disabled, &third[..])),
         ];
-        let record = sealed_under(&slots, root, 0, members, 0, b"chat 7");
+        let record = sealed_under(&slots, root, members, 0, b"chat 7");
         let set = slots.unwrap(root, b"chat 7", &record).unwrap();
         assert_holds(&slots, set, members, 0);
         let mut out = [0; RECORD_LEN];
@@ -3097,7 +3043,9 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
-        let set = slots.import32(Purpose::Wrap, &mut pattern(5, 2)).unwrap();
+        let set = slots
+            .import32(Purpose::ExternalData, &mut pattern(5, 2))
+            .unwrap();
         let next = flipped_epoch_key(0x5a);
         slots.begin_epoch(&mut next.clone()).unwrap();
         let mut record = [0; RECORD_LEN];
@@ -3118,7 +3066,7 @@ mod tests {
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
         let set = slots
-            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .generate(Purpose::ExternalData, KeyLength::Bytes32, &mut Counting)
             .unwrap();
         assert_eq!(slots.epoch.drawn, 1);
         let failed = slots.generate(Purpose::Wrap, KeyLength::Bytes32, &mut Failing);
@@ -3154,7 +3102,7 @@ mod tests {
             .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
             .unwrap();
         let second = slots
-            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .generate(Purpose::ExternalData, KeyLength::Bytes32, &mut Counting)
             .unwrap();
         assert_ne!(
             slots.memory[first.index].keys[0].bytes(),
@@ -3216,7 +3164,7 @@ mod tests {
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
         let key = slots
-            .import64(Purpose::Wrap, &mut pattern(59, 201))
+            .import32(Purpose::ExternalData, &mut pattern(59, 201))
             .unwrap();
         let long = [7; 256];
         let mut out = [0x55; RECORD_LEN];
@@ -3261,7 +3209,7 @@ mod tests {
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
         let mut key = slots
-            .import32(Purpose::Wrap, &mut pattern(59, 201))
+            .import32(Purpose::ExternalData, &mut pattern(59, 201))
             .unwrap();
         for context in [&[9][..], &[9; 255]] {
             let mut record = [0; RECORD_LEN];
@@ -3382,27 +3330,13 @@ mod tests {
         (members, primary)
     }
 
-    /// The parent of a round: a key imported as a set of one, or a set of up to three keys loaded
-    /// under such a key, among other sets and released slots.
+    /// The parent of a round: a key imported as a set of one, among other sets and released slots.
     fn random_parent<'a>(slots: &mut Slots<'a>, random: &mut Random) -> Handle<'a> {
-        let root = match random.key().len() {
+        let parent = match random.key().len() {
             32 => slots.import32(Purpose::Wrap, &mut random.bytes()),
             _ => slots.import64(Purpose::Wrap, &mut random.bytes()),
         }
         .unwrap();
-        let parent = if random.below(2) == 0 {
-            root
-        } else {
-            let (stages, primary) = random_stages(random);
-            let keys: Vec<Vec<u8>> = (0..MEMBERS).map(|_| random.key()).collect();
-            let members: [Member<'_>; MEMBERS] =
-                core::array::from_fn(|at| stages[at].map(|stage| (stage, &keys[at][..])));
-            let parent = loaded_set(slots, root, members, primary);
-            if random.below(2) == 0 {
-                slots.release(root).unwrap();
-            }
-            parent
-        };
         for _ in 0..random.below(3) {
             let filler = slots.import64(Purpose::Wrap, &mut random.bytes()).unwrap();
             if random.below(2) == 0 {
@@ -3414,17 +3348,23 @@ mod tests {
 
     /// The plaintext of a random set for either purpose at a random revision naming `named`, at
     /// times with a key held in `held` or one key twice, left as built, wholly random or with one
-    /// byte changed. A set of external data mostly holds 32-byte keys, as it has to.
+    /// byte changed. A set of external data mostly holds 32-byte keys, as it has to, and one for
+    /// wrapping is half the time a set of one that has never changed, as it has to be.
     fn random_plaintext(
         random: &mut Random,
         named: [u8; 16],
         held: &[Vec<u8>],
     ) -> [u8; PLAINTEXT_LEN] {
-        let (stages, primary) = random_stages(random);
         let purpose = if random.below(2) == 0 {
             Purpose::Wrap
         } else {
             Purpose::ExternalData
+        };
+        let one = purpose == Purpose::Wrap && random.below(2) == 0;
+        let (stages, primary) = if one {
+            ([Some(Status::Enabled), None, None], 0)
+        } else {
+            random_stages(random)
         };
         let mut keys: Vec<Vec<u8>> = (0..MEMBERS).map(|_| random.key()).collect();
         if purpose == Purpose::ExternalData && random.below(4) != 0 {
@@ -3446,7 +3386,9 @@ mod tests {
         let members: [Member<'_>; MEMBERS] =
             core::array::from_fn(|at| stages[at].map(|stage| (stage, &keys[at][..])));
         let mut plaintext = set_plaintext_for(members, primary, named, purpose);
-        plaintext[27..35].copy_from_slice(&random.bytes::<8>());
+        if !one {
+            plaintext[27..35].copy_from_slice(&random.bytes::<8>());
+        }
         match random.below(4) {
             0 => plaintext = random.bytes(),
             1 => plaintext[random.below(PLAINTEXT_LEN)] ^= random.bytes::<1>()[0] | 1,
@@ -3458,7 +3400,8 @@ mod tests {
     /// The keys of `plaintext` by position, if slots in the epoch `EPOCH` accept it: version 1,
     /// purpose 1 or 2, that epoch, each position zero throughout or stage 1 or 2 with length 32 or
     /// 64, only 32 for purpose 2, and zeros past the key, and an enabled key at the primary
-    /// position. Read from the layout, not by the parser.
+    /// position; for purpose 1, a key at the first position alone, the primary, at revision 0.
+    /// Read from the layout, not by the parser.
     fn accepted_keys(plaintext: &[u8; PLAINTEXT_LEN]) -> Option<[Option<Vec<u8>>; MEMBERS]> {
         let primary = usize::from(plaintext[2]);
         if plaintext[0] != 1
@@ -3484,7 +3427,9 @@ mod tests {
                 _ => return None,
             }
         }
-        Some(keys)
+        let one =
+            primary == 0 && keys[1..].iter().all(Option::is_none) && plaintext[27..35] == [0; 8];
+        (plaintext[1] == 2 || one).then_some(keys)
     }
 
     /// The slot that holds the set of an accepted `plaintext`, as the layout states it.
@@ -3521,7 +3466,7 @@ mod tests {
         holding
     }
 
-    /// Records sealed through the real derivation and cipher under a key of a random parent set or
+    /// Records sealed through the real derivation and cipher under the key of a random parent or
     /// under a key outside it, with random sets, keys held elsewhere, contexts of 0 to 300 bytes,
     /// and random changes to the plaintext, the record or the context: unwrapping never panics,
     /// refuses exactly what it should, with the error it should, loads the set the plaintext holds
@@ -3535,27 +3480,20 @@ mod tests {
             let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
             let parent = random_parent(&mut slots, &mut random);
             let parent_slot = &slots.memory[parent.index];
-            let positions: Vec<usize> = (0..MEMBERS)
-                .filter(|&at| parent_slot.stages.stage(at).is_some())
-                .collect();
-            let sealer_at =
-                (random.below(8) != 0).then(|| positions[random.below(positions.len())]);
+            let parent_key = &parent_slot.keys[0];
             let outsider = key_from(&random.key());
-            let sealer = key_from(match sealer_at {
-                Some(at) => &parent_slot.keys[at].bytes()[..parent_slot.keys[at].length().bytes()],
-                None => &outsider.bytes()[..outsider.length().bytes()],
+            let by_parent = random.below(8) != 0;
+            let sealer = key_from(if by_parent {
+                &parent_key.bytes()[..parent_key.length().bytes()]
+            } else {
+                &outsider.bytes()[..outsider.length().bytes()]
             });
             let sealer_id = id_of(&sealer).bytes();
-            let other_member = positions
-                .iter()
-                .find(|&&at| Some(at) != sealer_at)
-                .map(|&at| parent_slot.ids[at].bytes());
-            let named = match (random.below(8), other_member) {
-                (0, _) => random.bytes(),
-                (1, Some(other)) => other,
-                _ => sealer_id,
+            let named = if random.below(8) == 0 {
+                random.bytes()
+            } else {
+                sealer_id
             };
-            let sealer_stage = sealer_at.and_then(|at| parent_slot.stages.stage(at));
             let held = held_keys(&slots);
             let plaintext = random_plaintext(&mut random, named, &held);
             let context: Vec<u8> = (0..random.below(301))
@@ -3583,8 +3521,7 @@ mod tests {
             let first_free = before
                 .iter()
                 .position(|holding| holding.0 == Occupancy::Free);
-            let opens =
-                !changed && !other_context && sealer_at.is_some() && plaintext[3..19] == sealer_id;
+            let opens = !changed && !other_context && by_parent && plaintext[3..19] == sealer_id;
             let parsed = accepted_keys(&plaintext)
                 .map(|keys| keys.into_iter().flatten().collect::<Vec<Vec<u8>>>());
             let expected = if !valid_context {
@@ -3593,8 +3530,6 @@ mod tests {
                 Err(Error::NoFreeSlot)
             } else if !opens {
                 Err(Error::RecordRejected)
-            } else if sealer_stage == Some(Status::Disabled) {
-                Err(Error::KeyDisabled)
             } else if let Some(keys) = parsed {
                 let repeated = keys
                     .iter()
@@ -3706,26 +3641,17 @@ mod stack {
             .collect()
     }
 
-    /// The keys of the root, which wraps both sets.
-    fn root_bytes(flip: u8) -> [u8; 32] {
-        pattern(53, 3, 32, flip).try_into().unwrap()
+    /// The key of the parent, which wraps the child set: 64 bytes.
+    fn parent_bytes(flip: u8) -> [u8; 64] {
+        pattern(43, 9, 64, flip).try_into().unwrap()
     }
 
-    /// The keys of the parent set: 32, 64 and 32 bytes.
-    fn parent_keys(flip: u8) -> [Vec<u8>; MEMBERS] {
-        [
-            pattern(41, 7, 32, flip),
-            pattern(43, 9, 64, flip),
-            pattern(47, 11, 32, flip),
-        ]
-    }
-
-    /// The keys of the child set: 64, 32 and 64 bytes.
+    /// The keys of the child set, for external data.
     fn child_keys(flip: u8) -> [Vec<u8>; MEMBERS] {
         [
-            pattern(29, 101, 64, flip),
+            pattern(29, 101, 32, flip),
             pattern(31, 103, 32, flip),
-            pattern(37, 107, 64, flip),
+            pattern(37, 107, 32, flip),
         ]
     }
 
@@ -3849,19 +3775,19 @@ mod stack {
             .collect()
     }
 
-    /// Loads, under the set of one `root` refers to, the set of `keys` with `stages` and
-    /// `primary`, by unwrapping a record of it.
+    /// Loads, under the key `parent` refers to, the set of `keys` for external data with `stages`
+    /// and `primary`, by unwrapping a record of it.
     fn loaded_set(
         slots: &mut Slots<'_>,
-        root: Handle<'static>,
+        parent: Handle<'static>,
         keys: &[Vec<u8>; MEMBERS],
         stages: [Option<Status>; MEMBERS],
         primary: usize,
     ) -> Handle<'static> {
         let keys = keys.each_ref().map(|bytes| key_from(bytes));
         let header = Header {
-            purpose: Purpose::Wrap,
-            parent: slots.memory[root.index].ids[0].bytes(),
+            purpose: Purpose::ExternalData,
+            parent: slots.memory[parent.index].ids[0].bytes(),
             epoch: EPOCH,
         };
         let mut plaintext = [0; PLAINTEXT_LEN];
@@ -3873,7 +3799,7 @@ mod stack {
         );
         let mut cipher_key = [0; 32];
         derive_wrap_key(
-            &slots.memory[root.index].keys[0],
+            &slots.memory[parent.index].keys[0],
             &slots.epoch.key,
             &mut cipher_key,
         )
@@ -3882,29 +3808,21 @@ mod stack {
         let tag = seal::seal(&cipher_key, &NONCE, associated.bytes(), &mut plaintext).unwrap();
         let mut record = [0; RECORD_LEN];
         write_record(&mut record, &NONCE, &plaintext, &tag);
-        widen(slots.unwrap(root, SET_CONTEXT, &record).unwrap())
+        widen(slots.unwrap(parent, SET_CONTEXT, &record).unwrap())
     }
 
-    /// A root, the parent set, whose second key is the primary and whose third is disabled, and
-    /// the child set, whose first key is disabled and whose third is the primary, all made from
-    /// `flip`ped patterns.
+    /// The parent, and the child set, whose first key is disabled and whose third is the primary,
+    /// all made from `flip`ped patterns.
     fn sets(slots: &mut Slots<'_>, flip: u8) -> (Handle<'static>, Handle<'static>) {
-        let root = widen(
+        let parent = widen(
             slots
-                .import32(Purpose::Wrap, &mut root_bytes(flip))
+                .import64(Purpose::Wrap, &mut parent_bytes(flip))
                 .unwrap(),
         );
         let (enabled, disabled) = (Some(Status::Enabled), Some(Status::Disabled));
-        let parent = loaded_set(
-            slots,
-            root,
-            &parent_keys(flip),
-            [enabled, enabled, disabled],
-            1,
-        );
         let child = loaded_set(
             slots,
-            root,
+            parent,
             &child_keys(flip),
             [disabled, enabled, enabled],
             2,
@@ -3912,21 +3830,20 @@ mod stack {
         (parent, child)
     }
 
-    /// What is measured: a wrap, the trials of an unwrap whose record no key opens, or a whole
-    /// unwrap.
+    /// What is measured: a wrap, the trial of an unwrap whose record the key does not open, or a
+    /// whole unwrap.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Work {
         Wrap,
-        Trials,
+        Trial,
         Unwrap,
     }
 
-    /// The secrets the work handles on the sets made from `flip`ped patterns. For each key of the
-    /// parent it tries, or for the primary alone when it wraps: the derivation of the cipher key,
-    /// the cipher key, the message keys, the round keys of the cipher key and of the message
-    /// encryption key in the layout of FIPS 197, the keystream, and what the record decrypts to
-    /// under that key, the plaintext itself under the primary. For a whole unwrap, also the
-    /// derivations of the identifiers of the child's keys.
+    /// The secrets the work handles on the sets made from `flip`ped patterns: the key of the
+    /// parent, the derivation of the cipher key from it, the cipher key, the message keys, the
+    /// round keys of the cipher key and of the message encryption key in the layout of FIPS 197,
+    /// the keystream, and the plaintext. For a whole unwrap, also the derivations of the
+    /// identifiers of the child's keys.
     fn handled(flip: u8, work: Work) -> Vec<Vec<u8>> {
         let mut memory = [const { Slot::empty() }; 4];
         let mut epoch_memory = Epoch::empty();
@@ -3944,33 +3861,29 @@ mod stack {
         let nonce: [u8; 12] = record[..NONCE.len()].try_into().unwrap();
         let tag: [u8; 16] = record[NONCE.len() + PLAINTEXT_LEN..].try_into().unwrap();
         let ciphertext = &record[NONCE.len()..NONCE.len() + PLAINTEXT_LEN];
-        let parent_keys = parent_keys(flip);
-        let tried = if work == Work::Wrap { 1..2 } else { 0..MEMBERS };
-        let mut handled = Vec::new();
-        for bytes in &parent_keys[tried] {
-            let key = key_from(bytes);
-            let mut cipher_key = [0; 32];
-            derive_wrap_key(&key, &flipped_epoch(flip), &mut cipher_key).unwrap();
-            let (mac_key, enc_key) = message_keys(&cipher_key, &nonce);
-            let stream = keystream(&enc_key, &tag);
-            let decrypted = ciphertext.iter().zip(&stream).map(|(c, k)| c ^ k).collect();
-            handled.extend(secrets(
-                bytes,
-                &flipped_epoch_key(flip),
-                key.length(),
-                Branch::WrapKey,
-            ));
-            handled.extend([
-                cipher_key.to_vec(),
-                mac_key.to_vec(),
-                enc_key.to_vec(),
-                stream,
-                decrypted,
-            ]);
-            handled.extend(round_keys(&cipher_key));
-            handled.extend(round_keys(&enc_key));
-        }
-        handled.extend(parent_keys.iter().cloned());
+        let bytes = parent_bytes(flip);
+        let key = key_from(&bytes);
+        let mut cipher_key = [0; 32];
+        derive_wrap_key(&key, &flipped_epoch(flip), &mut cipher_key).unwrap();
+        let (mac_key, enc_key) = message_keys(&cipher_key, &nonce);
+        let stream = keystream(&enc_key, &tag);
+        let decrypted = ciphertext.iter().zip(&stream).map(|(c, k)| c ^ k).collect();
+        let mut handled = secrets(
+            &bytes,
+            &flipped_epoch_key(flip),
+            key.length(),
+            Branch::WrapKey,
+        );
+        handled.extend([
+            bytes.to_vec(),
+            cipher_key.to_vec(),
+            mac_key.to_vec(),
+            enc_key.to_vec(),
+            stream,
+            decrypted,
+        ]);
+        handled.extend(round_keys(&cipher_key));
+        handled.extend(round_keys(&enc_key));
         if work == Work::Unwrap {
             for bytes in child_keys(flip) {
                 handled.extend(secrets(
@@ -4044,13 +3957,13 @@ mod stack {
         });
     }
 
-    /// A record whose ciphertext was changed is decrypted under every key of the parent before
-    /// each tag fails. This is also the unwrap that shows the test sees residue: after a successful
-    /// one, the wipes that follow the derivations of the new keys' identifiers already cover the
-    /// frames the cipher used.
+    /// A record whose ciphertext was changed is decrypted under the key of the parent before the tag
+    /// fails. This is also the unwrap that shows the test sees residue: after a successful one,
+    /// the wipes that follow the derivations of the new keys' identifiers already cover the frames
+    /// the cipher used.
     #[test]
     fn a_rejected_unwrap_leaves_no_residue() {
-        let pieces = pieces(Work::Trials);
+        let pieces = pieces(Work::Trial);
         let mut memory = [const { Slot::empty() }; 4];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
@@ -4152,7 +4065,10 @@ mod stack {
             );
         }));
         let key = slots
-            .import64(Purpose::Wrap, &mut pattern(5, 5, 64, 0).try_into().unwrap())
+            .import32(
+                Purpose::ExternalData,
+                &mut pattern(5, 5, 32, 0).try_into().unwrap(),
+            )
             .unwrap();
         let mut out = [0; RECORD_LEN];
         wraps.push(depth_changed(|| {
@@ -4183,8 +4099,8 @@ mod stack {
                 black_box(generated.unwrap());
             }),
             depth_changed(|| {
-                let mut long: [u8; 64] = pattern(11, 11, 64, 0).try_into().unwrap();
-                black_box(slots.add64(key, &mut long).unwrap());
+                let mut short: [u8; 32] = pattern(11, 11, 32, 0).try_into().unwrap();
+                black_box(slots.add32(key, &mut short).unwrap());
             }),
             depth_changed(|| {
                 slots.settle();
@@ -4367,24 +4283,34 @@ mod proofs {
 
     /// A slot in any state, for either purpose, with any generation and any stages whose primary is
     /// enabled; when loaded, holding a key of a length its purpose takes and any identifier at each
-    /// position the stages fill, and changed and wrapped for the next epoch or not. A free or
-    /// retired slot keeps the purpose of the set it last held. Every load, addition and unwrap
-    /// keeps a key's length one its purpose takes, as their proofs show.
+    /// position the stages fill, a set of one if it is for wrapping, and changed and wrapped for
+    /// the next epoch or not. A free or retired slot keeps the purpose of the set it last held.
+    /// Every load, addition and unwrap keeps a key's length one its purpose takes, every load and
+    /// unwrap makes a set for wrapping a set of one, and no change or addition takes one, as their
+    /// proofs show.
     fn any_slot() -> Slot {
-        any_slot_in(match kani::any::<u8>() % 3 {
+        any_slot_in(any_occupancy())
+    }
+
+    fn any_occupancy() -> Occupancy {
+        match kani::any::<u8>() % 3 {
             0 => Occupancy::Free,
             1 => Occupancy::Loaded,
             _ => Occupancy::Retired,
-        })
+        }
     }
 
     fn any_slot_in(occupancy: Occupancy) -> Slot {
         let mut slot = Slot::empty();
         slot.generation = kani::any();
         slot.occupancy = occupancy;
-        slot.stages = any_whole_stages();
         let purpose = any_purpose();
         slot.purpose = purpose;
+        slot.stages = if purpose == Purpose::Wrap && occupancy == Occupancy::Loaded {
+            Stages::one()
+        } else {
+            any_whole_stages()
+        };
         if slot.occupancy == Occupancy::Loaded {
             slot.changed = kani::any();
             slot.sealed = kani::any();
@@ -5648,7 +5574,8 @@ mod proofs {
     /// and no key is held in a loaded slot or twice in the set; then the slot holds, at each
     /// position the plaintext fills, exactly the key it holds there with the stage it states and the
     /// identifier derived from it, nothing at the others, and the purpose, primary and revision
-    /// the plaintext states, unchanged in this epoch. A plaintext of another epoch is refused as
+    /// the plaintext states, unchanged in this epoch. A plaintext of another epoch, and one of a set
+    /// for wrapping other than a set of one that has never changed, are refused as
     /// `RecordRejected`. Otherwise no slot changes, and the failure is `NoFreeSlot`,
     /// `RecordRejected`, `DerivationFailed` or `DuplicateKey`, in that order. The offsets are written
     /// from the layout, independently of the parser.
@@ -5681,6 +5608,13 @@ mod proofs {
         let members = [0, 1, 2].map(|position| plaintext_key(&plaintext, position));
         let ids = members.map(|(key, length)| expected_key_id(&key, length));
         let filled = [0, 1, 2].map(|position| plaintext[35 + 66 * position] != 0);
+        let mut revision = [0; 8];
+        revision.copy_from_slice(&plaintext[27..35]);
+        let wrapping = plaintext[1] == 1;
+        let one = filled == [true, false, false]
+            && plaintext[35] == 1
+            && plaintext[2] == 0
+            && revision == [0; 8];
         let repeated = (0..MEMBERS).any(|position| {
             at(&filled, position)
                 && (held(&before, &at(&ids, position))
@@ -5689,7 +5623,7 @@ mod proofs {
                     }))
         });
         kani::assert(
-            if parsed.is_err() || other_epoch {
+            if parsed.is_err() || other_epoch || (wrapping && !one) {
                 result == Err(Error::RecordRejected)
             } else if any_failed() {
                 result == Err(Error::DerivationFailed)
@@ -5698,8 +5632,9 @@ mod proofs {
             } else {
                 result.is_ok()
             },
-            "a plaintext is admitted exactly when it parses, names this epoch, finds a free slot, \
-             its keys' identifiers are derived and none is held already or twice",
+            "a plaintext is admitted exactly when it parses, names this epoch, holds one key if it \
+             is for wrapping, finds a free slot, its keys' identifiers are derived and none is held \
+             already or twice",
         );
         if let (Ok(handle), Ok(stages)) = (result, parsed) {
             let now = snapshot(slot_at(&slots, index));
@@ -5761,6 +5696,7 @@ mod proofs {
                 purpose == Purpose::ExternalData,
                 "a set of external data is admitted"
             );
+            kani::cover!(purpose == Purpose::Wrap, "a set for wrapping is admitted");
         } else {
             kani::assert(
                 unchanged_except(&slots, &before, 2),
@@ -5771,6 +5707,10 @@ mod proofs {
         kani::cover!(
             parsed.is_ok() && other_epoch,
             "a plaintext of another epoch is refused"
+        );
+        kani::cover!(
+            parsed.is_ok() && !other_epoch && wrapping && !one && filled == [true, false, false],
+            "a set for wrapping that has changed is refused"
         );
         kani::cover!(
             result == Err(Error::DerivationFailed),
@@ -5803,22 +5743,22 @@ mod proofs {
         past_a(Occupancy::Retired, admit_from);
     }
 
-    /// Stands in for the cipher: writes any bytes, accepts or rejects at will, and remembers, call
-    /// by call, the key it was given, what it wrote and whether it accepted.
+    /// Stands in for the cipher: writes any bytes, accepts or rejects at will, and remembers how
+    /// often it was called, and the key it was given, what it wrote and whether it accepted.
     struct AnyCipher {
         calls: usize,
-        keys: [[u8; CIPHER_KEY_LEN]; MEMBERS],
-        written: [[u8; PLAINTEXT_LEN]; MEMBERS],
-        accepted: [bool; MEMBERS],
+        key: [u8; CIPHER_KEY_LEN],
+        written: [u8; PLAINTEXT_LEN],
+        accepted: bool,
     }
 
     impl AnyCipher {
         fn new() -> Self {
             Self {
                 calls: 0,
-                keys: [[0; CIPHER_KEY_LEN]; MEMBERS],
-                written: [[0; PLAINTEXT_LEN]; MEMBERS],
-                accepted: [false; MEMBERS],
+                key: [0; CIPHER_KEY_LEN],
+                written: [0; PLAINTEXT_LEN],
+                accepted: false,
             }
         }
 
@@ -5830,69 +5770,24 @@ mod proofs {
             let written: [u8; PLAINTEXT_LEN] = kani::any();
             let accepted: bool = kani::any();
             *buffer = written;
-            let [first_key, second_key, third_key] = &mut self.keys;
-            let [first, second, third] = &mut self.written;
-            let [first_accepted, second_accepted, third_accepted] = &mut self.accepted;
-            match self.calls {
-                0 => (*first_key, *first, *first_accepted) = (*key, written, accepted),
-                1 => (*second_key, *second, *second_accepted) = (*key, written, accepted),
-                _ => (*third_key, *third, *third_accepted) = (*key, written, accepted),
-            }
+            (self.key, self.written, self.accepted) = (*key, written, accepted);
             self.calls = self.calls.saturating_add(1);
             if accepted { Ok(()) } else { Err(Rejected) }
         }
     }
 
-    /// The positions a set fills, in order, and how many.
-    fn filled_positions(stages: &Stages) -> ([usize; MEMBERS], usize) {
-        let mut order = [0; MEMBERS];
-        let mut count = 0;
-        for position in 0..MEMBERS {
-            if stages.stage(position).is_some() {
-                let [first, second, third] = &mut order;
-                match count {
-                    0 => *first = position,
-                    1 => *second = position,
-                    _ => *third = position,
-                }
-                count += 1;
-            }
-        }
-        (order, count)
-    }
-
-    /// The call of the cipher that wins, from what it was given and did: the first that accepted
-    /// and wrote a plaintext naming the identifier of the key at that position. Read from the
-    /// layout, not by the code under proof.
-    fn winning_call(
-        cipher: &AnyCipher,
-        parent: &Snapshot,
-        order: &[usize; MEMBERS],
-        count: usize,
-    ) -> Option<usize> {
-        // Up to the most calls rather than up to `count`: a loop whose end the solver does not know
-        // unrolls to the whole bound of the proof.
-        (0..MEMBERS).find(|&call| {
-            let position = at(order, call);
-            let written = at(&cipher.written, call);
-            call < count
-                && at(&cipher.accepted, call)
-                && written[3..19] == pick(&parent.ids, position)
-        })
-    }
-
-    /// For a loaded parent set in any state, any 261-byte record, any associated data of up to two
-    /// bytes and any behaviour of the cipher its interface allows: opening tries every key of the
-    /// set, once each, in order of position, with the cipher key derived from that key, also after
-    /// one has opened the record; it leaves in the output the plaintext of the first key whose
-    /// trial the cipher accepts and whose plaintext names that key's identifier as its parent, and
-    /// succeeds if that key is enabled and fails with `KeyDisabled` if it is disabled; it fails
-    /// with `DerivationFailed` when a derivation fails, and otherwise with `RecordRejected` when no
-    /// trial does both. The cipher key is derived with the key of this epoch.
+    /// For a loaded set for wrapping in any state, any 261-byte record, any associated data of up to
+    /// two bytes and any behaviour of the cipher its interface allows: opening tries the key of the
+    /// set,
+    /// once, with the cipher key derived from it and the key of this epoch, and not at all when
+    /// that derivation fails, which is `DerivationFailed`; it leaves in the output the plaintext
+    /// the cipher wrote when the cipher accepts it and it names that key's identifier as its
+    /// parent, and otherwise fails with `RecordRejected` and leaves the output as it was.
     #[kani::proof]
     #[kani::unwind(65)]
-    fn opening_tries_every_key_of_the_parent() {
+    fn opening_uses_the_key_of_the_parent() {
         let mut memory = [any_slot_in(Occupancy::Loaded)];
+        kani::assume(memory[0].purpose == Purpose::Wrap);
         let changing = kani::any();
         let mut epoch = any_epoch(changing);
         let slots = Slots {
@@ -5903,70 +5798,38 @@ mod proofs {
         let aad: [u8; 2] = kani::any();
         let before = snapshot(&slots.memory[0]);
         let epoch_key = first_half(&slots.epoch.key);
-        let (order, count) = filled_positions(&before.stages);
         let mut cipher = AnyCipher::new();
-        let mut found: [u8; PLAINTEXT_LEN] = kani::any();
+        let original: [u8; PLAINTEXT_LEN] = kani::any();
+        let mut found = original;
 
         let result = slots.open_under(0, &aad, &record, &mut found, &mut |key, _, _, buffer, _| {
             cipher.open(key, buffer)
         });
-        kani::assert(cipher.calls == count, "every key of the set is tried once");
-        for call in 0..MEMBERS {
-            let position = at(&order, call);
-            kani::assert(
-                call >= count
-                    || any_failed()
-                    || at(&cipher.keys, call)
-                        == expected_wrap_key(
-                            &pick(&before.keys, position),
-                            at(&before.lengths, position),
-                            &epoch_key,
-                        ),
-                "each trial uses the cipher key derived from the key at its position",
-            );
-        }
-        let winner = winning_call(&cipher, &before, &order, count);
+        kani::assert(
+            cipher.calls == usize::from(!any_failed()),
+            "the key is tried once, unless its derivation fails",
+        );
+        kani::assert(
+            any_failed()
+                || cipher.key == expected_wrap_key(&before.keys.0, before.lengths[0], &epoch_key),
+            "the trial uses the cipher key derived from the key",
+        );
+        let named = cipher.accepted && cipher.written[3..19] == before.ids.0;
         kani::assert(
             if any_failed() {
-                result == Err(Error::DerivationFailed)
+                result == Err(Error::DerivationFailed) && same(&found, &original)
+            } else if named {
+                result == Ok(()) && same(&found, &cipher.written)
             } else {
-                match winner {
-                    Some(call) => {
-                        let stages = [
-                            before.stages.stage(0),
-                            before.stages.stage(1),
-                            before.stages.stage(2),
-                        ];
-                        let disabled = at(&stages, at(&order, call)) == Some(Status::Disabled);
-                        result
-                            == if disabled {
-                                Err(Error::KeyDisabled)
-                            } else {
-                                Ok(())
-                            }
-                            && same(&found, &at(&cipher.written, call))
-                    }
-                    None => result == Err(Error::RecordRejected),
-                }
+                result == Err(Error::RecordRejected) && same(&found, &original)
             },
-            "opening keeps the plaintext of the first key that opens the record and is named in it, \
-             and refuses it as KeyDisabled exactly when that key is disabled",
+            "opening keeps the plaintext exactly when the cipher accepts it and it names the key, \
+             and otherwise leaves the output as it was",
         );
+        kani::cover!(result.is_ok(), "the key opens the record");
         kani::cover!(
-            winner == Some(0) && count == 3 && cipher.accepted[2],
-            "the first key wins, and the last is still tried and accepts"
-        );
-        kani::cover!(
-            winner.is_some_and(|call| at(&order, call) == 2),
-            "the key at the last position opens the record"
-        );
-        kani::cover!(
-            result == Err(Error::KeyDisabled),
-            "a disabled key opens the record"
-        );
-        kani::cover!(
-            result == Err(Error::RecordRejected) && cipher.accepted[0],
-            "a key opens the record but is not named in it"
+            result == Err(Error::RecordRejected) && cipher.accepted,
+            "the key opens the record but is not named in it"
         );
     }
 
@@ -5989,8 +5852,8 @@ mod proofs {
     /// and any context of up to two bytes, whatever the cipher does: unwrapping refuses an empty
     /// context, a stale parent, a parent not for wrapping and a full set before it decrypts; a
     /// refused unwrap changes no slot, and one that succeeds changes only the first free slot, and
-    /// needs a trial the cipher accepts and every derivation to succeed. What the trial of the
-    /// parent's keys gives, `KeyDisabled` among it, `opening_tries_every_key_of_the_parent` proves.
+    /// needs the trial the cipher accepts and every derivation to succeed. What the trial of the
+    /// parent's key gives, `opening_uses_the_key_of_the_parent` proves.
     fn unwrap_from(mut memory: [Slot; 2]) -> Result<(), Error> {
         let id = memory.as_ptr().addr();
         let mut epoch = any_epoch(kani::any());
@@ -6035,11 +5898,14 @@ mod proofs {
             !refused_before || cipher.calls == 0,
             "those refusals come before any decryption",
         );
-        let [first, second, third] = cipher.accepted;
         kani::assert(
-            result.is_err() || ((first || second || third) && !any_failed()),
+            result.is_err() || (cipher.accepted && !any_failed()),
             "an unwrap loads a set only after a trial the cipher accepts and when every derivation \
              succeeds",
+        );
+        kani::assert(
+            refused_before || !any_failed() || result == Err(Error::DerivationFailed),
+            "an unwrap that a derivation fails fails with DerivationFailed",
         );
         kani::assert(
             match (result, first_free) {
@@ -6060,10 +5926,6 @@ mod proofs {
     /// The outcomes of an unwrap that decrypts.
     fn every_outcome(result: Result<(), Error>) {
         kani::cover!(result.is_ok(), "a record is unwrapped");
-        kani::cover!(
-            result == Err(Error::KeyDisabled),
-            "a disabled key opens the record"
-        );
         kani::cover!(result == Err(Error::RecordRejected), "a record is rejected");
     }
 
@@ -6256,8 +6118,9 @@ mod proofs {
     }
 
     /// From `memory`, with the slot `index` loaded and any position: promoting, disabling, enabling
-    /// and destroying through the live handle of that slot are refused as `EpochChanging` during a
-    /// change of epoch, then as `Unsaved` if the set has changed in this epoch, and otherwise
+    /// and destroying through the live handle of that slot are refused as `WrongPurpose` for a set
+    /// for wrapping, then as `EpochChanging` during a change of epoch, then as `Unsaved` if the set
+    /// has changed in this epoch, and otherwise
     /// change its stages exactly as the transition of the stages gives, marking the set changed and
     /// not wrapped for the next epoch; a refusal changes nothing; a destroy wipes the key and the
     /// identifier at the position and leaves every other key as it was; the slot keeps its
@@ -6281,18 +6144,22 @@ mod proofs {
         let chosen = any_position();
         let mut expected = named.stages;
         let (result, outcome, destroying) = any_change(&mut slots, handle, chosen, &mut expected);
-        let refused = changing || named.changed;
+        let wrapping = named.purpose == Purpose::Wrap;
+        let refused = wrapping || changing || named.changed;
         kani::assert(
             result
-                == if changing {
+                == if wrapping {
+                    Err(Error::WrongPurpose)
+                } else if changing {
                     Err(Error::EpochChanging)
                 } else if named.changed {
                     Err(Error::Unsaved)
                 } else {
                     outcome
                 },
-            "a change during a change of epoch, or of a set changed in this epoch, is refused, and \
-             otherwise succeeds exactly when the transition of the stages does, or fails as it does",
+            "a change of a set for wrapping, during a change of epoch, or of a set changed in this \
+             epoch is refused, and otherwise succeeds exactly when the transition of the stages \
+             does, or fails as it does",
         );
         let applied = result.is_ok();
         let now = snapshot(slot_at(&slots, index));
@@ -6349,6 +6216,10 @@ mod proofs {
             result == Err(Error::EpochChanging),
             "no set changes during a change of epoch"
         );
+        kani::cover!(
+            result == Err(Error::WrongPurpose),
+            "a set for wrapping takes no change"
+        );
     }
 
     /// A change through the first slot; with the next, through either slot of two in any state.
@@ -6398,51 +6269,17 @@ mod proofs {
         );
     }
 
-    /// The outcome of an addition through `handle`, and the bytes and length the position must
-    /// hold on success.
-    type Added = (Result<Position, Error>, Bytes, KeyLength);
-
-    /// Adds a key of 32 bytes, any bytes, through `handle`. An addition wipes its source exactly
-    /// when it succeeds. A generation fills a key as a load does, which the proofs of a load cover.
-    fn add_short(slots: &mut Slots<'_>, handle: Handle<'static>) -> Added {
-        let mut source: [u8; 32] = kani::any();
-        let original = source;
-        let result = slots.add32(handle, &mut source);
-        kani::assert(
-            source == if result.is_ok() { [0; 32] } else { original },
-            "an addition wipes its source exactly when it succeeds",
-        );
-        let mut bytes = [0; 64];
-        bytes[..32].copy_from_slice(&original);
-        (result, bytes, KeyLength::Bytes32)
-    }
-
-    /// Adds a key of 64 bytes, any bytes, through `handle`, as above.
-    fn add_long(slots: &mut Slots<'_>, handle: Handle<'static>) -> Added {
-        let mut source: [u8; 64] = kani::any();
-        let original = source;
-        let result = slots.add64(handle, &mut source);
-        kani::assert(
-            source == if result.is_ok() { [0; 64] } else { original },
-            "an addition wipes its source exactly when it succeeds",
-        );
-        (result, original, KeyLength::Bytes64)
-    }
-
     /// From `memory`, with the slot `index` loaded and no change of epoch under way: adding a key
-    /// with `add` through its live handle puts it into the first empty position of the set,
-    /// enabled, with the identifier derived from its bytes and its length alone, marks the set
-    /// changed and not wrapped for the next epoch, and changes nothing else; it fails as `Unsaved`
-    /// if the set has changed in this epoch, as `WrongLength` for a length the set's purpose does
-    /// not take, as the transition of the stages does when no position is empty or the set is
-    /// exhausted, and otherwise with DerivationFailed when the derivation fails and with
-    /// DuplicateKey exactly when a loaded slot holds a key with that identifier, for any purpose;
-    /// a failed addition changes no slot. Returns the outcome and the set's purpose.
-    fn add_in(
-        mut memory: [Slot; 2],
-        index: usize,
-        add: impl FnOnce(&mut Slots<'_>, Handle<'static>) -> Added,
-    ) -> (Result<Position, Error>, Purpose) {
+    /// of 32 bytes, any bytes, through its live handle puts it into the first empty position of
+    /// the set, enabled, with the identifier derived from its bytes and its length alone, marks the
+    /// set changed and not wrapped for the next epoch, and changes nothing else; it fails as
+    /// `WrongPurpose` for a set for wrapping, as `Unsaved` if the set has changed in this epoch, as
+    /// the transition of the stages does when no position is empty or the set is exhausted, and
+    /// otherwise with DerivationFailed when the derivation fails and with DuplicateKey exactly when
+    /// a loaded slot holds a key with that identifier, for any purpose; the source is wiped exactly
+    /// when the addition succeeds, and a failed addition changes no slot. A generation fills a key
+    /// as a load does, which the proofs of a load cover. Returns the outcome and the set's purpose.
+    fn add_in(mut memory: [Slot; 2], index: usize) -> (Result<Position, Error>, Purpose) {
         let id = memory.as_ptr().addr();
         let mut epoch = any_epoch(false);
         let mut slots = Slots {
@@ -6459,12 +6296,21 @@ mod proofs {
         };
         let mut expected = named.stages;
         let position = expected.add();
-        let (result, bytes, length) = add(&mut slots, handle);
+        let mut source: [u8; 32] = kani::any();
+        let original = source;
+        let result = slots.add32(handle, &mut source);
+        kani::assert(
+            source == if result.is_ok() { [0; 32] } else { original },
+            "an addition wipes its source exactly when it succeeds",
+        );
+        let mut bytes = [0; 64];
+        bytes[..32].copy_from_slice(&original);
+        let length = KeyLength::Bytes32;
         let key_id = expected_key_id(&bytes, length);
         kani::assert(
             match position {
+                _ if named.purpose == Purpose::Wrap => result == Err(Error::WrongPurpose),
                 _ if named.changed => result == Err(Error::Unsaved),
-                _ if !allowed(named.purpose, length) => result == Err(Error::WrongLength),
                 Err(refused) => result == Err(Error::from(refused)),
                 Ok(at) => {
                     if failed() {
@@ -6476,10 +6322,10 @@ mod proofs {
                     }
                 }
             },
-            "an addition fails as Unsaved for a set changed in this epoch, as WrongLength for a \
-             length its purpose does not take, as the stages refuse it, then with DerivationFailed \
-             when the derivation fails, with DuplicateKey when the key is held, and otherwise \
-             succeeds at the first empty position",
+            "an addition fails as WrongPurpose for a set for wrapping, as Unsaved for a set changed \
+             in this epoch, as the stages refuse it, then with DerivationFailed when the derivation \
+             fails, with DuplicateKey when the key is held, and otherwise succeeds at the first \
+             empty position",
         );
         if let (Ok(added), Ok(at)) = (result, position) {
             let now = snapshot(slot_at(&slots, index));
@@ -6526,6 +6372,10 @@ mod proofs {
             "a set changed in this epoch takes no key"
         );
         kani::cover!(result == Err(Error::SetFull), "the set is full");
+        kani::cover!(
+            result == Err(Error::WrongPurpose),
+            "a set for wrapping takes no key"
+        );
         kani::cover!(
             result == Err(Error::DerivationFailed),
             "the derivation fails"
@@ -6737,58 +6587,90 @@ mod proofs {
         at(lengths, position)
     }
 
-    // One proof for each length of key and each slot, so that each stays well inside its time.
-
-    /// An addition of 32 bytes through the first slot; with the next three, an addition of either
-    /// length through either slot of two in any state.
+    /// An addition through the first slot; with the next, an addition through either slot of two in
+    /// any state.
     #[kani::proof]
     #[kani::unwind(65)]
-    fn a_short_addition_in_the_first_slot() {
-        let (result, purpose) = add_in([any_slot_in(Occupancy::Loaded), any_slot()], 0, add_short);
+    fn an_addition_in_the_first_slot() {
+        let (result, purpose) = add_in([any_slot_in(Occupancy::Loaded), any_slot()], 0);
         kani::cover!(
             result.is_ok() && purpose == Purpose::ExternalData,
             "a key is added to a set of external data"
         );
     }
 
-    /// An addition of 64 bytes through the first slot.
+    /// An addition through the second slot.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn an_addition_in_the_second_slot() {
+        let (result, purpose) = add_in([any_slot(), any_slot_in(Occupancy::Loaded)], 1);
+        kani::cover!(
+            result.is_ok() && purpose == Purpose::ExternalData,
+            "a key is added to a set of external data"
+        );
+    }
+
+    /// With the first of two slots loaded, the second in any state and no change of epoch under way:
+    /// an addition of a key of either length, any bytes, through the live handle of the first, by
+    /// the code every addition runs, is refused as `WrongPurpose` for a set for wrapping, as
+    /// `Unsaved` for a set changed in this epoch, and then as `WrongLength` exactly for a length its
+    /// purpose does not take, changing nothing. No purpose takes an addition of 64 bytes.
     #[kani::proof]
     #[kani::unwind(65)]
     fn a_long_addition_in_the_first_slot() {
-        let (result, _) = add_in([any_slot_in(Occupancy::Loaded), any_slot()], 0, add_long);
+        let mut memory = [any_slot_in(Occupancy::Loaded), any_slot()];
+        let id = memory.as_ptr().addr();
+        let mut epoch = any_epoch(false);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let before = snapshots(&slots);
+        let handle = Handle {
+            slots: id,
+            index: 0,
+            generation: before[0].generation,
+            memory: PhantomData,
+        };
+        let length = any_length();
+        let mut source = AnyEntropy::new();
+        let result = slots.add(handle, length, |key, _| {
+            key.fill(length, &mut source)
+                .map_err(|EntropyError| Error::EntropyFailed)
+        });
+        let refusal = if before[0].purpose == Purpose::Wrap {
+            Some(Error::WrongPurpose)
+        } else if before[0].changed {
+            Some(Error::Unsaved)
+        } else if !allowed(before[0].purpose, length) {
+            Some(Error::WrongLength)
+        } else {
+            None
+        };
+        kani::assert(
+            match refusal {
+                Some(refusal) => result == Err(refusal) && unchanged_except(&slots, &before, 2),
+                None => result != Err(Error::WrongLength),
+            },
+            "an addition is refused for the first reason, a length its purpose does not take among \
+             them, and then changes nothing",
+        );
         kani::cover!(
             result == Err(Error::WrongLength),
             "a set of external data refuses a long key"
         );
-    }
-
-    /// An addition of 32 bytes through the second slot.
-    #[kani::proof]
-    #[kani::unwind(65)]
-    fn a_short_addition_in_the_second_slot() {
-        let (result, purpose) = add_in([any_slot(), any_slot_in(Occupancy::Loaded)], 1, add_short);
         kani::cover!(
-            result.is_ok() && purpose == Purpose::ExternalData,
-            "a key is added to a set of external data"
+            refusal.is_none() && result.is_ok(),
+            "a key of a length its purpose takes is added"
         );
-    }
-
-    /// An addition of 64 bytes through the second slot.
-    #[kani::proof]
-    #[kani::unwind(65)]
-    fn a_long_addition_in_the_second_slot() {
-        let (result, _) = add_in([any_slot(), any_slot_in(Occupancy::Loaded)], 1, add_long);
-        kani::cover!(
-            result == Err(Error::WrongLength),
-            "a set of external data refuses a long key"
-        );
+        kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
     }
 
     /// From any state of two slots during a change of epoch, for a handle of this set naming any
-    /// slot and generation: every change of stage and every addition, of 32 or 64 bytes or
-    /// generated, is refused, as `EpochChanging` if the handle is live and as `StaleHandle`
-    /// otherwise; the source is left as it was, the platform's source is not asked, and nothing
-    /// changes.
+    /// slot and generation: every change of stage and an addition are refused, as `StaleHandle` if
+    /// the handle is not live, as `WrongPurpose` for a set for wrapping, and as `EpochChanging`
+    /// otherwise; the source is left as it was, and nothing changes. A generated key goes through
+    /// the same code as the addition, which refuses before it fills the slot.
     #[kani::proof]
     #[kani::unwind(65)]
     fn no_set_changes_during_a_change_of_epoch() {
@@ -6802,35 +6684,26 @@ mod proofs {
         let handle = forged(id);
         let live = live(&slots, id, &handle);
         let before = snapshots(&slots);
+        let wrapping = live && snapshot_at(&before, handle.index).purpose == Purpose::Wrap;
         let (result, _, _) = any_change(&mut slots, handle, any_position(), &mut Stages::one());
-        let mut source: [u8; 64] = kani::any();
+        let mut source: [u8; 32] = kani::any();
         let original = source;
-        let mut entropy = AnyEntropy::new();
-        let added = match kani::any::<u8>() % 3 {
-            0 => {
-                let mut short = [0; 32];
-                short.copy_from_slice(&source[..32]);
-                let added = slots.add32(handle, &mut short);
-                source[..32].copy_from_slice(&short);
-                added
-            }
-            1 => slots.add64(handle, &mut source),
-            _ => slots.add_generated(handle, any_length(), &mut entropy),
-        };
-        let refusal = if live {
-            Error::EpochChanging
-        } else {
+        let added = slots.add32(handle, &mut source);
+        let refusal = if !live {
             Error::StaleHandle
+        } else if wrapping {
+            Error::WrongPurpose
+        } else {
+            Error::EpochChanging
         };
         kani::assert(
             result == Err(refusal)
                 && added == Err(refusal)
                 && source == original
-                && entropy.calls == 0
                 && unchanged_except(&slots, &before, 2)
                 && slots.epoch.changing,
             "during a change of epoch no set changes or takes a key, and nothing changes",
         );
-        kani::cover!(live, "a live set is refused");
+        kani::cover!(live && !wrapping, "a live set is refused");
     }
 }

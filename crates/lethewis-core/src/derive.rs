@@ -871,12 +871,7 @@ pub(crate) mod stack {
         let mut memory = [const { Slot::empty() }; 2];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, 1, &mut [9; 32]);
-        let set = slots.import32(Purpose::Wrap, &mut [3; 32]).unwrap();
-        let mut long = key_bytes();
-        assert_clean(&pieces(&key_bytes(), KeyLength::Bytes64), || {
-            slots.add64(set, &mut long).unwrap();
-        });
-        slots.settle();
+        let set = slots.import32(Purpose::ExternalData, &mut [3; 32]).unwrap();
         let mut short: [u8; 32] = key_bytes()[..32].try_into().unwrap();
         assert_clean(&pieces(&key_bytes(), KeyLength::Bytes32), || {
             slots.add32(set, &mut short).unwrap();
@@ -888,10 +883,12 @@ pub(crate) mod stack {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, 1, &mut epoch_bytes(0));
-        let set = slots.import32(Purpose::Wrap, &mut [3; 32]).unwrap();
-        for (count, length) in [(0, KeyLength::Bytes64), (1, KeyLength::Bytes32)] {
-            assert_clean(&generation_pieces(count, length), || {
-                slots.add_generated(set, length, &mut Counting).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut [3; 32]).unwrap();
+        for count in [0, 1] {
+            assert_clean(&generation_pieces(count, KeyLength::Bytes32), || {
+                slots
+                    .add_generated(set, KeyLength::Bytes32, &mut Counting)
+                    .unwrap();
             });
             slots.settle();
         }

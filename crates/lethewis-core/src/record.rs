@@ -30,9 +30,9 @@ const _: () = assert!(AAD_LABEL.len() + 2 + MAX_CONTEXT == AAD_CAPACITY);
 #[non_exhaustive]
 #[repr(u8)]
 pub enum Purpose {
-    /// A key of 32 or 64 bytes that wraps other keys. Leaves the library only as a record wrapped
-    /// by another key, or as the words [`Slots::generate_words`](crate::Slots::generate_words)
-    /// writes once.
+    /// A key of 32 or 64 bytes that wraps other keys. Its set holds this one key and never changes.
+    /// Leaves the library only as a record wrapped by another key, or as the words
+    /// [`Slots::generate_words`](crate::Slots::generate_words) writes once.
     Wrap = 1,
     /// A key of 32 bytes for data an engine outside the library encrypts, such as a database. It
     /// wraps no key, and leaves the library only as a record wrapped by another key or through

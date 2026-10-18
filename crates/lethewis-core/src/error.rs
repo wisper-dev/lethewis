@@ -15,11 +15,9 @@ pub enum Error {
     EntropyFailed,
     /// A value could not be derived from a key.
     DerivationFailed,
-    /// The record does not open with a key of the parent set and this context, holds a plaintext
+    /// The record does not open with the key of the parent set and this context, holds a plaintext
     /// this version of the library cannot read, or names a key other than the one that opens it.
     RecordRejected,
-    /// The record opens only with a disabled key, and a disabled key unwraps nothing.
-    KeyDisabled,
     /// A key set cannot wrap itself.
     SameKey,
     /// The context is empty or longer than 255 bytes.
@@ -84,7 +82,6 @@ impl fmt::Display for Error {
             Self::EntropyFailed => "random source failed",
             Self::DerivationFailed => "key derivation failed",
             Self::RecordRejected => "record rejected",
-            Self::KeyDisabled => "key disabled",
             Self::SameKey => "a key set cannot wrap itself",
             Self::InvalidContext => "invalid context",
             Self::CipherFailed => "cipher failed",
@@ -126,7 +123,6 @@ mod tests {
         assert_eq!(Error::EntropyFailed.to_string(), "random source failed");
         assert_eq!(Error::DerivationFailed.to_string(), "key derivation failed");
         assert_eq!(Error::RecordRejected.to_string(), "record rejected");
-        assert_eq!(Error::KeyDisabled.to_string(), "key disabled");
         assert_eq!(Error::SameKey.to_string(), "a key set cannot wrap itself");
         assert_eq!(Error::InvalidContext.to_string(), "invalid context");
         assert_eq!(Error::CipherFailed.to_string(), "cipher failed");
