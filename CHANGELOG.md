@@ -50,16 +50,16 @@ Nothing is published while the version is below 0.1.0.
 - Dependencies: `aes-gcm-siv` 0.12.1, `aes` 0.9.3 and `polyval` 0.7.3 or later compatible versions,
   without default features and with their `zeroize` features.
 - Key sets: a slot holds a set of up to three keys, each enabled or disabled, one of them the
-  primary, with a revision counter. An import or a generation loads a set of one. `Slots::wrap`
-  writes the set a handle refers to as one record of `RECORD_LEN` bytes, 261, encrypted with
-  AES-256-GCM-SIV under a key derived from the primary key of the parent set, bound to a context of 1
-  to 255 bytes; `Slots::unwrap` loads it back into a free slot, trying every key of the parent set,
-  also after one has opened the record. A record holds the set's purpose, the stage of each key, the
-  primary and the revision, and the identifier of the parent key. New errors: `RecordRejected` for
-  any record that does not open, parse or name the key that opened it, `KeyDisabled` for a record
-  wrapped under a disabled key of the parent, `SameKey` for a set wrapped under itself,
-  `InvalidContext`, `CipherFailed`, and `DuplicateKey`: a key is held in one place only, and a load
-  of a key the slots already hold, or of a set that holds one key twice, is refused.
+  primary, with a revision counter. An import or a generation loads a set of one.
+- `Slots::wrap` writes the set a handle refers to as one record of `RECORD_LEN` bytes, 261,
+  encrypted with AES-256-GCM-SIV under a key derived from the key of the parent set, bound to a
+  context of 1 to 255 bytes; `Slots::unwrap` loads it back into a free slot.
+- A record holds the set's purpose, the stage of each key, the primary and the revision, and the
+  identifier of the parent key.
+- New errors: `RecordRejected` for any record that does not open, parse or name the key that opened
+  it, `SameKey` for a set wrapped under itself, `InvalidContext` and `CipherFailed`.
+- `DuplicateKey`: a key is held in one place only, and a load of a key the slots already hold, or of
+  a set that holds one key twice, is refused.
 - Dependency: `ctutils` 0.4.2 or a later compatible version, without default features, to compare
   a record's parent identifier, and words with the list, in constant time.
 - The stack a wrap or an unwrap used is wiped after it, also when it fails: 24 KiB, or 64 KiB when
@@ -82,17 +82,17 @@ Nothing is published while the version is below 0.1.0.
   position of the primary and a revision counter, and for the stages of its keys: from any set whose
   primary is enabled, every transition keeps it so, counts one revision and changes only what it
   names, and a transition out of order is refused and changes nothing.
-- A test unwraps random records sealed with the real derivation and cipher: random sets, parent sets
-  of one to three keys, keys held elsewhere, contexts, slots and changed bits; a million of them from
+- A test unwraps random records sealed with the real derivation and cipher: random sets, parents,
+  keys held elsewhere, contexts, slots and changed bits; a million of them from
   a new seed on every pull request.
 - A build step checks that the machine code of the comparison of key identifiers runs straight
   through on x86-64, aarch64, Cortex-M4 and WebAssembly: no branch, no call and no write of the
   program counter but the final return.
-- Proofs with Kani 0.68.0 for wrapping and unwrapping, with a model of the cipher: a wrap changes no
-  slot and writes the record only when it succeeds; an unwrap tries every key of the parent once and
-  keeps the plaintext of the first that opens the record and is named in it; a refused unwrap
-  changes no slot; a decrypted set loads exactly the keys it holds, only when none is held already
-  or twice.
+- Proofs with Kani 0.68.0 for wrapping and unwrapping, with a model of the cipher. A wrap changes no
+  slot and writes the record only when it succeeds. An unwrap tries the key of the parent once and
+  keeps the plaintext when it opens the record and names that key.
+- A refused unwrap changes no slot, and a decrypted set loads exactly the keys it holds, only when
+  none is held already or twice.
 - Proofs with Kani 0.68.0 for the code around the cipher of the key records: a seal that fails, and
   a record that does not open, leave the buffer zero, and a record is refused exactly when the
   cipher rejects it.
@@ -101,8 +101,8 @@ Nothing is published while the version is below 0.1.0.
   `SECURITY.md`.
 - The stack a load of a key used is wiped after it, not only the stack of the derivation of its
   identifier.
-- Changes of a key set in its slot. `Slots::add32`, `Slots::add64` and `Slots::add_generated` add
-  a key, enabled, to the first empty position. `Slots::promote`, `Slots::disable`, `Slots::enable`
+- Changes of a key set in its slot. `Slots::add32` and `Slots::add_generated` add a key, enabled,
+  to the first empty position. `Slots::promote`, `Slots::disable`, `Slots::enable`
   and `Slots::destroy` change the stage of a key. A destroyed key is wiped with its identifier.
 - `Position` names the three positions of a set. New errors: `SetFull`, `PrimaryKey`,
   `WrongStage` and `SetExhausted`.
@@ -165,5 +165,33 @@ Nothing is published while the version is below 0.1.0.
   gives different bytes. Password salts are not hedged.
 - Proofs with Kani 0.68.0 that keys, words and nonces are the hedge of the source's bytes, and that
   the count of draws grows once for each draw the source answers.
+- A set for wrapping holds one key and never changes: changes of stage and additions refuse it with
+  `WrongPurpose`, and a record of one is unwrapped only if it holds a set of one that has never
+  changed.
+  Proofs with Kani 0.68.0 for both.
+- Levels of keys. A key for wrapping from a secret, imported or derived from a password or words,
+  is never wrapped and wraps only stored keys for wrapping; a stored one, generated or unlocked,
+  wraps only keys for external data. A call at the wrong level fails with `WrongLevel`.
+- `Slots::lock` keeps a stored key under a key from a secret as a lock record of
+  `LOCK_RECORD_LEN` bytes, 297, in two layers of AES-256-GCM-SIV. The inner one is under a key
+  derived from the key from a secret alone, the outer under a key derived from the key of the
+  epoch, with its number. `Slots::unlock` loads the stored key back.
+- `Slots::carry` moves a lock record into the next epoch during a change, without the key from a
+  secret. A lock record not carried opens no more once the change is committed and the old root
+  erased; a record of another epoch fails with `StaleRecord`.
+- Proofs with Kani 0.68.0 for the levels of loads, wraps, locks, unwraps and unlocks, and for the
+  layers of lock records and their carry. Tests against lock records and a carried record computed
+  by an independent implementation.
+- `Slots::combine` derives one key from a secret from two, the second of 32 bytes as the salt of
+  HKDF-SHA-256, and releases both. `Slots::challenge` derives from a key from a secret the
+  challenge to a chip, whose answer, combined with that key, makes a key that needs both.
+- Proofs with Kani 0.68.0 for combining and for the challenge; tests against an independent
+  implementation of HKDF-SHA-256.
+- The stack a lock, an unlock or a carry used is wiped after it, also when it fails: 24 KiB, or
+  64 KiB without optimisation; after a combination or a challenge, 8 KiB, or 64 KiB. Tests read
+  it back after each, and after a refused unlock.
+- A test of the hierarchy end to end, through the public interface. A profile key is locked under
+  a password with the chip and under words, with keys of chats under it. After a change of epoch, a
+  chat not wrapped again and a way in not carried open no more.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

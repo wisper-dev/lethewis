@@ -5,14 +5,17 @@ use core::{fmt, marker::PhantomData};
 
 use crate::{
     derive::{
-        Branch, Hedged, KeyId, derive_key_id, derive_wrap_key, wipe_cipher_stack, wipe_stack,
+        Branch, Hedged, KeyId, derive_challenge, derive_combined, derive_key_id, derive_layer_key,
+        derive_lock_key, derive_wrap_key, wipe_cipher_stack, wipe_stack,
     },
     entropy::{Entropy, EntropyError},
     epoch::{Epoch, Erasure, Root, RootFailed},
     error::Error,
     key::{Key, KeyBytes, KeyLength, wipe},
     keyset::{self, Header, MEMBERS, Position, Refused, Stages},
-    record::{AssociatedData, PLAINTEXT_LEN, Purpose, RECORD_LEN, Status},
+    record::{
+        AssociatedData, LAYER_LEN, LOCK_RECORD_LEN, PLAINTEXT_LEN, Purpose, RECORD_LEN, Status,
+    },
     seal::{self, KEY_LEN as CIPHER_KEY_LEN, NONCE_LEN, Rejected, TAG_LEN},
 };
 
@@ -26,6 +29,9 @@ pub struct Slot {
     ids: [KeyId; MEMBERS],
     stages: Stages,
     purpose: Purpose,
+    /// The set is a key from a secret the caller holds: it is never wrapped, and wraps only stored
+    /// keys for wrapping.
+    unlocks: bool,
     generation: u64,
     occupancy: Occupancy,
     /// The set has changed in this epoch.
@@ -51,6 +57,7 @@ impl Slot {
             ids: [const { KeyId::empty() }; MEMBERS],
             stages: Stages::one(),
             purpose: Purpose::Wrap,
+            unlocks: false,
             generation: 0,
             occupancy: Occupancy::Free,
             changed: false,
@@ -111,15 +118,12 @@ impl Slot {
         }
     }
 
-    /// The primary key of the set and its identifier.
-    fn primary(&self) -> (&Key, &KeyId) {
-        let [first, second, third] = &self.keys;
-        let [first_id, second_id, third_id] = &self.ids;
-        match self.stages.primary() {
-            0 => (first, first_id),
-            1 => (second, second_id),
-            _ => (third, third_id),
-        }
+    /// The key of a set for wrapping, which holds it alone at the first position, and its
+    /// identifier.
+    fn wrapping_key(&self) -> (&Key, &KeyId) {
+        let [first, ..] = &self.keys;
+        let [first_id, ..] = &self.ids;
+        (first, first_id)
     }
 }
 
@@ -207,27 +211,34 @@ pub struct Slots<'a> {
     epoch: &'a mut Epoch,
 }
 
-/// What opens a sealed plaintext: AES-256-GCM-SIV, or a model of it in the proofs.
-trait Open:
+/// What opens a sealed plaintext of `N` bytes: AES-256-GCM-SIV, or a model of it in the proofs.
+trait Open<const N: usize>:
     FnMut(
     &[u8; CIPHER_KEY_LEN],
     &[u8; NONCE_LEN],
     &[u8],
-    &mut [u8; PLAINTEXT_LEN],
+    &mut [u8; N],
     &[u8; TAG_LEN],
 ) -> Result<(), Rejected>
 {
 }
 
-impl<F> Open for F where
+impl<F, const N: usize> Open<N> for F where
     F: FnMut(
         &[u8; CIPHER_KEY_LEN],
         &[u8; NONCE_LEN],
         &[u8],
-        &mut [u8; PLAINTEXT_LEN],
+        &mut [u8; N],
         &[u8; TAG_LEN],
     ) -> Result<(), Rejected>
 {
+}
+
+/// Where a wrap writes: the record of a set for external data, or the lock record of a stored key
+/// for wrapping.
+enum Out<'r> {
+    Record(&'r mut [u8; RECORD_LEN]),
+    Lock(&'r mut [u8; LOCK_RECORD_LEN]),
 }
 
 impl<'a> Slots<'a> {
@@ -270,7 +281,8 @@ impl<'a> Slots<'a> {
         purpose: Purpose,
         source: &mut [u8; 32],
     ) -> Result<Handle<'a>, Error> {
-        let handle = self.load_new(purpose, KeyLength::Bytes32, |first, _| {
+        let secret = purpose == Purpose::Wrap;
+        let handle = self.load_new(purpose, KeyLength::Bytes32, secret, |first, _| {
             first.copy32(source);
             Ok(())
         })?;
@@ -297,7 +309,8 @@ impl<'a> Slots<'a> {
         purpose: Purpose,
         source: &mut [u8; 64],
     ) -> Result<Handle<'a>, Error> {
-        let handle = self.load_new(purpose, KeyLength::Bytes64, |first, _| {
+        let secret = purpose == Purpose::Wrap;
+        let handle = self.load_new(purpose, KeyLength::Bytes64, secret, |first, _| {
             first.copy64(source);
             Ok(())
         })?;
@@ -332,7 +345,7 @@ impl<'a> Slots<'a> {
         length: KeyLength,
         entropy: &mut (impl Entropy + ?Sized),
     ) -> Result<Handle<'a>, Error> {
-        self.load_new(purpose, length, |first, epoch| {
+        self.load_new(purpose, length, false, |first, epoch| {
             hedged_fill(first, length, entropy, epoch)
         })
     }
@@ -357,7 +370,7 @@ impl<'a> Slots<'a> {
         length: KeyLength,
         source: &mut (impl Entropy + ?Sized),
     ) -> Result<Handle<'a>, Error> {
-        self.load_new(purpose, length, |first, _| {
+        self.load_new(purpose, length, purpose == Purpose::Wrap, |first, _| {
             first
                 .fill(length, source)
                 .map_err(|EntropyError| Error::EntropyFailed)
@@ -420,12 +433,137 @@ impl<'a> Slots<'a> {
         Ok(())
     }
 
-    /// Wraps the key set that `set` refers to under the primary key of the set that `parent` refers
-    /// to and writes the record into `record`, in this epoch, or in the next while a change to it
-    /// is under way. The record holds every key of the set, its stage and which key is the primary,
-    /// and opens only with that key of the parent and the same `context`, which names the place the
-    /// record is kept, from 1 to 255 bytes. The nonce comes from
-    /// `entropy`, hedged with the key of the epoch the record is wrapped in.
+    /// Combines the keys from a secret that `key` and `salt` refer to into a new key from a secret
+    /// of 32 bytes in a free slot, and releases both: HKDF-Extract with the key of `salt`, 32
+    /// bytes, as the salt and the key of `key` as the input, then HKDF-Expand with a label of its
+    /// own. With the key from a password as `key` and the chip's answer to its
+    /// [`Slots::challenge`], imported for wrapping, as `salt`, the new key needs both.
+    ///
+    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the derivation, the load, and the whole combination, are each
+    /// followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate but
+    /// not the hash code it calls has to set that flag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
+    /// [`Error::SameKey`] if both refer to the same set, [`Error::WrongPurpose`] if either set does
+    /// not serve [`Purpose::Wrap`], [`Error::WrongLevel`] if either is not a key from a secret,
+    /// [`Error::WrongLength`] if the key of `salt` is not of 32 bytes, [`Error::NoFreeSlot`] if no
+    /// slot is free, [`Error::DerivationFailed`] if the key or its identifier cannot be derived,
+    /// and [`Error::DuplicateKey`] if these slots hold the new key already. No slot changes then.
+    pub fn combine(&mut self, key: Handle<'a>, salt: Handle<'a>) -> Result<Handle<'a>, Error> {
+        let combined = lethewis_dit::with(|| self.combine_on_stack(key, salt));
+        wipe_stack();
+        combined
+    }
+
+    /// The combination itself, in a frame of its own: the wipe that follows starts where this
+    /// frame starts.
+    #[inline(never)]
+    fn combine_on_stack(&mut self, key: Handle<'a>, salt: Handle<'a>) -> Result<Handle<'a>, Error> {
+        let (first, second) = self.combinable(key, salt)?;
+        let (Some(input), Some(salting)) = (self.memory.get(first), self.memory.get(second)) else {
+            return Err(Error::StaleHandle);
+        };
+        let (input_key, salt_key) = (input.wrapping_key().0, salting.wrapping_key().0);
+        let mut combined = [0; 32];
+        if derive_combined(input_key, salt_key, &mut combined).is_err() {
+            wipe(&mut combined);
+            return Err(Error::DerivationFailed);
+        }
+        let loaded = self.load_new(Purpose::Wrap, KeyLength::Bytes32, true, |slot_key, _| {
+            slot_key.copy32(&combined);
+            Ok(())
+        });
+        wipe(&mut combined);
+        let handle = loaded?;
+        for index in [first, second] {
+            if let Some(slot) = self.memory.get_mut(index) {
+                slot.unload();
+            }
+        }
+        Ok(handle)
+    }
+
+    /// The slots of the sets `key` and `salt` refer to, if they are two keys from a secret, the
+    /// second of 32 bytes, and a slot is free.
+    fn combinable(&self, key: Handle<'a>, salt: Handle<'a>) -> Result<(usize, usize), Error> {
+        let (first, second) = (self.loaded(key)?, self.loaded(salt)?);
+        if first == second {
+            return Err(Error::SameKey);
+        }
+        let (Some(input), Some(salting)) = (self.memory.get(first), self.memory.get(second)) else {
+            return Err(Error::StaleHandle);
+        };
+        if input.purpose != Purpose::Wrap || salting.purpose != Purpose::Wrap {
+            return Err(Error::WrongPurpose);
+        }
+        if !input.unlocks || !salting.unlocks {
+            return Err(Error::WrongLevel);
+        }
+        if salting.wrapping_key().0.length() != KeyLength::Bytes32 {
+            return Err(Error::WrongLength);
+        }
+        if !self.has_free() {
+            return Err(Error::NoFreeSlot);
+        }
+        Ok((first, second))
+    }
+
+    /// Writes into `out` the challenge to the platform's chip from the key from a secret that `set`
+    /// refers to: HKDF-Extract with the salt of identifiers, then HKDF-Expand with a label of its
+    /// own. The chip answers it under a key that never
+    /// leaves the chip; the answer, imported for wrapping and given to [`Slots::combine`] as the
+    /// salt of this key, makes a key that needs both. Whoever reads a challenge can test guesses at
+    /// the secret without the chip, as with a hash of a password: it is the caller's to wipe, and
+    /// to give to the chip alone.
+    ///
+    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the call is followed by a wipe of 8 KiB, or 64 KiB, below it,
+    /// whether it succeeded or not.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if the set does not serve [`Purpose::Wrap`], [`Error::WrongLevel`]
+    /// if it is not a key from a secret, and [`Error::DerivationFailed`] if the challenge cannot be
+    /// derived. `out` is then left as it was.
+    pub fn challenge(&self, set: Handle<'a>, out: &mut [u8; 32]) -> Result<(), Error> {
+        let challenged = lethewis_dit::with(|| self.challenge_on_stack(set, out));
+        wipe_stack();
+        challenged
+    }
+
+    /// The challenge itself, in a frame of its own: the wipe that follows starts where this frame
+    /// starts.
+    #[inline(never)]
+    fn challenge_on_stack(&self, set: Handle<'a>, out: &mut [u8; 32]) -> Result<(), Error> {
+        let slot = self
+            .memory
+            .get(self.loaded(set)?)
+            .ok_or(Error::StaleHandle)?;
+        if slot.purpose != Purpose::Wrap {
+            return Err(Error::WrongPurpose);
+        }
+        if !slot.unlocks {
+            return Err(Error::WrongLevel);
+        }
+        let mut derived = [0; 32];
+        let challenged = derive_challenge(slot.wrapping_key().0, &mut derived);
+        if challenged.is_ok() {
+            *out = derived;
+        }
+        wipe(&mut derived);
+        challenged.map_err(|_| Error::DerivationFailed)
+    }
+
+    /// Wraps the set for external data that `set` refers to under the stored key for wrapping that
+    /// `parent` refers to and writes the record into `record`, in this epoch, or in the next while
+    /// a change to it is under way. The record holds every key of the set, its stage and which key
+    /// is the primary, and opens only with that key and the same `context`, which names the place
+    /// the record is kept, from 1 to 255 bytes. The nonce comes from `entropy`, hedged with the key
+    /// of the epoch the record is wrapped in.
     ///
     /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
@@ -437,8 +575,9 @@ impl<'a> Slots<'a> {
     /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
     /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
     /// [`Error::SameKey`] if both refer to the same set, [`Error::WrongPurpose`] if the set
-    /// `parent` refers to does not serve [`Purpose::Wrap`], [`Error::Unsaved`] if the set `set`
-    /// refers to has changed in this epoch and no change to the next is under way,
+    /// `parent` refers to does not serve [`Purpose::Wrap`], [`Error::WrongLevel`] if the set `set`
+    /// refers to serves it, or `parent` refers to a key from a secret, [`Error::Unsaved`] if the
+    /// set `set` refers to has changed in this epoch and no change to the next is under way,
     /// [`Error::EntropyFailed`] if `entropy` fails,
     /// [`Error::DerivationFailed`] if the nonce cannot be hedged or the key that encrypts the record
     /// cannot be derived, and
@@ -452,14 +591,53 @@ impl<'a> Slots<'a> {
         entropy: &mut (impl Entropy + ?Sized),
         record: &mut [u8; RECORD_LEN],
     ) -> Result<(), Error> {
-        let wrapped =
-            lethewis_dit::with(|| self.wrap_on_stack(set, parent, context, entropy, record));
+        let wrapped = lethewis_dit::with(|| {
+            self.wrap_on_stack(set, parent, context, entropy, Out::Record(record))
+        });
         wipe_cipher_stack();
         wrapped
     }
 
-    /// The wrap itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
+    /// Locks the stored key for wrapping that `set` refers to under the key from a secret that
+    /// `parent` refers to, and writes the lock record into `record`, in this epoch, or in the next
+    /// while a change to it is under way. The record has two layers, both bound to `context`, from
+    /// 1 to 255 bytes, for good. The inner one opens only with the key from a secret, whatever the
+    /// epoch; the outer one only with the key of the epoch, which [`Slots::carry`] moves on to the
+    /// next without the key from a secret. The nonces come from `entropy`, hedged with the key of
+    /// the epoch the record is written in.
+    ///
+    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
+    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
+    /// code it calls has to set that flag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
+    /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
+    /// [`Error::SameKey`] if both refer to the same set, [`Error::WrongPurpose`] if the set
+    /// `parent` refers to does not serve [`Purpose::Wrap`], [`Error::WrongLevel`] if `set` does not
+    /// refer to a stored key for wrapping or `parent` to a key from a secret,
+    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if a nonce cannot
+    /// be hedged or a key that encrypts a layer cannot be derived, and [`Error::CipherFailed`] if
+    /// the cipher gives a known input a wrong answer or fails. `record` is then left as it was.
+    pub fn lock(
+        &mut self,
+        set: Handle<'a>,
+        parent: Handle<'a>,
+        context: &[u8],
+        entropy: &mut (impl Entropy + ?Sized),
+        record: &mut [u8; LOCK_RECORD_LEN],
+    ) -> Result<(), Error> {
+        let locked = lethewis_dit::with(|| {
+            self.wrap_on_stack(set, parent, context, entropy, Out::Lock(record))
+        });
+        wipe_cipher_stack();
+        locked
+    }
+
+    /// The wrap or the lock itself, in a frame of its own: the wipe that follows starts where this
+    /// frame starts.
     #[inline(never)]
     fn wrap_on_stack(
         &mut self,
@@ -467,8 +645,9 @@ impl<'a> Slots<'a> {
         parent: Handle<'a>,
         context: &[u8],
         entropy: &mut (impl Entropy + ?Sized),
-        record: &mut [u8; RECORD_LEN],
+        out: Out<'_>,
     ) -> Result<(), Error> {
+        let lock = matches!(out, Out::Lock(_));
         let associated = AssociatedData::new(context).map_err(|_| Error::InvalidContext)?;
         let (index, wrapping) = (self.loaded(set)?, self.loaded(parent)?);
         if index == wrapping {
@@ -480,6 +659,9 @@ impl<'a> Slots<'a> {
         };
         if wrapping.purpose != Purpose::Wrap {
             return Err(Error::WrongPurpose);
+        }
+        if child.unlocks || (child.purpose == Purpose::Wrap) != lock || wrapping.unlocks != lock {
+            return Err(Error::WrongLevel);
         }
         if child.changed && !self.epoch.changing {
             return Err(Error::Unsaved);
@@ -496,18 +678,23 @@ impl<'a> Slots<'a> {
         } else {
             (*number, &*key)
         };
-        let (parent_key, parent_id) = wrapping.primary();
+        let (parent_key, parent_id) = wrapping.wrapping_key();
         let mut nonce = [0; NONCE_LEN];
         hedged_draw(entropy, epoch_key, drawn, Branch::HedgeNonce, &mut nonce)?;
         let mut cipher_key = [0; CIPHER_KEY_LEN];
-        if derive_wrap_key(parent_key, epoch_key, &mut cipher_key).is_err() {
+        let derived = if lock {
+            derive_lock_key(parent_key, &mut cipher_key)
+        } else {
+            derive_wrap_key(parent_key, epoch_key, &mut cipher_key)
+        };
+        if derived.is_err() {
             wipe(&mut cipher_key);
             return Err(Error::DerivationFailed);
         }
         let header = Header {
             purpose: child.purpose,
             parent: parent_id.bytes(),
-            epoch,
+            epoch: if lock { 0 } else { epoch },
         };
         let [first, second, third] = &child.keys;
         let mut sealed = [0; PLAINTEXT_LEN];
@@ -515,7 +702,24 @@ impl<'a> Slots<'a> {
         let tag = seal::seal(&cipher_key, &nonce, associated.bytes(), &mut sealed);
         wipe(&mut cipher_key);
         let tag = tag.map_err(|_| Error::CipherFailed)?;
-        write_record(record, &nonce, &sealed, &tag);
+        match out {
+            Out::Record(record) => write_record(record, &nonce, &sealed, &tag),
+            Out::Lock(record) => {
+                let mut inner = [0; RECORD_LEN];
+                write_record(&mut inner, &nonce, &sealed, &tag);
+                wipe(&mut sealed);
+                let layered = seal_layer(
+                    (epoch_key, epoch),
+                    entropy,
+                    drawn,
+                    associated.bytes(),
+                    &inner,
+                    record,
+                );
+                wipe(&mut inner);
+                layered?;
+            }
+        }
         if self.epoch.changing
             && let Some(child) = self.memory.get_mut(index)
         {
@@ -524,9 +728,9 @@ impl<'a> Slots<'a> {
         Ok(())
     }
 
-    /// Unwraps `record` with the set that `parent` refers to and the `context` it was wrapped for,
-    /// into a free slot. Every key of the parent set is tried, whichever opens the record; the set
-    /// comes out with the purpose, keys, stages and primary the record holds.
+    /// Unwraps `record` with the stored key for wrapping that `parent` refers to and the `context`
+    /// it was wrapped for, into a free slot. The set comes out with the purpose, keys, stages and
+    /// primary the record holds.
     ///
     /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
@@ -537,14 +741,14 @@ impl<'a> Slots<'a> {
     ///
     /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
     /// [`Error::StaleHandle`] if `parent` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Wrap`],
-    /// [`Error::NoFreeSlot`] if no slot is free, [`Error::DerivationFailed`] if a value cannot be
-    /// derived from a key, [`Error::RecordRejected`] if the record does not open with a key of the
-    /// parent, this context and the key of this epoch, names a key other than the one that opens
-    /// it or another epoch, or holds a plaintext this version of the library cannot read,
-    /// [`Error::KeyDisabled`] if only a disabled key of
-    /// the parent opens it, and [`Error::DuplicateKey`] if these slots hold a key of the set already
-    /// or the set holds one key twice. No slot changes then.
+    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Wrap`], [`Error::WrongLevel`]
+    /// if it is a key from a secret, [`Error::NoFreeSlot`] if no slot is free,
+    /// [`Error::DerivationFailed`] if a value cannot be derived from a key,
+    /// [`Error::RecordRejected`] if the record does not open with the key of the parent, this
+    /// context and the key of this epoch, names a key other than the one that opens it or another
+    /// epoch, or holds a set for wrapping or a plaintext this version of the library cannot read,
+    /// and [`Error::DuplicateKey`] if these slots hold a key of the set already or the set holds
+    /// one key twice. No slot changes then.
     pub fn unwrap(
         &mut self,
         parent: Handle<'a>,
@@ -565,98 +769,260 @@ impl<'a> Slots<'a> {
         parent: Handle<'a>,
         context: &[u8],
         record: &[u8; RECORD_LEN],
-        mut open: impl Open,
+        mut open: impl Open<PLAINTEXT_LEN>,
     ) -> Result<Handle<'a>, Error> {
         let associated = AssociatedData::new(context).map_err(|_| Error::InvalidContext)?;
+        let index = self.parent(parent, false)?;
+        self.take(index, associated.bytes(), record, false, &mut open)
+    }
+
+    /// Unlocks the lock record `record` with the key from a secret that `parent` refers to and the
+    /// `context` it was locked for, into a free slot: the stored key for wrapping it holds comes
+    /// out as a set of one.
+    ///
+    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
+    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
+    /// code it calls has to set that flag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
+    /// [`Error::StaleHandle`] if `parent` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Wrap`], [`Error::WrongLevel`]
+    /// if it is not a key from a secret, [`Error::NoFreeSlot`] if no slot is free,
+    /// [`Error::DerivationFailed`] if a value cannot be derived from a key,
+    /// [`Error::StaleRecord`] if the record does not open in this epoch for this context: it was
+    /// not locked or carried into this epoch, or it was changed, [`Error::RecordRejected`] if it
+    /// does not open with the key of the parent, names a key other than the one that opens it, or
+    /// holds a plaintext this version of the library cannot read, and [`Error::DuplicateKey`] if
+    /// these slots hold its key already. No slot changes then.
+    pub fn unlock(
+        &mut self,
+        parent: Handle<'a>,
+        context: &[u8],
+        record: &[u8; LOCK_RECORD_LEN],
+    ) -> Result<Handle<'a>, Error> {
+        let unlocked = lethewis_dit::with(|| {
+            self.unlock_on_stack(parent, context, record, seal::open, seal::open)
+        });
+        wipe_cipher_stack();
+        unlocked
+    }
+
+    /// The unlock itself, in a frame of its own: the wipe that follows starts where this frame
+    /// starts.
+    #[inline(never)]
+    fn unlock_on_stack(
+        &mut self,
+        parent: Handle<'a>,
+        context: &[u8],
+        record: &[u8; LOCK_RECORD_LEN],
+        mut open_layer_with: impl Open<LAYER_LEN>,
+        mut open: impl Open<PLAINTEXT_LEN>,
+    ) -> Result<Handle<'a>, Error> {
+        let associated = AssociatedData::new(context).map_err(|_| Error::InvalidContext)?;
+        let index = self.parent(parent, true)?;
+        let mut inner = [0; RECORD_LEN];
+        let unlocked = open_layer(
+            (&self.epoch.key, self.epoch.number),
+            associated.bytes(),
+            record,
+            &mut inner,
+            &mut open_layer_with,
+        )
+        .and_then(|()| self.take(index, associated.bytes(), &inner, true, &mut open));
+        wipe(&mut inner);
+        unlocked
+    }
+
+    /// The slot of the set `parent` refers to, if it serves [`Purpose::Wrap`], is a key from a
+    /// secret exactly when `secret` says so, and a slot is free.
+    fn parent(&self, parent: Handle<'a>, secret: bool) -> Result<usize, Error> {
         let index = self.loaded(parent)?;
-        if self.memory.get(index).map(|slot| slot.purpose) != Some(Purpose::Wrap) {
+        let set = self.memory.get(index).ok_or(Error::StaleHandle)?;
+        if set.purpose != Purpose::Wrap {
             return Err(Error::WrongPurpose);
+        }
+        if set.unlocks != secret {
+            return Err(Error::WrongLevel);
         }
         if !self.has_free() {
             return Err(Error::NoFreeSlot);
         }
+        Ok(index)
+    }
+
+    /// Opens `record` under the key of the set in slot `parent`, a key from a secret when `lock`
+    /// says so, and loads the set it holds.
+    fn take(
+        &mut self,
+        parent: usize,
+        aad: &[u8],
+        record: &[u8; RECORD_LEN],
+        lock: bool,
+        open: &mut impl Open<PLAINTEXT_LEN>,
+    ) -> Result<Handle<'a>, Error> {
         let mut plaintext = [0; PLAINTEXT_LEN];
         let admitted = self
-            .open_under(index, associated.bytes(), record, &mut plaintext, &mut open)
-            .and_then(|()| self.admit(&plaintext));
+            .open_under(parent, aad, record, &mut plaintext, open, lock)
+            .and_then(|()| self.admit(&plaintext, lock));
         wipe(&mut plaintext);
         admitted
     }
 
-    /// Tries every key of the set in slot `parent` on `record`, without stopping at the first that
-    /// opens it. Keeps in `found` the plaintext of the first key that opens the record and whose
-    /// identifier the plaintext names as the parent's, and refuses it as `KeyDisabled` if that key
-    /// is disabled.
+    /// Opens `record` under the key of the set in slot `parent`, a key from a secret when `lock`
+    /// says so, and keeps the plaintext in `found` if it names that key's identifier as the
+    /// parent's.
     fn open_under(
         &self,
         parent: usize,
         aad: &[u8],
         record: &[u8; RECORD_LEN],
         found: &mut [u8; PLAINTEXT_LEN],
-        open: &mut impl Open,
+        open: &mut impl Open<PLAINTEXT_LEN>,
+        lock: bool,
     ) -> Result<(), Error> {
-        let set = self.memory.get(parent).ok_or(Error::StaleHandle)?;
-        let (nonce, mut sealed, tag) = split_record(record);
-        // The winner in two plain values: Kani 0.68.0 decodes values packed around `Status`, such as
-        // `Result<Status, Error>`, wrongly.
-        let mut won = false;
-        let mut won_stage = Status::Enabled;
-        let mut failed = false;
-        let mut try_key = |stage: Option<Status>, key: &Key, id: &KeyId| {
-            let Some(stage) = stage else {
-                return;
-            };
-            let mut cipher_key = [0; CIPHER_KEY_LEN];
-            failed |= derive_wrap_key(key, &self.epoch.key, &mut cipher_key).is_err();
-            let mut trial = sealed;
-            let opened = open(&cipher_key, &nonce, aad, &mut trial, &tag).is_ok();
-            wipe(&mut cipher_key);
-            if opened && id.is(keyset::parent_of(&trial)) && !won {
-                *found = trial;
-                won = true;
-                won_stage = stage;
-            }
-            wipe(&mut trial);
-        };
-        let [first, second, third] = &set.keys;
-        let [first_id, second_id, third_id] = &set.ids;
-        try_key(set.stages.stage(0), first, first_id);
-        try_key(set.stages.stage(1), second, second_id);
-        try_key(set.stages.stage(2), third, third_id);
-        wipe(&mut sealed);
-        if failed {
-            Err(Error::DerivationFailed)
-        } else if !won {
-            Err(Error::RecordRejected)
-        } else if won_stage == Status::Disabled {
-            Err(Error::KeyDisabled)
+        let (key, id) = self
+            .memory
+            .get(parent)
+            .ok_or(Error::StaleHandle)?
+            .wrapping_key();
+        let mut cipher_key = [0; CIPHER_KEY_LEN];
+        let derived = if lock {
+            derive_lock_key(key, &mut cipher_key)
         } else {
+            derive_wrap_key(key, &self.epoch.key, &mut cipher_key)
+        };
+        if derived.is_err() {
+            wipe(&mut cipher_key);
+            return Err(Error::DerivationFailed);
+        }
+        let (nonce, mut sealed, tag) = split_record(record);
+        let opened = open(&cipher_key, &nonce, aad, &mut sealed, &tag).is_ok();
+        wipe(&mut cipher_key);
+        let named = opened && id.is(keyset::parent_of(&sealed));
+        if named {
+            *found = sealed;
+        }
+        wipe(&mut sealed);
+        if named {
             Ok(())
+        } else {
+            Err(Error::RecordRejected)
         }
     }
 
     /// Loads the key set a record's plaintext holds into a free slot, if one is and the plaintext
-    /// parses.
-    fn admit(&mut self, plaintext: &[u8; PLAINTEXT_LEN]) -> Result<Handle<'a>, Error> {
+    /// parses: a set of external data from a record of this epoch, or, from a lock record, a set
+    /// of one stored key for wrapping.
+    fn admit(&mut self, plaintext: &[u8; PLAINTEXT_LEN], lock: bool) -> Result<Handle<'a>, Error> {
         if !self.has_free() {
             return Err(Error::NoFreeSlot);
         }
         let (header, stages, keys) = keyset::parse(plaintext).map_err(|_| Error::RecordRejected)?;
-        if header.epoch != self.epoch.number {
+        let epoch = if lock { 0 } else { self.epoch.number };
+        if header.epoch != epoch
+            || (header.purpose == Purpose::Wrap) != lock
+            || (header.purpose == Purpose::Wrap && !stages.is_one())
+        {
             return Err(Error::RecordRejected);
         }
-        self.load(header.purpose, stages, |[first, second, third], _| {
-            let [first_bytes, second_bytes, third_bytes] = keys;
-            let load = |key: &mut Key, bytes: Option<KeyBytes<'_>>| {
-                if let Some(bytes) = bytes {
-                    bytes.load_into(key);
-                }
-            };
-            load(first, first_bytes);
-            load(second, second_bytes);
-            load(third, third_bytes);
-            Ok(())
-        })
+        self.load(
+            header.purpose,
+            stages,
+            false,
+            |[first, second, third], _| {
+                let [first_bytes, second_bytes, third_bytes] = keys;
+                let load = |key: &mut Key, bytes: Option<KeyBytes<'_>>| {
+                    if let Some(bytes) = bytes {
+                        bytes.load_into(key);
+                    }
+                };
+                load(first, first_bytes);
+                load(second, second_bytes);
+                load(third, third_bytes);
+                Ok(())
+            },
+        )
+    }
+
+    /// Carries the lock record `from` into the next epoch while a change to it is under way, and
+    /// writes it into `to`: the same stored key for wrapping under the same key from a secret, for
+    /// the same `context`, without that key. The nonce comes from `entropy`, hedged with the key
+    /// of the next epoch. A lock record not carried opens no more once the change is committed, so
+    /// a change that leaves one behind revokes that way in; until the commit, and while the
+    /// platform keeps the old root, a copy of it still opens.
+    ///
+    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
+    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
+    /// code it calls has to set that flag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
+    /// [`Error::NoEpochChange`] if no change to the next epoch is under way,
+    /// [`Error::DerivationFailed`] if a key that encrypts a layer cannot be derived or the nonce
+    /// cannot be hedged, [`Error::StaleRecord`] if `from` does not open in this epoch for this
+    /// context, [`Error::EntropyFailed`] if `entropy` fails, and [`Error::CipherFailed`] if the
+    /// cipher gives a known input a wrong answer or fails. `to` is then left as it was.
+    pub fn carry(
+        &mut self,
+        context: &[u8],
+        entropy: &mut (impl Entropy + ?Sized),
+        from: &[u8; LOCK_RECORD_LEN],
+        to: &mut [u8; LOCK_RECORD_LEN],
+    ) -> Result<(), Error> {
+        let carried =
+            lethewis_dit::with(|| self.carry_on_stack(context, entropy, from, to, seal::open));
+        wipe_cipher_stack();
+        carried
+    }
+
+    /// The carry itself, in a frame of its own: the wipe that follows starts where this frame
+    /// starts.
+    #[inline(never)]
+    fn carry_on_stack(
+        &mut self,
+        context: &[u8],
+        entropy: &mut (impl Entropy + ?Sized),
+        from: &[u8; LOCK_RECORD_LEN],
+        to: &mut [u8; LOCK_RECORD_LEN],
+        mut open: impl Open<LAYER_LEN>,
+    ) -> Result<(), Error> {
+        let associated = AssociatedData::new(context).map_err(|_| Error::InvalidContext)?;
+        let Epoch {
+            number,
+            key,
+            next,
+            changing,
+            drawn,
+        } = &mut *self.epoch;
+        if !*changing {
+            return Err(Error::NoEpochChange);
+        }
+        let following = number.checked_add(1).ok_or(Error::EpochExhausted)?;
+        let mut inner = [0; RECORD_LEN];
+        let carried = open_layer(
+            (&*key, *number),
+            associated.bytes(),
+            from,
+            &mut inner,
+            &mut open,
+        )
+        .and_then(|()| {
+            seal_layer(
+                (&*next, following),
+                entropy,
+                drawn,
+                associated.bytes(),
+                &inner,
+                to,
+            )
+        });
+        wipe(&mut inner);
+        carried
     }
 
     pub(crate) fn has_free(&self) -> bool {
@@ -680,17 +1046,19 @@ impl<'a> Slots<'a> {
     }
 
     /// Puts one key of `length` for `purpose` into the first free slot with `fill`, as a set of one
-    /// whose key is the primary, if `purpose` takes `length`.
+    /// whose key is the primary, a key from a secret if `secret` says so, if `purpose` takes
+    /// `length`.
     fn load_new(
         &mut self,
         purpose: Purpose,
         length: KeyLength,
+        secret: bool,
         fill: impl FnOnce(&mut Key, &mut Epoch) -> Result<(), Error>,
     ) -> Result<Handle<'a>, Error> {
         if !purpose.takes(length) {
             return Err(Error::WrongLength);
         }
-        self.load(purpose, Stages::one(), |[first, ..], epoch| {
+        self.load(purpose, Stages::one(), secret, |[first, ..], epoch| {
             fill(first, epoch)
         })
     }
@@ -703,10 +1071,11 @@ impl<'a> Slots<'a> {
         &mut self,
         purpose: Purpose,
         stages: Stages,
+        secret: bool,
         fill: impl FnOnce(&mut [Key; MEMBERS], &mut Epoch) -> Result<(), Error>,
     ) -> Result<Handle<'a>, Error> {
         // The copy of the key and the checks after its derivation run above the derivation's wipe.
-        let loaded = lethewis_dit::with(|| self.load_in_slot(purpose, stages, fill));
+        let loaded = lethewis_dit::with(|| self.load_in_slot(purpose, stages, secret, fill));
         wipe_stack();
         loaded
     }
@@ -715,6 +1084,7 @@ impl<'a> Slots<'a> {
         &mut self,
         purpose: Purpose,
         stages: Stages,
+        secret: bool,
         fill: impl FnOnce(&mut [Key; MEMBERS], &mut Epoch) -> Result<(), Error>,
     ) -> Result<Handle<'a>, Error> {
         let slots = self.id();
@@ -745,6 +1115,7 @@ impl<'a> Slots<'a> {
         third.take(third_id);
         slot.stages = stages;
         slot.purpose = purpose;
+        slot.unlocks = secret;
         slot.occupancy = Occupancy::Loaded;
         Ok(Handle {
             slots,
@@ -798,6 +1169,7 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
     /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
     /// the set has changed in this epoch, [`Error::SetFull`] if every position holds a key,
     /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds,
@@ -807,33 +1179,6 @@ impl<'a> Slots<'a> {
     pub fn add32(&mut self, set: Handle<'a>, source: &mut [u8; 32]) -> Result<Position, Error> {
         let at = self.add(set, KeyLength::Bytes32, |key, _| {
             key.copy32(source);
-            Ok(())
-        })?;
-        wipe(source);
-        Ok(at)
-    }
-
-    /// Takes a 64-byte key from `source` into the first empty position of the set that `set` refers
-    /// to, enabled and not the primary, and wipes `source`. Returns the position.
-    ///
-    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole
-    /// addition, are each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises
-    /// this crate but not the hash code it calls has to set that flag.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
-    /// the set has changed in this epoch, [`Error::WrongLength`] if its purpose takes no 64-byte
-    /// key, [`Error::SetFull`] if every position holds a key,
-    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds,
-    /// [`Error::DerivationFailed`] if the identifier of the key cannot be derived, and
-    /// [`Error::DuplicateKey`] if these slots hold the key already. `source` is then left as it
-    /// was, and nothing changes.
-    pub fn add64(&mut self, set: Handle<'a>, source: &mut [u8; 64]) -> Result<Position, Error> {
-        let at = self.add(set, KeyLength::Bytes64, |key, _| {
-            key.copy64(source);
             Ok(())
         })?;
         wipe(source);
@@ -854,6 +1199,7 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
     /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
     /// the set has changed in this epoch, [`Error::WrongLength`] if its purpose takes no key of
     /// `length`, [`Error::SetFull`] if every position holds a key,
@@ -882,6 +1228,7 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
     /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
     /// the set has changed in this epoch, [`Error::PrimaryKey`] if the key at `at` is the primary
     /// already, [`Error::WrongStage`] if `at` does not hold an enabled key, and
@@ -891,12 +1238,13 @@ impl<'a> Slots<'a> {
         self.change(set, at, Stages::promote).map(|_| ())
     }
 
-    /// Disables the enabled key at `at` of the set that `set` refers to: it unwraps nothing until it
+    /// Disables the enabled key at `at` of the set that `set` refers to: it is not revealed until it
     /// is enabled again.
     ///
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
     /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
     /// the set has changed in this epoch, [`Error::PrimaryKey`] if the key at `at` is the primary,
     /// [`Error::WrongStage`] if `at` does not hold an enabled key, and [`Error::SetExhausted`] if
@@ -910,6 +1258,7 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
     /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
     /// the set has changed in this epoch, [`Error::PrimaryKey`] if `at` is the primary position,
     /// [`Error::WrongStage`] if `at` does not hold a disabled key, and [`Error::SetExhausted`] if
@@ -926,6 +1275,7 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
     /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
     /// the set has changed in this epoch, [`Error::PrimaryKey`] if `at` is the primary position,
     /// [`Error::WrongStage`] if `at` does not hold a disabled key, and [`Error::SetExhausted`] if
@@ -946,6 +1296,9 @@ impl<'a> Slots<'a> {
         transition: impl FnOnce(&mut Stages, usize) -> Result<(), Refused>,
     ) -> Result<&mut Slot, Error> {
         let index = self.loaded(set)?;
+        if self.memory.get(index).map(|slot| slot.purpose) == Some(Purpose::Wrap) {
+            return Err(Error::WrongPurpose);
+        }
         if self.epoch.changing {
             return Err(Error::EpochChanging);
         }
@@ -983,6 +1336,9 @@ impl<'a> Slots<'a> {
         fill: impl FnOnce(&mut Key, &mut Epoch) -> Result<(), Error>,
     ) -> Result<Position, Error> {
         let index = self.loaded(set)?;
+        if self.memory.get(index).map(|slot| slot.purpose) == Some(Purpose::Wrap) {
+            return Err(Error::WrongPurpose);
+        }
         if self.epoch.changing {
             return Err(Error::EpochChanging);
         }
@@ -1069,7 +1425,7 @@ impl<'a> Slots<'a> {
     /// is gone. Only then are the keys destroyed in this epoch out of reach of the records wrapped
     /// before. Before the commit, every record of the next epoch is to be stored, and the records
     /// of this epoch kept until it returns: a record of the next epoch opens only after it, and a
-    /// record of this epoch not wrapped again opens no more. Should the platform stop between
+    /// record of this epoch not wrapped or carried again opens no more. Should the platform stop between
     /// switching the root and erasing the old one, it erases the old one at its next start.
     ///
     /// # Errors
@@ -1134,6 +1490,16 @@ impl<'a> Slots<'a> {
         for slot in self.memory.iter_mut() {
             slot.changed = false;
         }
+    }
+
+    /// Makes the key for wrapping `handle` refers to a stored one, as an unlock gives it: for tests
+    /// of what a stored key does, without a lock record.
+    #[cfg(test)]
+    pub(crate) fn store(&mut self, handle: Handle<'a>) -> Handle<'a> {
+        if let Some(slot) = self.memory.get_mut(handle.index) {
+            slot.unlocks = false;
+        }
+        handle
     }
 
     /// Tells apart two `Slots` alive at once: their memory does not overlap, so neither do the
@@ -1209,6 +1575,86 @@ fn hedged_draw(
     })
 }
 
+/// Seals `inner`, the record of a stored key for wrapping, with the number of an epoch under that
+/// epoch's key, given in `epoch`, into the lock record `out`; the nonce comes from `entropy`, hedged
+/// with that key. `out` is written only when this succeeds.
+fn seal_layer(
+    (epoch_key, number): (&Key, u64),
+    entropy: &mut (impl Entropy + ?Sized),
+    drawn: &mut u64,
+    aad: &[u8],
+    inner: &[u8; RECORD_LEN],
+    out: &mut [u8; LOCK_RECORD_LEN],
+) -> Result<(), Error> {
+    let mut nonce = [0; NONCE_LEN];
+    hedged_draw(entropy, epoch_key, drawn, Branch::HedgeNonce, &mut nonce)?;
+    let mut layer_key = [0; CIPHER_KEY_LEN];
+    if derive_layer_key(epoch_key, &mut layer_key).is_err() {
+        wipe(&mut layer_key);
+        return Err(Error::DerivationFailed);
+    }
+    let mut layer = [0; LAYER_LEN];
+    if let Some((head, rest)) = layer.split_first_chunk_mut::<8>()
+        && let Ok(record) = <&mut [u8; RECORD_LEN]>::try_from(rest)
+    {
+        *head = number.to_le_bytes();
+        *record = *inner;
+    }
+    let tag = seal::seal(&layer_key, &nonce, aad, &mut layer);
+    wipe(&mut layer_key);
+    let tag = tag.map_err(|_| Error::CipherFailed)?;
+    if let Some((nonce_out, rest)) = out.split_first_chunk_mut::<NONCE_LEN>()
+        && let Some((layer_out, tag_out)) = rest.split_first_chunk_mut::<LAYER_LEN>()
+    {
+        *nonce_out = nonce;
+        *layer_out = layer;
+        tag_out.copy_from_slice(&tag);
+    }
+    Ok(())
+}
+
+/// Opens the lock record `record` under the key of an epoch, given in `epoch` with its number, and
+/// keeps the record it holds in `inner` if it names that number; otherwise `StaleRecord`, and
+/// `inner` is left as it was.
+fn open_layer(
+    (epoch_key, number): (&Key, u64),
+    aad: &[u8],
+    record: &[u8; LOCK_RECORD_LEN],
+    inner: &mut [u8; RECORD_LEN],
+    open: &mut impl Open<LAYER_LEN>,
+) -> Result<(), Error> {
+    let mut layer_key = [0; CIPHER_KEY_LEN];
+    if derive_layer_key(epoch_key, &mut layer_key).is_err() {
+        wipe(&mut layer_key);
+        return Err(Error::DerivationFailed);
+    }
+    let mut parts = ([0; NONCE_LEN], [0; LAYER_LEN], [0; TAG_LEN]);
+    if let Some((nonce, rest)) = record.split_first_chunk::<NONCE_LEN>()
+        && let Some((layer, tag)) = rest.split_first_chunk::<LAYER_LEN>()
+        && let Ok(tag) = <[u8; TAG_LEN]>::try_from(tag)
+    {
+        parts = (*nonce, *layer, tag);
+    }
+    let (nonce, mut layer, tag) = parts;
+    let opened = open(&layer_key, &nonce, aad, &mut layer, &tag).is_ok();
+    wipe(&mut layer_key);
+    let mut current = false;
+    if opened
+        && let Some((head, rest)) = layer.split_first_chunk::<8>()
+        && let Ok(record) = <&[u8; RECORD_LEN]>::try_from(rest)
+        && u64::from_le_bytes(*head) == number
+    {
+        *inner = *record;
+        current = true;
+    }
+    wipe(&mut layer);
+    if current {
+        Ok(())
+    } else {
+        Err(Error::StaleRecord)
+    }
+}
+
 /// The nonce, the encrypted plaintext and the tag of a record.
 fn split_record(
     record: &[u8; RECORD_LEN],
@@ -1267,8 +1713,9 @@ mod tests {
 
     use super::{
         AssociatedData, CIPHER_KEY_LEN, Entropy, EntropyError, Epoch, Erasure, Error, Handle,
-        Header, KeyLength, MEMBERS, Occupancy, PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Root,
-        RootFailed, Slot, Slots, Stages, Status, derive_wrap_key, keyset, seal, write_record,
+        Header, KeyLength, LAYER_LEN, LOCK_RECORD_LEN, MEMBERS, Occupancy, PLAINTEXT_LEN, Position,
+        Purpose, RECORD_LEN, Root, RootFailed, Slot, Slots, Stages, Status, derive_layer_key,
+        derive_lock_key, derive_wrap_key, keyset, seal, write_record,
     };
     use crate::derive::{CIPHER_STACK_WIPE, KeyId, STACK_WIPE, derive_key_id};
     use crate::key::{
@@ -1310,20 +1757,21 @@ mod tests {
     assert_not_impl!(Slot: Clone, PartialEq, Default);
     assert_not_impl!(Epoch: Clone, PartialEq, Default);
 
-    /// Every import, generation, wrap and unwrap derives, and every call on words reads and writes
-    /// them, with data-independent timing on, where the processor and the operating system offer
-    /// it.
+    /// Every import, generation, wrap, unwrap, lock, unlock, challenge, combination and carry
+    /// derives, and every call on words reads and writes them, with data-independent timing on,
+    /// where the processor and the operating system offer it.
     #[test]
     fn every_call_that_derives_holds_data_independent_timing() {
         use crate::derive::timing::seen;
         assert!(!lethewis_dit::active(), "the mode is off before the work");
         let _ = seen();
-        let mut memory = [const { Slot::empty() }; 4];
+        let mut memory = [const { Slot::empty() }; 7];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let parent = slots.import64(Purpose::Wrap, &mut [7; 64]).unwrap();
+        let parent = slots.store(parent);
         assert_eq!(seen(), Some(true));
-        let key = slots.import32(Purpose::Wrap, &mut [9; 32]).unwrap();
+        let key = slots.import32(Purpose::ExternalData, &mut [9; 32]).unwrap();
         assert_eq!(seen(), Some(true));
         slots
             .generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting)
@@ -1340,11 +1788,8 @@ mod tests {
         slots.add32(set, &mut [3; 32]).unwrap();
         assert_eq!(seen(), Some(true));
         slots.settle();
-        slots.add64(set, &mut [4; 64]).unwrap();
-        assert_eq!(seen(), Some(true));
-        slots.settle();
         slots.release(set).unwrap();
-        let set = slots.import32(Purpose::Wrap, &mut [5; 32]).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut [5; 32]).unwrap();
         let _ = seen();
         slots
             .add_generated(set, KeyLength::Bytes32, &mut Counting)
@@ -1357,6 +1802,32 @@ mod tests {
         assert_eq!(seen(), Some(true));
         slots.release(set).unwrap();
         slots.derive_from_words(&mut words).unwrap();
+        assert_eq!(seen(), Some(true));
+        let secret = slots.import32(Purpose::Wrap, &mut [6; 32]).unwrap();
+        let stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let _ = seen();
+        let mut locked = [0; LOCK_RECORD_LEN];
+        slots
+            .lock(stored, secret, b"context", &mut Counting, &mut locked)
+            .unwrap();
+        assert_eq!(seen(), Some(true));
+        slots.release(stored).unwrap();
+        slots.unlock(secret, b"context", &locked).unwrap();
+        assert_eq!(seen(), Some(true));
+        let answer = slots.import32(Purpose::Wrap, &mut [7; 32]).unwrap();
+        let mut challenge = [0; 32];
+        slots.challenge(secret, &mut challenge).unwrap();
+        assert_eq!(seen(), Some(true));
+        let combined = slots.combine(secret, answer).unwrap();
+        assert_eq!(seen(), Some(true));
+        slots.release(combined).unwrap();
+        slots.begin_epoch(&mut [8; 32]).unwrap();
+        let mut carried = [0; LOCK_RECORD_LEN];
+        slots
+            .carry(b"context", &mut Counting, &locked, &mut carried)
+            .unwrap();
         assert_eq!(seen(), Some(true));
     }
 
@@ -1381,8 +1852,9 @@ mod tests {
         lines.join(" ")
     }
 
-    /// The documentation of each import, generation, addition, reveal, wrap and unwrap states the
-    /// stack it needs and the depth of the wipe after it, and those depths are the library's.
+    /// The documentation of each import, generation, addition, reveal, wrap, unwrap, lock, unlock,
+    /// carry, combination and challenge states the stack it needs and the depth of the wipe after
+    /// it, and those depths are the library's.
     #[test]
     fn the_documentation_states_the_stack_calls_need() {
         let build = usize::from(cfg!(lethewis_unoptimised));
@@ -1395,11 +1867,15 @@ mod tests {
             ("import64", loads),
             ("generate", loads),
             ("add32", loads),
-            ("add64", loads),
             ("add_generated", loads),
             ("reveal32", loads),
+            ("combine", loads),
+            ("challenge", loads),
             ("wrap", wraps),
             ("unwrap", wraps),
+            ("lock", wraps),
+            ("unlock", wraps),
+            ("carry", wraps),
         ] {
             let text = documentation(call);
             for stated in [
@@ -1416,10 +1892,12 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let set = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
-        let mut long = [5; 64];
-        assert_eq!(slots.add64(set, &mut long), Ok(Position::Second));
-        assert_eq!(long, [0; 64]);
+        let set = slots
+            .import32(Purpose::ExternalData, &mut secret())
+            .unwrap();
+        let mut short = [5; 32];
+        assert_eq!(slots.add32(set, &mut short), Ok(Position::Second));
+        assert_eq!(short, [0; 32]);
         slots.settle();
         let added = slots.add_generated(set, KeyLength::Bytes32, &mut Counting);
         assert_eq!(added, Ok(Position::Third));
@@ -1430,7 +1908,7 @@ mod tests {
             set,
             [
                 Some((Status::Enabled, &secret())),
-                Some((Status::Enabled, &[5; 64])),
+                Some((Status::Enabled, &[5; 32])),
                 Some((Status::Enabled, &generated)),
             ],
             0,
@@ -1447,15 +1925,17 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let set = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
+        let set = slots
+            .import32(Purpose::ExternalData, &mut secret())
+            .unwrap();
         let mut source = Recording::default();
-        let added = slots.add_generated(set, KeyLength::Bytes64, &mut source);
+        let added = slots.add_generated(set, KeyLength::Bytes32, &mut source);
         assert_eq!(added, Ok(Position::Second));
-        assert_eq!((source.calls, source.asked), (1, 64));
+        assert_eq!((source.calls, source.asked), (1, 32));
         assert_ne!(source.at, slots.memory[0].keys[1].bytes().as_ptr().addr());
         assert_eq!(
-            slots.memory[0].keys[1].bytes()[..],
-            hedged(0, b"hedge key", &[3; 64], 64)[..]
+            slots.memory[0].keys[1].bytes()[..32],
+            hedged(0, b"hedge key", &[3; 32], 32)[..]
         );
         let mut full = Recording::default();
         slots.settle();
@@ -1473,17 +1953,18 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let first = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
-        let second = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
-        for (set, bytes) in [(second, [1; 32]), (second, [2; 32]), (first, [1; 32])] {
+        let second = slots.import32(Purpose::ExternalData, &mut [2; 32]).unwrap();
+        for bytes in [[1; 32], [2; 32]] {
             let mut source = bytes;
-            assert_eq!(slots.add32(set, &mut source), Err(Error::DuplicateKey));
+            assert_eq!(slots.add32(second, &mut source), Err(Error::DuplicateKey));
             assert_eq!(source, bytes);
         }
-        assert_holds(
+        assert_holds_for(
             &slots,
             first,
             [Some((Status::Enabled, &[1; 32])), None, None],
             0,
+            Purpose::Wrap,
         );
         assert_holds(
             &slots,
@@ -1498,8 +1979,10 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let set = slots.import32(Purpose::Wrap, &mut secret()).unwrap();
-        let failed = slots.add_generated(set, KeyLength::Bytes64, &mut Failing);
+        let set = slots
+            .import32(Purpose::ExternalData, &mut secret())
+            .unwrap();
+        let failed = slots.add_generated(set, KeyLength::Bytes32, &mut Failing);
         assert_eq!(failed, Err(Error::EntropyFailed));
         assert_holds(
             &slots,
@@ -1515,7 +1998,7 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut [1; 32]).unwrap();
         assert_eq!(slots.promote(set, Second), Err(Error::WrongStage));
         assert_eq!(slots.add32(set, &mut [2; 32]), Ok(Second));
         slots.settle();
@@ -1561,7 +2044,7 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut [1; 32]).unwrap();
         slots.add32(set, &mut [2; 32]).unwrap();
         slots.settle();
         let members = [Some(Status::Enabled), Some(Status::Enabled), None];
@@ -1596,9 +2079,9 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut [1; 32]).unwrap();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = slots.add_generated(set, KeyLength::Bytes64, &mut Panicking);
+            let _ = slots.add_generated(set, KeyLength::Bytes32, &mut Panicking);
         }));
         assert!(outcome.is_err());
         assert_holds(
@@ -1614,7 +2097,7 @@ mod tests {
         let mut memory = [const { Slot::empty() }; 1];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut [1; 32]).unwrap();
         slots.release(set).unwrap();
         let mut source = [2; 32];
         assert_eq!(slots.add32(set, &mut source), Err(Error::StaleHandle));
@@ -1632,6 +2115,167 @@ mod tests {
         let added = slots.add_generated(set, KeyLength::Bytes32, &mut Untouched);
         assert_eq!(added, Err(Error::StaleHandle));
         assert_eq!(slots.memory[0].occupancy, Occupancy::Free);
+    }
+
+    /// A set for wrapping holds its one key and never changes: every change of stage and every
+    /// addition is refused before anything else, the source is not asked, and nothing changes.
+    #[test]
+    fn a_wrapping_set_takes_no_changes() {
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+        slots.begin_epoch(&mut [5; 32]).unwrap();
+        let before = holdings(&slots);
+        let mut source = [2; 32];
+        assert_eq!(slots.add32(set, &mut source), Err(Error::WrongPurpose));
+        assert_eq!(source, [2; 32]);
+        let added = slots.add_generated(set, KeyLength::Bytes32, &mut Untouched);
+        assert_eq!(added, Err(Error::WrongPurpose));
+        for refused in [
+            slots.promote(set, Position::First),
+            slots.disable(set, Position::Second),
+            slots.enable(set, Position::Second),
+            slots.destroy(set, Position::Second),
+        ] {
+            assert_eq!(refused, Err(Error::WrongPurpose));
+        }
+        assert_eq!(holdings(&slots), before);
+        assert!(!slots.memory[0].changed);
+    }
+
+    /// A key whose bytes are 0, 1, 2 and so on, and one whose bytes count from `first`: the inputs of
+    /// the known answers of the derivations.
+    fn counted_from(first: u8) -> [u8; 32] {
+        core::array::from_fn(|i| first + u8::try_from(i).unwrap())
+    }
+
+    /// Two keys from a secret combine into one, the key an independent implementation of HKDF gives,
+    /// as a key from a secret, for a first key of either length; both are released.
+    #[test]
+    fn two_keys_from_a_secret_combine_into_one_and_go() {
+        for (long, expected) in [
+            (
+                false,
+                "d3bcd5a6261170da7661346c8ee46c257579fd9ba0b4b5bfa08d25c372af1869",
+            ),
+            (
+                true,
+                "2e7a0e4937b3ceb87d5015a733a6c8b30e03778b65d404f57996887d4498e5b1",
+            ),
+        ] {
+            let mut memory = [const { Slot::empty() }; 3];
+            let mut epoch_memory = Epoch::empty();
+            let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+            let password = if long {
+                let mut bytes = core::array::from_fn(|i| u8::try_from(i).unwrap());
+                slots.import64(Purpose::Wrap, &mut bytes)
+            } else {
+                slots.import32(Purpose::Wrap, &mut counted_from(0))
+            }
+            .unwrap();
+            let answer = slots
+                .import32(Purpose::Wrap, &mut counted_from(64))
+                .unwrap();
+            let combined = slots.combine(password, answer).unwrap();
+            let expected = unhex32(expected);
+            let only = [Some((Status::Enabled, &expected[..])), None, None];
+            assert_holds_for(&slots, combined, only, 0, Purpose::Wrap);
+            assert!(slots.memory[combined.index].unlocks);
+            for (handle, at) in [(password, 0), (answer, 1)] {
+                assert_eq!(slots.release(handle), Err(Error::StaleHandle));
+                assert_eq!(slots.memory[at].occupancy, Occupancy::Free);
+                assert_eq!(slots.memory[at].keys[0].bytes(), &padded(&[]));
+            }
+        }
+    }
+
+    fn unhex32(text: &str) -> [u8; 32] {
+        core::array::from_fn(|at| u8::from_str_radix(&text[2 * at..2 * at + 2], 16).unwrap())
+    }
+
+    /// A combination takes two keys from a secret, the second of 32 bytes, and a free slot, and
+    /// refuses anything else in order, changing nothing.
+    #[test]
+    fn a_combination_takes_only_two_keys_from_a_secret() {
+        let mut memory = [const { Slot::empty() }; 7];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let password = slots.import32(Purpose::Wrap, &mut counted_from(0)).unwrap();
+        let answer = slots
+            .import32(Purpose::Wrap, &mut counted_from(64))
+            .unwrap();
+        let long = slots.import64(Purpose::Wrap, &mut [7; 64]).unwrap();
+        let stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let data = slots
+            .import32(Purpose::ExternalData, &mut pattern(5, 2))
+            .unwrap();
+        let before = holdings(&slots);
+        for (key, salt, refusal) in [
+            (password, password, Error::SameKey),
+            (password, data, Error::WrongPurpose),
+            (data, answer, Error::WrongPurpose),
+            (password, stored, Error::WrongLevel),
+            (stored, answer, Error::WrongLevel),
+            (password, long, Error::WrongLength),
+        ] {
+            assert_eq!(slots.combine(key, salt), Err(refusal));
+        }
+        assert_eq!(holdings(&slots), before);
+        let fillers = [[3; 32], [4; 32]]
+            .map(|mut bytes| slots.import32(Purpose::ExternalData, &mut bytes).unwrap());
+        assert_eq!(slots.combine(password, answer), Err(Error::NoFreeSlot));
+        for filler in fillers {
+            slots.release(filler).unwrap();
+        }
+        let mut held = unhex32("d3bcd5a6261170da7661346c8ee46c257579fd9ba0b4b5bfa08d25c372af1869");
+        let held = slots.import32(Purpose::ExternalData, &mut held).unwrap();
+        let before = holdings(&slots);
+        assert_eq!(slots.combine(password, answer), Err(Error::DuplicateKey));
+        assert_eq!(holdings(&slots), before);
+        slots.release(held).unwrap();
+        slots.release(password).unwrap();
+        assert_eq!(slots.combine(password, answer), Err(Error::StaleHandle));
+    }
+
+    /// A key from a secret gives the challenge an independent implementation of HKDF gives; no
+    /// other key gives one, and a refusal writes nothing.
+    #[test]
+    fn a_challenge_comes_only_from_a_key_from_a_secret() {
+        let mut memory = [const { Slot::empty() }; 3];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let secret = slots.import32(Purpose::Wrap, &mut counted_from(0)).unwrap();
+        let mut out = [0x55; 32];
+        slots.challenge(secret, &mut out).unwrap();
+        assert_eq!(
+            out,
+            unhex32("0477373f3a3672a9f939bd9be82544eeccf23ab0b19b091e86b93ebb3ad348de")
+        );
+        slots.release(secret).unwrap();
+        let mut bytes = core::array::from_fn(|i| u8::try_from(i).unwrap());
+        let long = slots.import64(Purpose::Wrap, &mut bytes).unwrap();
+        slots.challenge(long, &mut out).unwrap();
+        assert_eq!(
+            out,
+            unhex32("0a1efc3452f44c26f65ae4613543a29c077440e7568c05b06deee2a000463da8")
+        );
+        slots.release(long).unwrap();
+        let secret = slots.import32(Purpose::Wrap, &mut counted_from(0)).unwrap();
+        let stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let data = slots
+            .import32(Purpose::ExternalData, &mut pattern(5, 2))
+            .unwrap();
+        let mut out = [0x55; 32];
+        assert_eq!(slots.challenge(stored, &mut out), Err(Error::WrongLevel));
+        assert_eq!(slots.challenge(data, &mut out), Err(Error::WrongPurpose));
+        slots.release(secret).unwrap();
+        assert_eq!(slots.challenge(secret, &mut out), Err(Error::StaleHandle));
+        assert_eq!(out, [0x55; 32]);
     }
 
     /// A platform that records what it is asked, and switches the root unless told to fail.
@@ -1658,75 +2302,46 @@ mod tests {
     }
 
     /// Saves the change of `set` by a new epoch whose key is all `byte`: wraps `set` under `root`
-    /// into `set_record`, and moves `chat`, a record under `set`, into the new epoch.
+    /// into `record`.
     fn save<'a>(
         slots: &mut Slots<'a>,
         platform: &mut Platform,
         (root, set): (Handle<'a>, Handle<'a>),
-        set_record: &mut [u8; RECORD_LEN],
-        chat: &mut [u8; RECORD_LEN],
+        record: &mut [u8; RECORD_LEN],
         byte: u8,
     ) {
         slots.begin_epoch(&mut [byte; 32]).unwrap();
         slots
-            .wrap(set, root, b"set", &mut Counting, set_record)
+            .wrap(set, root, b"set", &mut Counting, record)
             .unwrap();
-        let child = slots.unwrap(set, b"chat", chat).unwrap();
-        slots
-            .wrap(child, set, b"chat", &mut Counting, chat)
-            .unwrap();
-        slots.release(child).unwrap();
         assert_eq!(slots.commit_epoch(platform), Ok(Erasure::Guaranteed));
     }
 
-    /// A key goes from added to destroyed, each change saved by a new epoch with the record under
-    /// its set moved along. The copy of the set that holds the destroyed key does not reach the
-    /// last epoch, and no copy of an epoch past opens.
+    /// A key goes from added to destroyed, each change saved by a new epoch. The copy of the set
+    /// that holds the destroyed key does not reach the last epoch, and no copy of an epoch past
+    /// opens.
     #[test]
     fn keys_rotate_from_added_to_destroyed() {
         use Position::{First, Second};
-        let mut memory = [const { Slot::empty() }; 4];
+        let mut memory = [const { Slot::empty() }; 3];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let mut platform = Platform::default();
         let root = slots.import64(Purpose::Wrap, &mut [9; 64]).unwrap();
-        let set = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
-        let child = slots.import32(Purpose::Wrap, &mut [5; 32]).unwrap();
-        let mut chat = [0; RECORD_LEN];
+        let root = slots.store(root);
+        let set = slots.import32(Purpose::ExternalData, &mut [1; 32]).unwrap();
+        let mut record = [0; RECORD_LEN];
         slots
-            .wrap(child, set, b"chat", &mut Counting, &mut chat)
+            .wrap(set, root, b"set", &mut Counting, &mut record)
             .unwrap();
-        slots.release(child).unwrap();
-        let first_chat = chat;
-        let mut set_record = [0; RECORD_LEN];
+        let first = record;
         slots.add32(set, &mut [2; 32]).unwrap();
-        save(
-            &mut slots,
-            &mut platform,
-            (root, set),
-            &mut set_record,
-            &mut chat,
-            2,
-        );
+        save(&mut slots, &mut platform, (root, set), &mut record, 2);
         slots.promote(set, Second).unwrap();
-        save(
-            &mut slots,
-            &mut platform,
-            (root, set),
-            &mut set_record,
-            &mut chat,
-            3,
-        );
+        save(&mut slots, &mut platform, (root, set), &mut record, 3);
         slots.disable(set, First).unwrap();
-        save(
-            &mut slots,
-            &mut platform,
-            (root, set),
-            &mut set_record,
-            &mut chat,
-            4,
-        );
-        let with_disabled = set_record;
+        save(&mut slots, &mut platform, (root, set), &mut record, 4);
+        let with_disabled = record;
         slots.destroy(set, First).unwrap();
         slots.begin_epoch(&mut [5; 32]).unwrap();
         assert_eq!(
@@ -1734,34 +2349,23 @@ mod tests {
             Err(Error::DuplicateKey)
         );
         slots
-            .wrap(set, root, b"set", &mut Counting, &mut set_record)
+            .wrap(set, root, b"set", &mut Counting, &mut record)
             .unwrap();
-        let child = slots.unwrap(set, b"chat", &chat).unwrap();
-        slots
-            .wrap(child, set, b"chat", &mut Counting, &mut chat)
-            .unwrap();
-        slots.release(child).unwrap();
         assert_eq!(slots.commit_epoch(&mut platform), Ok(Erasure::Guaranteed));
         assert_eq!(platform.switched, [2, 3, 4, 5]);
         assert_eq!(platform.erased, [1, 2, 3, 4]);
         slots.release(set).unwrap();
-        let back = slots.unwrap(root, b"set", &set_record).unwrap();
+        let back = slots.unwrap(root, b"set", &record).unwrap();
         assert_holds(
             &slots,
             back,
             [None, Some((Status::Enabled, &[2; 32])), None],
             1,
         );
-        let child = slots.unwrap(back, b"chat", &chat).unwrap();
-        slots.release(child).unwrap();
-        assert_eq!(
-            slots.unwrap(root, b"set", &with_disabled),
-            Err(Error::RecordRejected)
-        );
-        assert_eq!(
-            slots.unwrap(back, b"chat", &first_chat),
-            Err(Error::RecordRejected)
-        );
+        slots.release(back).unwrap();
+        for old in [first, with_disabled] {
+            assert_eq!(slots.unwrap(root, b"set", &old), Err(Error::RecordRejected));
+        }
     }
 
     /// A set changes once in an epoch, and is neither released nor wrapped in it after the
@@ -1775,7 +2379,8 @@ mod tests {
         let mut platform = Platform::default();
         assert_eq!(slots.commit_epoch(&mut platform), Err(Error::NoEpochChange));
         let root = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
-        let set = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
+        let root = slots.store(root);
+        let set = slots.import32(Purpose::ExternalData, &mut [2; 32]).unwrap();
         slots.add32(set, &mut [3; 32]).unwrap();
         let mut more = [4; 32];
         assert_eq!(slots.add32(set, &mut more), Err(Error::Unsaved));
@@ -1827,7 +2432,8 @@ mod tests {
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let mut platform = Platform::default();
         let root = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
-        let set = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
+        let root = slots.store(root);
+        let set = slots.import32(Purpose::ExternalData, &mut [2; 32]).unwrap();
         slots.add32(set, &mut [3; 32]).unwrap();
         slots.begin_epoch(&mut [5; 32]).unwrap();
         let mut abandoned = [0; RECORD_LEN];
@@ -1878,7 +2484,8 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let root = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
-        let set = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
+        let root = slots.store(root);
+        let set = slots.import32(Purpose::ExternalData, &mut [2; 32]).unwrap();
         slots.add32(set, &mut [3; 32]).unwrap();
         slots.settle();
         slots.disable(set, Position::Second).unwrap();
@@ -1920,7 +2527,8 @@ mod tests {
             let mut epoch_memory = Epoch::empty();
             let mut slots = Slots::new(&mut memory, &mut epoch_memory, epoch, &mut key.clone());
             let parent = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
-            let set = slots.import32(Purpose::Wrap, &mut [2; 32]).unwrap();
+            let parent = slots.store(parent);
+            let set = slots.import32(Purpose::ExternalData, &mut [2; 32]).unwrap();
             let mut record = [0; RECORD_LEN];
             slots
                 .wrap(set, parent, b"set", &mut Counting, &mut record)
@@ -1932,6 +2540,7 @@ mod tests {
             let mut epoch_memory = Epoch::empty();
             let mut slots = Slots::new(&mut memory, &mut epoch_memory, epoch, &mut key.clone());
             let parent = slots.import32(Purpose::Wrap, &mut [1; 32]).unwrap();
+            let parent = slots.store(parent);
             slots.unwrap(parent, b"set", record).map(|_| ())
         };
         let record = wrapped(EPOCH, epoch_key());
@@ -2352,55 +2961,44 @@ mod tests {
     }
 
     /// Records computed by an implementation independent of this library, in epoch `EPOCH` with the
-    /// key `epoch_key()`: under a 32-byte parent, a set of one 64-byte key in "chat 7"; under a
-    /// 64-byte parent, a set of one 32-byte key in "profile"; under the 32-byte parent, in
-    /// "archive", a full set at revision 9: a disabled 64-byte key, an enabled 32-byte key, and the
-    /// primary, an enabled 64-byte key; and under the 32-byte parent, in "chat 9", a set of one
-    /// 32-byte key for external data. They are wrapped in this order in one set of slots, the
-    /// nonce `NONCE` the source gave each hedged as the next draw.
-    const KNOWN_RECORDS: [&str; 4] = [
+    /// key `epoch_key()`, of sets for external data: under a 32-byte parent, a set of one key in
+    /// "chat 7"; under a 64-byte parent, a set of one key in "chat 8"; and under the 32-byte parent,
+    /// in "archive", a full set at revision 9: a disabled key, an enabled key, and the primary, an
+    /// enabled key. They are wrapped in this order in one set of slots, the nonce `NONCE` the
+    /// source gave each hedged as the next draw.
+    const KNOWN_RECORDS: [&str; 3] = [
         concat!(
-            "c7a1550603080bf1aa1c5192b2c14a7179b3e5605c7b0c02d744bf9c4338da1c",
-            "30548bbbdf84ce9527b227f52a4e88bde05cf620e8d387c7a99b0d5bcf7a7bbf",
-            "b188ba652e54feb8bb154aa6f70797b908e419a1f359c93c12522c2d093043a2",
-            "a57f8a1ff63c50f91a28d5f28c858e0c33d22f778ea9aab3a853ae0cbc22739a",
-            "14a4e58f023f6fb5f6e364c20932c489c890eb8df50d698fe5665269bf759f01",
-            "da4485c06f28036765694e3dca5b70b582f500619964851743e44b074f1de1df",
-            "59932ac2775a95a5d2e03951a76ee77a03ff9866b41dc1e1402519f3ea0571b1",
-            "664372052d3ee9d47b317b855bd2618e490a19dd31c68e99fb6ffced11e382dd",
-            "355d498ca0",
+            "c7a1550603080bf1aa1c51924a6d5d642a6be55972bad74c1f1853ffffd3f2b6",
+            "87a3db11f39ee38c96dd1b88f187b7947c74e104117dae2f0839925604a70f42",
+            "136a1504e135d2df44843a0151d54fdc5448bb1d12dbd697955817baf260bfb0",
+            "c65cc712c3cb3dfac9453e5da727d5c867d3c450b1c5ee07670856a7904003de",
+            "85ea07617ceaf7793c998afb52974cc920a9b3f2411b7b206d81c3227c78103a",
+            "06d5e1e4de8ff1531a959d6263b93943ccc49c44b46f0624c9d2dda70ea6a3af",
+            "650b7418a669bdd26bfb4f16be562faa9c758f09086397456e405ca8d3ddf4cd",
+            "5ef8162e01b9a27569c34d7ee96bf6e9af1907bc0393da7fa5ea14d702c0b279",
+            "a7e3eb7be7",
         ),
         concat!(
-            "2d7fafac78ba33a2056ef2aec24c3b6c91aaa1be2c9a42dfb72e1a1ea27a4abd",
-            "0d62d217af2d5976e9e8f565d616c12f5a57bdbc41a863f84094e3ce4faa4bb9",
-            "83a179e95665649907328914ed0d068a0f9c9cf2e3c417ffaad2b9ab888217d2",
-            "93404dccfdb2babf34507a2f4845e7ba6f853d7dc9d0e97b91050c5b8031ec2f",
-            "fd54fbc10fd9c0ad4c2c8dd8d8098b211623b4fba75d39a28b2ff693537759f2",
-            "5e266558bf0ddd0c680cfe2846d1e69632ae96c3f24e094266a96b3720793c36",
-            "0b050d464abc4560d188abf7d4dcb911a06bbde22f9df162b5d364971a64f7a3",
-            "e20d32d93f061ab487d350898725e09f88cb35147d6e13528892c230283d3257",
-            "7393d0fbab",
+            "2d7fafac78ba33a2056ef2ae5455cae3d7fdb82cbbbf51f1222c1472afc6c4de",
+            "ad42046c5440e60d9fa207baec952179ee31580ff66dd9b66838e3f0c7ec9a50",
+            "74d27413582decd1b4d69046ca3207fb4a57ad1be9bedb216246b923ff300d50",
+            "e7ba44bf501e5c4d7c0c05bd69bd2d285ca3ad35bc9f2a63b765c21e250e3cad",
+            "e82f2730f0f24e7dc31803e8bcde5af92a02da96af8cdf785df977ad0cc26383",
+            "2642b27e135801595183c6f3bf4563c6d4fe7371563f6d849bdd4765386a7d25",
+            "7298a8bf60a67610af91c3bd96e3da969c17b2a64270b4902c0ce93916591de8",
+            "df1b8cdfdcca9429c254fd60ead1174a20f86d1a05eb7e18b6707518d210c1c7",
+            "ef827ac01a",
         ),
         concat!(
-            "27bae2fc323c379d396cc79b05186f957f0af4c8783b4042756d536a4cc90b04",
-            "04873bd5ed6a1d6b7c4335ab1e376c5e9d8a94501fd56ab11d4d874cd24e56c6",
-            "33640a7bdd9775ac67e17257003282fcf0524dab4e0c3e57b6fb1e1f20b25a0b",
-            "743556d687edcdec705dbef5bde79dd04a70907a4f44d2eba1481d39736c2552",
-            "5cf914b717791194e3cba5d85ada7ce79f55ec551d7239277c610a532abb1503",
-            "abf42cb438e2ab1f601382464f2408bf85bbc27180c482c976eb690a6a246a41",
-            "5e017f5eb75e5c871f1c3ad7e79f3541d98afac5a79f8ed55e78a86feb7ca0d7",
-            "7d9e296d87063b3822aa3a4a2a5de32a9a99e01a17b756f997eb426348205eb9",
-            "04740df31c",
-        ),
-        concat!(
-            "5afbf61400553277f85274b8cf589a20b2b6c44f60caf44bc2b69991bbb9c902",
-            "1a6ddacba0fe92ed7b293f852da687bf321fe697a3ca282a3a25c4ffad716d08",
-            "86c37776ada8bd246a59a3ee4837a58bf9748120fcc4d1fab9e7880e39aedb2c",
-            "2546fc8e077f95e332571e4e1dea1546a4a62f5d6be0698071c7e77dca8a3c01",
-            "fef375c848fbc36eb1e25ece07970b0ccef12adf089ec95222b74eaab6ef3706",
-            "0e27f6da61d5e68c1ed74bfd5197bfdd25fe98e0272b13146ed3f6a29f13ec47",
-            "3cb9b060c43840609d75f10583eccc3fb01abad65fa3525cb1c3ae92f3895217",
-            "461eb95042e54b5cb839485ff508dbacbbb9344df038b62a5b93f3b71168c84329275caf14",
+            "27bae2fc323c379d396cc79bd5267624a92673d4a5922e04131e647e01cb6ee2",
+            "0e3a9f03774451ccad997c3c206b6735e9f01afa797f67fc5d4cb86f9d9e6828",
+            "a88d2d8ffb0f4615acc84e4dcda93b156d9ac1ebdda06befb7752d19f8491ed8",
+            "56b959f216ee2c192241587ef1e5d675df0cb2b03ae3d0e1a7c7167d0cabff9e",
+            "4eafbe6382f73e213ae345b401f2990b5aba7833a0239f6ad4e35f2bdf985d6a",
+            "213bada052007a23fe7ef1aa4ef849cb214c22f77c22fd72d1d017563f44e6fb",
+            "2e0600e2b44e53cec455f1871378c58af221c96a6bf16f2ed6ce9bb60f344c8b",
+            "647b719d659ec6f538d5afcba724a57f498ef11b0cfd16ca88476a1a95827e9a",
+            "573514f847",
         ),
     ];
 
@@ -2414,19 +3012,19 @@ mod tests {
     }
 
     type Member<'b> = Option<(Status, &'b [u8])>;
-    /// A parent's bytes, a context, the members of a set, its primary and its purpose.
-    type Case<'b> = (&'b [u8], &'b [u8], [Member<'b>; MEMBERS], usize, Purpose);
+    /// A parent's bytes, a context, the members of a set and its primary.
+    type Case<'b> = (&'b [u8], &'b [u8], [Member<'b>; MEMBERS], usize);
 
     /// Asserts that the set `handle` refers to holds `members` at their positions, each with its
     /// stage and the identifier derived from it, with `primary` as the primary, and nothing at an
-    /// empty position, for wrapping.
+    /// empty position, for external data.
     fn assert_holds(
         slots: &Slots<'_>,
         handle: Handle<'_>,
         members: [Member<'_>; MEMBERS],
         primary: usize,
     ) {
-        assert_holds_for(slots, handle, members, primary, Purpose::Wrap);
+        assert_holds_for(slots, handle, members, primary, Purpose::ExternalData);
     }
 
     /// The same, for `purpose`.
@@ -2461,13 +3059,14 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let short_parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
-        let long_key = slots
-            .import64(Purpose::Wrap, &mut pattern(59, 201))
+        let short_parent = slots.store(short_parent);
+        let first = slots
+            .import32(Purpose::ExternalData, &mut pattern(59, 201))
             .unwrap();
         let mut record = [0; RECORD_LEN];
         slots
             .wrap(
-                long_key,
+                first,
                 short_parent,
                 b"chat 7",
                 &mut Fixed(&NONCE),
@@ -2477,21 +3076,24 @@ mod tests {
         assert_eq!(record, hex(KNOWN_RECORDS[0]));
 
         let long_parent = slots.import64(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
-        let short_key = slots
-            .import32(Purpose::Wrap, &mut pattern(59, 201))
+
+        let long_parent = slots.store(long_parent);
+        let second = slots
+            .import32(Purpose::ExternalData, &mut pattern(31, 7))
             .unwrap();
         slots
             .wrap(
-                short_key,
+                second,
                 long_parent,
-                b"profile",
+                b"chat 8",
                 &mut Fixed(&NONCE),
                 &mut record,
             )
             .unwrap();
         assert_eq!(record, hex(KNOWN_RECORDS[1]));
 
-        slots.release(long_key).unwrap();
+        slots.release(first).unwrap();
+        slots.release(second).unwrap();
         let full = slots
             .unwrap(short_parent, b"archive", &hex(KNOWN_RECORDS[2]))
             .unwrap();
@@ -2505,66 +3107,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(record, hex(KNOWN_RECORDS[2]));
-
-        slots.release(short_key).unwrap();
-        let data = slots
-            .import32(Purpose::ExternalData, &mut pattern(59, 201))
-            .unwrap();
-        slots
-            .wrap(
-                data,
-                short_parent,
-                b"chat 9",
-                &mut Fixed(&NONCE),
-                &mut record,
-            )
-            .unwrap();
-        assert_eq!(record, hex(KNOWN_RECORDS[3]));
     }
 
     #[test]
     fn an_unwrapped_set_is_the_set_that_was_wrapped() {
         let short_parent = pattern::<32>(97, 13);
         let long_parent = pattern::<64>(97, 13);
-        let long_key = pattern::<64>(59, 201);
-        let short_key = pattern::<32>(59, 201);
+        let first = pattern::<32>(59, 201);
         let middle = pattern::<32>(31, 7);
-        let last = pattern::<64>(83, 111);
-        let cases: [Case<'_>; 4] = [
+        let last = pattern::<32>(83, 111);
+        let cases: [Case<'_>; 3] = [
             (
                 &short_parent,
                 b"chat 7",
-                [Some((Status::Enabled, &long_key)), None, None],
+                [Some((Status::Enabled, &first)), None, None],
                 0,
-                Purpose::Wrap,
             ),
             (
                 &long_parent,
-                b"profile",
-                [Some((Status::Enabled, &short_key)), None, None],
+                b"chat 8",
+                [Some((Status::Enabled, &middle)), None, None],
                 0,
-                Purpose::Wrap,
             ),
             (
                 &short_parent,
                 b"archive",
                 [
-                    Some((Status::Disabled, &long_key)),
+                    Some((Status::Disabled, &first)),
                     Some((Status::Enabled, &middle)),
                     Some((Status::Enabled, &last)),
                 ],
                 2,
-                Purpose::Wrap,
-            ),
-            (
-                &short_parent,
-                b"chat 9",
-                [Some((Status::Enabled, &short_key)), None, None],
-                0,
-                Purpose::ExternalData,
             ),
         ];
-        for ((parent_bytes, context, members, primary, purpose), known) in
+        for ((parent_bytes, context, members, primary), known) in
             cases.into_iter().zip(KNOWN_RECORDS)
         {
             let mut memory = [const { Slot::empty() }; 2];
@@ -2575,8 +3151,9 @@ mod tests {
                 _ => slots.import64(Purpose::Wrap, &mut parent_bytes.try_into().unwrap()),
             }
             .unwrap();
+            let parent = slots.store(parent);
             let set = slots.unwrap(parent, context, &hex(known)).unwrap();
-            assert_holds_for(&slots, set, members, primary, purpose);
+            assert_holds(&slots, set, members, primary);
         }
     }
 
@@ -2587,8 +3164,9 @@ mod tests {
     ) -> (Slots<'a>, Handle<'a>, [u8; RECORD_LEN]) {
         let mut slots = Slots::new(memory, epoch, EPOCH, &mut epoch_key());
         let parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
+        let parent = slots.store(parent);
         let key = slots
-            .import64(Purpose::Wrap, &mut pattern(59, 201))
+            .import32(Purpose::ExternalData, &mut pattern(59, 201))
             .unwrap();
         let mut record = [0; RECORD_LEN];
         slots
@@ -2623,6 +3201,7 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let (mut slots, parent, record) = wrapped(&mut memory, &mut epoch_memory);
         let other = slots.import32(Purpose::Wrap, &mut pattern(97, 14)).unwrap();
+        let other = slots.store(other);
         assert_eq!(
             slots.unwrap(other, b"chat 7", &record),
             Err(Error::RecordRejected)
@@ -2652,14 +3231,14 @@ mod tests {
         record
     }
 
-    /// The plaintext of the set `members` with `primary`, naming `named` as its parent, built
-    /// without `wrap`.
+    /// The plaintext of the set `members` for external data with `primary`, naming `named` as its
+    /// parent, built without `wrap`.
     fn set_plaintext(
         members: [Member<'_>; MEMBERS],
         primary: usize,
         named: [u8; 16],
     ) -> [u8; PLAINTEXT_LEN] {
-        set_plaintext_for(members, primary, named, Purpose::Wrap)
+        set_plaintext_for(members, primary, named, Purpose::ExternalData)
     }
 
     /// The same, for `purpose`.
@@ -2691,60 +3270,37 @@ mod tests {
         plaintext
     }
 
-    /// The record of the set `members` with `primary`, sealed under the key at `at` of the set
-    /// `parent` refers to and naming that key, for `context`.
+    /// The record of the set `members` with `primary`, sealed under the key of the set `parent`
+    /// refers to and naming that key, for `context`.
     fn sealed_under(
         slots: &Slots<'_>,
         parent: Handle<'_>,
-        at: usize,
         members: [Member<'_>; MEMBERS],
         primary: usize,
         context: &[u8],
     ) -> [u8; RECORD_LEN] {
         let slot = &slots.memory[parent.index];
-        let plaintext = set_plaintext(members, primary, slot.ids[at].bytes());
-        seal_plaintext(&slot.keys[at], &plaintext, context, &NONCE)
+        let plaintext = set_plaintext(members, primary, slot.ids[0].bytes());
+        seal_plaintext(&slot.keys[0], &plaintext, context, &NONCE)
     }
 
-    /// Loads the set `members` with `primary` by unwrapping a record of it under `root`.
-    fn loaded_set<'a>(
-        slots: &mut Slots<'a>,
-        root: Handle<'a>,
-        members: [Member<'_>; MEMBERS],
-        primary: usize,
-    ) -> Handle<'a> {
-        let record = sealed_under(slots, root, 0, members, primary, b"set");
-        slots.unwrap(root, b"set", &record).unwrap()
-    }
-
-    /// A record under any key of the parent set opens; under a disabled one it is refused as
-    /// `KeyDisabled` and loads nothing; every key of the parent is tried each time, and only its
-    /// keys.
+    /// A record opens with one trial, under the key of its parent; naming that parent but sealed under
+    /// another key, it is refused, and nothing is loaded.
     #[test]
-    fn every_key_of_the_parent_is_tried() {
-        let mut memory = [const { Slot::empty() }; 3];
+    fn a_record_opens_under_the_key_of_its_parent_alone() {
+        let mut memory = [const { Slot::empty() }; 2];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
-        let (first, second, third) = (
-            pattern::<32>(5, 2),
-            pattern::<64>(7, 3),
-            pattern::<32>(11, 4),
-        );
-        let parent = loaded_set(
-            &mut slots,
-            root,
-            [
-                Some((Status::Disabled, &first)),
-                Some((Status::Enabled, &second)),
-                Some((Status::Enabled, &third)),
-            ],
-            2,
-        );
-        let child = pattern::<64>(13, 5);
+        let parent = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
+        let parent = slots.store(parent);
+        let child = pattern::<32>(13, 5);
         let only = [Some((Status::Enabled, &child[..])), None, None];
-        for (at, expected) in [(0, Err(Error::KeyDisabled)), (1, Ok(())), (2, Ok(()))] {
-            let record = sealed_under(&slots, parent, at, only, 0, b"chat 7");
+        let plaintext = set_plaintext(only, 0, slots.memory[parent.index].ids[0].bytes());
+        for (sealer, expected) in [
+            (pattern::<32>(3, 1), Ok(())),
+            (pattern::<32>(3, 2), Err(Error::RecordRejected)),
+        ] {
+            let record = seal_plaintext(&key_from(&sealer), &plaintext, b"chat 7", &NONCE);
             let mut tried = 0;
             let result = slots.unwrap_on_stack(
                 parent,
@@ -2755,59 +3311,398 @@ mod tests {
                     seal::open(key, nonce, aad, buffer, tag)
                 },
             );
-            assert_eq!(tried, 3, "position {at}");
-            assert_eq!(result.map(|_| ()), expected, "position {at}");
+            assert_eq!((tried, result.map(|_| ())), (1, expected));
             if let Ok(handle) = result {
                 assert_holds(&slots, handle, only, 0);
                 slots.release(handle).unwrap();
             }
-            assert_eq!(slots.memory[2].occupancy, Occupancy::Free, "position {at}");
-            assert_eq!(
-                slots.memory[2].keys[0].bytes(),
-                &padded(&[]),
-                "position {at}"
-            );
+            assert_eq!(slots.memory[1].occupancy, Occupancy::Free);
+            assert_eq!(slots.memory[1].keys[0].bytes(), &padded(&[]));
         }
-        let record = sealed_under(&slots, root, 0, only, 0, b"chat 7");
-        let mut tried = 0;
-        let result =
-            slots.unwrap_on_stack(root, b"chat 7", &record, |key, nonce, aad, buffer, tag| {
-                tried += 1;
-                seal::open(key, nonce, aad, buffer, tag)
-            });
-        assert_eq!((tried, result.is_ok()), (1, true));
     }
 
-    /// A set is wrapped under the primary key of its parent wherever the primary sits: the record is
-    /// the one computed independently under that key alone.
+    /// `plaintext`, the record of a stored key for wrapping, locked under the key from a secret
+    /// `sealer` and then, with the number of the epoch `epoch` names, under the key of that epoch,
+    /// for `context`: the inner layer with the first nonce, the outer with the second. Built
+    /// without `lock`.
+    fn lock_plaintext(
+        sealer: &Key,
+        plaintext: &[u8; PLAINTEXT_LEN],
+        (epoch_key, epoch): (&Key, u64),
+        context: &[u8],
+        nonces: [&[u8; 12]; 2],
+    ) -> [u8; LOCK_RECORD_LEN] {
+        let associated = AssociatedData::new(context).unwrap();
+        let mut cipher_key = [0; CIPHER_KEY_LEN];
+        derive_lock_key(sealer, &mut cipher_key).unwrap();
+        let mut encrypted = *plaintext;
+        let tag = seal::seal(&cipher_key, nonces[0], associated.bytes(), &mut encrypted).unwrap();
+        let mut inner = [0; RECORD_LEN];
+        write_record(&mut inner, nonces[0], &encrypted, &tag);
+        let mut layer_key = [0; CIPHER_KEY_LEN];
+        derive_layer_key(epoch_key, &mut layer_key).unwrap();
+        let mut layer = [0; LAYER_LEN];
+        layer[..8].copy_from_slice(&epoch.to_le_bytes());
+        layer[8..].copy_from_slice(&inner);
+        let tag = seal::seal(&layer_key, nonces[1], associated.bytes(), &mut layer).unwrap();
+        let mut record = [0; LOCK_RECORD_LEN];
+        record[..12].copy_from_slice(nonces[1]);
+        record[12..12 + LAYER_LEN].copy_from_slice(&layer);
+        record[12 + LAYER_LEN..].copy_from_slice(&tag);
+        record
+    }
+
+    /// `plaintext` naming epoch zero, as the plaintext of a lock record does.
+    fn of_epoch_zero(mut plaintext: [u8; PLAINTEXT_LEN]) -> [u8; PLAINTEXT_LEN] {
+        plaintext[19..27].copy_from_slice(&[0; 8]);
+        plaintext
+    }
+
+    /// The plaintext of the set `members` for wrapping, naming `named` as its parent, as a lock
+    /// record holds it: in epoch zero.
+    fn lock_set_plaintext(
+        members: [Member<'_>; MEMBERS],
+        primary: usize,
+        named: [u8; 16],
+    ) -> [u8; PLAINTEXT_LEN] {
+        let mut plaintext = set_plaintext_for(members, primary, named, Purpose::Wrap);
+        plaintext[19..27].copy_from_slice(&[0; 8]);
+        plaintext
+    }
+
+    /// A record holds a set for wrapping only in a lock record, and there only a set of one that has
+    /// never changed: a plain record of one, a lock record of a set for external data, of more
+    /// keys, of a changed set or of an epoch, are refused although they open.
     #[test]
-    fn a_set_is_wrapped_under_the_primary_of_its_parent() {
-        let primary = pattern::<32>(97, 13);
-        let (other, last) = (pattern::<64>(7, 3), pattern::<32>(11, 4));
-        for at in 0..MEMBERS {
-            let mut memory = [const { Slot::empty() }; 3];
-            let mut epoch_memory = Epoch::empty();
-            let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-            let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
-            let mut others =
-                [(Status::Disabled, &other[..]), (Status::Enabled, &last[..])].into_iter();
-            let members: [Member<'_>; MEMBERS] = core::array::from_fn(|position| {
-                if position == at {
-                    Some((Status::Enabled, &primary[..]))
-                } else {
-                    others.next()
-                }
-            });
-            let parent = loaded_set(&mut slots, root, members, at);
-            let child = slots
-                .import64(Purpose::Wrap, &mut pattern(59, 201))
-                .unwrap();
-            let mut record = [0; RECORD_LEN];
-            slots
-                .wrap(child, parent, b"chat 7", &mut Fixed(&NONCE), &mut record)
-                .unwrap();
-            assert_eq!(record, hex(KNOWN_RECORDS[0]), "primary at {at}");
+    fn a_set_for_wrapping_comes_back_only_from_a_lock_record_of_one_key() {
+        let mut memory = [const { Slot::empty() }; 3];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let stored = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
+        let stored = slots.store(stored);
+        let named = slots.memory[stored.index].ids[0].bytes();
+        let (first, second) = (pattern::<32>(5, 2), pattern::<64>(7, 3));
+        let one = [Some((Status::Enabled, &first[..])), None, None];
+        let plain = set_plaintext_for(one, 0, named, Purpose::Wrap);
+        let record = seal_plaintext(&key_from(&pattern::<32>(3, 1)), &plain, b"set", &NONCE);
+        assert_eq!(
+            slots.unwrap(stored, b"set", &record),
+            Err(Error::RecordRejected)
+        );
+
+        let secret = slots.import32(Purpose::Wrap, &mut pattern(3, 4)).unwrap();
+        let named = slots.memory[secret.index].ids[0].bytes();
+        let sealer = key_from(&pattern::<32>(3, 4));
+        let epoch = (&epoch(), EPOCH);
+        let lock = |plaintext: &[u8; PLAINTEXT_LEN]| {
+            lock_plaintext(&sealer, plaintext, epoch, b"set", [&NONCE, &NONCE])
+        };
+        let mut changed = lock_set_plaintext(one, 0, named);
+        changed[27] = 1;
+        let mut of_an_epoch = lock_set_plaintext(one, 0, named);
+        of_an_epoch[19] = 1;
+        let two = [
+            Some((Status::Enabled, &first[..])),
+            Some((Status::Enabled, &second[..])),
+            None,
+        ];
+        let elsewhere = [None, Some((Status::Enabled, &second[..])), None];
+        let refused = [
+            lock(&of_epoch_zero(set_plaintext(one, 0, named))),
+            lock(&lock_set_plaintext(two, 0, named)),
+            lock(&lock_set_plaintext(elsewhere, 1, named)),
+            lock(&changed),
+            lock(&of_an_epoch),
+        ];
+        let accepted = lock(&lock_set_plaintext(one, 0, named));
+        for record in refused {
+            assert_eq!(
+                slots.unlock(secret, b"set", &record),
+                Err(Error::RecordRejected)
+            );
+            assert_eq!(slots.memory[2].occupancy, Occupancy::Free);
         }
+        let set = slots.unlock(secret, b"set", &accepted).unwrap();
+        assert_holds_for(&slots, set, one, 0, Purpose::Wrap);
+        assert!(!slots.memory[set.index].unlocks);
+    }
+
+    /// A stored key for wrapping comes back from its lock record under the key from a secret it was
+    /// locked under, as the stored key it was, and wraps keys for external data.
+    #[test]
+    fn a_stored_key_comes_back_from_its_lock_record() {
+        let mut memory = [const { Slot::empty() }; 3];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let secret = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
+        let stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting)
+            .unwrap();
+        let mut record = [0; LOCK_RECORD_LEN];
+        slots
+            .lock(stored, secret, b"profile", &mut Counting, &mut record)
+            .unwrap();
+        slots.release(stored).unwrap();
+        let back = slots.unlock(secret, b"profile", &record).unwrap();
+        let generated = hedged(0, b"hedge key", &counted::<64>(), 64);
+        let only = [Some((Status::Enabled, &generated[..])), None, None];
+        assert_holds_for(&slots, back, only, 0, Purpose::Wrap);
+        assert!(slots.memory[secret.index].unlocks && !slots.memory[back.index].unlocks);
+        let data = slots
+            .import32(Purpose::ExternalData, &mut pattern(5, 2))
+            .unwrap();
+        let mut plain = [0; RECORD_LEN];
+        slots
+            .wrap(data, back, b"chat", &mut Counting, &mut plain)
+            .unwrap();
+    }
+
+    /// Each key wraps and unwraps only at its level: a key from a secret only stored keys for
+    /// wrapping, in lock records, and a stored key only keys for external data, in plain records.
+    /// Every other pairing is refused as `WrongLevel`, writes nothing and changes no slot.
+    #[test]
+    fn every_key_wraps_only_at_its_level() {
+        let mut memory = [const { Slot::empty() }; 6];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let secret = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
+        let other_secret = slots.import64(Purpose::Wrap, &mut pattern(3, 2)).unwrap();
+        let stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let other_stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting)
+            .unwrap();
+        let data = slots
+            .import32(Purpose::ExternalData, &mut pattern(5, 2))
+            .unwrap();
+        let before = holdings(&slots);
+        let mut plain = [0x55; RECORD_LEN];
+        for (set, parent) in [
+            (data, secret),
+            (stored, other_stored),
+            (secret, other_stored),
+        ] {
+            assert_eq!(
+                slots.wrap(set, parent, b"x", &mut Untouched, &mut plain),
+                Err(Error::WrongLevel)
+            );
+        }
+        let mut locked = [0x55; LOCK_RECORD_LEN];
+        for (set, parent) in [
+            (data, secret),
+            (other_secret, secret),
+            (stored, other_stored),
+        ] {
+            assert_eq!(
+                slots.lock(set, parent, b"x", &mut Untouched, &mut locked),
+                Err(Error::WrongLevel)
+            );
+        }
+        assert_eq!(slots.unwrap(secret, b"x", &plain), Err(Error::WrongLevel));
+        assert_eq!(slots.unlock(stored, b"x", &locked), Err(Error::WrongLevel));
+        assert_eq!(
+            (plain, locked, holdings(&slots)),
+            ([0x55; RECORD_LEN], [0x55; LOCK_RECORD_LEN], before)
+        );
+        slots
+            .wrap(data, stored, b"x", &mut Counting, &mut plain)
+            .unwrap();
+        slots
+            .lock(stored, secret, b"x", &mut Counting, &mut locked)
+            .unwrap();
+    }
+
+    /// A lock record opens only with its key from a secret and its context, and every changed bit
+    /// of it is refused, loading nothing: under another key from a secret it is `RecordRejected`,
+    /// for another context or changed `StaleRecord`.
+    #[test]
+    fn a_lock_record_opens_only_with_its_secret_and_context() {
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let secret = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
+        let other = slots.import32(Purpose::Wrap, &mut pattern(3, 2)).unwrap();
+        let stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let mut record = [0; LOCK_RECORD_LEN];
+        slots
+            .lock(stored, secret, b"profile", &mut Counting, &mut record)
+            .unwrap();
+        slots.release(stored).unwrap();
+        assert_eq!(
+            slots.unlock(other, b"profile", &record),
+            Err(Error::RecordRejected)
+        );
+        assert_eq!(
+            slots.unlock(secret, b"profile 2", &record),
+            Err(Error::StaleRecord)
+        );
+        for bit in 0..LOCK_RECORD_LEN * 8 {
+            let mut changed = record;
+            changed[bit / 8] ^= 1 << (bit % 8);
+            assert_eq!(
+                slots.unlock(secret, b"profile", &changed),
+                Err(Error::StaleRecord),
+                "bit {bit}"
+            );
+        }
+        assert_eq!(slots.memory[2].occupancy, Occupancy::Free);
+        assert!(slots.unlock(secret, b"profile", &record).is_ok());
+    }
+
+    /// A lock record is carried into the next epoch without its key from a secret, which no slot
+    /// then holds. After the commit the carried copy opens and the old one does not, nor does a
+    /// record left behind: so a way in is revoked. A carry needs a change under way, the record's
+    /// context and a record of this epoch, and writes nothing otherwise.
+    #[test]
+    fn a_lock_record_is_carried_into_the_next_epoch_without_its_secret() {
+        let mut memory = [const { Slot::empty() }; 3];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let mut platform = Platform::default();
+        let stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let (mut kept, mut left) = ([0; LOCK_RECORD_LEN], [0; LOCK_RECORD_LEN]);
+        for (bytes, record) in [(pattern(3, 1), &mut kept), (pattern(3, 2), &mut left)] {
+            let secret = slots.import32(Purpose::Wrap, &mut bytes.clone()).unwrap();
+            slots
+                .lock(stored, secret, b"profile", &mut Counting, record)
+                .unwrap();
+            slots.release(secret).unwrap();
+        }
+        slots.release(stored).unwrap();
+        let mut carried = [0x55; LOCK_RECORD_LEN];
+        assert_eq!(
+            slots.carry(b"profile", &mut Untouched, &kept, &mut carried),
+            Err(Error::NoEpochChange)
+        );
+        slots.begin_epoch(&mut flipped_epoch_key(0xff)).unwrap();
+        assert_eq!(
+            slots.carry(b"other", &mut Untouched, &kept, &mut carried),
+            Err(Error::StaleRecord)
+        );
+        assert_eq!(carried, [0x55; LOCK_RECORD_LEN]);
+        slots
+            .carry(b"profile", &mut Counting, &kept, &mut carried)
+            .unwrap();
+        let mut again = [0x55; LOCK_RECORD_LEN];
+        assert_eq!(
+            slots.carry(b"profile", &mut Untouched, &carried, &mut again),
+            Err(Error::StaleRecord)
+        );
+        assert_eq!(slots.commit_epoch(&mut platform), Ok(Erasure::Guaranteed));
+        let secret = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
+        assert_eq!(
+            slots.unlock(secret, b"profile", &kept),
+            Err(Error::StaleRecord)
+        );
+        let back = slots.unlock(secret, b"profile", &carried).unwrap();
+        slots.release(back).unwrap();
+        let revoked = slots.import32(Purpose::Wrap, &mut pattern(3, 2)).unwrap();
+        assert_eq!(
+            slots.unlock(revoked, b"profile", &left),
+            Err(Error::StaleRecord)
+        );
+    }
+
+    /// A lock record made during a change of epoch is of the next epoch: it opens only once the
+    /// change is committed, and never if the change is abandoned.
+    #[test]
+    fn a_lock_during_a_change_is_of_the_next_epoch() {
+        let mut memory = [const { Slot::empty() }; 3];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let mut platform = Platform::default();
+        let stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let secret = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
+        let (mut abandoned, mut committed) = ([0; LOCK_RECORD_LEN], [0; LOCK_RECORD_LEN]);
+        slots.begin_epoch(&mut flipped_epoch_key(0x0f)).unwrap();
+        slots
+            .lock(stored, secret, b"profile", &mut Counting, &mut abandoned)
+            .unwrap();
+        assert_eq!(slots.abandon_epoch(&mut platform), Ok(Erasure::Guaranteed));
+        slots.begin_epoch(&mut flipped_epoch_key(0xff)).unwrap();
+        slots
+            .lock(stored, secret, b"profile", &mut Counting, &mut committed)
+            .unwrap();
+        slots.release(stored).unwrap();
+        assert_eq!(
+            slots.unlock(secret, b"profile", &committed),
+            Err(Error::StaleRecord)
+        );
+        assert_eq!(slots.commit_epoch(&mut platform), Ok(Erasure::Guaranteed));
+        assert_eq!(
+            slots.unlock(secret, b"profile", &abandoned),
+            Err(Error::StaleRecord)
+        );
+        let back = slots.unlock(secret, b"profile", &committed).unwrap();
+        slots.release(back).unwrap();
+    }
+
+    /// A lock record and the same record carried into the next epoch, computed by an implementation
+    /// independent of this library: a 64-byte stored key under a 32-byte key from a secret, in
+    /// "profile", the nonce `NONCE` the source gave each hedged as the next draw, the inner one
+    /// first; the next epoch's key is the key of the test epoch with every bit flipped.
+    const KNOWN_LOCK: &str = concat!(
+        "2d7fafac78ba33a2056ef2ae3f24eeb2ce9eb701f1b749b053ca457729fa13cf",
+        "9c420772e867b9a831a0d611dca35747abee9a63e482baf4e4881c1a967e7984",
+        "b955d24cdc33545ed73767926871082de098a0f878c2492683138014ba490069",
+        "2559b87e53295bdb6efc67082430feaa96df3cf86e2ac8156158a46fb616dc3d",
+        "551bbf103b63e057eefd519d23e9df2ce4e83020e017943665ff8fc70afc90ca",
+        "11de5d9bb76d4cbecd0916c3eae31589f459328c2f843aeeb45183aca3454aea",
+        "ef565d2a95cca038a56bea795f436e81113cd99a6df3e78f787dab6936f1a927",
+        "abe4696cd15dd73196b28f512c424a862d1285905b8cede0c8b3449d75e32599",
+        "9444629fc37233caeba54c034c9ed738293e4be39acb99f7e2075beb440e1768",
+        "4cffa1962d553e77e7",
+    );
+    const KNOWN_CARRIED: &str = concat!(
+        "0bae0f1cf9c58c7fc766995bb27c08d9b917b6837aac371e7bfe8e1fab9cb011",
+        "fc4f2071c9e9b5c1f99f0de028b4d2fcda1b881703d2f58aa30875fb10913203",
+        "3b7483a2f4f320c988f279ab244e394269c356051e483c48457c2a715e4f7c25",
+        "44bf09614a7d8e890a77ea1d2cbdb91dd9126b76f8e0f2b4d19f497cc2328ac4",
+        "3e487530e938956349dc50914cf706cdbfe15f68c090f1288f075792534d3358",
+        "02e72c78b20870397fb4570eedc7a1a10b5d9666ce85e4481476e5d220de0197",
+        "9da5a02ba0e900b714213e30e5399bcd0fa94e0f410411f158b3eb51d9d42c40",
+        "5dc072cffd439eae3ef797cefc62a3388164dd849a6fe8887ad7fea89fe440fc",
+        "f45bcbfeb1c3e94f5e97c45c6fec3647c97e5bba3589884a6e2103159e150f12",
+        "b94577fad3ecce52fa",
+    );
+
+    fn lock_hex(text: &str) -> [u8; LOCK_RECORD_LEN] {
+        core::array::from_fn(|at| u8::from_str_radix(&text[2 * at..2 * at + 2], 16).unwrap())
+    }
+
+    #[test]
+    fn lock_records_match_ones_computed_independently() {
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let secret = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
+        let stored = slots
+            .import64(Purpose::Wrap, &mut pattern(59, 201))
+            .unwrap();
+        let stored = slots.store(stored);
+        let mut record = [0; LOCK_RECORD_LEN];
+        slots
+            .lock(stored, secret, b"profile", &mut Fixed(&NONCE), &mut record)
+            .unwrap();
+        assert_eq!(record, lock_hex(KNOWN_LOCK));
+        slots.release(stored).unwrap();
+        let back = slots.unlock(secret, b"profile", &record).unwrap();
+        let key = pattern::<64>(59, 201);
+        let only = [Some((Status::Enabled, &key[..])), None, None];
+        assert_holds_for(&slots, back, only, 0, Purpose::Wrap);
+        slots.begin_epoch(&mut flipped_epoch_key(0xff)).unwrap();
+        let mut carried = [0; LOCK_RECORD_LEN];
+        slots
+            .carry(b"profile", &mut Fixed(&NONCE), &record, &mut carried)
+            .unwrap();
+        assert_eq!(carried, lock_hex(KNOWN_CARRIED));
     }
 
     /// A key is held in one place only: an import of a key held here, and a set that holds such a
@@ -2820,13 +3715,14 @@ mod tests {
         let held = pattern::<32>(97, 13);
         let mut source = held;
         let root = slots.import32(Purpose::Wrap, &mut source).unwrap();
+        let root = slots.store(root);
         let mut again = held;
         assert_eq!(
             slots.import32(Purpose::Wrap, &mut again),
             Err(Error::DuplicateKey)
         );
         assert_eq!(again, held);
-        let other = pattern::<64>(5, 6);
+        let other = pattern::<32>(5, 6);
         for members in [
             [
                 Some((Status::Enabled, &other[..])),
@@ -2839,7 +3735,7 @@ mod tests {
                 Some((Status::Disabled, &other[..])),
             ],
         ] {
-            let record = sealed_under(&slots, root, 0, members, 0, b"chat 7");
+            let record = sealed_under(&slots, root, members, 0, b"chat 7");
             let before = holdings(&slots);
             assert_eq!(
                 slots.unwrap(root, b"chat 7", &record),
@@ -2848,10 +3744,10 @@ mod tests {
             assert_eq!(holdings(&slots), before);
         }
         let mut source = other;
-        let long = slots.import64(Purpose::Wrap, &mut source).unwrap();
-        slots.release(long).unwrap();
+        let set = slots.import32(Purpose::ExternalData, &mut source).unwrap();
+        slots.release(set).unwrap();
         let mut source = other;
-        assert!(slots.import64(Purpose::Wrap, &mut source).is_ok());
+        assert!(slots.import32(Purpose::ExternalData, &mut source).is_ok());
     }
 
     #[test]
@@ -2881,6 +3777,7 @@ mod tests {
         let set = slots
             .import32(Purpose::Wrap, &mut pattern(59, 201))
             .unwrap();
+        let set = slots.store(set);
         let mut record = [0x55; RECORD_LEN];
         let before = holdings(&slots);
         assert_eq!(
@@ -2889,7 +3786,7 @@ mod tests {
         );
         assert_eq!(record, [0x55; RECORD_LEN]);
         assert_eq!(
-            slots.unwrap(data, b"chat 9", &hex(KNOWN_RECORDS[3])),
+            slots.unwrap(data, b"chat 7", &hex(KNOWN_RECORDS[0])),
             Err(Error::WrongPurpose)
         );
         assert_eq!(holdings(&slots), before);
@@ -2925,8 +3822,6 @@ mod tests {
             .import32(Purpose::ExternalData, &mut pattern(97, 13))
             .unwrap();
         let before = holdings(&slots);
-        assert_eq!(slots.add64(data, &mut long), Err(Error::WrongLength));
-        assert_eq!(long, pattern::<64>(5, 2));
         assert_eq!(
             slots.add_generated(data, KeyLength::Bytes64, &mut source),
             Err(Error::WrongLength)
@@ -2936,9 +3831,10 @@ mod tests {
         assert!(slots.add32(data, &mut pattern(11, 4)).is_ok());
 
         let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
+
+        let root = slots.store(root);
         let named = slots.memory[root.index].ids[0].bytes();
-        let mut plaintext = set_plaintext([Some((Status::Enabled, &long)), None, None], 0, named);
-        plaintext[1] = Purpose::ExternalData as u8;
+        let plaintext = set_plaintext([Some((Status::Enabled, &long)), None, None], 0, named);
         let record = seal_plaintext(&slots.memory[root.index].keys[0], &plaintext, b"x", &NONCE);
         slots.settle();
         let before = holdings(&slots);
@@ -3039,6 +3935,7 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let root = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
+        let root = slots.store(root);
         let data = slots
             .import32(Purpose::ExternalData, &mut pattern(59, 201))
             .unwrap();
@@ -3067,13 +3964,14 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
-        let (first, third) = (pattern::<64>(5, 2), pattern::<32>(11, 4));
+        let root = slots.store(root);
+        let (first, third) = (pattern::<32>(5, 2), pattern::<32>(11, 4));
         let members = [
             Some((Status::Enabled, &first[..])),
             None,
             Some((Status::Disabled, &third[..])),
         ];
-        let record = sealed_under(&slots, root, 0, members, 0, b"chat 7");
+        let record = sealed_under(&slots, root, members, 0, b"chat 7");
         let set = slots.unwrap(root, b"chat 7", &record).unwrap();
         assert_holds(&slots, set, members, 0);
         let mut out = [0; RECORD_LEN];
@@ -3089,15 +3987,18 @@ mod tests {
         );
     }
 
-    /// During a change of epoch the nonce of a record is hedged with the key of the next epoch, the
-    /// key the record is wrapped in.
+    /// During a change of epoch the nonce of a record, and of the outer layer of a lock record, is
+    /// hedged with the key of the next epoch, the key the record is wrapped in.
     #[test]
     fn a_nonce_during_a_change_is_hedged_with_the_next_key() {
-        let mut memory = [const { Slot::empty() }; 2];
+        let mut memory = [const { Slot::empty() }; 4];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
-        let set = slots.import32(Purpose::Wrap, &mut pattern(5, 2)).unwrap();
+        let root = slots.store(root);
+        let set = slots
+            .import32(Purpose::ExternalData, &mut pattern(5, 2))
+            .unwrap();
         let next = flipped_epoch_key(0x5a);
         slots.begin_epoch(&mut next.clone()).unwrap();
         let mut record = [0; RECORD_LEN];
@@ -3106,6 +4007,15 @@ mod tests {
             .unwrap();
         let nonce = crate::derive::direct::hedged_directly(&next, 0, b"hedge nonce", &NONCE, 12);
         assert_eq!(record[..12], nonce[..]);
+        let secret = slots.import32(Purpose::Wrap, &mut pattern(3, 4)).unwrap();
+        let stored = slots.import32(Purpose::Wrap, &mut pattern(3, 5)).unwrap();
+        let stored = slots.store(stored);
+        let mut locked = [0; LOCK_RECORD_LEN];
+        slots
+            .lock(stored, secret, b"x", &mut Fixed(&NONCE), &mut locked)
+            .unwrap();
+        let outer = crate::derive::direct::hedged_directly(&next, 2, b"hedge nonce", &NONCE, 12);
+        assert_eq!(locked[..12], outer[..]);
     }
 
     /// The count of draws moves by one with each draw the source answers, and neither with a failed
@@ -3117,8 +4027,9 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
+        let root = slots.store(root);
         let set = slots
-            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .generate(Purpose::ExternalData, KeyLength::Bytes32, &mut Counting)
             .unwrap();
         assert_eq!(slots.epoch.drawn, 1);
         let failed = slots.generate(Purpose::Wrap, KeyLength::Bytes32, &mut Failing);
@@ -3154,7 +4065,7 @@ mod tests {
             .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
             .unwrap();
         let second = slots
-            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .generate(Purpose::ExternalData, KeyLength::Bytes32, &mut Counting)
             .unwrap();
         assert_ne!(
             slots.memory[first.index].keys[0].bytes(),
@@ -3180,6 +4091,7 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
+        let parent = slots.store(parent);
         let child = pattern::<32>(59, 201);
         let members = [Some((Status::Enabled, &child[..])), None, None];
         let parent_id = slots.memory[0].ids[0].bytes();
@@ -3215,8 +4127,9 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
+        let parent = slots.store(parent);
         let key = slots
-            .import64(Purpose::Wrap, &mut pattern(59, 201))
+            .import32(Purpose::ExternalData, &mut pattern(59, 201))
             .unwrap();
         let long = [7; 256];
         let mut out = [0x55; RECORD_LEN];
@@ -3260,8 +4173,9 @@ mod tests {
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
+        let parent = slots.store(parent);
         let mut key = slots
-            .import32(Purpose::Wrap, &mut pattern(59, 201))
+            .import32(Purpose::ExternalData, &mut pattern(59, 201))
             .unwrap();
         for context in [&[9][..], &[9; 255]] {
             let mut record = [0; RECORD_LEN];
@@ -3382,27 +4296,14 @@ mod tests {
         (members, primary)
     }
 
-    /// The parent of a round: a key imported as a set of one, or a set of up to three keys loaded
-    /// under such a key, among other sets and released slots.
+    /// The parent of a round: a key imported as a set of one, among other sets and released slots.
     fn random_parent<'a>(slots: &mut Slots<'a>, random: &mut Random) -> Handle<'a> {
-        let root = match random.key().len() {
+        let parent = match random.key().len() {
             32 => slots.import32(Purpose::Wrap, &mut random.bytes()),
             _ => slots.import64(Purpose::Wrap, &mut random.bytes()),
         }
         .unwrap();
-        let parent = if random.below(2) == 0 {
-            root
-        } else {
-            let (stages, primary) = random_stages(random);
-            let keys: Vec<Vec<u8>> = (0..MEMBERS).map(|_| random.key()).collect();
-            let members: [Member<'_>; MEMBERS] =
-                core::array::from_fn(|at| stages[at].map(|stage| (stage, &keys[at][..])));
-            let parent = loaded_set(slots, root, members, primary);
-            if random.below(2) == 0 {
-                slots.release(root).unwrap();
-            }
-            parent
-        };
+        let parent = slots.store(parent);
         for _ in 0..random.below(3) {
             let filler = slots.import64(Purpose::Wrap, &mut random.bytes()).unwrap();
             if random.below(2) == 0 {
@@ -3414,17 +4315,23 @@ mod tests {
 
     /// The plaintext of a random set for either purpose at a random revision naming `named`, at
     /// times with a key held in `held` or one key twice, left as built, wholly random or with one
-    /// byte changed. A set of external data mostly holds 32-byte keys, as it has to.
+    /// byte changed. A set of external data mostly holds 32-byte keys, as it has to, and one for
+    /// wrapping is half the time a set of one that has never changed, as it has to be.
     fn random_plaintext(
         random: &mut Random,
         named: [u8; 16],
         held: &[Vec<u8>],
     ) -> [u8; PLAINTEXT_LEN] {
-        let (stages, primary) = random_stages(random);
         let purpose = if random.below(2) == 0 {
             Purpose::Wrap
         } else {
             Purpose::ExternalData
+        };
+        let one = purpose == Purpose::Wrap && random.below(2) == 0;
+        let (stages, primary) = if one {
+            ([Some(Status::Enabled), None, None], 0)
+        } else {
+            random_stages(random)
         };
         let mut keys: Vec<Vec<u8>> = (0..MEMBERS).map(|_| random.key()).collect();
         if purpose == Purpose::ExternalData && random.below(4) != 0 {
@@ -3446,7 +4353,9 @@ mod tests {
         let members: [Member<'_>; MEMBERS] =
             core::array::from_fn(|at| stages[at].map(|stage| (stage, &keys[at][..])));
         let mut plaintext = set_plaintext_for(members, primary, named, purpose);
-        plaintext[27..35].copy_from_slice(&random.bytes::<8>());
+        if !one {
+            plaintext[27..35].copy_from_slice(&random.bytes::<8>());
+        }
         match random.below(4) {
             0 => plaintext = random.bytes(),
             1 => plaintext[random.below(PLAINTEXT_LEN)] ^= random.bytes::<1>()[0] | 1,
@@ -3458,7 +4367,8 @@ mod tests {
     /// The keys of `plaintext` by position, if slots in the epoch `EPOCH` accept it: version 1,
     /// purpose 1 or 2, that epoch, each position zero throughout or stage 1 or 2 with length 32 or
     /// 64, only 32 for purpose 2, and zeros past the key, and an enabled key at the primary
-    /// position. Read from the layout, not by the parser.
+    /// position, and purpose 2: a plain record holds no set for wrapping. Read from the layout, not
+    /// by the parser.
     fn accepted_keys(plaintext: &[u8; PLAINTEXT_LEN]) -> Option<[Option<Vec<u8>>; MEMBERS]> {
         let primary = usize::from(plaintext[2]);
         if plaintext[0] != 1
@@ -3484,7 +4394,7 @@ mod tests {
                 _ => return None,
             }
         }
-        Some(keys)
+        (plaintext[1] == 2).then_some(keys)
     }
 
     /// The slot that holds the set of an accepted `plaintext`, as the layout states it.
@@ -3521,7 +4431,7 @@ mod tests {
         holding
     }
 
-    /// Records sealed through the real derivation and cipher under a key of a random parent set or
+    /// Records sealed through the real derivation and cipher under the key of a random parent or
     /// under a key outside it, with random sets, keys held elsewhere, contexts of 0 to 300 bytes,
     /// and random changes to the plaintext, the record or the context: unwrapping never panics,
     /// refuses exactly what it should, with the error it should, loads the set the plaintext holds
@@ -3535,27 +4445,20 @@ mod tests {
             let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
             let parent = random_parent(&mut slots, &mut random);
             let parent_slot = &slots.memory[parent.index];
-            let positions: Vec<usize> = (0..MEMBERS)
-                .filter(|&at| parent_slot.stages.stage(at).is_some())
-                .collect();
-            let sealer_at =
-                (random.below(8) != 0).then(|| positions[random.below(positions.len())]);
+            let parent_key = &parent_slot.keys[0];
             let outsider = key_from(&random.key());
-            let sealer = key_from(match sealer_at {
-                Some(at) => &parent_slot.keys[at].bytes()[..parent_slot.keys[at].length().bytes()],
-                None => &outsider.bytes()[..outsider.length().bytes()],
+            let by_parent = random.below(8) != 0;
+            let sealer = key_from(if by_parent {
+                &parent_key.bytes()[..parent_key.length().bytes()]
+            } else {
+                &outsider.bytes()[..outsider.length().bytes()]
             });
             let sealer_id = id_of(&sealer).bytes();
-            let other_member = positions
-                .iter()
-                .find(|&&at| Some(at) != sealer_at)
-                .map(|&at| parent_slot.ids[at].bytes());
-            let named = match (random.below(8), other_member) {
-                (0, _) => random.bytes(),
-                (1, Some(other)) => other,
-                _ => sealer_id,
+            let named = if random.below(8) == 0 {
+                random.bytes()
+            } else {
+                sealer_id
             };
-            let sealer_stage = sealer_at.and_then(|at| parent_slot.stages.stage(at));
             let held = held_keys(&slots);
             let plaintext = random_plaintext(&mut random, named, &held);
             let context: Vec<u8> = (0..random.below(301))
@@ -3583,8 +4486,7 @@ mod tests {
             let first_free = before
                 .iter()
                 .position(|holding| holding.0 == Occupancy::Free);
-            let opens =
-                !changed && !other_context && sealer_at.is_some() && plaintext[3..19] == sealer_id;
+            let opens = !changed && !other_context && by_parent && plaintext[3..19] == sealer_id;
             let parsed = accepted_keys(&plaintext)
                 .map(|keys| keys.into_iter().flatten().collect::<Vec<Vec<u8>>>());
             let expected = if !valid_context {
@@ -3593,8 +4495,6 @@ mod tests {
                 Err(Error::NoFreeSlot)
             } else if !opens {
                 Err(Error::RecordRejected)
-            } else if sealer_stage == Some(Status::Disabled) {
-                Err(Error::KeyDisabled)
             } else if let Some(keys) = parsed {
                 let repeated = keys
                     .iter()
@@ -3663,11 +4563,12 @@ mod stack {
         EPOCH, LOAD_NEEDS, WRAP_NEEDS, epoch_key, flipped_epoch, flipped_epoch_key,
     };
     use super::{
-        Entropy, EntropyError, Epoch, Error, Handle, Header, MEMBERS, Position, Purpose,
-        RECORD_LEN, Slot, Slots, Stages, Status, keyset, write_record,
+        Entropy, EntropyError, Epoch, Error, Handle, Header, LAYER_LEN, LOCK_RECORD_LEN, MEMBERS,
+        Out, Position, Purpose, RECORD_LEN, Slot, Slots, Stages, Status, keyset, write_record,
     };
     use crate::derive::{
-        Branch, CIPHER_STACK_WIPE, SALT, STACK_WIPE, derive_wrap_key, stack::secrets,
+        Branch, CIPHER_STACK_WIPE, SALT, STACK_WIPE, derive_layer_key, derive_lock_key,
+        derive_wrap_key, stack::secrets,
     };
     use crate::key::{
         Key, KeyLength,
@@ -3706,26 +4607,17 @@ mod stack {
             .collect()
     }
 
-    /// The keys of the root, which wraps both sets.
-    fn root_bytes(flip: u8) -> [u8; 32] {
-        pattern(53, 3, 32, flip).try_into().unwrap()
+    /// The key of the parent, which wraps the child set: 64 bytes.
+    fn parent_bytes(flip: u8) -> [u8; 64] {
+        pattern(43, 9, 64, flip).try_into().unwrap()
     }
 
-    /// The keys of the parent set: 32, 64 and 32 bytes.
-    fn parent_keys(flip: u8) -> [Vec<u8>; MEMBERS] {
-        [
-            pattern(41, 7, 32, flip),
-            pattern(43, 9, 64, flip),
-            pattern(47, 11, 32, flip),
-        ]
-    }
-
-    /// The keys of the child set: 64, 32 and 64 bytes.
+    /// The keys of the child set, for external data.
     fn child_keys(flip: u8) -> [Vec<u8>; MEMBERS] {
         [
-            pattern(29, 101, 64, flip),
+            pattern(29, 101, 32, flip),
             pattern(31, 103, 32, flip),
-            pattern(37, 107, 64, flip),
+            pattern(37, 107, 32, flip),
         ]
     }
 
@@ -3837,10 +4729,15 @@ mod stack {
     /// The keystream of a record whose tag is `tag`: counter blocks from the tag with its top bit
     /// set, the first word counting up, RFC 8452, section 4; as long as a record's plaintext.
     fn keystream(enc_key: &[u8; 32], tag: &[u8; 16]) -> Vec<u8> {
+        keystream_of(enc_key, tag, PLAINTEXT_LEN)
+    }
+
+    /// The same, `length` bytes long.
+    fn keystream_of(enc_key: &[u8; 32], tag: &[u8; 16], length: usize) -> Vec<u8> {
         let mut block = *tag;
         block[15] |= 0x80;
         let first = u32::from_le_bytes(block[..4].try_into().unwrap());
-        let blocks = u32::try_from(PLAINTEXT_LEN.div_ceil(16)).unwrap();
+        let blocks = u32::try_from(length.div_ceil(16)).unwrap();
         (0..blocks)
             .flat_map(|step| {
                 block[..4].copy_from_slice(&first.wrapping_add(step).to_le_bytes());
@@ -3849,19 +4746,19 @@ mod stack {
             .collect()
     }
 
-    /// Loads, under the set of one `root` refers to, the set of `keys` with `stages` and
-    /// `primary`, by unwrapping a record of it.
+    /// Loads, under the key `parent` refers to, the set of `keys` for external data with `stages`
+    /// and `primary`, by unwrapping a record of it.
     fn loaded_set(
         slots: &mut Slots<'_>,
-        root: Handle<'static>,
+        parent: Handle<'static>,
         keys: &[Vec<u8>; MEMBERS],
         stages: [Option<Status>; MEMBERS],
         primary: usize,
     ) -> Handle<'static> {
         let keys = keys.each_ref().map(|bytes| key_from(bytes));
         let header = Header {
-            purpose: Purpose::Wrap,
-            parent: slots.memory[root.index].ids[0].bytes(),
+            purpose: Purpose::ExternalData,
+            parent: slots.memory[parent.index].ids[0].bytes(),
             epoch: EPOCH,
         };
         let mut plaintext = [0; PLAINTEXT_LEN];
@@ -3873,7 +4770,7 @@ mod stack {
         );
         let mut cipher_key = [0; 32];
         derive_wrap_key(
-            &slots.memory[root.index].keys[0],
+            &slots.memory[parent.index].keys[0],
             &slots.epoch.key,
             &mut cipher_key,
         )
@@ -3882,29 +4779,20 @@ mod stack {
         let tag = seal::seal(&cipher_key, &NONCE, associated.bytes(), &mut plaintext).unwrap();
         let mut record = [0; RECORD_LEN];
         write_record(&mut record, &NONCE, &plaintext, &tag);
-        widen(slots.unwrap(root, SET_CONTEXT, &record).unwrap())
+        widen(slots.unwrap(parent, SET_CONTEXT, &record).unwrap())
     }
 
-    /// A root, the parent set, whose second key is the primary and whose third is disabled, and
-    /// the child set, whose first key is disabled and whose third is the primary, all made from
-    /// `flip`ped patterns.
+    /// The parent, and the child set, whose first key is disabled and whose third is the primary,
+    /// all made from `flip`ped patterns.
     fn sets(slots: &mut Slots<'_>, flip: u8) -> (Handle<'static>, Handle<'static>) {
-        let root = widen(
-            slots
-                .import32(Purpose::Wrap, &mut root_bytes(flip))
-                .unwrap(),
-        );
+        let parent = slots
+            .import64(Purpose::Wrap, &mut parent_bytes(flip))
+            .unwrap();
+        let parent = widen(slots.store(parent));
         let (enabled, disabled) = (Some(Status::Enabled), Some(Status::Disabled));
-        let parent = loaded_set(
-            slots,
-            root,
-            &parent_keys(flip),
-            [enabled, enabled, disabled],
-            1,
-        );
         let child = loaded_set(
             slots,
-            root,
+            parent,
             &child_keys(flip),
             [disabled, enabled, enabled],
             2,
@@ -3912,21 +4800,20 @@ mod stack {
         (parent, child)
     }
 
-    /// What is measured: a wrap, the trials of an unwrap whose record no key opens, or a whole
-    /// unwrap.
+    /// What is measured: a wrap, the trial of an unwrap whose record the key does not open, or a
+    /// whole unwrap.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Work {
         Wrap,
-        Trials,
+        Trial,
         Unwrap,
     }
 
-    /// The secrets the work handles on the sets made from `flip`ped patterns. For each key of the
-    /// parent it tries, or for the primary alone when it wraps: the derivation of the cipher key,
-    /// the cipher key, the message keys, the round keys of the cipher key and of the message
-    /// encryption key in the layout of FIPS 197, the keystream, and what the record decrypts to
-    /// under that key, the plaintext itself under the primary. For a whole unwrap, also the
-    /// derivations of the identifiers of the child's keys.
+    /// The secrets the work handles on the sets made from `flip`ped patterns: the key of the
+    /// parent, the derivation of the cipher key from it, the cipher key, the message keys, the
+    /// round keys of the cipher key and of the message encryption key in the layout of FIPS 197,
+    /// the keystream, and the plaintext. For a whole unwrap, also the derivations of the
+    /// identifiers of the child's keys.
     fn handled(flip: u8, work: Work) -> Vec<Vec<u8>> {
         let mut memory = [const { Slot::empty() }; 4];
         let mut epoch_memory = Epoch::empty();
@@ -3944,33 +4831,29 @@ mod stack {
         let nonce: [u8; 12] = record[..NONCE.len()].try_into().unwrap();
         let tag: [u8; 16] = record[NONCE.len() + PLAINTEXT_LEN..].try_into().unwrap();
         let ciphertext = &record[NONCE.len()..NONCE.len() + PLAINTEXT_LEN];
-        let parent_keys = parent_keys(flip);
-        let tried = if work == Work::Wrap { 1..2 } else { 0..MEMBERS };
-        let mut handled = Vec::new();
-        for bytes in &parent_keys[tried] {
-            let key = key_from(bytes);
-            let mut cipher_key = [0; 32];
-            derive_wrap_key(&key, &flipped_epoch(flip), &mut cipher_key).unwrap();
-            let (mac_key, enc_key) = message_keys(&cipher_key, &nonce);
-            let stream = keystream(&enc_key, &tag);
-            let decrypted = ciphertext.iter().zip(&stream).map(|(c, k)| c ^ k).collect();
-            handled.extend(secrets(
-                bytes,
-                &flipped_epoch_key(flip),
-                key.length(),
-                Branch::WrapKey,
-            ));
-            handled.extend([
-                cipher_key.to_vec(),
-                mac_key.to_vec(),
-                enc_key.to_vec(),
-                stream,
-                decrypted,
-            ]);
-            handled.extend(round_keys(&cipher_key));
-            handled.extend(round_keys(&enc_key));
-        }
-        handled.extend(parent_keys.iter().cloned());
+        let bytes = parent_bytes(flip);
+        let key = key_from(&bytes);
+        let mut cipher_key = [0; 32];
+        derive_wrap_key(&key, &flipped_epoch(flip), &mut cipher_key).unwrap();
+        let (mac_key, enc_key) = message_keys(&cipher_key, &nonce);
+        let stream = keystream(&enc_key, &tag);
+        let decrypted = ciphertext.iter().zip(&stream).map(|(c, k)| c ^ k).collect();
+        let mut handled = secrets(
+            &bytes,
+            &flipped_epoch_key(flip),
+            key.length(),
+            Branch::WrapKey,
+        );
+        handled.extend([
+            bytes.to_vec(),
+            cipher_key.to_vec(),
+            mac_key.to_vec(),
+            enc_key.to_vec(),
+            stream,
+            decrypted,
+        ]);
+        handled.extend(round_keys(&cipher_key));
+        handled.extend(round_keys(&enc_key));
         if work == Work::Unwrap {
             for bytes in child_keys(flip) {
                 handled.extend(secrets(
@@ -3998,7 +4881,7 @@ mod stack {
         let mut record = [0; RECORD_LEN];
         let range = below_pad(false, || {
             slots
-                .wrap_on_stack(child, parent, CONTEXT, &mut Fixed, &mut record)
+                .wrap_on_stack(child, parent, CONTEXT, &mut Fixed, Out::Record(&mut record))
                 .unwrap();
             black_box(&record);
         });
@@ -4044,13 +4927,13 @@ mod stack {
         });
     }
 
-    /// A record whose ciphertext was changed is decrypted under every key of the parent before
-    /// each tag fails. This is also the unwrap that shows the test sees residue: after a successful
-    /// one, the wipes that follow the derivations of the new keys' identifiers already cover the
-    /// frames the cipher used.
+    /// A record whose ciphertext was changed is decrypted under the key of the parent before the tag
+    /// fails. This is also the unwrap that shows the test sees residue: after a successful one,
+    /// the wipes that follow the derivations of the new keys' identifiers already cover the frames
+    /// the cipher used.
     #[test]
     fn a_rejected_unwrap_leaves_no_residue() {
-        let pieces = pieces(Work::Trials);
+        let pieces = pieces(Work::Trial);
         let mut memory = [const { Slot::empty() }; 4];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
@@ -4064,6 +4947,327 @@ mod stack {
         assert_clean(&pieces, || {
             let refused = slots.unwrap(parent, CONTEXT, &record);
             assert_eq!(black_box(refused), Err(Error::RecordRejected));
+        });
+    }
+
+    /// The key from a secret of the lock tests, and the stored key it locks: 32 and 64 bytes.
+    fn secret_bytes(flip: u8) -> [u8; 32] {
+        pattern(61, 13, 32, flip).try_into().unwrap()
+    }
+
+    fn stored_bytes(flip: u8) -> [u8; 64] {
+        pattern(67, 17, 64, flip).try_into().unwrap()
+    }
+
+    /// What the cipher works with under `cipher_key` for a record whose nonce, encrypted part and
+    /// tag are given: the cipher key, the message keys, their round keys, the keystream and what
+    /// the record decrypts to, which it returns as well.
+    fn cipher_secrets(
+        cipher_key: &[u8; 32],
+        nonce: &[u8; 12],
+        sealed: &[u8],
+        tag: &[u8; 16],
+    ) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let (mac_key, enc_key) = message_keys(cipher_key, nonce);
+        let stream = keystream_of(&enc_key, tag, sealed.len());
+        let decrypted: Vec<u8> = sealed.iter().zip(&stream).map(|(c, k)| c ^ k).collect();
+        let mut found = std::vec![
+            cipher_key.to_vec(),
+            mac_key.to_vec(),
+            enc_key.to_vec(),
+            stream,
+            decrypted.clone(),
+        ];
+        found.extend(round_keys(cipher_key));
+        found.extend(round_keys(&enc_key));
+        (found, decrypted)
+    }
+
+    /// The outer layer of a lock record, under the key of the epoch `epoch`: the secrets of the
+    /// derivation of its key and of the cipher, and what it decrypts to.
+    fn layer_secrets(epoch: &[u8; 32], record: &[u8; LOCK_RECORD_LEN]) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let mut layer_key = [0; 32];
+        derive_layer_key(&key_from(epoch), &mut layer_key).unwrap();
+        let nonce: [u8; 12] = record[..12].try_into().unwrap();
+        let tag: [u8; 16] = record[12 + LAYER_LEN..].try_into().unwrap();
+        let (mut found, layer) =
+            cipher_secrets(&layer_key, &nonce, &record[12..12 + LAYER_LEN], &tag);
+        found.extend(secrets(epoch, SALT, KeyLength::Bytes32, Branch::EpochLayer));
+        (found, layer)
+    }
+
+    /// What is measured with lock records.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Locking {
+        Lock,
+        Unlock,
+        Carry,
+    }
+
+    /// The slots of the lock tests, made from `flip`ped patterns: a key from a secret, the stored
+    /// key it locks, and their lock record.
+    fn locked(
+        slots: &mut Slots<'_>,
+        flip: u8,
+    ) -> (Handle<'static>, Handle<'static>, [u8; LOCK_RECORD_LEN]) {
+        let secret = widen(
+            slots
+                .import32(Purpose::Wrap, &mut secret_bytes(flip))
+                .unwrap(),
+        );
+        let stored = slots
+            .import64(Purpose::Wrap, &mut stored_bytes(flip))
+            .unwrap();
+        let stored = widen(slots.store(stored));
+        let mut record = [0; LOCK_RECORD_LEN];
+        slots
+            .lock(stored, secret, CONTEXT, &mut Fixed, &mut record)
+            .unwrap();
+        (secret, stored, record)
+    }
+
+    /// The key of the next epoch in the lock tests.
+    fn next_key(flip: u8) -> [u8; 32] {
+        flipped_epoch_key(flip ^ 0x5a)
+    }
+
+    /// The secrets the work with lock records handles on keys made from `flip`ped patterns: both
+    /// layers' derivations, cipher keys, message keys, round keys and keystreams, the record the
+    /// outer layer holds and the plaintext of the inner, both keys, and for an unlock the
+    /// derivation of the stored key's identifier, for a carry the new outer layer.
+    fn lock_handled(flip: u8, work: Locking) -> Vec<Vec<u8>> {
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(
+            &mut memory,
+            &mut epoch_memory,
+            EPOCH,
+            &mut flipped_epoch_key(flip),
+        );
+        let (_, _, record) = locked(&mut slots, flip);
+        let (mut handled, layer) = layer_secrets(&flipped_epoch_key(flip), &record);
+        let inner = &layer[8..];
+        let mut lock_key = [0; 32];
+        derive_lock_key(&key_from(&secret_bytes(flip)), &mut lock_key).unwrap();
+        let nonce: [u8; 12] = inner[..12].try_into().unwrap();
+        let tag: [u8; 16] = inner[12 + PLAINTEXT_LEN..].try_into().unwrap();
+        let (found, _) = cipher_secrets(&lock_key, &nonce, &inner[12..12 + PLAINTEXT_LEN], &tag);
+        handled.extend(found);
+        handled.extend(secrets(
+            &secret_bytes(flip),
+            SALT,
+            KeyLength::Bytes32,
+            Branch::LockKey,
+        ));
+        handled.extend([
+            inner.to_vec(),
+            secret_bytes(flip).to_vec(),
+            stored_bytes(flip).to_vec(),
+        ]);
+        match work {
+            Locking::Lock => {}
+            Locking::Unlock => handled.extend(secrets(
+                &stored_bytes(flip),
+                SALT,
+                KeyLength::Bytes64,
+                Branch::KeyId,
+            )),
+            Locking::Carry => {
+                slots.begin_epoch(&mut next_key(flip)).unwrap();
+                let mut carried = [0; LOCK_RECORD_LEN];
+                slots
+                    .carry(CONTEXT, &mut Fixed, &record, &mut carried)
+                    .unwrap();
+                handled.extend(layer_secrets(&next_key(flip), &carried).0);
+            }
+        }
+        handled
+    }
+
+    fn lock_pieces(work: Locking) -> Vec<Vec<u8>> {
+        key_dependent(&lock_handled(0, work), &lock_handled(0xff, work))
+    }
+
+    #[test]
+    fn a_lock_without_the_wipe_leaves_residue() {
+        let pieces = lock_pieces(Locking::Lock);
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let (secret, stored, _) = locked(&mut slots, 0);
+        let mut record = [0; LOCK_RECORD_LEN];
+        let range = below_pad(false, || {
+            slots
+                .wrap_on_stack(stored, secret, CONTEXT, &mut Fixed, Out::Lock(&mut record))
+                .unwrap();
+            black_box(&record);
+        });
+        assert!(residue(range, &pieces) > 0);
+    }
+
+    #[test]
+    fn a_lock_leaves_no_residue() {
+        let pieces = lock_pieces(Locking::Lock);
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let (secret, stored, _) = locked(&mut slots, 0);
+        let mut record = [0; LOCK_RECORD_LEN];
+        assert_clean(&pieces, || {
+            slots
+                .lock(stored, secret, CONTEXT, &mut Fixed, &mut record)
+                .unwrap();
+            black_box(&record);
+        });
+    }
+
+    #[test]
+    fn an_unlock_leaves_no_residue() {
+        let pieces = lock_pieces(Locking::Unlock);
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let (secret, stored, record) = locked(&mut slots, 0);
+        slots.release(stored).unwrap();
+        assert_clean(&pieces, || {
+            black_box(slots.unlock(secret, CONTEXT, &record).unwrap());
+        });
+    }
+
+    /// An unlock under another key from a secret decrypts the outer layer and fails at the inner:
+    /// the record of the outer layer and the secrets of both trials are left on the stack without
+    /// the wipe, and none with it.
+    #[test]
+    fn a_rejected_unlock_leaves_no_residue() {
+        let handled = |flip| {
+            let mut memory = [const { Slot::empty() }; 4];
+            let mut epoch_memory = Epoch::empty();
+            let mut slots = Slots::new(
+                &mut memory,
+                &mut epoch_memory,
+                EPOCH,
+                &mut flipped_epoch_key(flip),
+            );
+            let (_, _, record) = locked(&mut slots, flip);
+            let (mut handled, layer) = layer_secrets(&flipped_epoch_key(flip), &record);
+            handled.push(layer[8..].to_vec());
+            handled
+        };
+        let pieces = key_dependent(&handled(0), &handled(0xff));
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let (_, stored, record) = locked(&mut slots, 0);
+        slots.release(stored).unwrap();
+        let other = slots
+            .import32(
+                Purpose::Wrap,
+                &mut pattern(89, 3, 32, 0).try_into().unwrap(),
+            )
+            .unwrap();
+        let range = below_pad(false, || {
+            let refused = slots.unlock_on_stack(other, CONTEXT, &record, seal::open, seal::open);
+            assert_eq!(black_box(refused), Err(Error::RecordRejected));
+        });
+        assert!(residue(range, &pieces) > 0);
+        assert_clean(&pieces, || {
+            let refused = slots.unlock(other, CONTEXT, &record);
+            assert_eq!(black_box(refused), Err(Error::RecordRejected));
+        });
+    }
+
+    #[test]
+    fn a_carry_without_the_wipe_leaves_residue() {
+        let pieces = lock_pieces(Locking::Carry);
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let (_, _, record) = locked(&mut slots, 0);
+        slots.begin_epoch(&mut next_key(0)).unwrap();
+        let mut carried = [0; LOCK_RECORD_LEN];
+        let range = below_pad(false, || {
+            slots
+                .carry_on_stack(CONTEXT, &mut Fixed, &record, &mut carried, seal::open)
+                .unwrap();
+            black_box(&carried);
+        });
+        assert!(residue(range, &pieces) > 0);
+    }
+
+    #[test]
+    fn a_carry_leaves_no_residue() {
+        let pieces = lock_pieces(Locking::Carry);
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let (_, _, record) = locked(&mut slots, 0);
+        slots.begin_epoch(&mut next_key(0)).unwrap();
+        let mut carried = [0; LOCK_RECORD_LEN];
+        assert_clean(&pieces, || {
+            slots
+                .carry(CONTEXT, &mut Fixed, &record, &mut carried)
+                .unwrap();
+            black_box(&carried);
+        });
+    }
+
+    /// The secrets a combination of keys made from `flip`ped patterns handles: the derivation of the
+    /// new key, the key itself and the derivation of its identifier, and both keys it takes.
+    fn combination_handled(flip: u8) -> Vec<Vec<u8>> {
+        let key = pattern(71, 3, 32, flip);
+        let salt = pattern(73, 5, 32, flip);
+        let mut combined = [0; 32];
+        crate::derive::derive_combined(&key_from(&key), &key_from(&salt), &mut combined).unwrap();
+        let mut handled = secrets(&key, &salt, KeyLength::Bytes32, Branch::Combined);
+        handled.extend(secrets(&combined, SALT, KeyLength::Bytes32, Branch::KeyId));
+        handled.extend([key, salt, combined.to_vec()]);
+        handled
+    }
+
+    #[test]
+    fn a_combination_leaves_no_residue() {
+        let pieces = key_dependent(&combination_handled(0), &combination_handled(0xff));
+        let mut memory = [const { Slot::empty() }; 3];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let key = slots
+            .import32(
+                Purpose::Wrap,
+                &mut pattern(71, 3, 32, 0).try_into().unwrap(),
+            )
+            .unwrap();
+        let salt = slots
+            .import32(
+                Purpose::Wrap,
+                &mut pattern(73, 5, 32, 0).try_into().unwrap(),
+            )
+            .unwrap();
+        assert_clean(&pieces, || {
+            black_box(slots.combine(key, salt).unwrap());
+        });
+    }
+
+    /// A challenge is written into the caller's buffer, and no piece of it or of its derivation is
+    /// left on the stack.
+    #[test]
+    fn a_challenge_leaves_no_residue() {
+        let handled = |flip| {
+            let key = pattern(79, 7, 32, flip);
+            secrets(&key, SALT, KeyLength::Bytes32, Branch::Challenge)
+        };
+        let pieces = key_dependent(&handled(0), &handled(0xff));
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let key = slots
+            .import32(
+                Purpose::Wrap,
+                &mut pattern(79, 7, 32, 0).try_into().unwrap(),
+            )
+            .unwrap();
+        let mut out = [0; 32];
+        assert_clean(&pieces, || {
+            slots.challenge(key, &mut out).unwrap();
         });
     }
 
@@ -4135,7 +5339,7 @@ mod stack {
     /// when the call fails, and no call reaches deeper than its documentation says it needs.
     #[test]
     fn wraps_unwraps_and_loads_wipe_and_need_the_stack_documented() {
-        let mut memory = [const { Slot::empty() }; 8];
+        let mut memory = [const { Slot::empty() }; 12];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let (parent, record) = wrapped(&mut slots);
@@ -4152,7 +5356,10 @@ mod stack {
             );
         }));
         let key = slots
-            .import64(Purpose::Wrap, &mut pattern(5, 5, 64, 0).try_into().unwrap())
+            .import32(
+                Purpose::ExternalData,
+                &mut pattern(5, 5, 32, 0).try_into().unwrap(),
+            )
             .unwrap();
         let mut out = [0; RECORD_LEN];
         wraps.push(depth_changed(|| {
@@ -4183,8 +5390,8 @@ mod stack {
                 black_box(generated.unwrap());
             }),
             depth_changed(|| {
-                let mut long: [u8; 64] = pattern(11, 11, 64, 0).try_into().unwrap();
-                black_box(slots.add64(key, &mut long).unwrap());
+                let mut short: [u8; 32] = pattern(11, 11, 32, 0).try_into().unwrap();
+                black_box(slots.add32(key, &mut short).unwrap());
             }),
             depth_changed(|| {
                 slots.settle();
@@ -4220,6 +5427,106 @@ mod stack {
             assert!(depth <= LOAD_STACK, "{depth} bytes reached");
         }
     }
+
+    /// The wipes that follow a lock, an unlock and a carry reach as deep as those after a wrap, also
+    /// when the call fails, and no call reaches deeper than its documentation says it needs.
+    #[test]
+    fn lock_records_wipe_and_need_the_stack_documented() {
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let secret = slots.import32(Purpose::Wrap, &mut [3; 32]).unwrap();
+        let stored = slots.import32(Purpose::Wrap, &mut [4; 32]).unwrap();
+        let stored = slots.store(stored);
+        let mut locked = [0; LOCK_RECORD_LEN];
+        let mut depths = Vec::new();
+        depths.push(depth_changed(|| {
+            slots
+                .lock(stored, secret, CONTEXT, &mut Fixed, &mut locked)
+                .unwrap();
+            black_box(&locked);
+        }));
+        depths.push(depth_changed(|| {
+            let failed = slots.lock(stored, secret, CONTEXT, &mut Failing, &mut locked);
+            assert_eq!(black_box(failed), Err(Error::EntropyFailed));
+        }));
+        slots.release(stored).unwrap();
+        let mut changed = locked;
+        changed[40] ^= 1;
+        depths.push(depth_changed(|| {
+            black_box(slots.unlock(secret, CONTEXT, &locked).unwrap());
+        }));
+        depths.push(depth_changed(|| {
+            assert_eq!(
+                black_box(slots.unlock(secret, CONTEXT, &changed)),
+                Err(Error::StaleRecord)
+            );
+        }));
+        slots.begin_epoch(&mut [5; 32]).unwrap();
+        let mut carried = [0; LOCK_RECORD_LEN];
+        depths.push(depth_changed(|| {
+            slots
+                .carry(CONTEXT, &mut Fixed, &locked, &mut carried)
+                .unwrap();
+            black_box(&carried);
+        }));
+        depths.push(depth_changed(|| {
+            let refused = slots.carry(CONTEXT, &mut Fixed, &changed, &mut carried);
+            assert_eq!(black_box(refused), Err(Error::StaleRecord));
+        }));
+        for depth in depths {
+            assert!(depth >= CIPHER_STACK_WIPE, "{depth} bytes wiped");
+            assert!(depth <= WRAP_STACK, "{depth} bytes reached");
+        }
+    }
+
+    /// The wipes that follow a challenge and a combination reach as deep as those after a load, also
+    /// when the call fails, and neither reaches deeper than its documentation says it needs.
+    #[test]
+    fn calls_on_keys_from_a_secret_wipe_and_need_the_stack_documented() {
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let data = slots
+            .import32(
+                Purpose::ExternalData,
+                &mut pattern(13, 13, 32, 0).try_into().unwrap(),
+            )
+            .unwrap();
+        let password = slots
+            .import32(
+                Purpose::Wrap,
+                &mut pattern(15, 15, 32, 0).try_into().unwrap(),
+            )
+            .unwrap();
+        let answer = slots
+            .import32(
+                Purpose::Wrap,
+                &mut pattern(17, 17, 32, 0).try_into().unwrap(),
+            )
+            .unwrap();
+        let mut challenge = [0; 32];
+        let secrets = [
+            depth_changed(|| {
+                slots.challenge(password, &mut challenge).unwrap();
+                black_box(&challenge);
+            }),
+            depth_changed(|| {
+                let refused = slots.challenge(data, &mut challenge);
+                assert_eq!(black_box(refused), Err(Error::WrongPurpose));
+            }),
+            depth_changed(|| {
+                black_box(slots.combine(password, answer).unwrap());
+            }),
+        ];
+        for depth in secrets {
+            assert!(
+                depth >= STACK_WIPE,
+                "{depth} bytes wiped after a call on keys from a secret"
+            );
+            assert!(depth <= LOAD_STACK, "{depth} bytes reached");
+        }
+    }
 }
 
 #[cfg(kani)]
@@ -4229,13 +5536,17 @@ mod proofs {
 
     use super::{
         CIPHER_KEY_LEN, Entropy, EntropyError, Epoch, Erasure, Error, Handle, Key, KeyId,
-        KeyLength, MEMBERS, Occupancy, PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Rejected,
-        Root, RootFailed, Slot, Slots, Stages, Status,
+        KeyLength, LAYER_LEN, LOCK_RECORD_LEN, MEMBERS, NONCE_LEN, Occupancy, Out, PLAINTEXT_LEN,
+        Position, Purpose, RECORD_LEN, Rejected, Root, RootFailed, Slot, Slots, Stages, Status,
+        TAG_LEN,
     };
     use crate::derive::{
         Branch,
         model::{any_failed, failed, id_bytes, id_from_bytes},
-        proofs::{expected_hedge, expected_key_id, expected_words_key, expected_wrap_key},
+        proofs::{
+            expected_challenge, expected_combined, expected_hedge, expected_key_id,
+            expected_layer_key, expected_lock_key, expected_words_key, expected_wrap_key,
+        },
     };
     use crate::keyset::proofs::{allowed, any_purpose, any_whole_stages};
     use crate::password::{MemoryBlock, model::argon2_failed, proofs::any_params};
@@ -4262,6 +5573,7 @@ mod proofs {
         ids: Three<Id>,
         stages: Stages,
         purpose: Purpose,
+        unlocks: bool,
         changed: bool,
         sealed: bool,
     }
@@ -4281,6 +5593,7 @@ mod proofs {
             ),
             stages: slot.stages,
             purpose: slot.purpose,
+            unlocks: slot.unlocks,
             changed: slot.changed,
             sealed: slot.sealed,
         }
@@ -4318,6 +5631,11 @@ mod proofs {
 
     /// Whether two buffers hold the same bytes, compared in pieces no longer than a key.
     fn same<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {
+        same_bytes(a, b)
+    }
+
+    /// The same for two slices of one length.
+    fn same_bytes(a: &[u8], b: &[u8]) -> bool {
         a.chunks(64).zip(b.chunks(64)).all(|(x, y)| x == y)
     }
 
@@ -4367,24 +5685,35 @@ mod proofs {
 
     /// A slot in any state, for either purpose, with any generation and any stages whose primary is
     /// enabled; when loaded, holding a key of a length its purpose takes and any identifier at each
-    /// position the stages fill, and changed and wrapped for the next epoch or not. A free or
-    /// retired slot keeps the purpose of the set it last held. Every load, addition and unwrap
-    /// keeps a key's length one its purpose takes, as their proofs show.
+    /// position the stages fill, a set of one if it is for wrapping, from a secret or stored, and
+    /// changed and wrapped for the next epoch or not. A free or retired slot keeps the purpose of
+    /// the set it last held. Every load, addition and unwrap keeps a key's length one its purpose
+    /// takes, every load and unwrap makes a set for wrapping a set of one, and no change or
+    /// addition takes one, as their proofs show.
     fn any_slot() -> Slot {
-        any_slot_in(match kani::any::<u8>() % 3 {
+        any_slot_in(any_occupancy())
+    }
+
+    fn any_occupancy() -> Occupancy {
+        match kani::any::<u8>() % 3 {
             0 => Occupancy::Free,
             1 => Occupancy::Loaded,
             _ => Occupancy::Retired,
-        })
+        }
     }
 
     fn any_slot_in(occupancy: Occupancy) -> Slot {
         let mut slot = Slot::empty();
         slot.generation = kani::any();
         slot.occupancy = occupancy;
-        slot.stages = any_whole_stages();
         let purpose = any_purpose();
         slot.purpose = purpose;
+        slot.stages = if purpose == Purpose::Wrap && occupancy == Occupancy::Loaded {
+            Stages::one()
+        } else {
+            any_whole_stages()
+        };
+        slot.unlocks = purpose == Purpose::Wrap && kani::any();
         if slot.occupancy == Occupancy::Loaded {
             slot.changed = kani::any();
             slot.sealed = kani::any();
@@ -4469,10 +5798,11 @@ mod proofs {
 
     /// A platform source that writes any bytes and then either succeeds or fails, as a real one
     /// may fail after writing part of its output. It remembers how often and for how many bytes it
-    /// was asked, and what it wrote.
+    /// was asked, how often it answered, and what it wrote.
     struct AnyEntropy {
         written: Bytes,
         calls: u8,
+        answered: u8,
         requested: usize,
         at: usize,
         failed: bool,
@@ -4483,6 +5813,7 @@ mod proofs {
             Self {
                 written: [0; 64],
                 calls: 0,
+                answered: 0,
                 requested: 0,
                 at: 0,
                 failed: false,
@@ -4502,6 +5833,7 @@ mod proofs {
             if self.failed {
                 return Err(EntropyError);
             }
+            self.answered = self.answered.saturating_add(1);
             Ok(())
         }
     }
@@ -4546,15 +5878,15 @@ mod proofs {
     }
 
     /// Loads one key by any of the three ways, with any key and length, for `purpose`. Returns the
-    /// outcome, the bytes and length the slot must hold on success, and whether a platform source
-    /// was asked and failed.
+    /// outcome, the bytes and length the slot must hold on success, whether a platform source was
+    /// asked and failed, and whether the key was imported.
     fn load_any(
         slots: &mut Slots<'_>,
         purpose: Purpose,
-    ) -> (Result<Handle<'static>, Error>, Bytes, KeyLength, bool) {
+    ) -> (Result<Handle<'static>, Error>, Bytes, KeyLength, bool, bool) {
         if kani::any() {
             let (result, expected, length) = import_any(slots, purpose);
-            return (result, expected, length, false);
+            return (result, expected, length, false, true);
         }
         let mut entropy = AnyEntropy::new();
         let length = any_length();
@@ -4624,7 +5956,7 @@ mod proofs {
             result.is_ok() && slots.epoch.changing,
             "a key is generated during a change of epoch"
         );
-        (result.map(widen), hedged, length, entropy.failed)
+        (result.map(widen), hedged, length, entropy.failed, false)
     }
 
     /// Whether `handle`, issued for a set whose key at `position` is `expected` of `length`,
@@ -4980,7 +6312,7 @@ mod proofs {
         let before = snapshots(&slots);
         let first_free = first_free(&before);
         let purpose = any_purpose();
-        let (result, expected, length, source_failed) = load_any(&mut slots, purpose);
+        let (result, expected, length, source_failed, imported) = load_any(&mut slots, purpose);
         let id = expected_key_id(&expected, length);
         kani::assert(
             if !allowed(purpose, length) {
@@ -5028,8 +6360,10 @@ mod proofs {
             kani::assert(
                 now.ids == (id, [0; ID_LEN], [0; ID_LEN])
                     && now.stages == Stages::one()
-                    && now.purpose == purpose,
-                "the slot keeps the purpose, a set of one and the identifier derived from its key",
+                    && now.purpose == purpose
+                    && now.unlocks == (imported && purpose == Purpose::Wrap),
+                "the slot keeps the purpose, a set of one and the identifier derived from its key; an \
+                 imported key for wrapping is a key from a secret, a generated one is stored",
             );
             kani::assert(
                 unchanged_except(&slots, &before, index),
@@ -5138,8 +6472,9 @@ mod proofs {
                     && now.keys.0[32..] == [0; 32]
                     && now.ids.0 == expected_key_id(&now.keys.0, KeyLength::Bytes32)
                     && now.stages == Stages::one()
-                    && now.purpose == Purpose::Wrap,
-                "the first free slot holds a 32-byte wrapping key and its identifier",
+                    && now.purpose == Purpose::Wrap
+                    && now.unlocks,
+                "the first free slot holds a 32-byte key from a secret and its identifier",
             );
             kani::assert(
                 unchanged_except(&slots, &before, handle.index),
@@ -5215,9 +6550,10 @@ mod proofs {
                     && now.keys.0[32..] == [0; 32]
                     && now.ids.0 == expected_key_id(&now.keys.0, KeyLength::Bytes32)
                     && now.stages == Stages::one()
-                    && now.purpose == Purpose::Wrap,
-                "the first free slot holds the wrapping key of the bytes and the identifier derived \
-                 from it",
+                    && now.purpose == Purpose::Wrap
+                    && now.unlocks,
+                "the first free slot holds the key from a secret of the bytes and the identifier \
+                 derived from it",
             );
             kani::assert(
                 unchanged_except(&slots, &before, handle.index),
@@ -5391,8 +6727,8 @@ mod proofs {
             if result.is_ok() {
                 let now = snapshot(&slots.memory[0]);
                 kani::assert(
-                    now.keys.0[..32] == expected_words_key(&bytes),
-                    "the key in the slot is the one the hedged bytes derive",
+                    now.keys.0[..32] == expected_words_key(&bytes) && now.unlocks,
+                    "the key in the slot is the one the hedged bytes derive, a key from a secret",
                 );
             } else {
                 kani::assert(
@@ -5648,8 +6984,10 @@ mod proofs {
     /// and no key is held in a loaded slot or twice in the set; then the slot holds, at each
     /// position the plaintext fills, exactly the key it holds there with the stage it states and the
     /// identifier derived from it, nothing at the others, and the purpose, primary and revision
-    /// the plaintext states, unchanged in this epoch. A plaintext of another epoch is refused as
-    /// `RecordRejected`. Otherwise no slot changes, and the failure is `NoFreeSlot`,
+    /// the plaintext states, unchanged in this epoch, and a stored set. From a plain record, a
+    /// plaintext of another epoch or of a set for wrapping is refused as `RecordRejected`; from a
+    /// lock record, a plaintext of an epoch other than zero, of a set for external data, or of a
+    /// set for wrapping other than a set of one that has never changed. Otherwise no slot changes, and the failure is `NoFreeSlot`,
     /// `RecordRejected`, `DerivationFailed` or `DuplicateKey`, in that order. The offsets are written
     /// from the layout, independently of the parser.
     fn admit_from(mut memory: [Slot; 2]) {
@@ -5661,9 +6999,10 @@ mod proofs {
             epoch: &mut epoch,
         };
         let plaintext: [u8; PLAINTEXT_LEN] = kani::any();
+        let lock: bool = kani::any();
         let before = snapshots(&slots);
         let first_free = first_free(&before);
-        let result = slots.admit(&plaintext);
+        let result = slots.admit(&plaintext, lock);
         kani::assert(
             first_free.is_some()
                 || (result == Err(Error::NoFreeSlot) && unchanged_except(&slots, &before, 2)),
@@ -5677,10 +7016,18 @@ mod proofs {
         let parsed = crate::keyset::parse(&plaintext).map(|(_, stages, _)| stages);
         let mut named_epoch = [0; 8];
         named_epoch.copy_from_slice(&plaintext[19..27]);
-        let other_epoch = u64::from_le_bytes(named_epoch) != slots.epoch.number;
+        let other_epoch =
+            u64::from_le_bytes(named_epoch) != if lock { 0 } else { slots.epoch.number };
         let members = [0, 1, 2].map(|position| plaintext_key(&plaintext, position));
         let ids = members.map(|(key, length)| expected_key_id(&key, length));
         let filled = [0, 1, 2].map(|position| plaintext[35 + 66 * position] != 0);
+        let mut revision = [0; 8];
+        revision.copy_from_slice(&plaintext[27..35]);
+        let wrapping = plaintext[1] == 1;
+        let one = filled == [true, false, false]
+            && plaintext[35] == 1
+            && plaintext[2] == 0
+            && revision == [0; 8];
         let repeated = (0..MEMBERS).any(|position| {
             at(&filled, position)
                 && (held(&before, &at(&ids, position))
@@ -5689,7 +7036,7 @@ mod proofs {
                     }))
         });
         kani::assert(
-            if parsed.is_err() || other_epoch {
+            if parsed.is_err() || other_epoch || wrapping != lock || (wrapping && !one) {
                 result == Err(Error::RecordRejected)
             } else if any_failed() {
                 result == Err(Error::DerivationFailed)
@@ -5698,8 +7045,9 @@ mod proofs {
             } else {
                 result.is_ok()
             },
-            "a plaintext is admitted exactly when it parses, names this epoch, finds a free slot, \
-             its keys' identifiers are derived and none is held already or twice",
+            "a plaintext is admitted exactly when it parses, names its epoch, is for wrapping exactly \
+             when it comes from a lock record and then holds one key, finds a free slot, its keys' \
+             identifiers are derived and none is held already or twice",
         );
         if let (Ok(handle), Ok(stages)) = (result, parsed) {
             let now = snapshot(slot_at(&slots, index));
@@ -5745,9 +7093,10 @@ mod proofs {
                 now.stages == stages
                     && now.stages.primary() == usize::from(plaintext[2])
                     && now.purpose == purpose
+                    && !now.unlocks
                     && !now.changed,
-                "the slot keeps the primary, the revision and the purpose the plaintext states, \
-                 unchanged in this epoch",
+                "the slot keeps the primary, the revision and the purpose the plaintext states, a \
+                 stored set, unchanged in this epoch",
             );
             kani::assert(
                 unchanged_except(&slots, &before, index),
@@ -5761,6 +7110,7 @@ mod proofs {
                 purpose == Purpose::ExternalData,
                 "a set of external data is admitted"
             );
+            kani::cover!(purpose == Purpose::Wrap, "a set for wrapping is admitted");
         } else {
             kani::assert(
                 unchanged_except(&slots, &before, 2),
@@ -5771,6 +7121,10 @@ mod proofs {
         kani::cover!(
             parsed.is_ok() && other_epoch,
             "a plaintext of another epoch is refused"
+        );
+        kani::cover!(
+            parsed.is_ok() && !other_epoch && wrapping && !one && filled == [true, false, false],
+            "a set for wrapping that has changed is refused"
         );
         kani::cover!(
             result == Err(Error::DerivationFailed),
@@ -5803,96 +7157,61 @@ mod proofs {
         past_a(Occupancy::Retired, admit_from);
     }
 
-    /// Stands in for the cipher: writes any bytes, accepts or rejects at will, and remembers, call
-    /// by call, the key it was given, what it wrote and whether it accepted.
-    struct AnyCipher {
+    /// Stands in for the cipher of `N` bytes: writes any bytes, accepts or rejects at will, and
+    /// remembers how often it was called, and the key and nonce it was given, what it wrote and
+    /// whether it accepted.
+    struct AnyCipher<const N: usize> {
         calls: usize,
-        keys: [[u8; CIPHER_KEY_LEN]; MEMBERS],
-        written: [[u8; PLAINTEXT_LEN]; MEMBERS],
-        accepted: [bool; MEMBERS],
+        key: [u8; CIPHER_KEY_LEN],
+        nonce: [u8; NONCE_LEN],
+        given: [u8; N],
+        tag: [u8; TAG_LEN],
+        written: [u8; N],
+        accepted: bool,
     }
 
-    impl AnyCipher {
+    impl<const N: usize> AnyCipher<N> {
         fn new() -> Self {
             Self {
                 calls: 0,
-                keys: [[0; CIPHER_KEY_LEN]; MEMBERS],
-                written: [[0; PLAINTEXT_LEN]; MEMBERS],
-                accepted: [false; MEMBERS],
+                key: [0; CIPHER_KEY_LEN],
+                nonce: [0; NONCE_LEN],
+                given: [0; N],
+                tag: [0; TAG_LEN],
+                written: [0; N],
+                accepted: false,
             }
         }
 
         fn open(
             &mut self,
             key: &[u8; CIPHER_KEY_LEN],
-            buffer: &mut [u8; PLAINTEXT_LEN],
+            nonce: &[u8; NONCE_LEN],
+            buffer: &mut [u8; N],
+            tag: &[u8; TAG_LEN],
         ) -> Result<(), Rejected> {
-            let written: [u8; PLAINTEXT_LEN] = kani::any();
+            let written: [u8; N] = kani::any();
             let accepted: bool = kani::any();
+            (self.given, self.tag) = (*buffer, *tag);
             *buffer = written;
-            let [first_key, second_key, third_key] = &mut self.keys;
-            let [first, second, third] = &mut self.written;
-            let [first_accepted, second_accepted, third_accepted] = &mut self.accepted;
-            match self.calls {
-                0 => (*first_key, *first, *first_accepted) = (*key, written, accepted),
-                1 => (*second_key, *second, *second_accepted) = (*key, written, accepted),
-                _ => (*third_key, *third, *third_accepted) = (*key, written, accepted),
-            }
+            (self.key, self.nonce, self.written, self.accepted) = (*key, *nonce, written, accepted);
             self.calls = self.calls.saturating_add(1);
             if accepted { Ok(()) } else { Err(Rejected) }
         }
     }
 
-    /// The positions a set fills, in order, and how many.
-    fn filled_positions(stages: &Stages) -> ([usize; MEMBERS], usize) {
-        let mut order = [0; MEMBERS];
-        let mut count = 0;
-        for position in 0..MEMBERS {
-            if stages.stage(position).is_some() {
-                let [first, second, third] = &mut order;
-                match count {
-                    0 => *first = position,
-                    1 => *second = position,
-                    _ => *third = position,
-                }
-                count += 1;
-            }
-        }
-        (order, count)
-    }
-
-    /// The call of the cipher that wins, from what it was given and did: the first that accepted
-    /// and wrote a plaintext naming the identifier of the key at that position. Read from the
-    /// layout, not by the code under proof.
-    fn winning_call(
-        cipher: &AnyCipher,
-        parent: &Snapshot,
-        order: &[usize; MEMBERS],
-        count: usize,
-    ) -> Option<usize> {
-        // Up to the most calls rather than up to `count`: a loop whose end the solver does not know
-        // unrolls to the whole bound of the proof.
-        (0..MEMBERS).find(|&call| {
-            let position = at(order, call);
-            let written = at(&cipher.written, call);
-            call < count
-                && at(&cipher.accepted, call)
-                && written[3..19] == pick(&parent.ids, position)
-        })
-    }
-
-    /// For a loaded parent set in any state, any 261-byte record, any associated data of up to two
-    /// bytes and any behaviour of the cipher its interface allows: opening tries every key of the
-    /// set, once each, in order of position, with the cipher key derived from that key, also after
-    /// one has opened the record; it leaves in the output the plaintext of the first key whose
-    /// trial the cipher accepts and whose plaintext names that key's identifier as its parent, and
-    /// succeeds if that key is enabled and fails with `KeyDisabled` if it is disabled; it fails
-    /// with `DerivationFailed` when a derivation fails, and otherwise with `RecordRejected` when no
-    /// trial does both. The cipher key is derived with the key of this epoch.
+    /// For a loaded set for wrapping in any state, any 261-byte record, any associated data of up to
+    /// two bytes and any behaviour of the cipher its interface allows: opening tries the key of the
+    /// set, once, with the cipher key derived from it and the key of this epoch, or from it alone for
+    /// a lock record, and not at all when that derivation fails, which is `DerivationFailed`; it
+    /// leaves in the output the plaintext the cipher wrote when the cipher accepts it and it names
+    /// that key's identifier as its parent, and otherwise fails with `RecordRejected` and leaves the
+    /// output as it was.
     #[kani::proof]
     #[kani::unwind(65)]
-    fn opening_tries_every_key_of_the_parent() {
+    fn opening_uses_the_key_of_the_parent() {
         let mut memory = [any_slot_in(Occupancy::Loaded)];
+        kani::assume(memory[0].purpose == Purpose::Wrap);
         let changing = kani::any();
         let mut epoch = any_epoch(changing);
         let slots = Slots {
@@ -5903,70 +7222,52 @@ mod proofs {
         let aad: [u8; 2] = kani::any();
         let before = snapshot(&slots.memory[0]);
         let epoch_key = first_half(&slots.epoch.key);
-        let (order, count) = filled_positions(&before.stages);
-        let mut cipher = AnyCipher::new();
-        let mut found: [u8; PLAINTEXT_LEN] = kani::any();
+        let mut cipher = AnyCipher::<PLAINTEXT_LEN>::new();
+        let original: [u8; PLAINTEXT_LEN] = kani::any();
+        let mut found = original;
+        let lock: bool = kani::any();
 
-        let result = slots.open_under(0, &aad, &record, &mut found, &mut |key, _, _, buffer, _| {
-            cipher.open(key, buffer)
-        });
-        kani::assert(cipher.calls == count, "every key of the set is tried once");
-        for call in 0..MEMBERS {
-            let position = at(&order, call);
-            kani::assert(
-                call >= count
-                    || any_failed()
-                    || at(&cipher.keys, call)
-                        == expected_wrap_key(
-                            &pick(&before.keys, position),
-                            at(&before.lengths, position),
-                            &epoch_key,
-                        ),
-                "each trial uses the cipher key derived from the key at its position",
-            );
-        }
-        let winner = winning_call(&cipher, &before, &order, count);
+        let result = slots.open_under(
+            0,
+            &aad,
+            &record,
+            &mut found,
+            &mut |key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag),
+            lock,
+        );
+        kani::assert(
+            cipher.calls == usize::from(!any_failed()),
+            "the key is tried once, unless its derivation fails",
+        );
+        let expected = if lock {
+            expected_lock_key(&before.keys.0, before.lengths[0])
+        } else {
+            expected_wrap_key(&before.keys.0, before.lengths[0], &epoch_key)
+        };
+        kani::assert(
+            any_failed() || (cipher.key == expected && cipher.nonce[..] == record[..NONCE_LEN]),
+            "the trial uses the cipher key derived from the key, and the record's nonce",
+        );
+        let named = cipher.accepted && cipher.written[3..19] == before.ids.0;
         kani::assert(
             if any_failed() {
-                result == Err(Error::DerivationFailed)
+                result == Err(Error::DerivationFailed) && same(&found, &original)
+            } else if named {
+                result == Ok(()) && same(&found, &cipher.written)
             } else {
-                match winner {
-                    Some(call) => {
-                        let stages = [
-                            before.stages.stage(0),
-                            before.stages.stage(1),
-                            before.stages.stage(2),
-                        ];
-                        let disabled = at(&stages, at(&order, call)) == Some(Status::Disabled);
-                        result
-                            == if disabled {
-                                Err(Error::KeyDisabled)
-                            } else {
-                                Ok(())
-                            }
-                            && same(&found, &at(&cipher.written, call))
-                    }
-                    None => result == Err(Error::RecordRejected),
-                }
+                result == Err(Error::RecordRejected) && same(&found, &original)
             },
-            "opening keeps the plaintext of the first key that opens the record and is named in it, \
-             and refuses it as KeyDisabled exactly when that key is disabled",
+            "opening keeps the plaintext exactly when the cipher accepts it and it names the key, \
+             and otherwise leaves the output as it was",
         );
         kani::cover!(
-            winner == Some(0) && count == 3 && cipher.accepted[2],
-            "the first key wins, and the last is still tried and accepts"
+            result.is_ok() && lock,
+            "the key from a secret opens the record"
         );
+        kani::cover!(result.is_ok() && !lock, "the stored key opens the record");
         kani::cover!(
-            winner.is_some_and(|call| at(&order, call) == 2),
-            "the key at the last position opens the record"
-        );
-        kani::cover!(
-            result == Err(Error::KeyDisabled),
-            "a disabled key opens the record"
-        );
-        kani::cover!(
-            result == Err(Error::RecordRejected) && cipher.accepted[0],
-            "a key opens the record but is not named in it"
+            result == Err(Error::RecordRejected) && cipher.accepted,
+            "the key opens the record but is not named in it"
         );
     }
 
@@ -5985,13 +7286,18 @@ mod proofs {
         }
     }
 
-    /// Unwrapping in `memory`, for a handle of this set naming any slot and generation, any record
-    /// and any context of up to two bytes, whatever the cipher does: unwrapping refuses an empty
-    /// context, a stale parent, a parent not for wrapping and a full set before it decrypts; a
-    /// refused unwrap changes no slot, and one that succeeds changes only the first free slot, and
-    /// needs a trial the cipher accepts and every derivation to succeed. What the trial of the
-    /// parent's keys gives, `KeyDisabled` among it, `opening_tries_every_key_of_the_parent` proves.
-    fn unwrap_from(mut memory: [Slot; 2]) -> Result<(), Error> {
+    /// Unwrapping or unlocking in `memory`, for a handle of this set naming any slot and generation,
+    /// any record or lock record and any context of up to two bytes, whatever the cipher does: an
+    /// empty context, a stale parent, a parent not for wrapping, one of the other level and a full
+    /// set are refused, in that order, before anything is decrypted. An unlock opens the outer
+    /// layer once, under the key derived from the key of this epoch, and refuses it as
+    /// `StaleRecord`, decrypting nothing more, unless the cipher accepts it and it names this
+    /// epoch; the inner record it then opens is the one the outer layer holds. A refused call
+    /// changes no slot, and one that succeeds changes only the first free slot, and needs every
+    /// trial the cipher accepts and every derivation to succeed. What the trial of the parent's
+    /// key gives, `opening_uses_the_key_of_the_parent` proves. Returns the outcome and whether it
+    /// was an unlock.
+    fn unwrap_from(mut memory: [Slot; 2]) -> (Result<(), Error>, bool) {
         let id = memory.as_ptr().addr();
         let mut epoch = any_epoch(kani::any());
         let mut slots = Slots {
@@ -5999,19 +7305,35 @@ mod proofs {
             epoch: &mut epoch,
         };
         let parent = forged(id);
-        let record: [u8; RECORD_LEN] = kani::any();
+        let lock: bool = kani::any();
         let context_bytes: [u8; 2] = kani::any();
         let context = any_context(&context_bytes);
         let before = snapshots(&slots);
         let parent_live = names_loaded(&before, &parent);
-        let wrapping = parent_live && snapshot_at(&before, parent.index).purpose == Purpose::Wrap;
+        let named = snapshot_at(&before, parent.index);
+        let wrapping = parent_live && named.purpose == Purpose::Wrap;
+        let level = wrapping && named.unlocks == lock;
         let first_free = first_free(&before);
-        let mut cipher = AnyCipher::new();
+        let (epoch_key, number) = (first_half(&slots.epoch.key), slots.epoch.number);
+        let mut layer = AnyCipher::<LAYER_LEN>::new();
+        let mut cipher = AnyCipher::<PLAINTEXT_LEN>::new();
 
-        let result = slots.unwrap_on_stack(parent, context, &record, |key, _, _, buffer, _| {
-            cipher.open(key, buffer)
-        });
-        let refused_before = context.is_empty() || !wrapping || first_free.is_none();
+        let result = if lock {
+            let record: [u8; LOCK_RECORD_LEN] = kani::any();
+            slots.unlock_on_stack(
+                parent,
+                context,
+                &record,
+                |key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag),
+                |key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag),
+            )
+        } else {
+            let record: [u8; RECORD_LEN] = kani::any();
+            slots.unwrap_on_stack(parent, context, &record, |key, nonce, _, buffer, tag| {
+                cipher.open(key, nonce, buffer, tag)
+            })
+        };
+        let refused_before = context.is_empty() || !level || first_free.is_none();
         kani::assert(
             if context.is_empty() {
                 result == Err(Error::InvalidContext)
@@ -6019,27 +7341,64 @@ mod proofs {
                 result == Err(Error::StaleHandle)
             } else if !wrapping {
                 result == Err(Error::WrongPurpose)
+            } else if !level {
+                result == Err(Error::WrongLevel)
             } else if first_free.is_none() {
                 result == Err(Error::NoFreeSlot)
             } else {
                 true
             },
-            "an unwrap refuses a bad context, a stale parent, a parent not for wrapping and a full \
-             set",
+            "an unwrap and an unlock refuse a bad context, a stale parent, a parent not for \
+             wrapping, a parent of the other level and a full set",
         );
         kani::cover!(
             result == Err(Error::WrongPurpose),
             "a parent for external data is refused"
         );
+        kani::cover!(
+            result == Err(Error::WrongLevel) && lock,
+            "a stored key unlocks nothing"
+        );
+        kani::cover!(
+            result == Err(Error::WrongLevel) && !lock,
+            "a key from a secret unwraps nothing"
+        );
         kani::assert(
-            !refused_before || cipher.calls == 0,
+            !refused_before || (cipher.calls == 0 && layer.calls == 0),
             "those refusals come before any decryption",
         );
-        let [first, second, third] = cipher.accepted;
+        let current = layer.accepted && layer.written[..8] == number.to_le_bytes();
+        let layer_key = expected_layer_key(&epoch_key);
+        let mut inner = [0; RECORD_LEN];
+        inner.copy_from_slice(&layer.written[8..]);
+        let held = cipher.nonce[..] == inner[..NONCE_LEN]
+            && same_bytes(&cipher.given, &inner[NONCE_LEN..NONCE_LEN + PLAINTEXT_LEN])
+            && cipher.tag[..] == inner[NONCE_LEN + PLAINTEXT_LEN..];
         kani::assert(
-            result.is_err() || ((first || second || third) && !any_failed()),
-            "an unwrap loads a set only after a trial the cipher accepts and when every derivation \
+            !lock
+                || refused_before
+                || (any_failed()
+                    && layer.calls == 0
+                    && cipher.calls == 0
+                    && result == Err(Error::DerivationFailed))
+                || (layer.calls == 1
+                    && layer.key == layer_key
+                    && (current || (result == Err(Error::StaleRecord) && cipher.calls == 0))),
+            "an unlock opens the outer layer once, under the key of this epoch, and refuses it as \
+             StaleRecord, decrypting nothing more, unless it opens and names this epoch",
+        );
+        kani::assert(
+            !lock || cipher.calls == 0 || held,
+            "the inner record is the one the outer layer holds: its nonce, encrypted part and tag",
+        );
+        kani::assert(
+            result.is_err() || (cipher.accepted && !any_failed() && (!lock || current)),
+            "a set is loaded only after the trials the cipher accepts and when every derivation \
              succeeds",
+        );
+        kani::assert(
+            refused_before || !any_failed() || result == Err(Error::DerivationFailed),
+            "a call that a derivation fails fails with DerivationFailed",
         );
         kani::assert(
             match (result, first_free) {
@@ -6051,20 +7410,21 @@ mod proofs {
                 }
                 _ => result.is_err() && unchanged_except(&slots, &before, 2),
             },
-            "a refused unwrap changes no slot, and one that succeeds only the first free slot, whose \
+            "a refused call changes no slot, and one that succeeds only the first free slot, whose \
              handle names these slots and that slot's generation",
         );
-        result.map(|_| ())
+        (result.map(|_| ()), lock)
     }
 
-    /// The outcomes of an unwrap that decrypts.
-    fn every_outcome(result: Result<(), Error>) {
-        kani::cover!(result.is_ok(), "a record is unwrapped");
-        kani::cover!(
-            result == Err(Error::KeyDisabled),
-            "a disabled key opens the record"
-        );
+    /// The outcomes of an unwrap or an unlock that decrypts.
+    fn every_outcome((result, lock): (Result<(), Error>, bool)) {
+        kani::cover!(result.is_ok() && !lock, "a record is unwrapped");
+        kani::cover!(result.is_ok() && lock, "a lock record is unlocked");
         kani::cover!(result == Err(Error::RecordRejected), "a record is rejected");
+        kani::cover!(
+            result == Err(Error::StaleRecord),
+            "a lock record not of this epoch is refused"
+        );
     }
 
     /// Unwrapping with the first slot free; with the next two, any state of two slots.
@@ -6086,7 +7446,7 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(65)]
     fn an_unwrap_past_a_retired_slot() {
-        let result = past_a(Occupancy::Retired, unwrap_from);
+        let (result, _) = past_a(Occupancy::Retired, unwrap_from);
         kani::cover!(
             result == Err(Error::NoFreeSlot),
             "a live parent leaves no slot free"
@@ -6095,15 +7455,15 @@ mod proofs {
 
     /// From any state of two slots and of the epoch, with a change to the next under way or not,
     /// for handles of this set naming any slots and generations, any context of up to two bytes
-    /// and any record buffer, whatever the platform's source and the cipher do: wrapping changes no
-    /// key, stage or epoch, and marks the set wrapped for the next epoch only when it succeeds
-    /// during a change; it writes the record only when it succeeds, starting with the nonce the
-    /// source gave hedged with the key the record is wrapped in; it refuses an empty context, a
-    /// stale handle, a set wrapped under itself, a parent that does not serve wrapping, a set
-    /// changed in this epoch outside a change, and a failed source.
-    #[kani::proof]
-    #[kani::unwind(234)]
-    fn a_wrap_changes_no_slot_and_writes_only_when_it_succeeds() {
+    /// and any record buffer, whatever the platform's source and the cipher do: a wrap, or a lock
+    /// when `lock` says so, changes no key, stage or epoch, and marks the set wrapped for the next
+    /// epoch only when it succeeds during a change; it writes the record only when it succeeds,
+    /// starting with the nonce the source gave last, hedged with the key the record is wrapped in
+    /// at its count; it refuses an empty context, a stale handle, a set wrapped under itself, a
+    /// parent that does not serve wrapping, a set or a parent of the wrong level, a set changed in
+    /// this epoch outside a change, and a failed source. Each draw the source answers is counted
+    /// once. Returns the outcome.
+    fn wrap_from(lock: bool) -> Result<(), Error> {
         let mut memory = [any_slot(), any_slot()];
         let id = memory.as_ptr().addr();
         let changing = kani::any();
@@ -6116,21 +7476,32 @@ mod proofs {
         let (set, parent) = (forged(id), forged(id));
         let context_bytes: [u8; 2] = kani::any();
         let context = any_context(&context_bytes);
-        let original: [u8; RECORD_LEN] = kani::any();
+        let original: [u8; LOCK_RECORD_LEN] = kani::any();
         let mut record = original;
         let mut entropy = AnyEntropy::new();
         let before = snapshots(&slots);
         let live = names_loaded(&before, &set) && names_loaded(&before, &parent);
+        let (child, wrapping) = (
+            snapshot_at(&before, set.index),
+            snapshot_at(&before, parent.index),
+        );
 
         let (epoch_key, next_key) = (*slots.epoch.key.bytes(), *slots.epoch.next.bytes());
         let count = slots.epoch.drawn;
-        let result = slots.wrap(set, parent, context, &mut entropy, &mut record);
+        let result = if lock {
+            slots.wrap_on_stack(set, parent, context, &mut entropy, Out::Lock(&mut record))
+        } else {
+            let mut plain: [u8; RECORD_LEN] = original[..RECORD_LEN].try_into().unwrap();
+            let result =
+                slots.wrap_on_stack(set, parent, context, &mut entropy, Out::Record(&mut plain));
+            record[..RECORD_LEN].copy_from_slice(&plain);
+            result
+        };
         let sealing = result.is_ok() && changing;
         kani::assert(
             if sealing {
-                let named = snapshot_at(&before, set.index);
                 unchanged_except(&slots, &before, set.index)
-                    && snapshot(slot_at(&slots, set.index)) == marked(named, named.changed, true)
+                    && snapshot(slot_at(&slots, set.index)) == marked(child, child.changed, true)
             } else {
                 unchanged_except(&slots, &before, 2)
             },
@@ -6145,14 +7516,11 @@ mod proofs {
             "a wrap changes no epoch and no key of one",
         );
         kani::assert(
-            slots.epoch.drawn
-                == if entropy.calls == 1 && !entropy.failed {
-                    count.wrapping_add(1)
-                } else {
-                    count
-                },
+            slots.epoch.drawn == count.wrapping_add(u64::from(entropy.answered)),
             "a draw the source answers is counted once",
         );
+        let level =
+            !child.unlocks && (child.purpose == Purpose::Wrap) == lock && wrapping.unlocks == lock;
         kani::assert(
             if context.is_empty() {
                 result == Err(Error::InvalidContext)
@@ -6160,9 +7528,11 @@ mod proofs {
                 result == Err(Error::StaleHandle)
             } else if set.index == parent.index {
                 result == Err(Error::SameKey)
-            } else if snapshot_at(&before, parent.index).purpose != Purpose::Wrap {
+            } else if wrapping.purpose != Purpose::Wrap {
                 result == Err(Error::WrongPurpose)
-            } else if snapshot_at(&before, set.index).changed && !changing {
+            } else if !level {
+                result == Err(Error::WrongLevel)
+            } else if child.changed && !changing {
                 result == Err(Error::Unsaved)
             } else if changing && epoch == u64::MAX {
                 result == Err(Error::EpochExhausted)
@@ -6174,43 +7544,426 @@ mod proofs {
                     || result == Err(Error::CipherFailed)
             },
             "a wrap refuses a bad context, a stale handle, a set wrapping itself, a parent not for \
-             wrapping, an unsaved set outside a change and a failed source",
+             wrapping, a set or a parent of the wrong level, an unsaved set outside a change and a \
+             failed source",
         );
         kani::cover!(
             result == Err(Error::WrongPurpose),
             "a parent for external data is refused"
         );
         kani::cover!(
-            result.is_ok() && snapshot_at(&before, set.index).purpose == Purpose::ExternalData,
-            "a set for external data is wrapped"
+            result == Err(Error::WrongLevel),
+            "a set of the wrong level is refused"
         );
+        let written = if lock { LOCK_RECORD_LEN } else { RECORD_LEN };
         kani::assert(
             if result.is_ok() {
                 let mut drawn = [0; 12];
                 drawn.copy_from_slice(&entropy.written[..12]);
                 let mut salt = [0; 32];
                 salt.copy_from_slice(&if changing { next_key } else { epoch_key }[..32]);
-                record[..12] == expected_hedge(&salt, count, Branch::HedgeNonce, &drawn)
+                let last = count
+                    .wrapping_add(u64::from(entropy.answered))
+                    .wrapping_sub(1);
+                record[..12] == expected_hedge(&salt, last, Branch::HedgeNonce, &drawn)
             } else {
-                same(&record, &original)
+                same_bytes(&record[..written], &original[..written])
             },
             "a wrap writes the record only when it succeeds, starting with the nonce hedged from \
-             the source's bytes",
+             the source's last bytes",
+        );
+        kani::assert(
+            !any_failed() || result == Err(Error::DerivationFailed),
+            "a wrap that a derivation fails fails with DerivationFailed",
         );
         kani::cover!(result.is_ok(), "a set is wrapped");
         kani::cover!(
-            sealing && snapshot_at(&before, set.index).changed,
+            sealing && child.changed,
             "a changed set is wrapped for the next epoch"
-        );
-        kani::cover!(
-            result == Err(Error::Unsaved),
-            "a changed set is not wrapped in its epoch"
         );
         kani::cover!(
             entropy.failed && entropy.written.iter().any(|&byte| byte != 0),
             "the source fails after writing bytes"
         );
         kani::cover!(result == Err(Error::CipherFailed), "the cipher fails");
+        kani::cover!(
+            result == Err(Error::DerivationFailed),
+            "the derivation fails"
+        );
+        result
+    }
+
+    /// The wrap of a set for external data.
+    #[kani::proof]
+    #[kani::unwind(234)]
+    fn a_wrap_changes_no_slot_and_writes_only_when_it_succeeds() {
+        let result = wrap_from(false);
+        kani::cover!(
+            result == Err(Error::Unsaved),
+            "a changed set is not wrapped in its epoch"
+        );
+    }
+
+    /// The lock of a stored key for wrapping.
+    #[kani::proof]
+    #[kani::unwind(270)]
+    fn a_lock_changes_no_slot_and_writes_only_when_it_succeeds() {
+        let result = wrap_from(true);
+        kani::cover!(result.is_ok(), "a stored key is locked");
+    }
+
+    /// From any state of two slots and of the epoch, with a change to the next under way or not,
+    /// for any lock record, any output buffer and any context of up to two bytes, whatever the
+    /// platform's source and the cipher do: a carry changes no slot and no epoch but its count of
+    /// draws. It refuses an empty context and a missing change before it decrypts, then opens the
+    /// record once, under the key derived from the key of this epoch and with the record's nonce,
+    /// and refuses it as `StaleRecord`, asking the source nothing, unless the cipher accepts it
+    /// and it names this epoch. It writes the output only when it succeeds, starting with the nonce
+    /// the source gave, hedged with the key of the next epoch.
+    #[kani::proof]
+    #[kani::unwind(270)]
+    fn a_carry_changes_no_slot_and_writes_only_when_it_succeeds() {
+        let mut memory = [any_slot(), any_slot()];
+        let changing = kani::any();
+        let mut epoch = any_epoch(changing);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let (number, epoch_key, next_key) = (
+            slots.epoch.number,
+            first_half(&slots.epoch.key),
+            first_half(&slots.epoch.next),
+        );
+        let count = slots.epoch.drawn;
+        let context_bytes: [u8; 2] = kani::any();
+        let context = any_context(&context_bytes);
+        let from: [u8; LOCK_RECORD_LEN] = kani::any();
+        let original: [u8; LOCK_RECORD_LEN] = kani::any();
+        let mut to = original;
+        let mut entropy = AnyEntropy::new();
+        let mut layer = AnyCipher::<LAYER_LEN>::new();
+        let before = snapshots(&slots);
+
+        let result = slots.carry_on_stack(
+            context,
+            &mut entropy,
+            &from,
+            &mut to,
+            |key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag),
+        );
+        kani::assert(
+            unchanged_except(&slots, &before, 2)
+                && slots.epoch.number == number
+                && slots.epoch.changing == changing
+                && first_half(&slots.epoch.key) == epoch_key
+                && first_half(&slots.epoch.next) == next_key
+                && slots.epoch.drawn == count.wrapping_add(u64::from(entropy.answered)),
+            "a carry changes no slot and no epoch, and counts once each draw the source answers",
+        );
+        let current = layer.accepted && layer.written[..8] == number.to_le_bytes();
+        kani::assert(
+            if context.is_empty() {
+                result == Err(Error::InvalidContext) && layer.calls == 0
+            } else if !changing {
+                result == Err(Error::NoEpochChange) && layer.calls == 0
+            } else if number == u64::MAX {
+                result == Err(Error::EpochExhausted) && layer.calls == 0
+            } else if layer.calls == 0 {
+                result == Err(Error::DerivationFailed) && any_failed()
+            } else if !current {
+                result == Err(Error::StaleRecord) && entropy.calls == 0
+            } else if entropy.failed {
+                result == Err(Error::EntropyFailed)
+            } else {
+                result.is_ok()
+                    || result == Err(Error::DerivationFailed)
+                    || result == Err(Error::CipherFailed)
+            },
+            "a carry refuses a bad context and a missing change, a failed derivation, a record that \
+             does not open in this epoch and a failed source",
+        );
+        kani::assert(
+            !any_failed() || result == Err(Error::DerivationFailed),
+            "a carry that a derivation fails fails with DerivationFailed",
+        );
+        kani::assert(
+            layer.calls <= 1
+                && (layer.calls == 0
+                    || (layer.key == expected_layer_key(&epoch_key)
+                        && layer.nonce[..] == from[..NONCE_LEN])),
+            "the record is opened once, under the key of this epoch and with its own nonce",
+        );
+        kani::assert(
+            if result.is_ok() {
+                let mut drawn = [0; 12];
+                drawn.copy_from_slice(&entropy.written[..12]);
+                to[..12] == expected_hedge(&next_key, count, Branch::HedgeNonce, &drawn)
+            } else {
+                same(&to, &original)
+            },
+            "a carry writes its output only when it succeeds, starting with the nonce hedged with \
+             the key of the next epoch",
+        );
+        kani::cover!(result.is_ok(), "a lock record is carried");
+        kani::cover!(
+            result == Err(Error::StaleRecord) && layer.accepted,
+            "a lock record of another epoch is refused"
+        );
+        kani::cover!(
+            result == Err(Error::NoEpochChange),
+            "nothing is carried outside a change"
+        );
+        kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
+    }
+
+    /// From any state of three slots, for handles of this set naming any slots and generations: the
+    /// check a combination starts with refuses a stale handle, one set twice, a set not for
+    /// wrapping, one that is not a key from a secret, a salt not of 32 bytes and a want of a free
+    /// slot, in that order, and passes otherwise. What follows the check,
+    /// `a_combination_loads_its_key_and_releases_both` proves.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_combination_refuses_in_order() {
+        let mut memory = [any_slot(), any_slot(), any_slot()];
+        let id = memory.as_ptr().addr();
+        let mut epoch = any_epoch(kani::any());
+        let slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let (key, salt) = (forged(id), forged(id));
+        let before = [
+            snapshot(&slots.memory[0]),
+            snapshot(&slots.memory[1]),
+            snapshot(&slots.memory[2]),
+        ];
+        let named = |handle: &Handle<'_>| match handle.index {
+            0 => before[0],
+            1 => before[1],
+            _ => before[2],
+        };
+        let live = |handle: &Handle<'_>| {
+            handle.index < 3
+                && named(handle).occupancy == Occupancy::Loaded
+                && named(handle).generation == handle.generation
+        };
+        let result = slots.combinable(key, salt);
+        let (first, second) = (named(&key), named(&salt));
+        let expected = if !live(&key) || !live(&salt) {
+            Err(Error::StaleHandle)
+        } else if key.index == salt.index {
+            Err(Error::SameKey)
+        } else if first.purpose != Purpose::Wrap || second.purpose != Purpose::Wrap {
+            Err(Error::WrongPurpose)
+        } else if !first.unlocks || !second.unlocks {
+            Err(Error::WrongLevel)
+        } else if second.lengths[0] != KeyLength::Bytes32 {
+            Err(Error::WrongLength)
+        } else if before.iter().all(|slot| slot.occupancy != Occupancy::Free) {
+            Err(Error::NoFreeSlot)
+        } else {
+            Ok((key.index, salt.index))
+        };
+        kani::assert(
+            result == expected,
+            "a combination is checked for the first reason to refuse it, and otherwise passes",
+        );
+        kani::cover!(
+            result == Err(Error::StaleHandle),
+            "a stale handle is refused"
+        );
+        kani::cover!(
+            result == Err(Error::SameKey),
+            "a set is not combined with itself"
+        );
+        kani::cover!(
+            result == Err(Error::WrongPurpose),
+            "a set for external data is not combined"
+        );
+        kani::cover!(
+            result == Err(Error::WrongLevel),
+            "a stored key is not combined"
+        );
+        kani::cover!(result == Err(Error::WrongLength), "a long salt is refused");
+        kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
+        kani::cover!(
+            result.is_ok(),
+            "two keys from a secret pass with a slot free"
+        );
+    }
+
+    /// A loaded slot of any generation that holds a key from a secret of `length`, any bytes, with
+    /// any identifier.
+    fn any_secret(length: KeyLength) -> Slot {
+        let mut slot = Slot::empty();
+        slot.generation = kani::any();
+        slot.occupancy = Occupancy::Loaded;
+        slot.unlocks = true;
+        let [first, ..] = &mut slot.keys;
+        any_key(first);
+        kani::assume(first.length() == length);
+        slot.ids[0] = id_from_bytes(kani::any());
+        slot
+    }
+
+    /// With keys from a secret of 32 bytes in the first two slots and the third free: combining them
+    /// through their live handles succeeds exactly when every derivation succeeds and neither holds
+    /// the new key. It then loads into the third slot a set of one 32-byte key from a secret, the
+    /// derivation of the first key with the second as the salt, with its identifier, and releases
+    /// both: their slots hold nothing and are past their generation. A refusal changes no slot.
+    /// Without a free slot the check before refuses, as `a_combination_refuses_in_order` proves;
+    /// other places of the three sets, the whole of a 64-byte key, and which key is the salt, which
+    /// the model of the derivation does not tell apart, unit tests check.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_combination_loads_its_key_and_releases_both() {
+        let length = KeyLength::Bytes32;
+        let mut memory = [
+            any_secret(length),
+            any_secret(length),
+            any_slot_in(Occupancy::Free),
+        ];
+        let id = memory.as_ptr().addr();
+        let mut epoch = any_epoch(kani::any());
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let before = [
+            snapshot(&slots.memory[0]),
+            snapshot(&slots.memory[1]),
+            snapshot(&slots.memory[2]),
+        ];
+        let handle = |index: usize| Handle {
+            slots: id,
+            index,
+            generation: before[index].generation,
+            memory: PhantomData,
+        };
+        let result = slots.combine(handle(0), handle(1));
+        let mut salt = [0; 32];
+        salt.copy_from_slice(&before[1].keys.0[..32]);
+        let mut expected = [0; 64];
+        expected[..32].copy_from_slice(&expected_combined(&before[0].keys.0, length, &salt));
+        let key_id = expected_key_id(&expected, KeyLength::Bytes32);
+        let held = before.iter().any(|snapshot| {
+            snapshot.occupancy == Occupancy::Loaded
+                && (0..MEMBERS).any(|position| {
+                    snapshot.stages.stage(position).is_some()
+                        && pick(&snapshot.ids, position) == key_id
+                })
+        });
+        kani::assert(
+            if any_failed() {
+                result == Err(Error::DerivationFailed)
+            } else if held {
+                result == Err(Error::DuplicateKey)
+            } else {
+                result.is_ok()
+            },
+            "a combination needs a free slot, every derivation and a key held nowhere",
+        );
+        if let Ok(combined) = result {
+            let now = snapshot(&slots.memory[2]);
+            kani::assert(
+                combined.index == 2
+                    && combined.generation == before[2].generation
+                    && now.occupancy == Occupancy::Loaded
+                    && now.keys == (expected, [0; 64], [0; 64])
+                    && now.lengths[0] == KeyLength::Bytes32
+                    && now.ids == (key_id, [0; ID_LEN], [0; ID_LEN])
+                    && now.stages == Stages::one()
+                    && now.purpose == Purpose::Wrap
+                    && now.unlocks
+                    && !now.changed,
+                "the free slot holds the combined key from a secret alone, with its identifier",
+            );
+            for index in 0..2 {
+                let slot = &slots.memory[index];
+                let generation = before[index].generation;
+                kani::assert(
+                    wiped(slot)
+                        && match generation.checked_add(1) {
+                            Some(next) => {
+                                slot.occupancy == Occupancy::Free && slot.generation == next
+                            }
+                            None => slot.occupancy == Occupancy::Retired,
+                        },
+                    "both keys it took are released",
+                );
+                kani::cover!(
+                    slot.occupancy == Occupancy::Retired,
+                    "a key it took retires its slot"
+                );
+            }
+        } else {
+            kani::assert(
+                (0..3).all(|index| snapshot(&slots.memory[index]) == before[index]),
+                "a refused combination changes no slot",
+            );
+        }
+        kani::cover!(result.is_ok(), "two keys are combined");
+        kani::cover!(
+            result == Err(Error::DuplicateKey),
+            "the combined key is held"
+        );
+        kani::cover!(result == Err(Error::DerivationFailed), "a derivation fails");
+    }
+
+    /// From any state of two slots, for a handle of this set naming any slot and generation: a
+    /// challenge is written exactly from a live key from a secret, the derivation of its key, and
+    /// is otherwise refused as `StaleHandle`, `WrongPurpose`, `WrongLevel` or `DerivationFailed`,
+    /// in that order, writing nothing. No slot changes either way.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn only_a_key_from_a_secret_gives_a_challenge() {
+        let mut memory = [any_slot(), any_slot()];
+        let id = memory.as_ptr().addr();
+        let mut epoch = any_epoch(kani::any());
+        let slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let handle = forged(id);
+        let before = snapshots(&slots);
+        let original: [u8; 32] = kani::any();
+        let mut out = original;
+        let result = slots.challenge(handle, &mut out);
+        let named = snapshot_at(&before, handle.index);
+        let expected = if !names_loaded(&before, &handle) {
+            Err(Error::StaleHandle)
+        } else if named.purpose != Purpose::Wrap {
+            Err(Error::WrongPurpose)
+        } else if !named.unlocks {
+            Err(Error::WrongLevel)
+        } else if any_failed() {
+            Err(Error::DerivationFailed)
+        } else {
+            Ok(())
+        };
+        kani::assert(
+            result == expected,
+            "a challenge comes from a live key from a secret, and is otherwise refused for the \
+             first reason",
+        );
+        kani::assert(
+            if result.is_ok() {
+                out == expected_challenge(&named.keys.0, named.lengths[0])
+            } else {
+                out == original
+            },
+            "a challenge writes exactly the derivation of the key, or nothing",
+        );
+        kani::assert(
+            unchanged_except(&slots, &before, 2),
+            "a challenge changes no slot",
+        );
+        kani::cover!(result.is_ok(), "a challenge is given");
+        kani::cover!(
+            result == Err(Error::WrongLevel),
+            "a stored key gives no challenge"
+        );
         kani::cover!(
             result == Err(Error::DerivationFailed),
             "the derivation fails"
@@ -6256,8 +8009,9 @@ mod proofs {
     }
 
     /// From `memory`, with the slot `index` loaded and any position: promoting, disabling, enabling
-    /// and destroying through the live handle of that slot are refused as `EpochChanging` during a
-    /// change of epoch, then as `Unsaved` if the set has changed in this epoch, and otherwise
+    /// and destroying through the live handle of that slot are refused as `WrongPurpose` for a set
+    /// for wrapping, then as `EpochChanging` during a change of epoch, then as `Unsaved` if the set
+    /// has changed in this epoch, and otherwise
     /// change its stages exactly as the transition of the stages gives, marking the set changed and
     /// not wrapped for the next epoch; a refusal changes nothing; a destroy wipes the key and the
     /// identifier at the position and leaves every other key as it was; the slot keeps its
@@ -6281,18 +8035,22 @@ mod proofs {
         let chosen = any_position();
         let mut expected = named.stages;
         let (result, outcome, destroying) = any_change(&mut slots, handle, chosen, &mut expected);
-        let refused = changing || named.changed;
+        let wrapping = named.purpose == Purpose::Wrap;
+        let refused = wrapping || changing || named.changed;
         kani::assert(
             result
-                == if changing {
+                == if wrapping {
+                    Err(Error::WrongPurpose)
+                } else if changing {
                     Err(Error::EpochChanging)
                 } else if named.changed {
                     Err(Error::Unsaved)
                 } else {
                     outcome
                 },
-            "a change during a change of epoch, or of a set changed in this epoch, is refused, and \
-             otherwise succeeds exactly when the transition of the stages does, or fails as it does",
+            "a change of a set for wrapping, during a change of epoch, or of a set changed in this \
+             epoch is refused, and otherwise succeeds exactly when the transition of the stages \
+             does, or fails as it does",
         );
         let applied = result.is_ok();
         let now = snapshot(slot_at(&slots, index));
@@ -6349,6 +8107,10 @@ mod proofs {
             result == Err(Error::EpochChanging),
             "no set changes during a change of epoch"
         );
+        kani::cover!(
+            result == Err(Error::WrongPurpose),
+            "a set for wrapping takes no change"
+        );
     }
 
     /// A change through the first slot; with the next, through either slot of two in any state.
@@ -6398,51 +8160,17 @@ mod proofs {
         );
     }
 
-    /// The outcome of an addition through `handle`, and the bytes and length the position must
-    /// hold on success.
-    type Added = (Result<Position, Error>, Bytes, KeyLength);
-
-    /// Adds a key of 32 bytes, any bytes, through `handle`. An addition wipes its source exactly
-    /// when it succeeds. A generation fills a key as a load does, which the proofs of a load cover.
-    fn add_short(slots: &mut Slots<'_>, handle: Handle<'static>) -> Added {
-        let mut source: [u8; 32] = kani::any();
-        let original = source;
-        let result = slots.add32(handle, &mut source);
-        kani::assert(
-            source == if result.is_ok() { [0; 32] } else { original },
-            "an addition wipes its source exactly when it succeeds",
-        );
-        let mut bytes = [0; 64];
-        bytes[..32].copy_from_slice(&original);
-        (result, bytes, KeyLength::Bytes32)
-    }
-
-    /// Adds a key of 64 bytes, any bytes, through `handle`, as above.
-    fn add_long(slots: &mut Slots<'_>, handle: Handle<'static>) -> Added {
-        let mut source: [u8; 64] = kani::any();
-        let original = source;
-        let result = slots.add64(handle, &mut source);
-        kani::assert(
-            source == if result.is_ok() { [0; 64] } else { original },
-            "an addition wipes its source exactly when it succeeds",
-        );
-        (result, original, KeyLength::Bytes64)
-    }
-
     /// From `memory`, with the slot `index` loaded and no change of epoch under way: adding a key
-    /// with `add` through its live handle puts it into the first empty position of the set,
-    /// enabled, with the identifier derived from its bytes and its length alone, marks the set
-    /// changed and not wrapped for the next epoch, and changes nothing else; it fails as `Unsaved`
-    /// if the set has changed in this epoch, as `WrongLength` for a length the set's purpose does
-    /// not take, as the transition of the stages does when no position is empty or the set is
-    /// exhausted, and otherwise with DerivationFailed when the derivation fails and with
-    /// DuplicateKey exactly when a loaded slot holds a key with that identifier, for any purpose;
-    /// a failed addition changes no slot. Returns the outcome and the set's purpose.
-    fn add_in(
-        mut memory: [Slot; 2],
-        index: usize,
-        add: impl FnOnce(&mut Slots<'_>, Handle<'static>) -> Added,
-    ) -> (Result<Position, Error>, Purpose) {
+    /// of 32 bytes, any bytes, through its live handle puts it into the first empty position of
+    /// the set, enabled, with the identifier derived from its bytes and its length alone, marks the
+    /// set changed and not wrapped for the next epoch, and changes nothing else; it fails as
+    /// `WrongPurpose` for a set for wrapping, as `Unsaved` if the set has changed in this epoch, as
+    /// the transition of the stages does when no position is empty or the set is exhausted, and
+    /// otherwise with DerivationFailed when the derivation fails and with DuplicateKey exactly when
+    /// a loaded slot holds a key with that identifier, for any purpose; the source is wiped exactly
+    /// when the addition succeeds, and a failed addition changes no slot. A generation fills a key
+    /// as a load does, which the proofs of a load cover. Returns the outcome and the set's purpose.
+    fn add_in(mut memory: [Slot; 2], index: usize) -> (Result<Position, Error>, Purpose) {
         let id = memory.as_ptr().addr();
         let mut epoch = any_epoch(false);
         let mut slots = Slots {
@@ -6459,12 +8187,21 @@ mod proofs {
         };
         let mut expected = named.stages;
         let position = expected.add();
-        let (result, bytes, length) = add(&mut slots, handle);
+        let mut source: [u8; 32] = kani::any();
+        let original = source;
+        let result = slots.add32(handle, &mut source);
+        kani::assert(
+            source == if result.is_ok() { [0; 32] } else { original },
+            "an addition wipes its source exactly when it succeeds",
+        );
+        let mut bytes = [0; 64];
+        bytes[..32].copy_from_slice(&original);
+        let length = KeyLength::Bytes32;
         let key_id = expected_key_id(&bytes, length);
         kani::assert(
             match position {
+                _ if named.purpose == Purpose::Wrap => result == Err(Error::WrongPurpose),
                 _ if named.changed => result == Err(Error::Unsaved),
-                _ if !allowed(named.purpose, length) => result == Err(Error::WrongLength),
                 Err(refused) => result == Err(Error::from(refused)),
                 Ok(at) => {
                     if failed() {
@@ -6476,10 +8213,10 @@ mod proofs {
                     }
                 }
             },
-            "an addition fails as Unsaved for a set changed in this epoch, as WrongLength for a \
-             length its purpose does not take, as the stages refuse it, then with DerivationFailed \
-             when the derivation fails, with DuplicateKey when the key is held, and otherwise \
-             succeeds at the first empty position",
+            "an addition fails as WrongPurpose for a set for wrapping, as Unsaved for a set changed \
+             in this epoch, as the stages refuse it, then with DerivationFailed when the derivation \
+             fails, with DuplicateKey when the key is held, and otherwise succeeds at the first \
+             empty position",
         );
         if let (Ok(added), Ok(at)) = (result, position) {
             let now = snapshot(slot_at(&slots, index));
@@ -6526,6 +8263,10 @@ mod proofs {
             "a set changed in this epoch takes no key"
         );
         kani::cover!(result == Err(Error::SetFull), "the set is full");
+        kani::cover!(
+            result == Err(Error::WrongPurpose),
+            "a set for wrapping takes no key"
+        );
         kani::cover!(
             result == Err(Error::DerivationFailed),
             "the derivation fails"
@@ -6737,58 +8478,90 @@ mod proofs {
         at(lengths, position)
     }
 
-    // One proof for each length of key and each slot, so that each stays well inside its time.
-
-    /// An addition of 32 bytes through the first slot; with the next three, an addition of either
-    /// length through either slot of two in any state.
+    /// An addition through the first slot; with the next, an addition through either slot of two in
+    /// any state.
     #[kani::proof]
     #[kani::unwind(65)]
-    fn a_short_addition_in_the_first_slot() {
-        let (result, purpose) = add_in([any_slot_in(Occupancy::Loaded), any_slot()], 0, add_short);
+    fn an_addition_in_the_first_slot() {
+        let (result, purpose) = add_in([any_slot_in(Occupancy::Loaded), any_slot()], 0);
         kani::cover!(
             result.is_ok() && purpose == Purpose::ExternalData,
             "a key is added to a set of external data"
         );
     }
 
-    /// An addition of 64 bytes through the first slot.
+    /// An addition through the second slot.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn an_addition_in_the_second_slot() {
+        let (result, purpose) = add_in([any_slot(), any_slot_in(Occupancy::Loaded)], 1);
+        kani::cover!(
+            result.is_ok() && purpose == Purpose::ExternalData,
+            "a key is added to a set of external data"
+        );
+    }
+
+    /// With the first of two slots loaded, the second in any state and no change of epoch under way:
+    /// an addition of a key of either length, any bytes, through the live handle of the first, by
+    /// the code every addition runs, is refused as `WrongPurpose` for a set for wrapping, as
+    /// `Unsaved` for a set changed in this epoch, and then as `WrongLength` exactly for a length its
+    /// purpose does not take, changing nothing. No purpose takes an addition of 64 bytes.
     #[kani::proof]
     #[kani::unwind(65)]
     fn a_long_addition_in_the_first_slot() {
-        let (result, _) = add_in([any_slot_in(Occupancy::Loaded), any_slot()], 0, add_long);
+        let mut memory = [any_slot_in(Occupancy::Loaded), any_slot()];
+        let id = memory.as_ptr().addr();
+        let mut epoch = any_epoch(false);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let before = snapshots(&slots);
+        let handle = Handle {
+            slots: id,
+            index: 0,
+            generation: before[0].generation,
+            memory: PhantomData,
+        };
+        let length = any_length();
+        let mut source = AnyEntropy::new();
+        let result = slots.add(handle, length, |key, _| {
+            key.fill(length, &mut source)
+                .map_err(|EntropyError| Error::EntropyFailed)
+        });
+        let refusal = if before[0].purpose == Purpose::Wrap {
+            Some(Error::WrongPurpose)
+        } else if before[0].changed {
+            Some(Error::Unsaved)
+        } else if !allowed(before[0].purpose, length) {
+            Some(Error::WrongLength)
+        } else {
+            None
+        };
+        kani::assert(
+            match refusal {
+                Some(refusal) => result == Err(refusal) && unchanged_except(&slots, &before, 2),
+                None => result != Err(Error::WrongLength),
+            },
+            "an addition is refused for the first reason, a length its purpose does not take among \
+             them, and then changes nothing",
+        );
         kani::cover!(
             result == Err(Error::WrongLength),
             "a set of external data refuses a long key"
         );
-    }
-
-    /// An addition of 32 bytes through the second slot.
-    #[kani::proof]
-    #[kani::unwind(65)]
-    fn a_short_addition_in_the_second_slot() {
-        let (result, purpose) = add_in([any_slot(), any_slot_in(Occupancy::Loaded)], 1, add_short);
         kani::cover!(
-            result.is_ok() && purpose == Purpose::ExternalData,
-            "a key is added to a set of external data"
+            refusal.is_none() && result.is_ok(),
+            "a key of a length its purpose takes is added"
         );
-    }
-
-    /// An addition of 64 bytes through the second slot.
-    #[kani::proof]
-    #[kani::unwind(65)]
-    fn a_long_addition_in_the_second_slot() {
-        let (result, _) = add_in([any_slot(), any_slot_in(Occupancy::Loaded)], 1, add_long);
-        kani::cover!(
-            result == Err(Error::WrongLength),
-            "a set of external data refuses a long key"
-        );
+        kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
     }
 
     /// From any state of two slots during a change of epoch, for a handle of this set naming any
-    /// slot and generation: every change of stage and every addition, of 32 or 64 bytes or
-    /// generated, is refused, as `EpochChanging` if the handle is live and as `StaleHandle`
-    /// otherwise; the source is left as it was, the platform's source is not asked, and nothing
-    /// changes.
+    /// slot and generation: every change of stage and an addition are refused, as `StaleHandle` if
+    /// the handle is not live, as `WrongPurpose` for a set for wrapping, and as `EpochChanging`
+    /// otherwise; the source is left as it was, and nothing changes. A generated key goes through
+    /// the same code as the addition, which refuses before it fills the slot.
     #[kani::proof]
     #[kani::unwind(65)]
     fn no_set_changes_during_a_change_of_epoch() {
@@ -6802,35 +8575,26 @@ mod proofs {
         let handle = forged(id);
         let live = live(&slots, id, &handle);
         let before = snapshots(&slots);
+        let wrapping = live && snapshot_at(&before, handle.index).purpose == Purpose::Wrap;
         let (result, _, _) = any_change(&mut slots, handle, any_position(), &mut Stages::one());
-        let mut source: [u8; 64] = kani::any();
+        let mut source: [u8; 32] = kani::any();
         let original = source;
-        let mut entropy = AnyEntropy::new();
-        let added = match kani::any::<u8>() % 3 {
-            0 => {
-                let mut short = [0; 32];
-                short.copy_from_slice(&source[..32]);
-                let added = slots.add32(handle, &mut short);
-                source[..32].copy_from_slice(&short);
-                added
-            }
-            1 => slots.add64(handle, &mut source),
-            _ => slots.add_generated(handle, any_length(), &mut entropy),
-        };
-        let refusal = if live {
-            Error::EpochChanging
-        } else {
+        let added = slots.add32(handle, &mut source);
+        let refusal = if !live {
             Error::StaleHandle
+        } else if wrapping {
+            Error::WrongPurpose
+        } else {
+            Error::EpochChanging
         };
         kani::assert(
             result == Err(refusal)
                 && added == Err(refusal)
                 && source == original
-                && entropy.calls == 0
                 && unchanged_except(&slots, &before, 2)
                 && slots.epoch.changing,
             "during a change of epoch no set changes or takes a key, and nothing changes",
         );
-        kani::cover!(live, "a live set is refused");
+        kani::cover!(live && !wrapping, "a live set is refused");
     }
 }

@@ -9,6 +9,12 @@ pub(crate) const PLAINTEXT_LEN: usize = 233;
 /// The size of a record of a wrapped key set in bytes: the nonce, the encrypted plaintext and the
 /// tag.
 pub const RECORD_LEN: usize = 261;
+/// The size of a lock record in bytes: the nonce, the number of the epoch and the record of a
+/// stored key for wrapping, encrypted together, and the tag.
+pub const LOCK_RECORD_LEN: usize = 297;
+/// The size of what the outer layer of a lock record encrypts: the number of the epoch and the
+/// record.
+pub(crate) const LAYER_LEN: usize = 8 + RECORD_LEN;
 /// The longest context a record can be bound to, in bytes.
 pub(crate) const MAX_CONTEXT: usize = 255;
 const AAD_LABEL: &[u8; 19] = b"lethewis key record";
@@ -22,6 +28,7 @@ pub(crate) const ID_LEN: usize = 16;
 pub(crate) const VERSION: u8 = 1;
 
 const _: () = assert!(NONCE_LEN + PLAINTEXT_LEN + TAG_LEN == RECORD_LEN);
+const _: () = assert!(NONCE_LEN + LAYER_LEN + TAG_LEN == LOCK_RECORD_LEN);
 const _: () = assert!(AAD_LABEL.len() + 2 + MAX_CONTEXT == AAD_CAPACITY);
 
 /// What a key may be used for: a class of operations together with its algorithm. It is given when
@@ -30,9 +37,12 @@ const _: () = assert!(AAD_LABEL.len() + 2 + MAX_CONTEXT == AAD_CAPACITY);
 #[non_exhaustive]
 #[repr(u8)]
 pub enum Purpose {
-    /// A key of 32 or 64 bytes that wraps other keys. Leaves the library only as a record wrapped
-    /// by another key, or as the words [`Slots::generate_words`](crate::Slots::generate_words)
-    /// writes once.
+    /// A key of 32 or 64 bytes that wraps other keys. Its set holds this one key and never changes.
+    /// A key from a secret, such as a password, wraps only stored keys for wrapping, which
+    /// [`Slots::lock`](crate::Slots::lock) keeps under it; a stored key wraps only keys for external
+    /// data. Leaves the library only wrapped, or as the words
+    /// [`Slots::generate_words`](crate::Slots::generate_words) writes once; a key from a secret
+    /// gives out a [`Slots::challenge`](crate::Slots::challenge) derived from it.
     Wrap = 1,
     /// A key of 32 bytes for data an engine outside the library encrypts, such as a database. It
     /// wraps no key, and leaves the library only as a record wrapped by another key or through

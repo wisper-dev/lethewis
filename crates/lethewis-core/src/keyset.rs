@@ -89,6 +89,13 @@ impl Stages {
         }
     }
 
+    /// Whether this is a set of one enabled key, which is the primary, that has never changed.
+    pub(crate) fn is_one(&self) -> bool {
+        matches!(self.members, [Some(Status::Enabled), None, None])
+            && self.primary == 0
+            && self.revision == 0
+    }
+
     /// Whether the primary position holds an enabled key.
     pub(crate) fn is_whole(&self) -> bool {
         self.members.get(self.primary) == Some(&Some(Status::Enabled))
@@ -100,6 +107,7 @@ impl Stages {
     }
 
     /// The position of the primary key.
+    #[cfg(any(test, kani))]
     pub(crate) const fn primary(&self) -> usize {
         self.primary
     }
