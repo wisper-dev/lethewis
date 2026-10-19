@@ -187,6 +187,9 @@ Nothing is published while the version is below 0.1.0.
   challenge to a chip, whose answer, combined with that key, makes a key that needs both.
 - Proofs with Kani 0.68.0 for combining and for the challenge; tests against an independent
   implementation of HKDF-SHA-256.
+- The stack a lock, an unlock or a carry used is wiped after it, also when it fails: 24 KiB, or
+  64 KiB without optimisation; after a combination or a challenge, 8 KiB, or 64 KiB. Tests read
+  it back after each, and after a refused unlock.
 - A test of the hierarchy end to end, through the public interface. A profile key is locked under
   a password with the chip and under words, with keys of chats under it. After a change of epoch, a
   chat not wrapped again and a way in not carried open no more.

@@ -127,9 +127,12 @@ no 16-byte piece of the key, the extracted key, the HMAC key blocks, the SHA-256
 and message schedules, or the output beyond the identifier, in the byte orders and arrangements the
 two SHA-256 paths use.
 
-After a wrap and an unwrap the stack below the caller is wiped as well: 24 KiB, or 64 KiB without
-optimisation, at least twice what the cipher uses at every level of optimisation by the same
-measurement.
+The same wipe follows a combination of two keys and a challenge to the chip, and tests read the
+stack back after each.
+
+After a wrap, an unwrap, a lock, an unlock and a carry the stack below the caller is wiped as
+well: 24 KiB, or 64 KiB without optimisation, at least twice what the cipher uses at every level
+of optimisation by the same measurement.
 
 Tests read the stack back after a wrap, an unwrap and an unwrap whose record fails its tag, with a set
 of three keys under a 64-byte parent. They look for pieces of every key, of the derived cipher key
@@ -137,6 +140,9 @@ and of the message keys.
 
 They also look for the AES round keys of the derived key and of the message encryption key as laid
 out by the instructions, the keystream and what the record decrypts to.
+
+Tests read the stack back the same way after a lock, an unlock, a refused unlock and a carry, for
+both layers of the record and the keys derived for them.
 
 The wipe on release and on creating the slots, and the refusal of a released or foreign handle, are
 proven for two slots; the statements and their limits are in [proofs.md](proofs.md).
