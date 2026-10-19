@@ -179,13 +179,16 @@ Nothing is published while the version is below 0.1.0.
 - `Slots::carry` moves a lock record into the next epoch during a change, without the key from a
   secret. A lock record not carried opens no more once the change is committed and the old root
   erased; a record of another epoch fails with `StaleRecord`.
+- Proofs with Kani 0.68.0 for the levels of loads, wraps, locks, unwraps and unlocks, and for the
+  layers of lock records and their carry. Tests against lock records and a carried record computed
+  by an independent implementation.
 - `Slots::combine` derives one key from a secret from two, the second of 32 bytes as the salt of
   HKDF-SHA-256, and releases both. `Slots::challenge` derives from a key from a secret the
   challenge to a chip, whose answer, combined with that key, makes a key that needs both.
 - Proofs with Kani 0.68.0 for combining and for the challenge; tests against an independent
   implementation of HKDF-SHA-256.
-- Proofs with Kani 0.68.0 for the levels of loads, wraps, locks, unwraps and unlocks, and for the
-  layers of lock records and their carry. Tests against lock records and a carried record computed
-  by an independent implementation.
+- A test of the hierarchy end to end, through the public interface. A profile key is locked under
+  a password with the chip and under words, with keys of chats under it. After a change of epoch, a
+  chat not wrapped again and a way in not carried open no more.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main
