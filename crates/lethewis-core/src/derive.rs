@@ -29,6 +29,8 @@ const HEDGE_WORDS: &[u8; 11] = b"hedge words";
 const HEDGE_NONCE: &[u8; 11] = b"hedge nonce";
 const LOCK_KEY: &[u8; 8] = b"lock key";
 const EPOCH_LAYER: &[u8; 11] = b"epoch layer";
+const COMBINED: &[u8; 12] = b"combined key";
+const CHALLENGE: &[u8; 9] = b"challenge";
 /// The count of a draw, after the bytes the source gave, in the material a hedge extracts.
 const COUNT_LEN: usize = 8;
 /// How many bytes twelve words stand for.
@@ -66,16 +68,26 @@ pub(crate) enum Branch {
     LockKey,
     /// The key that encrypts the outer layer of the lock records of an epoch.
     EpochLayer,
+    /// A key from a secret, from another one and a key as the salt.
+    Combined,
+    /// The challenge to a chip from a key from a secret.
+    Challenge,
 }
 
 /// The purpose each branch is derived for.
 #[cfg(test)]
 pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
     match branch {
-        Branch::WrapKey | Branch::FromWords | Branch::LockKey | Branch::EpochLayer => {
-            Some(Purpose::Wrap)
-        }
-        Branch::KeyId | Branch::HedgeKey | Branch::HedgeWords | Branch::HedgeNonce => None,
+        Branch::WrapKey
+        | Branch::FromWords
+        | Branch::LockKey
+        | Branch::EpochLayer
+        | Branch::Combined => Some(Purpose::Wrap),
+        Branch::KeyId
+        | Branch::HedgeKey
+        | Branch::HedgeWords
+        | Branch::HedgeNonce
+        | Branch::Challenge => None,
     }
 }
 
@@ -192,6 +204,22 @@ pub(crate) fn derive_lock_key(
     out: &mut [u8; CIPHER_KEY_LEN],
 ) -> Result<(), DerivationFailed> {
     derive(key, SALT, Some(Purpose::Wrap), Branch::LockKey, out)
+}
+
+/// Derives into `out` the key from a secret that the key from a secret `key` and the key `salt`, as
+/// the salt, make together.
+pub(crate) fn derive_combined(
+    key: &Key,
+    salt: &Key,
+    out: &mut [u8; 32],
+) -> Result<(), DerivationFailed> {
+    let salt = salt.material().ok_or(DerivationFailed)?;
+    derive(key, salt, Some(Purpose::Wrap), Branch::Combined, out)
+}
+
+/// Derives into `out` the challenge to a chip from the key from a secret `key`.
+pub(crate) fn derive_challenge(key: &Key, out: &mut [u8; 32]) -> Result<(), DerivationFailed> {
+    derive(key, SALT, None, Branch::Challenge, out)
 }
 
 /// Derives the key that encrypts the outer layer of the lock records of the epoch whose key is
@@ -645,7 +673,12 @@ pub(crate) mod stack {
             Branch::KeyId | Branch::HedgeWords => 16,
             Branch::HedgeNonce => 12,
             Branch::HedgeKey => key.len() - 8,
-            Branch::WrapKey | Branch::FromWords | Branch::LockKey | Branch::EpochLayer => 32,
+            Branch::WrapKey
+            | Branch::FromWords
+            | Branch::LockKey
+            | Branch::EpochLayer
+            | Branch::Combined
+            | Branch::Challenge => 32,
         };
         let length = u8::try_from(key.len()).unwrap();
         let (label, used) = label(purpose_of(branch), length, branch, out_len).unwrap();
@@ -673,10 +706,15 @@ pub(crate) mod stack {
             .finalize();
 
         let mut secrets = std::vec![key.to_vec(), output[1..].to_vec()];
-        // The salt of a wrap key and of a hedge is the key of an epoch.
+        // The salt of a wrap key and of a hedge is the key of an epoch, and that of a combined key a
+        // key as well.
         if matches!(
             branch,
-            Branch::WrapKey | Branch::HedgeKey | Branch::HedgeWords | Branch::HedgeNonce
+            Branch::WrapKey
+                | Branch::HedgeKey
+                | Branch::HedgeWords
+                | Branch::HedgeNonce
+                | Branch::Combined
         ) {
             secrets.extend(salt_secrets(salt));
         }
@@ -1194,6 +1232,8 @@ fn label(
         Branch::HedgeNonce => joined(head, HEDGE_NONCE),
         Branch::LockKey => joined(head, LOCK_KEY),
         Branch::EpochLayer => joined(head, EPOCH_LAYER),
+        Branch::Combined => joined(head, COMBINED),
+        Branch::Challenge => joined(head, CHALLENGE),
     }
 }
 
@@ -1225,9 +1265,9 @@ mod tests {
     use sha2::Sha256;
 
     use super::{
-        Branch, DerivationFailed, EPOCH_LAYER, FROM_WORDS, HEDGE_KEY, HEDGE_NONCE, HEDGE_WORDS,
-        Hedged, KEY_ID, KeyId, LOCK_KEY, SALT, WRAP_KEY, derive, derive_from_words, derive_key_id,
-        hedge, label, purpose_of,
+        Branch, CHALLENGE, COMBINED, DerivationFailed, EPOCH_LAYER, FROM_WORDS, HEDGE_KEY,
+        HEDGE_NONCE, HEDGE_WORDS, Hedged, KEY_ID, KeyId, LOCK_KEY, SALT, WRAP_KEY, derive,
+        derive_from_words, derive_key_id, hedge, label, purpose_of,
     };
     use crate::entropy::{Entropy, EntropyError};
     use crate::key::{Key, KeyLength};
@@ -1397,12 +1437,39 @@ mod tests {
                 Branch::EpochLayer,
                 "9703118a50323bc84eff5d6653e209d4822837684a270208b934c0d02da087eb",
             ),
+            (
+                KeyLength::Bytes32,
+                Branch::Challenge,
+                "0477373f3a3672a9f939bd9be82544eeccf23ab0b19b091e86b93ebb3ad348de",
+            ),
         ];
         for (length, branch, expected) in cases {
             let mut out = [0; 32];
             let out = &mut out[..expected.len().checked_div(2).unwrap()];
             derive(&counted_key(length), SALT, purpose_of(branch), branch, out).unwrap();
             assert_eq!(hex(out), expected, "{length:?} {branch:?}");
+        }
+    }
+
+    /// A combined key against an independent implementation of HKDF-SHA-256: the key from a
+    /// secret, of either length, goes in, with the 32 bytes of the other key as the salt.
+    #[test]
+    fn a_combined_key_matches_known_answers() {
+        let mut salt = Key::empty();
+        salt.load32(&mut core::array::from_fn(|i| 64 + u8::try_from(i).unwrap()));
+        for (length, expected) in [
+            (
+                KeyLength::Bytes32,
+                "d3bcd5a6261170da7661346c8ee46c257579fd9ba0b4b5bfa08d25c372af1869",
+            ),
+            (
+                KeyLength::Bytes64,
+                "2e7a0e4937b3ceb87d5015a733a6c8b30e03778b65d404f57996887d4498e5b1",
+            ),
+        ] {
+            let mut out = [0; 32];
+            super::derive_combined(&counted_key(length), &salt, &mut out).unwrap();
+            assert_eq!(hex(&out), expected, "{length:?}");
         }
     }
 
@@ -1573,6 +1640,8 @@ mod tests {
             Branch::HedgeNonce,
             Branch::LockKey,
             Branch::EpochLayer,
+            Branch::Combined,
+            Branch::Challenge,
         ] {
             let (_, used) = label(purpose_of(branch), 64, branch, 32).unwrap();
             let name = match branch {
@@ -1584,6 +1653,8 @@ mod tests {
                 Branch::HedgeNonce => HEDGE_NONCE.len(),
                 Branch::LockKey => LOCK_KEY.len(),
                 Branch::EpochLayer => EPOCH_LAYER.len(),
+                Branch::Combined => COMBINED.len(),
+                Branch::Challenge => CHALLENGE.len(),
             };
             assert_eq!(used, 14 + name);
         }
@@ -1674,6 +1745,36 @@ pub(crate) mod proofs {
         out
     }
 
+    /// The key from a secret the model of HKDF gives from the first `length` bytes of `key` and the
+    /// 32 bytes of `salt`, worked out in the same way.
+    pub(crate) fn expected_combined(
+        key: &[u8; 64],
+        length: KeyLength,
+        salt: &[u8; 32],
+    ) -> [u8; 32] {
+        let mut out = [0; 32];
+        let _ = label(
+            Some(Purpose::Wrap),
+            length_to_byte(length),
+            Branch::Combined,
+            32,
+        )
+        .map(|(label, used)| {
+            fold(salt, &key[..length.bytes()], &label[..used], &mut out);
+        });
+        out
+    }
+
+    /// The challenge the model of HKDF gives from the first `length` bytes of `key`, worked out in
+    /// the same way.
+    pub(crate) fn expected_challenge(key: &[u8; 64], length: KeyLength) -> [u8; 32] {
+        let mut out = [0; 32];
+        let _ = label(None, length_to_byte(length), Branch::Challenge, 32).map(|(label, used)| {
+            fold(SALT, &key[..length.bytes()], &label[..used], &mut out);
+        });
+        out
+    }
+
     /// The key the model of HKDF gives the outer layer of lock records in the epoch whose key is
     /// `epoch`, worked out in the same way.
     pub(crate) fn expected_layer_key(epoch: &[u8; 32]) -> [u8; CIPHER_KEY_LEN] {
@@ -1706,7 +1807,9 @@ pub(crate) mod proofs {
             4 => Branch::HedgeWords,
             5 => Branch::HedgeNonce,
             6 => Branch::LockKey,
-            _ => Branch::EpochLayer,
+            7 => Branch::EpochLayer,
+            8 => Branch::Combined,
+            _ => Branch::Challenge,
         }
     }
 

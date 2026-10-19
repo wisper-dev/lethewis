@@ -5,8 +5,8 @@ use core::{fmt, marker::PhantomData};
 
 use crate::{
     derive::{
-        Branch, Hedged, KeyId, derive_key_id, derive_layer_key, derive_lock_key, derive_wrap_key,
-        wipe_cipher_stack, wipe_stack,
+        Branch, Hedged, KeyId, derive_challenge, derive_combined, derive_key_id, derive_layer_key,
+        derive_lock_key, derive_wrap_key, wipe_cipher_stack, wipe_stack,
     },
     entropy::{Entropy, EntropyError},
     epoch::{Epoch, Erasure, Root, RootFailed},
@@ -431,6 +431,131 @@ impl<'a> Slots<'a> {
             .ok_or(Error::WrongLength)?;
         *out = *key;
         Ok(())
+    }
+
+    /// Combines the keys from a secret that `key` and `salt` refer to into a new key from a secret
+    /// of 32 bytes in a free slot, and releases both: HKDF-Extract with the key of `salt`, 32
+    /// bytes, as the salt and the key of `key` as the input, then HKDF-Expand with a label of its
+    /// own. With the key from a password as `key` and the chip's answer to its
+    /// [`Slots::challenge`], imported for wrapping, as `salt`, the new key needs both.
+    ///
+    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the derivation, the load, and the whole combination, are each
+    /// followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate but
+    /// not the hash code it calls has to set that flag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
+    /// [`Error::SameKey`] if both refer to the same set, [`Error::WrongPurpose`] if either set does
+    /// not serve [`Purpose::Wrap`], [`Error::WrongLevel`] if either is not a key from a secret,
+    /// [`Error::WrongLength`] if the key of `salt` is not of 32 bytes, [`Error::NoFreeSlot`] if no
+    /// slot is free, [`Error::DerivationFailed`] if the key or its identifier cannot be derived,
+    /// and [`Error::DuplicateKey`] if these slots hold the new key already. No slot changes then.
+    pub fn combine(&mut self, key: Handle<'a>, salt: Handle<'a>) -> Result<Handle<'a>, Error> {
+        let combined = lethewis_dit::with(|| self.combine_on_stack(key, salt));
+        wipe_stack();
+        combined
+    }
+
+    /// The combination itself, in a frame of its own: the wipe that follows starts where this
+    /// frame starts.
+    #[inline(never)]
+    fn combine_on_stack(&mut self, key: Handle<'a>, salt: Handle<'a>) -> Result<Handle<'a>, Error> {
+        let (first, second) = self.combinable(key, salt)?;
+        let (Some(input), Some(salting)) = (self.memory.get(first), self.memory.get(second)) else {
+            return Err(Error::StaleHandle);
+        };
+        let (input_key, salt_key) = (input.wrapping_key().0, salting.wrapping_key().0);
+        let mut combined = [0; 32];
+        if derive_combined(input_key, salt_key, &mut combined).is_err() {
+            wipe(&mut combined);
+            return Err(Error::DerivationFailed);
+        }
+        let loaded = self.load_new(Purpose::Wrap, KeyLength::Bytes32, true, |slot_key, _| {
+            slot_key.copy32(&combined);
+            Ok(())
+        });
+        wipe(&mut combined);
+        let handle = loaded?;
+        for index in [first, second] {
+            if let Some(slot) = self.memory.get_mut(index) {
+                slot.unload();
+            }
+        }
+        Ok(handle)
+    }
+
+    /// The slots of the sets `key` and `salt` refer to, if they are two keys from a secret, the
+    /// second of 32 bytes, and a slot is free.
+    fn combinable(&self, key: Handle<'a>, salt: Handle<'a>) -> Result<(usize, usize), Error> {
+        let (first, second) = (self.loaded(key)?, self.loaded(salt)?);
+        if first == second {
+            return Err(Error::SameKey);
+        }
+        let (Some(input), Some(salting)) = (self.memory.get(first), self.memory.get(second)) else {
+            return Err(Error::StaleHandle);
+        };
+        if input.purpose != Purpose::Wrap || salting.purpose != Purpose::Wrap {
+            return Err(Error::WrongPurpose);
+        }
+        if !input.unlocks || !salting.unlocks {
+            return Err(Error::WrongLevel);
+        }
+        if salting.wrapping_key().0.length() != KeyLength::Bytes32 {
+            return Err(Error::WrongLength);
+        }
+        if !self.has_free() {
+            return Err(Error::NoFreeSlot);
+        }
+        Ok((first, second))
+    }
+
+    /// Writes into `out` the challenge to the platform's chip from the key from a secret that `set`
+    /// refers to: HKDF-Extract with the salt of identifiers, then HKDF-Expand with a label of its
+    /// own. The chip answers it under a key that never
+    /// leaves the chip; the answer, imported for wrapping and given to [`Slots::combine`] as the
+    /// salt of this key, makes a key that needs both. Whoever reads a challenge can test guesses at
+    /// the secret without the chip, as with a hash of a password: it is the caller's to wipe, and
+    /// to give to the chip alone.
+    ///
+    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the call is followed by a wipe of 8 KiB, or 64 KiB, below it,
+    /// whether it succeeded or not.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if the set does not serve [`Purpose::Wrap`], [`Error::WrongLevel`]
+    /// if it is not a key from a secret, and [`Error::DerivationFailed`] if the challenge cannot be
+    /// derived. `out` is then left as it was.
+    pub fn challenge(&self, set: Handle<'a>, out: &mut [u8; 32]) -> Result<(), Error> {
+        let challenged = lethewis_dit::with(|| self.challenge_on_stack(set, out));
+        wipe_stack();
+        challenged
+    }
+
+    /// The challenge itself, in a frame of its own: the wipe that follows starts where this frame
+    /// starts.
+    #[inline(never)]
+    fn challenge_on_stack(&self, set: Handle<'a>, out: &mut [u8; 32]) -> Result<(), Error> {
+        let slot = self
+            .memory
+            .get(self.loaded(set)?)
+            .ok_or(Error::StaleHandle)?;
+        if slot.purpose != Purpose::Wrap {
+            return Err(Error::WrongPurpose);
+        }
+        if !slot.unlocks {
+            return Err(Error::WrongLevel);
+        }
+        let mut derived = [0; 32];
+        let challenged = derive_challenge(slot.wrapping_key().0, &mut derived);
+        if challenged.is_ok() {
+            *out = derived;
+        }
+        wipe(&mut derived);
+        challenged.map_err(|_| Error::DerivationFailed)
     }
 
     /// Wraps the set for external data that `set` refers to under the stored key for wrapping that
@@ -1632,9 +1757,9 @@ mod tests {
     assert_not_impl!(Slot: Clone, PartialEq, Default);
     assert_not_impl!(Epoch: Clone, PartialEq, Default);
 
-    /// Every import, generation, wrap, unwrap, lock, unlock and carry derives, and every call on
-    /// words reads and writes them, with data-independent timing on, where the processor and the
-    /// operating system offer it.
+    /// Every import, generation, wrap, unwrap, lock, unlock, challenge, combination and carry
+    /// derives, and every call on words reads and writes them, with data-independent timing on,
+    /// where the processor and the operating system offer it.
     #[test]
     fn every_call_that_derives_holds_data_independent_timing() {
         use crate::derive::timing::seen;
@@ -1691,6 +1816,13 @@ mod tests {
         slots.release(stored).unwrap();
         slots.unlock(secret, b"context", &locked).unwrap();
         assert_eq!(seen(), Some(true));
+        let answer = slots.import32(Purpose::Wrap, &mut [7; 32]).unwrap();
+        let mut challenge = [0; 32];
+        slots.challenge(secret, &mut challenge).unwrap();
+        assert_eq!(seen(), Some(true));
+        let combined = slots.combine(secret, answer).unwrap();
+        assert_eq!(seen(), Some(true));
+        slots.release(combined).unwrap();
         slots.begin_epoch(&mut [8; 32]).unwrap();
         let mut carried = [0; LOCK_RECORD_LEN];
         slots
@@ -1720,9 +1852,9 @@ mod tests {
         lines.join(" ")
     }
 
-    /// The documentation of each import, generation, addition, reveal, wrap, unwrap, lock, unlock
-    /// and carry states the stack it needs and the depth of the wipe after it, and those depths are
-    /// the library's.
+    /// The documentation of each import, generation, addition, reveal, wrap, unwrap, lock, unlock,
+    /// carry, combination and challenge states the stack it needs and the depth of the wipe after
+    /// it, and those depths are the library's.
     #[test]
     fn the_documentation_states_the_stack_calls_need() {
         let build = usize::from(cfg!(lethewis_unoptimised));
@@ -1737,6 +1869,8 @@ mod tests {
             ("add32", loads),
             ("add_generated", loads),
             ("reveal32", loads),
+            ("combine", loads),
+            ("challenge", loads),
             ("wrap", wraps),
             ("unwrap", wraps),
             ("lock", wraps),
@@ -2008,6 +2142,140 @@ mod tests {
         }
         assert_eq!(holdings(&slots), before);
         assert!(!slots.memory[0].changed);
+    }
+
+    /// A key whose bytes are 0, 1, 2 and so on, and one whose bytes count from `first`: the inputs of
+    /// the known answers of the derivations.
+    fn counted_from(first: u8) -> [u8; 32] {
+        core::array::from_fn(|i| first + u8::try_from(i).unwrap())
+    }
+
+    /// Two keys from a secret combine into one, the key an independent implementation of HKDF gives,
+    /// as a key from a secret, for a first key of either length; both are released.
+    #[test]
+    fn two_keys_from_a_secret_combine_into_one_and_go() {
+        for (long, expected) in [
+            (
+                false,
+                "d3bcd5a6261170da7661346c8ee46c257579fd9ba0b4b5bfa08d25c372af1869",
+            ),
+            (
+                true,
+                "2e7a0e4937b3ceb87d5015a733a6c8b30e03778b65d404f57996887d4498e5b1",
+            ),
+        ] {
+            let mut memory = [const { Slot::empty() }; 3];
+            let mut epoch_memory = Epoch::empty();
+            let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+            let password = if long {
+                let mut bytes = core::array::from_fn(|i| u8::try_from(i).unwrap());
+                slots.import64(Purpose::Wrap, &mut bytes)
+            } else {
+                slots.import32(Purpose::Wrap, &mut counted_from(0))
+            }
+            .unwrap();
+            let answer = slots
+                .import32(Purpose::Wrap, &mut counted_from(64))
+                .unwrap();
+            let combined = slots.combine(password, answer).unwrap();
+            let expected = unhex32(expected);
+            let only = [Some((Status::Enabled, &expected[..])), None, None];
+            assert_holds_for(&slots, combined, only, 0, Purpose::Wrap);
+            assert!(slots.memory[combined.index].unlocks);
+            for (handle, at) in [(password, 0), (answer, 1)] {
+                assert_eq!(slots.release(handle), Err(Error::StaleHandle));
+                assert_eq!(slots.memory[at].occupancy, Occupancy::Free);
+                assert_eq!(slots.memory[at].keys[0].bytes(), &padded(&[]));
+            }
+        }
+    }
+
+    fn unhex32(text: &str) -> [u8; 32] {
+        core::array::from_fn(|at| u8::from_str_radix(&text[2 * at..2 * at + 2], 16).unwrap())
+    }
+
+    /// A combination takes two keys from a secret, the second of 32 bytes, and a free slot, and
+    /// refuses anything else in order, changing nothing.
+    #[test]
+    fn a_combination_takes_only_two_keys_from_a_secret() {
+        let mut memory = [const { Slot::empty() }; 7];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let password = slots.import32(Purpose::Wrap, &mut counted_from(0)).unwrap();
+        let answer = slots
+            .import32(Purpose::Wrap, &mut counted_from(64))
+            .unwrap();
+        let long = slots.import64(Purpose::Wrap, &mut [7; 64]).unwrap();
+        let stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let data = slots
+            .import32(Purpose::ExternalData, &mut pattern(5, 2))
+            .unwrap();
+        let before = holdings(&slots);
+        for (key, salt, refusal) in [
+            (password, password, Error::SameKey),
+            (password, data, Error::WrongPurpose),
+            (data, answer, Error::WrongPurpose),
+            (password, stored, Error::WrongLevel),
+            (stored, answer, Error::WrongLevel),
+            (password, long, Error::WrongLength),
+        ] {
+            assert_eq!(slots.combine(key, salt), Err(refusal));
+        }
+        assert_eq!(holdings(&slots), before);
+        let fillers = [[3; 32], [4; 32]]
+            .map(|mut bytes| slots.import32(Purpose::ExternalData, &mut bytes).unwrap());
+        assert_eq!(slots.combine(password, answer), Err(Error::NoFreeSlot));
+        for filler in fillers {
+            slots.release(filler).unwrap();
+        }
+        let mut held = unhex32("d3bcd5a6261170da7661346c8ee46c257579fd9ba0b4b5bfa08d25c372af1869");
+        let held = slots.import32(Purpose::ExternalData, &mut held).unwrap();
+        let before = holdings(&slots);
+        assert_eq!(slots.combine(password, answer), Err(Error::DuplicateKey));
+        assert_eq!(holdings(&slots), before);
+        slots.release(held).unwrap();
+        slots.release(password).unwrap();
+        assert_eq!(slots.combine(password, answer), Err(Error::StaleHandle));
+    }
+
+    /// A key from a secret gives the challenge an independent implementation of HKDF gives; no
+    /// other key gives one, and a refusal writes nothing.
+    #[test]
+    fn a_challenge_comes_only_from_a_key_from_a_secret() {
+        let mut memory = [const { Slot::empty() }; 3];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let secret = slots.import32(Purpose::Wrap, &mut counted_from(0)).unwrap();
+        let mut out = [0x55; 32];
+        slots.challenge(secret, &mut out).unwrap();
+        assert_eq!(
+            out,
+            unhex32("0477373f3a3672a9f939bd9be82544eeccf23ab0b19b091e86b93ebb3ad348de")
+        );
+        slots.release(secret).unwrap();
+        let mut bytes = core::array::from_fn(|i| u8::try_from(i).unwrap());
+        let long = slots.import64(Purpose::Wrap, &mut bytes).unwrap();
+        slots.challenge(long, &mut out).unwrap();
+        assert_eq!(
+            out,
+            unhex32("0a1efc3452f44c26f65ae4613543a29c077440e7568c05b06deee2a000463da8")
+        );
+        slots.release(long).unwrap();
+        let secret = slots.import32(Purpose::Wrap, &mut counted_from(0)).unwrap();
+        let stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let data = slots
+            .import32(Purpose::ExternalData, &mut pattern(5, 2))
+            .unwrap();
+        let mut out = [0x55; 32];
+        assert_eq!(slots.challenge(stored, &mut out), Err(Error::WrongLevel));
+        assert_eq!(slots.challenge(data, &mut out), Err(Error::WrongPurpose));
+        slots.release(secret).unwrap();
+        assert_eq!(slots.challenge(secret, &mut out), Err(Error::StaleHandle));
+        assert_eq!(out, [0x55; 32]);
     }
 
     /// A platform that records what it is asked, and switches the root unless told to fail.
@@ -4943,6 +5211,66 @@ mod stack {
         });
     }
 
+    /// The secrets a combination of keys made from `flip`ped patterns handles: the derivation of the
+    /// new key, the key itself and the derivation of its identifier, and both keys it takes.
+    fn combination_handled(flip: u8) -> Vec<Vec<u8>> {
+        let key = pattern(71, 3, 32, flip);
+        let salt = pattern(73, 5, 32, flip);
+        let mut combined = [0; 32];
+        crate::derive::derive_combined(&key_from(&key), &key_from(&salt), &mut combined).unwrap();
+        let mut handled = secrets(&key, &salt, KeyLength::Bytes32, Branch::Combined);
+        handled.extend(secrets(&combined, SALT, KeyLength::Bytes32, Branch::KeyId));
+        handled.extend([key, salt, combined.to_vec()]);
+        handled
+    }
+
+    #[test]
+    fn a_combination_leaves_no_residue() {
+        let pieces = key_dependent(&combination_handled(0), &combination_handled(0xff));
+        let mut memory = [const { Slot::empty() }; 3];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let key = slots
+            .import32(
+                Purpose::Wrap,
+                &mut pattern(71, 3, 32, 0).try_into().unwrap(),
+            )
+            .unwrap();
+        let salt = slots
+            .import32(
+                Purpose::Wrap,
+                &mut pattern(73, 5, 32, 0).try_into().unwrap(),
+            )
+            .unwrap();
+        assert_clean(&pieces, || {
+            black_box(slots.combine(key, salt).unwrap());
+        });
+    }
+
+    /// A challenge is written into the caller's buffer, and no piece of it or of its derivation is
+    /// left on the stack.
+    #[test]
+    fn a_challenge_leaves_no_residue() {
+        let handled = |flip| {
+            let key = pattern(79, 7, 32, flip);
+            secrets(&key, SALT, KeyLength::Bytes32, Branch::Challenge)
+        };
+        let pieces = key_dependent(&handled(0), &handled(0xff));
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let key = slots
+            .import32(
+                Purpose::Wrap,
+                &mut pattern(79, 7, 32, 0).try_into().unwrap(),
+            )
+            .unwrap();
+        let mut out = [0; 32];
+        assert_clean(&pieces, || {
+            slots.challenge(key, &mut out).unwrap();
+        });
+    }
+
     /// A reveal writes the key into the caller's buffer and leaves no piece of it on the stack;
     /// without the wipe after it, a build without optimisation leaves the key there.
     #[test]
@@ -5151,6 +5479,54 @@ mod stack {
             assert!(depth <= WRAP_STACK, "{depth} bytes reached");
         }
     }
+
+    /// The wipes that follow a challenge and a combination reach as deep as those after a load, also
+    /// when the call fails, and neither reaches deeper than its documentation says it needs.
+    #[test]
+    fn calls_on_keys_from_a_secret_wipe_and_need_the_stack_documented() {
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let data = slots
+            .import32(
+                Purpose::ExternalData,
+                &mut pattern(13, 13, 32, 0).try_into().unwrap(),
+            )
+            .unwrap();
+        let password = slots
+            .import32(
+                Purpose::Wrap,
+                &mut pattern(15, 15, 32, 0).try_into().unwrap(),
+            )
+            .unwrap();
+        let answer = slots
+            .import32(
+                Purpose::Wrap,
+                &mut pattern(17, 17, 32, 0).try_into().unwrap(),
+            )
+            .unwrap();
+        let mut challenge = [0; 32];
+        let secrets = [
+            depth_changed(|| {
+                slots.challenge(password, &mut challenge).unwrap();
+                black_box(&challenge);
+            }),
+            depth_changed(|| {
+                let refused = slots.challenge(data, &mut challenge);
+                assert_eq!(black_box(refused), Err(Error::WrongPurpose));
+            }),
+            depth_changed(|| {
+                black_box(slots.combine(password, answer).unwrap());
+            }),
+        ];
+        for depth in secrets {
+            assert!(
+                depth >= STACK_WIPE,
+                "{depth} bytes wiped after a call on keys from a secret"
+            );
+            assert!(depth <= LOAD_STACK, "{depth} bytes reached");
+        }
+    }
 }
 
 #[cfg(kani)]
@@ -5168,8 +5544,8 @@ mod proofs {
         Branch,
         model::{any_failed, failed, id_bytes, id_from_bytes},
         proofs::{
-            expected_hedge, expected_key_id, expected_layer_key, expected_lock_key,
-            expected_words_key, expected_wrap_key,
+            expected_challenge, expected_combined, expected_hedge, expected_key_id,
+            expected_layer_key, expected_lock_key, expected_words_key, expected_wrap_key,
         },
     };
     use crate::keyset::proofs::{allowed, any_purpose, any_whole_stages};
@@ -7339,6 +7715,259 @@ mod proofs {
             "nothing is carried outside a change"
         );
         kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
+    }
+
+    /// From any state of three slots, for handles of this set naming any slots and generations: the
+    /// check a combination starts with refuses a stale handle, one set twice, a set not for
+    /// wrapping, one that is not a key from a secret, a salt not of 32 bytes and a want of a free
+    /// slot, in that order, and passes otherwise. What follows the check,
+    /// `a_combination_loads_its_key_and_releases_both` proves.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_combination_refuses_in_order() {
+        let mut memory = [any_slot(), any_slot(), any_slot()];
+        let id = memory.as_ptr().addr();
+        let mut epoch = any_epoch(kani::any());
+        let slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let (key, salt) = (forged(id), forged(id));
+        let before = [
+            snapshot(&slots.memory[0]),
+            snapshot(&slots.memory[1]),
+            snapshot(&slots.memory[2]),
+        ];
+        let named = |handle: &Handle<'_>| match handle.index {
+            0 => before[0],
+            1 => before[1],
+            _ => before[2],
+        };
+        let live = |handle: &Handle<'_>| {
+            handle.index < 3
+                && named(handle).occupancy == Occupancy::Loaded
+                && named(handle).generation == handle.generation
+        };
+        let result = slots.combinable(key, salt);
+        let (first, second) = (named(&key), named(&salt));
+        let expected = if !live(&key) || !live(&salt) {
+            Err(Error::StaleHandle)
+        } else if key.index == salt.index {
+            Err(Error::SameKey)
+        } else if first.purpose != Purpose::Wrap || second.purpose != Purpose::Wrap {
+            Err(Error::WrongPurpose)
+        } else if !first.unlocks || !second.unlocks {
+            Err(Error::WrongLevel)
+        } else if second.lengths[0] != KeyLength::Bytes32 {
+            Err(Error::WrongLength)
+        } else if before.iter().all(|slot| slot.occupancy != Occupancy::Free) {
+            Err(Error::NoFreeSlot)
+        } else {
+            Ok((key.index, salt.index))
+        };
+        kani::assert(
+            result == expected,
+            "a combination is checked for the first reason to refuse it, and otherwise passes",
+        );
+        kani::cover!(
+            result == Err(Error::StaleHandle),
+            "a stale handle is refused"
+        );
+        kani::cover!(
+            result == Err(Error::SameKey),
+            "a set is not combined with itself"
+        );
+        kani::cover!(
+            result == Err(Error::WrongPurpose),
+            "a set for external data is not combined"
+        );
+        kani::cover!(
+            result == Err(Error::WrongLevel),
+            "a stored key is not combined"
+        );
+        kani::cover!(result == Err(Error::WrongLength), "a long salt is refused");
+        kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
+        kani::cover!(
+            result.is_ok(),
+            "two keys from a secret pass with a slot free"
+        );
+    }
+
+    /// A loaded slot of any generation that holds a key from a secret of `length`, any bytes, with
+    /// any identifier.
+    fn any_secret(length: KeyLength) -> Slot {
+        let mut slot = Slot::empty();
+        slot.generation = kani::any();
+        slot.occupancy = Occupancy::Loaded;
+        slot.unlocks = true;
+        let [first, ..] = &mut slot.keys;
+        any_key(first);
+        kani::assume(first.length() == length);
+        slot.ids[0] = id_from_bytes(kani::any());
+        slot
+    }
+
+    /// With keys from a secret of 32 bytes in the first two slots and the third free: combining them
+    /// through their live handles succeeds exactly when every derivation succeeds and neither holds
+    /// the new key. It then loads into the third slot a set of one 32-byte key from a secret, the
+    /// derivation of the first key with the second as the salt, with its identifier, and releases
+    /// both: their slots hold nothing and are past their generation. A refusal changes no slot.
+    /// Without a free slot the check before refuses, as `a_combination_refuses_in_order` proves;
+    /// other places of the three sets, the whole of a 64-byte key, and which key is the salt, which
+    /// the model of the derivation does not tell apart, unit tests check.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_combination_loads_its_key_and_releases_both() {
+        let length = KeyLength::Bytes32;
+        let mut memory = [
+            any_secret(length),
+            any_secret(length),
+            any_slot_in(Occupancy::Free),
+        ];
+        let id = memory.as_ptr().addr();
+        let mut epoch = any_epoch(kani::any());
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let before = [
+            snapshot(&slots.memory[0]),
+            snapshot(&slots.memory[1]),
+            snapshot(&slots.memory[2]),
+        ];
+        let handle = |index: usize| Handle {
+            slots: id,
+            index,
+            generation: before[index].generation,
+            memory: PhantomData,
+        };
+        let result = slots.combine(handle(0), handle(1));
+        let mut salt = [0; 32];
+        salt.copy_from_slice(&before[1].keys.0[..32]);
+        let mut expected = [0; 64];
+        expected[..32].copy_from_slice(&expected_combined(&before[0].keys.0, length, &salt));
+        let key_id = expected_key_id(&expected, KeyLength::Bytes32);
+        let held = before.iter().any(|snapshot| {
+            snapshot.occupancy == Occupancy::Loaded
+                && (0..MEMBERS).any(|position| {
+                    snapshot.stages.stage(position).is_some()
+                        && pick(&snapshot.ids, position) == key_id
+                })
+        });
+        kani::assert(
+            if any_failed() {
+                result == Err(Error::DerivationFailed)
+            } else if held {
+                result == Err(Error::DuplicateKey)
+            } else {
+                result.is_ok()
+            },
+            "a combination needs a free slot, every derivation and a key held nowhere",
+        );
+        if let Ok(combined) = result {
+            let now = snapshot(&slots.memory[2]);
+            kani::assert(
+                combined.index == 2
+                    && combined.generation == before[2].generation
+                    && now.occupancy == Occupancy::Loaded
+                    && now.keys == (expected, [0; 64], [0; 64])
+                    && now.lengths[0] == KeyLength::Bytes32
+                    && now.ids == (key_id, [0; ID_LEN], [0; ID_LEN])
+                    && now.stages == Stages::one()
+                    && now.purpose == Purpose::Wrap
+                    && now.unlocks
+                    && !now.changed,
+                "the free slot holds the combined key from a secret alone, with its identifier",
+            );
+            for index in 0..2 {
+                let slot = &slots.memory[index];
+                let generation = before[index].generation;
+                kani::assert(
+                    wiped(slot)
+                        && match generation.checked_add(1) {
+                            Some(next) => {
+                                slot.occupancy == Occupancy::Free && slot.generation == next
+                            }
+                            None => slot.occupancy == Occupancy::Retired,
+                        },
+                    "both keys it took are released",
+                );
+                kani::cover!(
+                    slot.occupancy == Occupancy::Retired,
+                    "a key it took retires its slot"
+                );
+            }
+        } else {
+            kani::assert(
+                (0..3).all(|index| snapshot(&slots.memory[index]) == before[index]),
+                "a refused combination changes no slot",
+            );
+        }
+        kani::cover!(result.is_ok(), "two keys are combined");
+        kani::cover!(
+            result == Err(Error::DuplicateKey),
+            "the combined key is held"
+        );
+        kani::cover!(result == Err(Error::DerivationFailed), "a derivation fails");
+    }
+
+    /// From any state of two slots, for a handle of this set naming any slot and generation: a
+    /// challenge is written exactly from a live key from a secret, the derivation of its key, and
+    /// is otherwise refused as `StaleHandle`, `WrongPurpose`, `WrongLevel` or `DerivationFailed`,
+    /// in that order, writing nothing. No slot changes either way.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn only_a_key_from_a_secret_gives_a_challenge() {
+        let mut memory = [any_slot(), any_slot()];
+        let id = memory.as_ptr().addr();
+        let mut epoch = any_epoch(kani::any());
+        let slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let handle = forged(id);
+        let before = snapshots(&slots);
+        let original: [u8; 32] = kani::any();
+        let mut out = original;
+        let result = slots.challenge(handle, &mut out);
+        let named = snapshot_at(&before, handle.index);
+        let expected = if !names_loaded(&before, &handle) {
+            Err(Error::StaleHandle)
+        } else if named.purpose != Purpose::Wrap {
+            Err(Error::WrongPurpose)
+        } else if !named.unlocks {
+            Err(Error::WrongLevel)
+        } else if any_failed() {
+            Err(Error::DerivationFailed)
+        } else {
+            Ok(())
+        };
+        kani::assert(
+            result == expected,
+            "a challenge comes from a live key from a secret, and is otherwise refused for the \
+             first reason",
+        );
+        kani::assert(
+            if result.is_ok() {
+                out == expected_challenge(&named.keys.0, named.lengths[0])
+            } else {
+                out == original
+            },
+            "a challenge writes exactly the derivation of the key, or nothing",
+        );
+        kani::assert(
+            unchanged_except(&slots, &before, 2),
+            "a challenge changes no slot",
+        );
+        kani::cover!(result.is_ok(), "a challenge is given");
+        kani::cover!(
+            result == Err(Error::WrongLevel),
+            "a stored key gives no challenge"
+        );
+        kani::cover!(
+            result == Err(Error::DerivationFailed),
+            "the derivation fails"
+        );
     }
 
     fn any_position() -> Position {

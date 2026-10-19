@@ -53,6 +53,9 @@ password and the hardware secret at each unlock, and neither alone is enough.
 - **A way in is revoked only by the next change of epoch.** A lock record left behind opens until
   the change is committed and the old root erased. Against someone who held an epoch's key while
   the record lived and knows its secret, only a new profile key helps.
+- **A challenge to the chip is as sensitive as a hash of the password.** Whoever reads one on its
+  way to the chip can test guesses at the password without the chip. Wiping it after use and
+  passing it only to the chip is the caller's.
 - **Wiping a value from memory does not reach every copy.** Copies left by a value move, a buffer
   reallocation, a CPU register, swap or a crash dump are outside what this library clears. Each
   load, addition, derivation, reveal, wrap and unwrap wipes the stack it used, short of registers,

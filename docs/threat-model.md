@@ -32,13 +32,18 @@ A key for wrapping from a password, from words or imported is never wrapped. It 
 key for wrapping, in a lock record of two layers: the inner one opens only under that key, the outer
 only under the key of the epoch. A guess at a password against a lock record needs that epoch's key too.
 
+A key from a password can be combined with the chip's answer to a challenge derived from it: the key
+the two make needs both, so each guess at the password needs the chip of the device.
+
 **Intended.** Parameters tuned to seconds on the target device by the platform layer, and the
-hardware element wrapping the master key, confining attempts to that one device. After destruction, no call returns the key.
+platform layer that puts the challenge to the chip. After destruction, no call returns the key.
 
 **Not defended.** A device unlocked once since boot holds keys in memory, lock screen or not. Many
 Android devices lack a dedicated secure element, so the password can be attacked off the device on
 fast hardware, where a short secret falls quickly; their share is our estimate. The library is
 intended to record the level actually reached.
+
+A challenge read on its way to the chip lets guesses at the password run without the chip.
 
 ### 2. Someone who compels the password
 

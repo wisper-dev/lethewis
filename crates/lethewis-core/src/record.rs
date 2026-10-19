@@ -41,7 +41,8 @@ pub enum Purpose {
     /// A key from a secret, such as a password, wraps only stored keys for wrapping, which
     /// [`Slots::lock`](crate::Slots::lock) keeps under it; a stored key wraps only keys for external
     /// data. Leaves the library only wrapped, or as the words
-    /// [`Slots::generate_words`](crate::Slots::generate_words) writes once.
+    /// [`Slots::generate_words`](crate::Slots::generate_words) writes once; a key from a secret
+    /// gives out a [`Slots::challenge`](crate::Slots::challenge) derived from it.
     Wrap = 1,
     /// A key of 32 bytes for data an engine outside the library encrypts, such as a database. It
     /// wraps no key, and leaves the library only as a record wrapped by another key or through
