@@ -288,6 +288,35 @@ jobs:
           done
           exit "$fail"
 
+  # Tests, mutants, proofs and the dependency checks are skipped when only Markdown changed since a
+  # commit of the request on which they all passed. They run when that is not known. Their names
+  # are listed in scripts/text-only.sh.
+  text:
+    name: Only text changed since a passing commit
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    # The heavy jobs wait for it.
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: read # the results of the earlier commits of the pull request
+    outputs:
+      only: ${{ steps.changes.outputs.only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: What changed since the newest commit that passed
+        id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE: origin/${{ github.base_ref }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: scripts/text-only.sh >>"$GITHUB_OUTPUT"
+
   build:
     name: Build and lint
     # Nothing third-party is built before every version of it is known to be reviewed.
@@ -339,8 +368,10 @@ jobs:
 
   test:
     name: Tests
-    needs: lockfile
-    if: github.event_name == 'pull_request'
+    needs: [lockfile, text]
+    if: >-
+      ${{ !cancelled() && github.event_name == 'pull_request' && needs.lockfile.result == 'success'
+      && !(needs.text.result == 'success' && needs.text.outputs.only == 'true') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -411,8 +442,10 @@ jobs:
 
   test-aarch64-linux:
     name: Tests on aarch64 Linux
-    needs: lockfile
-    if: github.event_name == 'pull_request'
+    needs: [lockfile, text]
+    if: >-
+      ${{ !cancelled() && github.event_name == 'pull_request' && needs.lockfile.result == 'success'
+      && !(needs.text.result == 'success' && needs.text.outputs.only == 'true') }}
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
@@ -476,8 +509,10 @@ jobs:
   test-macos:
     # The tests that read the stack back need /proc and do not build here.
     name: Tests on macOS
-    needs: lockfile
-    if: github.event_name == 'pull_request'
+    needs: [lockfile, text]
+    if: >-
+      ${{ !cancelled() && github.event_name == 'pull_request' && needs.lockfile.result == 'success'
+      && !(needs.text.result == 'success' && needs.text.outputs.only == 'true') }}
     runs-on: macos-15
     permissions:
       contents: read
@@ -533,8 +568,10 @@ jobs:
 
   mutant-parts:
     name: Mutants, part ${{ matrix.part }} of ${{ strategy.job-total }}
-    needs: lockfile
-    if: github.event_name == 'pull_request'
+    needs: [lockfile, text]
+    if: >-
+      ${{ !cancelled() && github.event_name == 'pull_request' && needs.lockfile.result == 'success'
+      && !(needs.text.result == 'success' && needs.text.outputs.only == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -597,9 +634,11 @@ jobs:
 
   mutants:
     name: Every mutant is caught
-    needs: mutant-parts
+    needs: [mutant-parts, text]
     # Runs after a failed or cancelled part too: a required check that is skipped counts as passed.
-    if: ${{ always() && github.event_name == 'pull_request' }}
+    if: >-
+      ${{ always() && github.event_name == 'pull_request'
+      && !(needs.text.result == 'success' && needs.text.outputs.only == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -640,8 +679,10 @@ jobs:
 
   proof-parts:
     name: Proofs, part ${{ matrix.part }} of 3
-    needs: lockfile
-    if: github.event_name == 'pull_request'
+    needs: [lockfile, text]
+    if: >-
+      ${{ !cancelled() && github.event_name == 'pull_request' && needs.lockfile.result == 'success'
+      && !(needs.text.result == 'success' && needs.text.outputs.only == 'true') }}
     runs-on: ubuntu-24.04
     # A proof that grows past its budget fails the job rather than slowing every pull request.
     timeout-minutes: 20
@@ -687,9 +728,11 @@ jobs:
 
   proofs:
     name: Proofs hold
-    needs: proof-parts
+    needs: [proof-parts, text]
     # Runs after a failed or cancelled part too: a required check that is skipped counts as passed.
-    if: ${{ always() && github.event_name == 'pull_request' }}
+    if: >-
+      ${{ always() && github.event_name == 'pull_request'
+      && !(needs.text.result == 'success' && needs.text.outputs.only == 'true') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -795,6 +838,8 @@ jobs:
 
   dependencies:
     name: Advisories, licences, sources
+    needs: text
+    if: ${{ !cancelled() && !(needs.text.result == 'success' && needs.text.outputs.only == 'true') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
