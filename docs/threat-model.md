@@ -28,6 +28,10 @@ writes stand for 128 bits of the platform's random source, hedged with the key o
 cannot be guessed. Other words derive another key, under which no record wrapped under the first
 key opens.
 
+A key for wrapping from a password, from words or imported is never wrapped. It wraps only a stored
+key for wrapping, in a lock record of two layers: the inner one opens only under that key, the outer
+only under the key of the epoch. A guess at a password against a lock record needs that epoch's key too.
+
 **Intended.** Parameters tuned to seconds on the target device by the platform layer, and the
 hardware element wrapping the master key, confining attempts to that one device. After destruction, no call returns the key.
 
@@ -40,8 +44,12 @@ intended to record the level actually reached.
 
 **Capability.** Can demand that the owner unlock, lawfully or otherwise.
 
+**In place, in the library.** A profile's stored key is destroyed by a change of epoch that carries
+none of its lock records and locks it under no key again. Once the change is committed, the old root
+erased and no slot holds the key, the password still derives its key, and that key opens nothing.
+
 **Intended.** Give each profile its own entry key, so that a second password derives a different
-profile's key rather than part of the same one, and allow destroying a profile's key on command.
+profile's key rather than part of the same one.
 
 **This is not deniable storage.** Whether a second profile exists at all is a question about the
 storage layer, which is outside this library.
@@ -59,9 +67,16 @@ key set's change is saved only in a new epoch. Once the platform erases the old 
 on flash from an earlier epoch no longer opens, even with the password; the commit reports how
 surely it was erased.
 
+A lock record is carried into a new epoch without the key from a secret that opens it, and one not
+carried opens no more once the old root is erased: so a way in is revoked.
+
 **Intended.** A platform layer whose root the hardware erases.
 
-**Not defended.** Whether a chip really erases a key, and whether the keys it uses to wrap its own
+**Not defended.** Whoever held the key of an epoch while a lock record lived, and knows the secret it
+was locked under, keeps the stored key it holds after that way in is revoked. Only a new stored key,
+with every way in locked again, stands against that.
+
+Whether a chip really erases a key, and whether the keys it uses to wrap its own
 keys stay inside it, cannot be checked from outside. On a device without an erasable root, or where
 a platform gives two epochs the same key, old records stay readable to whoever holds the password
 and the flash.
@@ -73,6 +88,10 @@ and the flash.
 **In place.** Keys are held only in fixed-size slots whose memory the caller provides, each slot a
 set of up to three keys. A key is held in one place only, whatever purpose it serves: a load of a key
 the slots already hold, or of a set that holds one key twice, is refused.
+
+Each key wraps only at its level: a key from a secret only stored keys for wrapping, in lock
+records, and a stored key only keys for external data, in plain records. No call wraps a key from a
+secret.
 
 A new key is the hedge of the platform's random bytes under the key of the epoch, written straight
 into its slot; the bytes drawn are wiped, and if the source fails or panics, so is the slot. The

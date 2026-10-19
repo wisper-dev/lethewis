@@ -169,5 +169,18 @@ Nothing is published while the version is below 0.1.0.
   `WrongPurpose`, and a record of one is unwrapped only if it holds a set of one that has never
   changed.
   Proofs with Kani 0.68.0 for both.
+- Levels of keys. A key for wrapping from a secret, imported or derived from a password or words,
+  is never wrapped and wraps only stored keys for wrapping; a stored one, generated or unlocked,
+  wraps only keys for external data. A call at the wrong level fails with `WrongLevel`.
+- `Slots::lock` keeps a stored key under a key from a secret as a lock record of
+  `LOCK_RECORD_LEN` bytes, 297, in two layers of AES-256-GCM-SIV. The inner one is under a key
+  derived from the key from a secret alone, the outer under a key derived from the key of the
+  epoch, with its number. `Slots::unlock` loads the stored key back.
+- `Slots::carry` moves a lock record into the next epoch during a change, without the key from a
+  secret. A lock record not carried opens no more once the change is committed and the old root
+  erased; a record of another epoch fails with `StaleRecord`.
+- Proofs with Kani 0.68.0 for the levels of loads, wraps, locks, unwraps and unlocks, and for the
+  layers of lock records and their carry. Tests against lock records and a carried record computed
+  by an independent implementation.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

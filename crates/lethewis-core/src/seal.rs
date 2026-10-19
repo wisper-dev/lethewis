@@ -99,22 +99,22 @@ const KNOWN: Known = Known {
 
 /// Encrypts `buffer` in place with AES-256-GCM-SIV and returns the tag. The cipher first encrypts a
 /// known input; if its answer is wrong or the cipher fails, `buffer` is wiped and nothing is
-/// encrypted.
-pub(crate) fn seal(
+/// encrypted. The cipher runs the same code for every length.
+pub(crate) fn seal<const N: usize>(
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     aad: &[u8],
-    buffer: &mut [u8; PLAINTEXT_LEN],
+    buffer: &mut [u8; N],
 ) -> Result<[u8; TAG_LEN], SealFailed> {
     seal_checked(&KNOWN, key, nonce, aad, buffer)
 }
 
-fn seal_checked(
+fn seal_checked<const N: usize>(
     known: &Known,
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     aad: &[u8],
-    buffer: &mut [u8; PLAINTEXT_LEN],
+    buffer: &mut [u8; N],
 ) -> Result<[u8; TAG_LEN], SealFailed> {
     let sealed = if answers(known) {
         encrypt(key, nonce, aad, buffer)
@@ -136,11 +136,11 @@ fn answers(known: &Known) -> bool {
 
 /// Decrypts `buffer` in place if `tag` matches it, the key, the nonce and the associated data, and
 /// otherwise wipes it.
-pub(crate) fn open(
+pub(crate) fn open<const N: usize>(
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],
     aad: &[u8],
-    buffer: &mut [u8; PLAINTEXT_LEN],
+    buffer: &mut [u8; N],
     tag: &[u8; TAG_LEN],
 ) -> Result<(), Rejected> {
     let opened = decrypt(key, nonce, aad, buffer, tag);
@@ -192,7 +192,7 @@ use model::{decrypt, encrypt};
 pub(crate) mod model {
     use core::sync::atomic::{AtomicBool, Ordering};
 
-    use super::{KEY_LEN, NONCE_LEN, PLAINTEXT_LEN, Rejected, SealFailed, TAG_LEN};
+    use super::{KEY_LEN, NONCE_LEN, Rejected, SealFailed, TAG_LEN};
 
     /// Whether the last decryption was rejected, so a proof can tell a rejection by the cipher from
     /// one the code makes up.
@@ -200,11 +200,11 @@ pub(crate) mod model {
 
     /// AES-256-GCM-SIV is beyond Kani. Encryption writes any bytes, then gives any tag or fails. The
     /// buffer is written whole: a write per byte multiplies the proofs' work.
-    pub(super) fn encrypt(
+    pub(super) fn encrypt<const N: usize>(
         _: &[u8; KEY_LEN],
         _: &[u8; NONCE_LEN],
         _: &[u8],
-        buffer: &mut [u8; PLAINTEXT_LEN],
+        buffer: &mut [u8; N],
     ) -> Result<[u8; TAG_LEN], SealFailed> {
         *buffer = kani::any();
         if kani::any() {
@@ -215,11 +215,11 @@ pub(crate) mod model {
     }
 
     /// Decryption writes any bytes, then accepts or rejects at will and records which.
-    pub(super) fn decrypt(
+    pub(super) fn decrypt<const N: usize>(
         _: &[u8; KEY_LEN],
         _: &[u8; NONCE_LEN],
         _: &[u8],
-        buffer: &mut [u8; PLAINTEXT_LEN],
+        buffer: &mut [u8; N],
         _: &[u8; TAG_LEN],
     ) -> Result<(), Rejected> {
         *buffer = kani::any();
@@ -746,30 +746,41 @@ mod tests {
 #[cfg(kani)]
 #[coverage(on)]
 mod proofs {
-    use super::{PLAINTEXT_LEN, model::rejected, open, seal};
+    use super::{model::rejected, open, seal};
+    use crate::record::{LAYER_LEN, PLAINTEXT_LEN};
 
-    /// For any key, nonce, associated data and record, and whatever the cipher does: sealing either
-    /// gives a tag, or fails and leaves the buffer zero.
-    #[kani::proof]
-    #[kani::unwind(234)]
-    fn a_failed_seal_leaves_the_buffer_wiped() {
-        let mut buffer: [u8; PLAINTEXT_LEN] = kani::any();
+    /// Sealing any `N` bytes: it gives a tag, or fails and leaves the buffer zero. Returns whether it
+    /// sealed.
+    fn seal_any<const N: usize>() -> bool {
+        let mut buffer: [u8; N] = kani::any();
         let aad: [u8; 4] = kani::any();
         let sealed = seal(&kani::any(), &kani::any(), &aad, &mut buffer);
         kani::assert(
-            sealed.is_ok() || buffer == [0; PLAINTEXT_LEN],
+            sealed.is_ok() || buffer == [0; N],
             "a failed seal leaves the buffer zero",
         );
-        kani::cover!(sealed.is_ok(), "a record is sealed");
-        kani::cover!(sealed.is_err(), "a seal fails");
+        sealed.is_ok()
     }
 
-    /// For any key, nonce, associated data, record and tag, and whatever the cipher does: opening
-    /// fails exactly when the cipher rejects the record, and then leaves the buffer zero.
+    /// For any key, nonce, associated data and plaintext of a record or of the outer layer of a lock
+    /// record, and whatever the cipher does: sealing either gives a tag, or fails and leaves the
+    /// buffer zero.
     #[kani::proof]
-    #[kani::unwind(234)]
-    fn a_rejected_record_leaves_the_buffer_wiped() {
-        let mut buffer: [u8; PLAINTEXT_LEN] = kani::any();
+    #[kani::unwind(270)]
+    fn a_failed_seal_leaves_the_buffer_wiped() {
+        let sealed = if kani::any() {
+            seal_any::<PLAINTEXT_LEN>()
+        } else {
+            seal_any::<LAYER_LEN>()
+        };
+        kani::cover!(sealed, "a record is sealed");
+        kani::cover!(!sealed, "a seal fails");
+    }
+
+    /// Opening any `N` bytes: it fails exactly when the cipher rejects them, and then leaves the
+    /// buffer zero. Returns whether it opened.
+    fn open_any<const N: usize>() -> bool {
+        let mut buffer: [u8; N] = kani::any();
         let aad: [u8; 4] = kani::any();
         let opened = open(&kani::any(), &kani::any(), &aad, &mut buffer, &kani::any());
         kani::assert(
@@ -777,10 +788,24 @@ mod proofs {
             "a record is refused exactly when the cipher rejects it",
         );
         kani::assert(
-            opened.is_ok() || buffer == [0; PLAINTEXT_LEN],
+            opened.is_ok() || buffer == [0; N],
             "a refused record leaves the buffer zero",
         );
-        kani::cover!(opened.is_ok(), "a record opens");
-        kani::cover!(opened.is_err(), "a record is refused");
+        opened.is_ok()
+    }
+
+    /// For any key, nonce, associated data, tag and encrypted record or outer layer of a lock record,
+    /// and whatever the cipher does: opening fails exactly when the cipher rejects it, and then
+    /// leaves the buffer zero.
+    #[kani::proof]
+    #[kani::unwind(270)]
+    fn a_rejected_record_leaves_the_buffer_wiped() {
+        let opened = if kani::any() {
+            open_any::<PLAINTEXT_LEN>()
+        } else {
+            open_any::<LAYER_LEN>()
+        };
+        kani::cover!(opened, "a record opens");
+        kani::cover!(!opened, "a record is refused");
     }
 }

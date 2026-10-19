@@ -60,6 +60,12 @@ pub enum Error {
     WrongPurpose,
     /// The purpose takes no key of this length.
     WrongLength,
+    /// The set is not of the level the call takes: a key from a secret wraps only stored keys for
+    /// wrapping, which wrap only keys for external data.
+    WrongLevel,
+    /// The lock record does not open in this epoch for this context: it was not locked or carried
+    /// into it, or it was changed.
+    StaleRecord,
 }
 
 impl From<crate::keyset::Refused> for Error {
@@ -102,6 +108,8 @@ impl fmt::Display for Error {
             Self::InvalidChecksum => "invalid checksum",
             Self::WrongPurpose => "wrong purpose",
             Self::WrongLength => "wrong key length",
+            Self::WrongLevel => "wrong level",
+            Self::StaleRecord => "stale record",
         })
     }
 }
@@ -146,5 +154,7 @@ mod tests {
         assert_eq!(Error::InvalidChecksum.to_string(), "invalid checksum");
         assert_eq!(Error::WrongPurpose.to_string(), "wrong purpose");
         assert_eq!(Error::WrongLength.to_string(), "wrong key length");
+        assert_eq!(Error::WrongLevel.to_string(), "wrong level");
+        assert_eq!(Error::StaleRecord.to_string(), "stale record");
     }
 }

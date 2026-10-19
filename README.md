@@ -49,7 +49,10 @@ password and the hardware secret at each unlock, and neither alone is enough.
   unless the hardware's own keys leak. Without such a root a destroyed key is most likely gone, not
   certainly.
 - **A key derived from a password or from twelve words comes back from them.** Destroying it does
-  not reach the password or the words.
+  not reach the password or the words; destroying the profile key it opens does.
+- **A way in is revoked only by the next change of epoch.** A lock record left behind opens until
+  the change is committed and the old root erased. Against someone who held an epoch's key while
+  the record lived and knows its secret, only a new profile key helps.
 - **Wiping a value from memory does not reach every copy.** Copies left by a value move, a buffer
   reallocation, a CPU register, swap or a crash dump are outside what this library clears. Each
   load, addition, derivation, reveal, wrap and unwrap wipes the stack it used, short of registers,

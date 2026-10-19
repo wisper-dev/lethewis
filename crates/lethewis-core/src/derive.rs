@@ -27,6 +27,8 @@ const FROM_WORDS: &[u8; 10] = b"from words";
 const HEDGE_KEY: &[u8; 9] = b"hedge key";
 const HEDGE_WORDS: &[u8; 11] = b"hedge words";
 const HEDGE_NONCE: &[u8; 11] = b"hedge nonce";
+const LOCK_KEY: &[u8; 8] = b"lock key";
+const EPOCH_LAYER: &[u8; 11] = b"epoch layer";
 /// The count of a draw, after the bytes the source gave, in the material a hedge extracts.
 const COUNT_LEN: usize = 8;
 /// How many bytes twelve words stand for.
@@ -60,13 +62,19 @@ pub(crate) enum Branch {
     HedgeWords,
     /// The nonce of a record, hedged.
     HedgeNonce,
+    /// The key that encrypts the records a key from a secret locks, whatever the epoch.
+    LockKey,
+    /// The key that encrypts the outer layer of the lock records of an epoch.
+    EpochLayer,
 }
 
 /// The purpose each branch is derived for.
 #[cfg(test)]
 pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
     match branch {
-        Branch::WrapKey | Branch::FromWords => Some(Purpose::Wrap),
+        Branch::WrapKey | Branch::FromWords | Branch::LockKey | Branch::EpochLayer => {
+            Some(Purpose::Wrap)
+        }
         Branch::KeyId | Branch::HedgeKey | Branch::HedgeWords | Branch::HedgeNonce => None,
     }
 }
@@ -176,6 +184,23 @@ pub(crate) fn derive_wrap_key(
 ) -> Result<(), DerivationFailed> {
     let salt = epoch.material().ok_or(DerivationFailed)?;
     derive(key, salt, Some(Purpose::Wrap), Branch::WrapKey, out)
+}
+
+/// Derives the key that encrypts the records the key from a secret `key` locks, in any epoch.
+pub(crate) fn derive_lock_key(
+    key: &Key,
+    out: &mut [u8; CIPHER_KEY_LEN],
+) -> Result<(), DerivationFailed> {
+    derive(key, SALT, Some(Purpose::Wrap), Branch::LockKey, out)
+}
+
+/// Derives the key that encrypts the outer layer of the lock records of the epoch whose key is
+/// `epoch`.
+pub(crate) fn derive_layer_key(
+    epoch: &Key,
+    out: &mut [u8; CIPHER_KEY_LEN],
+) -> Result<(), DerivationFailed> {
+    derive(epoch, SALT, Some(Purpose::Wrap), Branch::EpochLayer, out)
 }
 
 /// Fills `out` with the wrapping key that the bytes twelve words stand for, `entropy`, derive:
@@ -620,7 +645,7 @@ pub(crate) mod stack {
             Branch::KeyId | Branch::HedgeWords => 16,
             Branch::HedgeNonce => 12,
             Branch::HedgeKey => key.len() - 8,
-            Branch::WrapKey | Branch::FromWords => 32,
+            Branch::WrapKey | Branch::FromWords | Branch::LockKey | Branch::EpochLayer => 32,
         };
         let length = u8::try_from(key.len()).unwrap();
         let (label, used) = label(purpose_of(branch), length, branch, out_len).unwrap();
@@ -649,7 +674,10 @@ pub(crate) mod stack {
 
         let mut secrets = std::vec![key.to_vec(), output[1..].to_vec()];
         // The salt of a wrap key and of a hedge is the key of an epoch.
-        if branch != Branch::KeyId && branch != Branch::FromWords {
+        if matches!(
+            branch,
+            Branch::WrapKey | Branch::HedgeKey | Branch::HedgeWords | Branch::HedgeNonce
+        ) {
             secrets.extend(salt_secrets(salt));
         }
         secrets.extend(hash_forms(&prk));
@@ -1164,6 +1192,8 @@ fn label(
         Branch::HedgeKey => joined(head, HEDGE_KEY),
         Branch::HedgeWords => joined(head, HEDGE_WORDS),
         Branch::HedgeNonce => joined(head, HEDGE_NONCE),
+        Branch::LockKey => joined(head, LOCK_KEY),
+        Branch::EpochLayer => joined(head, EPOCH_LAYER),
     }
 }
 
@@ -1195,8 +1225,9 @@ mod tests {
     use sha2::Sha256;
 
     use super::{
-        Branch, DerivationFailed, FROM_WORDS, HEDGE_KEY, HEDGE_NONCE, HEDGE_WORDS, Hedged, KEY_ID,
-        KeyId, SALT, WRAP_KEY, derive, derive_from_words, derive_key_id, hedge, label, purpose_of,
+        Branch, DerivationFailed, EPOCH_LAYER, FROM_WORDS, HEDGE_KEY, HEDGE_NONCE, HEDGE_WORDS,
+        Hedged, KEY_ID, KeyId, LOCK_KEY, SALT, WRAP_KEY, derive, derive_from_words, derive_key_id,
+        hedge, label, purpose_of,
     };
     use crate::entropy::{Entropy, EntropyError};
     use crate::key::{Key, KeyLength};
@@ -1350,6 +1381,21 @@ mod tests {
                 KeyLength::Bytes64,
                 Branch::WrapKey,
                 "36a276730fac754e12ca4c3b3a6cfdf685d2429d5347438ee3020107dfa668f2",
+            ),
+            (
+                KeyLength::Bytes32,
+                Branch::LockKey,
+                "23f8b69ca6944ae73ae44d9c658de7c7524a81bbd2b36a9aad152c3b24b19eda",
+            ),
+            (
+                KeyLength::Bytes64,
+                Branch::LockKey,
+                "45bb3bbe7c6432dbfab90f14d4d8a056eaff60c446ea42b871b1ac36b26bd533",
+            ),
+            (
+                KeyLength::Bytes32,
+                Branch::EpochLayer,
+                "9703118a50323bc84eff5d6653e209d4822837684a270208b934c0d02da087eb",
             ),
         ];
         for (length, branch, expected) in cases {
@@ -1525,6 +1571,8 @@ mod tests {
             Branch::HedgeKey,
             Branch::HedgeWords,
             Branch::HedgeNonce,
+            Branch::LockKey,
+            Branch::EpochLayer,
         ] {
             let (_, used) = label(purpose_of(branch), 64, branch, 32).unwrap();
             let name = match branch {
@@ -1534,6 +1582,8 @@ mod tests {
                 Branch::HedgeKey => HEDGE_KEY.len(),
                 Branch::HedgeWords => HEDGE_WORDS.len(),
                 Branch::HedgeNonce => HEDGE_NONCE.len(),
+                Branch::LockKey => LOCK_KEY.len(),
+                Branch::EpochLayer => EPOCH_LAYER.len(),
             };
             assert_eq!(used, 14 + name);
         }
@@ -1607,6 +1657,35 @@ pub(crate) mod proofs {
         out
     }
 
+    /// The key the model of HKDF gives the records the key from a secret `key`, of `length`, locks,
+    /// worked out in the same way.
+    pub(crate) fn expected_lock_key(key: &[u8; 64], length: KeyLength) -> [u8; CIPHER_KEY_LEN] {
+        let mut out = [0; CIPHER_KEY_LEN];
+        let length_byte = length_to_byte(length);
+        let _ = label(
+            Some(Purpose::Wrap),
+            length_byte,
+            Branch::LockKey,
+            CIPHER_KEY_LEN,
+        )
+        .map(|(label, used)| {
+            fold(SALT, &key[..length.bytes()], &label[..used], &mut out);
+        });
+        out
+    }
+
+    /// The key the model of HKDF gives the outer layer of lock records in the epoch whose key is
+    /// `epoch`, worked out in the same way.
+    pub(crate) fn expected_layer_key(epoch: &[u8; 32]) -> [u8; CIPHER_KEY_LEN] {
+        let mut out = [0; CIPHER_KEY_LEN];
+        let _ = label(Some(Purpose::Wrap), 32, Branch::EpochLayer, CIPHER_KEY_LEN).map(
+            |(label, used)| {
+                fold(SALT, epoch, &label[..used], &mut out);
+            },
+        );
+        out
+    }
+
     /// The wrapping key the model of HKDF gives from the bytes twelve words stand for, worked out
     /// in the same way.
     pub(crate) fn expected_words_key(bytes: &[u8; WORDS_ENTROPY_LEN]) -> [u8; 32] {
@@ -1625,7 +1704,9 @@ pub(crate) mod proofs {
             2 => Branch::FromWords,
             3 => Branch::HedgeKey,
             4 => Branch::HedgeWords,
-            _ => Branch::HedgeNonce,
+            5 => Branch::HedgeNonce,
+            6 => Branch::LockKey,
+            _ => Branch::EpochLayer,
         }
     }
 
