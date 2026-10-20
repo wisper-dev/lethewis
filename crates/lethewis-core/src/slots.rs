@@ -5,8 +5,8 @@ use core::{fmt, marker::PhantomData};
 
 use crate::{
     derive::{
-        Branch, Hedged, KeyId, derive_challenge, derive_combined, derive_key_id, derive_layer_key,
-        derive_lock_key, derive_wrap_key, wipe_cipher_stack, wipe_stack,
+        Branch, Hedged, KeyId, derive_challenge, derive_combined, derive_export_key, derive_key_id,
+        derive_layer_key, derive_lock_key, derive_wrap_key, wipe_cipher_stack, wipe_stack,
     },
     entropy::{Entropy, EntropyError},
     epoch::{Epoch, Erasure, Root, RootFailed},
@@ -14,7 +14,8 @@ use crate::{
     key::{Key, KeyBytes, KeyLength, wipe},
     keyset::{self, Header, MEMBERS, Position, Refused, Stages},
     record::{
-        AssociatedData, LAYER_LEN, LOCK_RECORD_LEN, PLAINTEXT_LEN, Purpose, RECORD_LEN, Status,
+        AssociatedData, END_LABEL, END_RECORD_LEN, EXPORT_LABEL, LAYER_LEN, LOCK_RECORD_LEN,
+        PLAINTEXT_LEN, Purpose, RECORD_LEN, Status,
     },
     seal::{self, KEY_LEN as CIPHER_KEY_LEN, NONCE_LEN, Rejected, TAG_LEN},
 };
@@ -38,6 +39,22 @@ pub struct Slot {
     changed: bool,
     /// The set is wrapped in the next epoch, and has not changed since.
     sealed: bool,
+    /// The slot and generation of the key for transfers the set came under, until the end of that
+    /// transfer is received.
+    pending: Option<(usize, u64)>,
+    /// For a key for transfers: the tag of the last record of the export it writes or receives, or
+    /// zero before the first.
+    chain: [u8; TAG_LEN],
+    /// For a key for transfers: whether it writes an export or receives one, until its end.
+    direction: Direction,
+}
+
+/// Which way the records of a key for transfers go until the end of its export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Idle,
+    Out,
+    In,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +79,9 @@ impl Slot {
             occupancy: Occupancy::Free,
             changed: false,
             sealed: false,
+            pending: None,
+            chain: [0; TAG_LEN],
+            direction: Direction::Idle,
         }
     }
 
@@ -82,6 +102,9 @@ impl Slot {
         self.wipe_keys();
         self.changed = false;
         self.sealed = false;
+        self.pending = None;
+        self.chain = [0; TAG_LEN];
+        self.direction = Direction::Idle;
         match self.generation.checked_add(1) {
             Some(next) => {
                 self.generation = next;
@@ -115,6 +138,26 @@ impl Slot {
             Position::First => (first, first_id),
             Position::Second => (second, second_id),
             Position::Third => (third, third_id),
+        }
+    }
+
+    /// Refuses a key for transfers that carries an export the other way than `way`.
+    fn may_go(&self, way: Direction) -> Result<(), Error> {
+        if self.direction == Direction::Idle || self.direction == way {
+            Ok(())
+        } else {
+            Err(Error::Unfinished)
+        }
+    }
+
+    /// Refuses the end of an export `way` that the key for transfers does not carry.
+    fn may_end(&self, way: Direction) -> Result<(), Error> {
+        if self.direction == way {
+            Ok(())
+        } else if self.direction == Direction::Idle {
+            Err(Error::NoTransfer)
+        } else {
+            Err(Error::Unfinished)
         }
     }
 
@@ -234,11 +277,41 @@ impl<F, const N: usize> Open<N> for F where
 {
 }
 
-/// Where a wrap writes: the record of a set for external data, or the lock record of a stored key
-/// for wrapping.
+/// Where a wrap writes: the record of a set under a stored key for wrapping, the lock record of a
+/// stored key for wrapping, or a record of an export.
 enum Out<'r> {
     Record(&'r mut [u8; RECORD_LEN]),
     Lock(&'r mut [u8; LOCK_RECORD_LEN]),
+    Export(&'r mut [u8; RECORD_LEN]),
+}
+
+impl Out<'_> {
+    const fn kind(&self) -> Kind {
+        match self {
+            Self::Record(_) => Kind::Record,
+            Self::Lock(_) => Kind::Lock,
+            Self::Export(_) => Kind::Export,
+        }
+    }
+}
+
+/// What a record is: of a set under a stored key for wrapping, in an epoch; the inner record of a
+/// lock record, under a key from a secret; or of an export, under a key for transfers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Record,
+    Lock,
+    Export,
+}
+
+impl Kind {
+    /// The purpose of the key a record of this kind is wrapped under.
+    const fn parent_purpose(self) -> Purpose {
+        match self {
+            Self::Record | Self::Lock => Purpose::Wrap,
+            Self::Export => Purpose::Transfer,
+        }
+    }
 }
 
 impl<'a> Slots<'a> {
@@ -322,7 +395,7 @@ impl<'a> Slots<'a> {
     /// of one whose key is the primary. The bytes are hedged with the key of the epoch, as RFC 8937
     /// has it, and the key derived from them is written straight into the slot; the bytes `entropy`
     /// gave are wiped, and so is the stack the derivations used. `entropy` is asked once, and only
-    /// when `purpose` takes `length` and a slot is free.
+    /// when `purpose` is generated, takes `length` and a slot is free.
     ///
     /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the hedge, the derivation of the key's identifier, and the
@@ -331,10 +404,11 @@ impl<'a> Slots<'a> {
     ///
     /// # Errors
     ///
-    /// [`Error::WrongLength`] if `purpose` takes no key of `length`, [`Error::NoFreeSlot`] if no
-    /// slot is free, [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if
-    /// the key or its identifier cannot be derived, and [`Error::DuplicateKey`] if these slots hold
-    /// the key already. No slot changes then.
+    /// [`Error::WrongPurpose`] if `purpose` is [`Purpose::Transfer`], whose key the other device
+    /// has to share, [`Error::WrongLength`] if `purpose` takes no key of `length`,
+    /// [`Error::NoFreeSlot`] if no slot is free, [`Error::EntropyFailed`] if `entropy` fails,
+    /// [`Error::DerivationFailed`] if the key or its identifier cannot be derived, and
+    /// [`Error::DuplicateKey`] if these slots hold the key already. No slot changes then.
     ///
     /// # Panics
     ///
@@ -345,6 +419,9 @@ impl<'a> Slots<'a> {
         length: KeyLength,
         entropy: &mut (impl Entropy + ?Sized),
     ) -> Result<Handle<'a>, Error> {
+        if purpose == Purpose::Transfer {
+            return Err(Error::WrongPurpose);
+        }
         self.load_new(purpose, length, false, |first, epoch| {
             hedged_fill(first, length, entropy, epoch)
         })
@@ -390,8 +467,9 @@ impl<'a> Slots<'a> {
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
     /// [`Error::WrongPurpose`] if the set serves another purpose than `purpose` or keys of
-    /// `purpose` never leave the library, and [`Error::WrongStage`] if `at` does not hold an
-    /// enabled key. `out` is then left as it was.
+    /// `purpose` never leave the library, [`Error::Unfinished`] if the set came in an export whose
+    /// end has not been received, and [`Error::WrongStage`] if `at` does not hold an enabled key.
+    /// `out` is then left as it was.
     pub fn reveal32(
         &self,
         set: Handle<'a>,
@@ -420,6 +498,9 @@ impl<'a> Slots<'a> {
             .ok_or(Error::StaleHandle)?;
         if purpose != Purpose::ExternalData || slot.purpose != purpose {
             return Err(Error::WrongPurpose);
+        }
+        if slot.pending.is_some() {
+            return Err(Error::Unfinished);
         }
         if slot.stages.stage(at.index()) != Some(Status::Enabled) {
             return Err(Error::WrongStage);
@@ -558,12 +639,12 @@ impl<'a> Slots<'a> {
         challenged.map_err(|_| Error::DerivationFailed)
     }
 
-    /// Wraps the set for external data that `set` refers to under the stored key for wrapping that
-    /// `parent` refers to and writes the record into `record`, in this epoch, or in the next while
-    /// a change to it is under way. The record holds every key of the set, its stage and which key
-    /// is the primary, and opens only with that key and the same `context`, which names the place
-    /// the record is kept, from 1 to 255 bytes. The nonce comes from `entropy`, hedged with the key
-    /// of the epoch the record is wrapped in.
+    /// Wraps the set for external data or the key for transfers that `set` refers to under the
+    /// stored key for wrapping that `parent` refers to and writes the record into `record`, in this
+    /// epoch, or in the next while a change to it is under way. The record holds every key of the
+    /// set, its stage and which key is the primary, and opens only with that key and the same
+    /// `context`, which names the place the record is kept, from 1 to 255 bytes. The nonce comes
+    /// from `entropy`, hedged with the key of the epoch the record is wrapped in.
     ///
     /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
@@ -576,13 +657,12 @@ impl<'a> Slots<'a> {
     /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
     /// [`Error::SameKey`] if both refer to the same set, [`Error::WrongPurpose`] if the set
     /// `parent` refers to does not serve [`Purpose::Wrap`], [`Error::WrongLevel`] if the set `set`
-    /// refers to serves it, or `parent` refers to a key from a secret, [`Error::Unsaved`] if the
-    /// set `set` refers to has changed in this epoch and no change to the next is under way,
-    /// [`Error::EntropyFailed`] if `entropy` fails,
-    /// [`Error::DerivationFailed`] if the nonce cannot be hedged or the key that encrypts the record
-    /// cannot be derived, and
-    /// [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or fails. `record`
-    /// is then left as it was.
+    /// refers to serves it, or `parent` refers to a key from a secret, [`Error::Unfinished`] if the
+    /// set `set` refers to came in a transfer whose end has not been received, [`Error::Unsaved`]
+    /// if it has changed in this epoch and no change to the next is under way,
+    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if the nonce cannot
+    /// be hedged or the key that encrypts the record cannot be derived, and [`Error::CipherFailed`]
+    /// if the cipher gives a known input a wrong answer or fails. `record` is then left as it was.
     pub fn wrap(
         &mut self,
         set: Handle<'a>,
@@ -636,8 +716,152 @@ impl<'a> Slots<'a> {
         locked
     }
 
-    /// The wrap or the lock itself, in a frame of its own: the wipe that follows starts where this
+    /// Refuses a record of `kind` of the set in slot `index` under the set in slot `parent`, for
+    /// the first reason that applies once both handles are live.
+    fn wrappable(&self, index: usize, parent: usize, kind: Kind) -> Result<(), Error> {
+        if index == parent {
+            return Err(Error::SameKey);
+        }
+        let (Some(child), Some(wrapping)) = (self.memory.get(index), self.memory.get(parent))
+        else {
+            return Err(Error::StaleHandle);
+        };
+        if wrapping.purpose != kind.parent_purpose() {
+            return Err(Error::WrongPurpose);
+        }
+        let level = match kind {
+            Kind::Record => child.purpose != Purpose::Wrap && !wrapping.unlocks,
+            Kind::Lock => child.purpose == Purpose::Wrap && !child.unlocks && wrapping.unlocks,
+            Kind::Export => child.purpose == Purpose::ExternalData,
+        };
+        if !level {
+            return Err(Error::WrongLevel);
+        }
+        if child.pending.is_some() {
+            return Err(Error::Unfinished);
+        }
+        if kind == Kind::Export {
+            wrapping.may_go(Direction::Out)?;
+        } else if child.changed && !self.epoch.changing {
+            return Err(Error::Unsaved);
+        }
+        Ok(())
+    }
+
+    /// Exports the set for external data that `set` refers to under the key for transfers that
+    /// `transfer` refers to, and writes the record into `record`: the next record of the export, in
+    /// the order of the calls, until [`Slots::end_export`] ends it. The key carries this one export
+    /// until then: it receives none, and releasing it abandons the export. The record holds every
+    /// key of the set, disabled ones too, its stage and which key is the primary, and opens only
+    /// with that key, the same `context`, from 1 to 255 bytes, and the records before it, in any
+    /// epoch: neither a change of epoch nor a destruction afterwards reaches it. The nonce comes
+    /// from `entropy`, hedged with the key of this epoch.
+    ///
+    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
+    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
+    /// code it calls has to set that flag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
+    /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
+    /// [`Error::SameKey`] if both refer to the same set, [`Error::WrongPurpose`] if the set
+    /// `transfer` refers to does not serve [`Purpose::Transfer`], [`Error::WrongLevel`] if the set
+    /// `set` refers to does not serve [`Purpose::ExternalData`], [`Error::Unfinished`] if it came
+    /// in an export whose end has not been received or the key for transfers receives one,
+    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if the nonce cannot
+    /// be hedged or the key that encrypts the record cannot be derived, and [`Error::CipherFailed`]
+    /// if the cipher gives a known input a wrong answer or fails. `record` is then left as it was,
+    /// and the export goes on as before the call.
+    pub fn export(
+        &mut self,
+        set: Handle<'a>,
+        transfer: Handle<'a>,
+        context: &[u8],
+        entropy: &mut (impl Entropy + ?Sized),
+        record: &mut [u8; RECORD_LEN],
+    ) -> Result<(), Error> {
+        let exported = lethewis_dit::with(|| {
+            self.wrap_on_stack(set, transfer, context, entropy, Out::Export(record))
+        });
+        wipe_cipher_stack();
+        exported
+    }
+
+    /// Ends the export under the key for transfers that `transfer` refers to and writes its end
+    /// into `end`: it opens only after every record of the export, in order, with the same
+    /// `context`. The next record exported under the key begins a new export. The nonce comes from
+    /// `entropy`, hedged with the key of this epoch.
+    ///
+    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
+    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
+    /// code it calls has to set that flag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
+    /// [`Error::StaleHandle`] if `transfer` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Transfer`],
+    /// [`Error::NoTransfer`] if the key carries no export: it has written or received no record
+    /// since its load or its last end, [`Error::Unfinished`] if it receives one,
+    /// [`Error::EntropyFailed`] if `entropy` fails,
+    /// [`Error::DerivationFailed`] if the nonce cannot be hedged or the key that encrypts the end
+    /// cannot be derived, and [`Error::CipherFailed`] if the cipher gives a known input a wrong
+    /// answer or fails. `end` is then left as it was, and the export goes on as before the call.
+    pub fn end_export(
+        &mut self,
+        transfer: Handle<'a>,
+        context: &[u8],
+        entropy: &mut (impl Entropy + ?Sized),
+        end: &mut [u8; END_RECORD_LEN],
+    ) -> Result<(), Error> {
+        let ended =
+            lethewis_dit::with(|| self.end_export_on_stack(transfer, context, entropy, end));
+        wipe_cipher_stack();
+        ended
+    }
+
+    /// The end of an export itself, in a frame of its own: the wipe that follows starts where this
     /// frame starts.
+    #[inline(never)]
+    fn end_export_on_stack(
+        &mut self,
+        transfer: Handle<'a>,
+        context: &[u8],
+        entropy: &mut (impl Entropy + ?Sized),
+        end: &mut [u8; END_RECORD_LEN],
+    ) -> Result<(), Error> {
+        let associated = AssociatedData::new(context).map_err(|_| Error::InvalidContext)?;
+        let index = self.serving(transfer, Purpose::Transfer)?;
+        let slot = self.memory.get(index).ok_or(Error::StaleHandle)?;
+        slot.may_end(Direction::Out)?;
+        let associated = associated.chained(END_LABEL, &slot.chain);
+        let Epoch { key, drawn, .. } = &mut *self.epoch;
+        let mut nonce = [0; NONCE_LEN];
+        hedged_draw(entropy, key, drawn, Branch::HedgeNonce, &mut nonce)?;
+        let mut cipher_key = [0; CIPHER_KEY_LEN];
+        if derive_export_key(slot.wrapping_key().0, &mut cipher_key).is_err() {
+            wipe(&mut cipher_key);
+            return Err(Error::DerivationFailed);
+        }
+        let tag = seal::seal(&cipher_key, &nonce, associated.bytes(), &mut []);
+        wipe(&mut cipher_key);
+        let tag = tag.map_err(|_| Error::CipherFailed)?;
+        if let Some((nonce_out, tag_out)) = end.split_first_chunk_mut::<NONCE_LEN>() {
+            *nonce_out = nonce;
+            tag_out.copy_from_slice(&tag);
+        }
+        if let Some(slot) = self.memory.get_mut(index) {
+            slot.chain = [0; TAG_LEN];
+            slot.direction = Direction::Idle;
+        }
+        Ok(())
+    }
+
+    /// The wrap, the lock or the export itself, in a frame of its own: the wipe that follows starts
+    /// where this frame starts.
     #[inline(never)]
     fn wrap_on_stack(
         &mut self,
@@ -647,25 +871,15 @@ impl<'a> Slots<'a> {
         entropy: &mut (impl Entropy + ?Sized),
         out: Out<'_>,
     ) -> Result<(), Error> {
-        let lock = matches!(out, Out::Lock(_));
+        let kind = out.kind();
         let associated = AssociatedData::new(context).map_err(|_| Error::InvalidContext)?;
-        let (index, wrapping) = (self.loaded(set)?, self.loaded(parent)?);
-        if index == wrapping {
-            return Err(Error::SameKey);
-        }
-        let (Some(child), Some(wrapping)) = (self.memory.get(index), self.memory.get(wrapping))
+        let (index, parent_index) = (self.loaded(set)?, self.loaded(parent)?);
+        self.wrappable(index, parent_index, kind)?;
+        let (Some(child), Some(wrapping)) = (self.memory.get(index), self.memory.get(parent_index))
         else {
             return Err(Error::StaleHandle);
         };
-        if wrapping.purpose != Purpose::Wrap {
-            return Err(Error::WrongPurpose);
-        }
-        if child.unlocks || (child.purpose == Purpose::Wrap) != lock || wrapping.unlocks != lock {
-            return Err(Error::WrongLevel);
-        }
-        if child.changed && !self.epoch.changing {
-            return Err(Error::Unsaved);
-        }
+        let in_epoch = kind != Kind::Export;
         let Epoch {
             number,
             key,
@@ -673,7 +887,7 @@ impl<'a> Slots<'a> {
             changing,
             drawn,
         } = &mut *self.epoch;
-        let (epoch, epoch_key) = if *changing {
+        let (epoch, epoch_key) = if in_epoch && *changing {
             (number.checked_add(1).ok_or(Error::EpochExhausted)?, &*next)
         } else {
             (*number, &*key)
@@ -682,10 +896,10 @@ impl<'a> Slots<'a> {
         let mut nonce = [0; NONCE_LEN];
         hedged_draw(entropy, epoch_key, drawn, Branch::HedgeNonce, &mut nonce)?;
         let mut cipher_key = [0; CIPHER_KEY_LEN];
-        let derived = if lock {
-            derive_lock_key(parent_key, &mut cipher_key)
-        } else {
-            derive_wrap_key(parent_key, epoch_key, &mut cipher_key)
+        let derived = match kind {
+            Kind::Record => derive_wrap_key(parent_key, epoch_key, &mut cipher_key),
+            Kind::Lock => derive_lock_key(parent_key, &mut cipher_key),
+            Kind::Export => derive_export_key(parent_key, &mut cipher_key),
         };
         if derived.is_err() {
             wipe(&mut cipher_key);
@@ -694,7 +908,12 @@ impl<'a> Slots<'a> {
         let header = Header {
             purpose: child.purpose,
             parent: parent_id.bytes(),
-            epoch: if lock { 0 } else { epoch },
+            epoch: if kind == Kind::Record { epoch } else { 0 },
+        };
+        let associated = if kind == Kind::Export {
+            associated.chained(EXPORT_LABEL, &wrapping.chain)
+        } else {
+            associated
         };
         let [first, second, third] = &child.keys;
         let mut sealed = [0; PLAINTEXT_LEN];
@@ -703,7 +922,9 @@ impl<'a> Slots<'a> {
         wipe(&mut cipher_key);
         let tag = tag.map_err(|_| Error::CipherFailed)?;
         match out {
-            Out::Record(record) => write_record(record, &nonce, &sealed, &tag),
+            Out::Record(record) | Out::Export(record) => {
+                write_record(record, &nonce, &sealed, &tag);
+            }
             Out::Lock(record) => {
                 let mut inner = [0; RECORD_LEN];
                 write_record(&mut inner, &nonce, &sealed, &tag);
@@ -720,7 +941,12 @@ impl<'a> Slots<'a> {
                 layered?;
             }
         }
-        if self.epoch.changing
+        if kind == Kind::Export {
+            if let Some(wrapping) = self.memory.get_mut(parent_index) {
+                wrapping.chain = tag;
+                wrapping.direction = Direction::Out;
+            }
+        } else if self.epoch.changing
             && let Some(child) = self.memory.get_mut(index)
         {
             child.sealed = true;
@@ -729,8 +955,8 @@ impl<'a> Slots<'a> {
     }
 
     /// Unwraps `record` with the stored key for wrapping that `parent` refers to and the `context`
-    /// it was wrapped for, into a free slot. The set comes out with the purpose, keys, stages and
-    /// primary the record holds.
+    /// it was wrapped for, into a free slot. The set, of external data or a key for transfers,
+    /// comes out with the purpose, keys, stages and primary the record holds.
     ///
     /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
@@ -746,7 +972,8 @@ impl<'a> Slots<'a> {
     /// [`Error::DerivationFailed`] if a value cannot be derived from a key,
     /// [`Error::RecordRejected`] if the record does not open with the key of the parent, this
     /// context and the key of this epoch, names a key other than the one that opens it or another
-    /// epoch, or holds a set for wrapping or a plaintext this version of the library cannot read,
+    /// epoch, or holds a set for wrapping, a key for transfers other than one key that has never
+    /// changed, or a plaintext this version of the library cannot read,
     /// and [`Error::DuplicateKey`] if these slots hold a key of the set already or the set holds
     /// one key twice. No slot changes then.
     pub fn unwrap(
@@ -772,8 +999,152 @@ impl<'a> Slots<'a> {
         mut open: impl Open<PLAINTEXT_LEN>,
     ) -> Result<Handle<'a>, Error> {
         let associated = AssociatedData::new(context).map_err(|_| Error::InvalidContext)?;
-        let index = self.parent(parent, false)?;
-        self.take(index, associated.bytes(), record, false, &mut open)
+        let index = self.parent(parent, Kind::Record)?;
+        self.take(index, associated.bytes(), record, Kind::Record, &mut open)
+    }
+
+    /// Receives `record`, the next record of an export under the key for transfers that `transfer`
+    /// refers to, for the `context` it was exported for, into a free slot: it opens only after the
+    /// records received under that key before it, in the order they were exported. The set comes
+    /// out with the keys, stages and primary the record holds, and is neither revealed, wrapped,
+    /// exported nor changed until [`Slots::end_receive`] receives the end of the export; it may be
+    /// released. The key carries this one export until then: it exports none, a receipt goes on
+    /// from the record it stopped at, and releasing the key abandons the export, whose sets are
+    /// then to be released before it is received again from its first record.
+    ///
+    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
+    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
+    /// code it calls has to set that flag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
+    /// [`Error::StaleHandle`] if `transfer` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Transfer`],
+    /// [`Error::NoFreeSlot`] if no slot is free, [`Error::Unfinished`] if the key writes an export,
+    /// [`Error::DerivationFailed`] if a value cannot be derived from a key,
+    /// [`Error::RecordRejected`] if the record does not open with that key, this context and the
+    /// records received before it, names a key other than the one that opens it or an epoch, or
+    /// holds a set not for external data or a plaintext this version of the library cannot read,
+    /// and [`Error::DuplicateKey`] if these slots hold a key of the set already or the set holds
+    /// one key twice. No slot changes then, and the export goes on as before the call.
+    pub fn receive(
+        &mut self,
+        transfer: Handle<'a>,
+        context: &[u8],
+        record: &[u8; RECORD_LEN],
+    ) -> Result<Handle<'a>, Error> {
+        let received =
+            lethewis_dit::with(|| self.receive_on_stack(transfer, context, record, seal::open));
+        wipe_cipher_stack();
+        received
+    }
+
+    /// The receipt itself, in a frame of its own: the wipe that follows starts where this frame
+    /// starts.
+    #[inline(never)]
+    fn receive_on_stack(
+        &mut self,
+        transfer: Handle<'a>,
+        context: &[u8],
+        record: &[u8; RECORD_LEN],
+        mut open: impl Open<PLAINTEXT_LEN>,
+    ) -> Result<Handle<'a>, Error> {
+        let associated = AssociatedData::new(context).map_err(|_| Error::InvalidContext)?;
+        let index = self.parent(transfer, Kind::Export)?;
+        let slot = self.memory.get(index).ok_or(Error::StaleHandle)?;
+        slot.may_go(Direction::In)?;
+        let (associated, generation) = (
+            associated.chained(EXPORT_LABEL, &slot.chain),
+            slot.generation,
+        );
+        let handle = self.take(index, associated.bytes(), record, Kind::Export, &mut open)?;
+        if let Some(received) = self.memory.get_mut(handle.index) {
+            received.pending = Some((index, generation));
+        }
+        if let (Some(slot), Some(tag)) = (self.memory.get_mut(index), record.last_chunk()) {
+            slot.chain = *tag;
+            slot.direction = Direction::In;
+        }
+        Ok(handle)
+    }
+
+    /// Receives `end`, the end of the export under the key for transfers that `transfer` refers to,
+    /// for the `context` it was exported for: it opens only after every record of the export, in
+    /// order. The sets received under that key are then revealed, wrapped, exported and changed as
+    /// any other, and the next record received under it begins a new export.
+    ///
+    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
+    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
+    /// code it calls has to set that flag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
+    /// [`Error::StaleHandle`] if `transfer` does not refer to a set held here now,
+    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Transfer`],
+    /// [`Error::NoTransfer`] if the key carries no export: it has written or received no record
+    /// since its load or its last end, [`Error::Unfinished`] if it writes one,
+    /// [`Error::DerivationFailed`] if the key that encrypts the end cannot be derived, and
+    /// [`Error::RecordRejected`] if the end does not open with that key, this context and the
+    /// records received: a record is missing or another end was given. No slot changes then, and
+    /// the export goes on as before the call.
+    pub fn end_receive(
+        &mut self,
+        transfer: Handle<'a>,
+        context: &[u8],
+        end: &[u8; END_RECORD_LEN],
+    ) -> Result<(), Error> {
+        let ended =
+            lethewis_dit::with(|| self.end_receive_on_stack(transfer, context, end, seal::open));
+        wipe_cipher_stack();
+        ended
+    }
+
+    /// The receipt of the end itself, in a frame of its own: the wipe that follows starts where
+    /// this frame starts.
+    #[inline(never)]
+    fn end_receive_on_stack(
+        &mut self,
+        transfer: Handle<'a>,
+        context: &[u8],
+        end: &[u8; END_RECORD_LEN],
+        mut open: impl Open<0>,
+    ) -> Result<(), Error> {
+        let associated = AssociatedData::new(context).map_err(|_| Error::InvalidContext)?;
+        let index = self.serving(transfer, Purpose::Transfer)?;
+        let slot = self.memory.get(index).ok_or(Error::StaleHandle)?;
+        slot.may_end(Direction::In)?;
+        let (associated, generation) =
+            (associated.chained(END_LABEL, &slot.chain), slot.generation);
+        let mut cipher_key = [0; CIPHER_KEY_LEN];
+        if derive_export_key(slot.wrapping_key().0, &mut cipher_key).is_err() {
+            wipe(&mut cipher_key);
+            return Err(Error::DerivationFailed);
+        }
+        let (mut nonce, mut tag) = ([0; NONCE_LEN], [0; TAG_LEN]);
+        if let Some((given_nonce, given_tag)) = end.split_first_chunk::<NONCE_LEN>()
+            && let Ok(given_tag) = <[u8; TAG_LEN]>::try_from(given_tag)
+        {
+            (nonce, tag) = (*given_nonce, given_tag);
+        }
+        let opened = open(&cipher_key, &nonce, associated.bytes(), &mut [], &tag).is_ok();
+        wipe(&mut cipher_key);
+        if !opened {
+            return Err(Error::RecordRejected);
+        }
+        for slot in self.memory.iter_mut() {
+            if slot.pending == Some((index, generation)) {
+                slot.pending = None;
+            }
+        }
+        if let Some(slot) = self.memory.get_mut(index) {
+            slot.chain = [0; TAG_LEN];
+            slot.direction = Direction::Idle;
+        }
+        Ok(())
     }
 
     /// Unlocks the lock record `record` with the key from a secret that `parent` refers to and the
@@ -822,7 +1193,7 @@ impl<'a> Slots<'a> {
         mut open: impl Open<PLAINTEXT_LEN>,
     ) -> Result<Handle<'a>, Error> {
         let associated = AssociatedData::new(context).map_err(|_| Error::InvalidContext)?;
-        let index = self.parent(parent, true)?;
+        let index = self.parent(parent, Kind::Lock)?;
         let mut inner = [0; RECORD_LEN];
         let unlocked = open_layer(
             (&self.epoch.key, self.epoch.number),
@@ -831,20 +1202,27 @@ impl<'a> Slots<'a> {
             &mut inner,
             &mut open_layer_with,
         )
-        .and_then(|()| self.take(index, associated.bytes(), &inner, true, &mut open));
+        .and_then(|()| self.take(index, associated.bytes(), &inner, Kind::Lock, &mut open));
         wipe(&mut inner);
         unlocked
     }
 
-    /// The slot of the set `parent` refers to, if it serves [`Purpose::Wrap`], is a key from a
-    /// secret exactly when `secret` says so, and a slot is free.
-    fn parent(&self, parent: Handle<'a>, secret: bool) -> Result<usize, Error> {
-        let index = self.loaded(parent)?;
+    /// The slot of the set `handle` refers to, if it serves `purpose`.
+    fn serving(&self, handle: Handle<'a>, purpose: Purpose) -> Result<usize, Error> {
+        let index = self.loaded(handle)?;
         let set = self.memory.get(index).ok_or(Error::StaleHandle)?;
-        if set.purpose != Purpose::Wrap {
+        if set.purpose != purpose {
             return Err(Error::WrongPurpose);
         }
-        if set.unlocks != secret {
+        Ok(index)
+    }
+
+    /// The slot of the set `parent` refers to, if it is the key records of `kind` are wrapped
+    /// under, of the level they take, and a slot is free.
+    fn parent(&self, parent: Handle<'a>, kind: Kind) -> Result<usize, Error> {
+        let index = self.serving(parent, kind.parent_purpose())?;
+        let set = self.memory.get(index).ok_or(Error::StaleHandle)?;
+        if set.unlocks != (kind == Kind::Lock) {
             return Err(Error::WrongLevel);
         }
         if !self.has_free() {
@@ -853,27 +1231,26 @@ impl<'a> Slots<'a> {
         Ok(index)
     }
 
-    /// Opens `record` under the key of the set in slot `parent`, a key from a secret when `lock`
-    /// says so, and loads the set it holds.
+    /// Opens `record`, of `kind`, under the key of the set in slot `parent`, and loads the set it
+    /// holds.
     fn take(
         &mut self,
         parent: usize,
         aad: &[u8],
         record: &[u8; RECORD_LEN],
-        lock: bool,
+        kind: Kind,
         open: &mut impl Open<PLAINTEXT_LEN>,
     ) -> Result<Handle<'a>, Error> {
         let mut plaintext = [0; PLAINTEXT_LEN];
         let admitted = self
-            .open_under(parent, aad, record, &mut plaintext, open, lock)
-            .and_then(|()| self.admit(&plaintext, lock));
+            .open_under(parent, aad, record, &mut plaintext, open, kind)
+            .and_then(|()| self.admit(&plaintext, kind));
         wipe(&mut plaintext);
         admitted
     }
 
-    /// Opens `record` under the key of the set in slot `parent`, a key from a secret when `lock`
-    /// says so, and keeps the plaintext in `found` if it names that key's identifier as the
-    /// parent's.
+    /// Opens `record`, of `kind`, under the key of the set in slot `parent`, and keeps the
+    /// plaintext in `found` if it names that key's identifier as the parent's.
     fn open_under(
         &self,
         parent: usize,
@@ -881,7 +1258,7 @@ impl<'a> Slots<'a> {
         record: &[u8; RECORD_LEN],
         found: &mut [u8; PLAINTEXT_LEN],
         open: &mut impl Open<PLAINTEXT_LEN>,
-        lock: bool,
+        kind: Kind,
     ) -> Result<(), Error> {
         let (key, id) = self
             .memory
@@ -889,10 +1266,10 @@ impl<'a> Slots<'a> {
             .ok_or(Error::StaleHandle)?
             .wrapping_key();
         let mut cipher_key = [0; CIPHER_KEY_LEN];
-        let derived = if lock {
-            derive_lock_key(key, &mut cipher_key)
-        } else {
-            derive_wrap_key(key, &self.epoch.key, &mut cipher_key)
+        let derived = match kind {
+            Kind::Record => derive_wrap_key(key, &self.epoch.key, &mut cipher_key),
+            Kind::Lock => derive_lock_key(key, &mut cipher_key),
+            Kind::Export => derive_export_key(key, &mut cipher_key),
         };
         if derived.is_err() {
             wipe(&mut cipher_key);
@@ -914,17 +1291,27 @@ impl<'a> Slots<'a> {
     }
 
     /// Loads the key set a record's plaintext holds into a free slot, if one is and the plaintext
-    /// parses: a set of external data from a record of this epoch, or, from a lock record, a set
-    /// of one stored key for wrapping.
-    fn admit(&mut self, plaintext: &[u8; PLAINTEXT_LEN], lock: bool) -> Result<Handle<'a>, Error> {
+    /// parses: from a record of this epoch, a set of external data or a key for transfers; from a
+    /// lock record, a stored key for wrapping; from a record of an export, a set of external data.
+    /// A set of a key for transfers or for wrapping is a set of one that has never changed.
+    fn admit(&mut self, plaintext: &[u8; PLAINTEXT_LEN], kind: Kind) -> Result<Handle<'a>, Error> {
         if !self.has_free() {
             return Err(Error::NoFreeSlot);
         }
         let (header, stages, keys) = keyset::parse(plaintext).map_err(|_| Error::RecordRejected)?;
-        let epoch = if lock { 0 } else { self.epoch.number };
+        let epoch = if kind == Kind::Record {
+            self.epoch.number
+        } else {
+            0
+        };
+        let held = match kind {
+            Kind::Record => header.purpose != Purpose::Wrap,
+            Kind::Lock => header.purpose == Purpose::Wrap,
+            Kind::Export => header.purpose == Purpose::ExternalData,
+        };
         if header.epoch != epoch
-            || (header.purpose == Purpose::Wrap) != lock
-            || (header.purpose == Purpose::Wrap && !stages.is_one())
+            || !held
+            || (header.purpose != Purpose::ExternalData && !stages.is_one())
         {
             return Err(Error::RecordRejected);
         }
@@ -1169,12 +1556,13 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
-    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
-    /// the set has changed in this epoch, [`Error::SetFull`] if every position holds a key,
-    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds,
-    /// [`Error::DerivationFailed`] if the identifier of the key cannot be derived, and
-    /// [`Error::DuplicateKey`] if these slots hold the key already. `source` is then left as it
+    /// [`Error::WrongPurpose`] if the set does not serve [`Purpose::ExternalData`]: no other set
+    /// changes, [`Error::EpochChanging`] if a change to the next epoch is under way,
+    /// [`Error::Unfinished`] if the set came in a transfer whose end has not been received,
+    /// [`Error::Unsaved`] if the set has changed in this epoch, [`Error::SetFull`] if every
+    /// position holds a key, [`Error::SetExhausted`] if the set has changed as many times as its
+    /// counter holds, [`Error::DerivationFailed`] if the identifier of the key cannot be derived,
+    /// and [`Error::DuplicateKey`] if these slots hold the key already. `source` is then left as it
     /// was, and nothing changes.
     pub fn add32(&mut self, set: Handle<'a>, source: &mut [u8; 32]) -> Result<Position, Error> {
         let at = self.add(set, KeyLength::Bytes32, |key, _| {
@@ -1199,10 +1587,11 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
-    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
-    /// the set has changed in this epoch, [`Error::WrongLength`] if its purpose takes no key of
-    /// `length`, [`Error::SetFull`] if every position holds a key,
+    /// [`Error::WrongPurpose`] if the set does not serve [`Purpose::ExternalData`]: no other set
+    /// changes, [`Error::EpochChanging`] if a change to the next epoch is under way,
+    /// [`Error::Unfinished`] if the set came in a transfer whose end has not been received,
+    /// [`Error::Unsaved`] if the set has changed in this epoch, [`Error::WrongLength`] if its
+    /// purpose takes no key of `length`, [`Error::SetFull`] if every position holds a key,
     /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds,
     /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if the key or its
     /// identifier cannot be derived, and [`Error::DuplicateKey`] if these slots hold the key
@@ -1228,10 +1617,11 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
-    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
-    /// the set has changed in this epoch, [`Error::PrimaryKey`] if the key at `at` is the primary
-    /// already, [`Error::WrongStage`] if `at` does not hold an enabled key, and
+    /// [`Error::WrongPurpose`] if the set does not serve [`Purpose::ExternalData`]: no other set
+    /// changes, [`Error::EpochChanging`] if a change to the next epoch is under way,
+    /// [`Error::Unfinished`] if the set came in a transfer whose end has not been received,
+    /// [`Error::Unsaved`] if the set has changed in this epoch, [`Error::PrimaryKey`] if the key at
+    /// `at` is the primary already, [`Error::WrongStage`] if `at` does not hold an enabled key, and
     /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds. Nothing
     /// changes then.
     pub fn promote(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
@@ -1244,11 +1634,13 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
-    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
-    /// the set has changed in this epoch, [`Error::PrimaryKey`] if the key at `at` is the primary,
-    /// [`Error::WrongStage`] if `at` does not hold an enabled key, and [`Error::SetExhausted`] if
-    /// the set has changed as many times as its counter holds. Nothing changes then.
+    /// [`Error::WrongPurpose`] if the set does not serve [`Purpose::ExternalData`]: no other set
+    /// changes, [`Error::EpochChanging`] if a change to the next epoch is under way,
+    /// [`Error::Unfinished`] if the set came in a transfer whose end has not been received,
+    /// [`Error::Unsaved`] if the set has changed in this epoch, [`Error::PrimaryKey`] if the key at
+    /// `at` is the primary, [`Error::WrongStage`] if `at` does not hold an enabled key, and
+    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds. Nothing
+    /// changes then.
     pub fn disable(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
         self.change(set, at, Stages::disable).map(|_| ())
     }
@@ -1258,11 +1650,13 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
-    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
-    /// the set has changed in this epoch, [`Error::PrimaryKey`] if `at` is the primary position,
-    /// [`Error::WrongStage`] if `at` does not hold a disabled key, and [`Error::SetExhausted`] if
-    /// the set has changed as many times as its counter holds. Nothing changes then.
+    /// [`Error::WrongPurpose`] if the set does not serve [`Purpose::ExternalData`]: no other set
+    /// changes, [`Error::EpochChanging`] if a change to the next epoch is under way,
+    /// [`Error::Unfinished`] if the set came in a transfer whose end has not been received,
+    /// [`Error::Unsaved`] if the set has changed in this epoch, [`Error::PrimaryKey`] if `at` is
+    /// the primary position, [`Error::WrongStage`] if `at` does not hold a disabled key, and
+    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds. Nothing
+    /// changes then.
     pub fn enable(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
         self.change(set, at, Stages::enable).map(|_| ())
     }
@@ -1275,11 +1669,13 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set serves [`Purpose::Wrap`], which takes no changes,
-    /// [`Error::EpochChanging`] if a change to the next epoch is under way, [`Error::Unsaved`] if
-    /// the set has changed in this epoch, [`Error::PrimaryKey`] if `at` is the primary position,
-    /// [`Error::WrongStage`] if `at` does not hold a disabled key, and [`Error::SetExhausted`] if
-    /// the set has changed as many times as its counter holds. Nothing changes then.
+    /// [`Error::WrongPurpose`] if the set does not serve [`Purpose::ExternalData`]: no other set
+    /// changes, [`Error::EpochChanging`] if a change to the next epoch is under way,
+    /// [`Error::Unfinished`] if the set came in a transfer whose end has not been received,
+    /// [`Error::Unsaved`] if the set has changed in this epoch, [`Error::PrimaryKey`] if `at` is
+    /// the primary position, [`Error::WrongStage`] if `at` does not hold a disabled key, and
+    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds. Nothing
+    /// changes then.
     pub fn destroy(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
         let (key, id) = self.change(set, at, Stages::destroy)?.member(at);
         key.wipe();
@@ -1296,13 +1692,16 @@ impl<'a> Slots<'a> {
         transition: impl FnOnce(&mut Stages, usize) -> Result<(), Refused>,
     ) -> Result<&mut Slot, Error> {
         let index = self.loaded(set)?;
-        if self.memory.get(index).map(|slot| slot.purpose) == Some(Purpose::Wrap) {
+        if self.memory.get(index).map(|slot| slot.purpose) != Some(Purpose::ExternalData) {
             return Err(Error::WrongPurpose);
         }
         if self.epoch.changing {
             return Err(Error::EpochChanging);
         }
         let slot = self.memory.get_mut(index).ok_or(Error::StaleHandle)?;
+        if slot.pending.is_some() {
+            return Err(Error::Unfinished);
+        }
         if slot.changed {
             return Err(Error::Unsaved);
         }
@@ -1336,13 +1735,16 @@ impl<'a> Slots<'a> {
         fill: impl FnOnce(&mut Key, &mut Epoch) -> Result<(), Error>,
     ) -> Result<Position, Error> {
         let index = self.loaded(set)?;
-        if self.memory.get(index).map(|slot| slot.purpose) == Some(Purpose::Wrap) {
+        if self.memory.get(index).map(|slot| slot.purpose) != Some(Purpose::ExternalData) {
             return Err(Error::WrongPurpose);
         }
         if self.epoch.changing {
             return Err(Error::EpochChanging);
         }
         let slot = self.memory.get_mut(index).ok_or(Error::StaleHandle)?;
+        if slot.pending.is_some() {
+            return Err(Error::Unfinished);
+        }
         if slot.changed {
             return Err(Error::Unsaved);
         }
@@ -1712,10 +2114,10 @@ mod tests {
     use std::vec::Vec;
 
     use super::{
-        AssociatedData, CIPHER_KEY_LEN, Entropy, EntropyError, Epoch, Erasure, Error, Handle,
-        Header, KeyLength, LAYER_LEN, LOCK_RECORD_LEN, MEMBERS, Occupancy, PLAINTEXT_LEN, Position,
-        Purpose, RECORD_LEN, Root, RootFailed, Slot, Slots, Stages, Status, derive_layer_key,
-        derive_lock_key, derive_wrap_key, keyset, seal, write_record,
+        AssociatedData, CIPHER_KEY_LEN, END_RECORD_LEN, Entropy, EntropyError, Epoch, Erasure,
+        Error, Handle, Header, KeyLength, LAYER_LEN, LOCK_RECORD_LEN, MEMBERS, Occupancy,
+        PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Root, RootFailed, Slot, Slots, Stages,
+        Status, derive_layer_key, derive_lock_key, derive_wrap_key, keyset, seal, write_record,
     };
     use crate::derive::{CIPHER_STACK_WIPE, KeyId, STACK_WIPE, derive_key_id};
     use crate::key::{
@@ -1757,8 +2159,9 @@ mod tests {
     assert_not_impl!(Slot: Clone, PartialEq, Default);
     assert_not_impl!(Epoch: Clone, PartialEq, Default);
 
-    /// Every import, generation, wrap, unwrap, lock, unlock, challenge, combination and carry
-    /// derives, and every call on words reads and writes them, with data-independent timing on,
+    /// Every import, generation, wrap, unwrap, lock, unlock, challenge, combination, carry, export
+    /// and receipt derives, and every call on words reads and writes them, with data-independent
+    /// timing on,
     /// where the processor and the operating system offer it.
     #[test]
     fn every_call_that_derives_holds_data_independent_timing() {
@@ -1800,6 +2203,7 @@ mod tests {
         let mut words = [[0; 8]; 12];
         let set = slots.generate_words(&mut Counting, &mut words).unwrap();
         assert_eq!(seen(), Some(true));
+        let mut kept = words;
         slots.release(set).unwrap();
         slots.derive_from_words(&mut words).unwrap();
         assert_eq!(seen(), Some(true));
@@ -1829,6 +2233,27 @@ mod tests {
             .carry(b"context", &mut Counting, &locked, &mut carried)
             .unwrap();
         assert_eq!(seen(), Some(true));
+        let transfer = slots.import32(Purpose::Transfer, &mut [4; 32]).unwrap();
+        let data = slots.import32(Purpose::ExternalData, &mut [2; 32]).unwrap();
+        let _ = seen();
+        let mut exported = [0; RECORD_LEN];
+        slots
+            .export(data, transfer, b"context", &mut Counting, &mut exported)
+            .unwrap();
+        assert_eq!(seen(), Some(true));
+        let mut end = [0; END_RECORD_LEN];
+        slots
+            .end_export(transfer, b"context", &mut Counting, &mut end)
+            .unwrap();
+        assert_eq!(seen(), Some(true));
+        slots.release(data).unwrap();
+        slots.receive(transfer, b"context", &exported).unwrap();
+        assert_eq!(seen(), Some(true));
+        slots.end_receive(transfer, b"context", &end).unwrap();
+        assert_eq!(seen(), Some(true));
+        slots.release(transfer).unwrap();
+        slots.transfer_from_words(&mut kept).unwrap();
+        assert_eq!(seen(), Some(true));
     }
 
     /// The stack, in KiB, that a load and that a wrap or an unwrap need, and the depth of the wipes
@@ -1853,8 +2278,8 @@ mod tests {
     }
 
     /// The documentation of each import, generation, addition, reveal, wrap, unwrap, lock, unlock,
-    /// carry, combination and challenge states the stack it needs and the depth of the wipe after
-    /// it, and those depths are the library's.
+    /// carry, combination, challenge, export and receipt states the stack it needs and the depth of
+    /// the wipe after it, and those depths are the library's.
     #[test]
     fn the_documentation_states_the_stack_calls_need() {
         let build = usize::from(cfg!(lethewis_unoptimised));
@@ -1876,6 +2301,10 @@ mod tests {
             ("lock", wraps),
             ("unlock", wraps),
             ("carry", wraps),
+            ("export", wraps),
+            ("end_export", wraps),
+            ("receive", wraps),
+            ("end_receive", wraps),
         ] {
             let text = documentation(call);
             for stated in [
@@ -3705,6 +4134,570 @@ mod tests {
         assert_eq!(carried, lock_hex(KNOWN_CARRIED));
     }
 
+    /// An export computed by an implementation independent of this library, under the key for
+    /// transfers `pattern(41, 3)` in "move", in epoch `EPOCH` with the key `epoch_key()`: the set
+    /// of the first of `KNOWN_RECORDS`, the full set of the third, and the end, each nonce `NONCE`
+    /// hedged as the next draw.
+    const KNOWN_EXPORT: [&str; 2] = [
+        concat!(
+            "c7a1550603080bf1aa1c5192e380992e16666f44fc3fa7685aa5c7fb96716cdf",
+            "daa6b90f28f5b29dce32de34dbdd3fd4cd5b51cf98e35276030b07af5b66a84f",
+            "7fe896d0f964df415213e0995547491c378ee37601cbddcbd0c4bed5771eb5f5",
+            "3f2edc8a5a0e996c12b067c098725d2c7ac3fabb740f843b1e011d910cbc56b5",
+            "a91da5430d0f7e106554eb79d17848f52fa0ae94e8c5b092a8bdf77c981e514c",
+            "8d1f579a0ed7e7659673b7f6dbdd1ed344df52db3fecd8807df054c1971233a7",
+            "ffaf8f5ffdbc92558bda9c89b9c479b6ff4306836da1cb3f3caec998159ee96e",
+            "f2fd9e740104de9660d96da5698afdb88e1267afbcb9fbf533db7147657818f5",
+            "0ee89e2912",
+        ),
+        concat!(
+            "2d7fafac78ba33a2056ef2ae28d1188b6aad91f3339e40faae10de2b51e166e6",
+            "489c484db809f19bb4f363a2e4c45625de97d0dff3ed2bdca912aed482f2360d",
+            "7a6ab58c8f49a926990bc990032b65c115bca46c3d85642beb30abf7412ffaf9",
+            "0a50a38479abd381df6b4f0deac40199866f2b38a6b7434399eca70d3d0138ed",
+            "6321eb55414fb0f0fec3343016067184f0edf50b3020c21ed61b67e9d0f6ce01",
+            "a43c6b53ea025aa4a810551ade85a49fba7208ec9fa6e11ee03392ae4623a88f",
+            "88b982cc27468a3d73f96b81567846a1d6431d5320874257cc338103a9894d81",
+            "d388aba8141e4e597ab13038177893546ac129bbefce1b713797d275dc306a0c",
+            "d15945a5a0",
+        ),
+    ];
+    const KNOWN_END: &str = "27bae2fc323c379d396cc79b29c2a553399d4673ce2433fd8134dd4b";
+
+    fn end_hex(text: &str) -> [u8; END_RECORD_LEN] {
+        core::array::from_fn(|at| u8::from_str_radix(&text[2 * at..2 * at + 2], 16).unwrap())
+    }
+
+    #[test]
+    fn exports_match_ones_computed_independently() {
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
+        let parent = slots.store(parent);
+        let transfer = slots
+            .import32(Purpose::Transfer, &mut pattern(41, 3))
+            .unwrap();
+        let first = slots
+            .import32(Purpose::ExternalData, &mut pattern(59, 201))
+            .unwrap();
+        let mut record = [0; RECORD_LEN];
+        slots
+            .export(first, transfer, b"move", &mut Fixed(&NONCE), &mut record)
+            .unwrap();
+        assert_eq!(record, hex(KNOWN_EXPORT[0]));
+        slots.release(first).unwrap();
+        let full = slots
+            .unwrap(parent, b"archive", &hex(KNOWN_RECORDS[2]))
+            .unwrap();
+        slots
+            .export(full, transfer, b"move", &mut Fixed(&NONCE), &mut record)
+            .unwrap();
+        assert_eq!(record, hex(KNOWN_EXPORT[1]));
+        let mut end = [0; END_RECORD_LEN];
+        slots
+            .end_export(transfer, b"move", &mut Fixed(&NONCE), &mut end)
+            .unwrap();
+        assert_eq!(end, end_hex(KNOWN_END));
+    }
+
+    /// The export computed independently comes in whole on other slots, in another epoch: each set
+    /// as it went out, and none wrapped until the end.
+    #[test]
+    fn an_export_is_received_in_another_epoch() {
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, 9, &mut [0x3c; 32]);
+        let stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let transfer = slots
+            .import32(Purpose::Transfer, &mut pattern(41, 3))
+            .unwrap();
+        let one = slots
+            .receive(transfer, b"move", &hex(KNOWN_EXPORT[0]))
+            .unwrap();
+        let first = pattern::<32>(59, 201);
+        let middle = pattern::<32>(31, 7);
+        let last = pattern::<32>(83, 111);
+        assert_holds(
+            &slots,
+            one,
+            [Some((Status::Enabled, &first)), None, None],
+            0,
+        );
+        let mut record = [0; RECORD_LEN];
+        assert_eq!(
+            slots.wrap(one, stored, b"chat", &mut Counting, &mut record),
+            Err(Error::Unfinished)
+        );
+        // The full set holds the first key too, and a key is held in one place only.
+        slots.release(one).unwrap();
+        let full = slots
+            .receive(transfer, b"move", &hex(KNOWN_EXPORT[1]))
+            .unwrap();
+        assert_holds(
+            &slots,
+            full,
+            [
+                Some((Status::Disabled, &first)),
+                Some((Status::Enabled, &middle)),
+                Some((Status::Enabled, &last)),
+            ],
+            2,
+        );
+        assert_eq!(
+            slots.wrap(full, stored, b"chat", &mut Counting, &mut record),
+            Err(Error::Unfinished)
+        );
+        slots
+            .end_receive(transfer, b"move", &end_hex(KNOWN_END))
+            .unwrap();
+        slots
+            .wrap(full, stored, b"chat", &mut Counting, &mut record)
+            .unwrap();
+    }
+
+    /// Slots of one device and of another, each with a stored key and the same key for transfers,
+    /// and three sets for external data on the first.
+    struct Pair<'a> {
+        from: Slots<'a>,
+        to: Slots<'a>,
+        sets: [Handle<'a>; 3],
+        out: Handle<'a>,
+        into: Handle<'a>,
+        stored: Handle<'a>,
+    }
+
+    fn pair<'a>(
+        (memory, epoch): (&'a mut [Slot], &'a mut Epoch),
+        (other_memory, other_epoch): (&'a mut [Slot], &'a mut Epoch),
+    ) -> Pair<'a> {
+        let mut from = Slots::new(memory, epoch, EPOCH, &mut epoch_key());
+        let mut to = Slots::new(other_memory, other_epoch, 4, &mut [0x5a; 32]);
+        let sets = [1, 2, 3].map(|plus| {
+            from.import32(Purpose::ExternalData, &mut pattern(19, plus))
+                .unwrap()
+        });
+        let out = from
+            .import32(Purpose::Transfer, &mut pattern(41, 3))
+            .unwrap();
+        let into = to.import32(Purpose::Transfer, &mut pattern(41, 3)).unwrap();
+        let stored = to
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        Pair {
+            from,
+            to,
+            sets,
+            out,
+            into,
+            stored,
+        }
+    }
+
+    /// The records of the three sets and the end, exported in order.
+    fn exported(pair: &mut Pair<'_>) -> ([[u8; RECORD_LEN]; 3], [u8; END_RECORD_LEN]) {
+        let mut records = [[0; RECORD_LEN]; 3];
+        for (set, record) in pair.sets.into_iter().zip(&mut records) {
+            pair.from
+                .export(set, pair.out, b"move", &mut Counting, record)
+                .unwrap();
+        }
+        let mut end = [0; END_RECORD_LEN];
+        pair.from
+            .end_export(pair.out, b"move", &mut Counting, &mut end)
+            .unwrap();
+        (records, end)
+    }
+
+    /// A record opens only in its place in the export: a record out of order, one given twice, one
+    /// of another context and one under another key are refused and load nothing, and the export
+    /// goes on from where it was.
+    #[test]
+    fn records_of_an_export_open_only_in_order() {
+        let (mut memory, mut epoch) = ([const { Slot::empty() }; 5], Epoch::empty());
+        let (mut other_memory, mut other_epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
+        let mut pair = pair(
+            (&mut memory, &mut epoch),
+            (&mut other_memory, &mut other_epoch),
+        );
+        let (records, end) = exported(&mut pair);
+        let into = pair.into;
+        let to = &mut pair.to;
+        let other = to.import32(Purpose::Transfer, &mut pattern(41, 4)).unwrap();
+        let before = holdings(to);
+        assert_eq!(
+            to.receive(into, b"move", &records[1]),
+            Err(Error::RecordRejected)
+        );
+        assert_eq!(
+            to.receive(into, b"other", &records[0]),
+            Err(Error::RecordRejected)
+        );
+        assert_eq!(
+            to.receive(other, b"move", &records[0]),
+            Err(Error::RecordRejected)
+        );
+        assert_eq!(holdings(to), before);
+        to.receive(into, b"move", &records[0]).unwrap();
+        assert_eq!(
+            to.receive(into, b"move", &records[0]),
+            Err(Error::RecordRejected)
+        );
+        assert_eq!(
+            to.receive(into, b"move", &records[2]),
+            Err(Error::RecordRejected)
+        );
+        to.receive(into, b"move", &records[1]).unwrap();
+        assert_eq!(
+            to.end_receive(into, b"move", &end),
+            Err(Error::RecordRejected)
+        );
+        to.receive(into, b"move", &records[2]).unwrap();
+        assert_eq!(
+            to.end_receive(into, b"other", &end),
+            Err(Error::RecordRejected)
+        );
+        assert_eq!(to.end_receive(other, b"move", &end), Err(Error::NoTransfer));
+        to.end_receive(into, b"move", &end).unwrap();
+    }
+
+    /// Until the end of its export is received, a set that came in it is neither revealed, wrapped,
+    /// exported nor changed, and is released; an end that does not open lets nothing go, and the
+    /// end of one export lets go only the sets that came in it.
+    #[test]
+    fn sets_wait_for_the_end_of_their_own_export() {
+        let (mut memory, mut epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
+        let (mut other_memory, mut other_epoch) = ([const { Slot::empty() }; 8], Epoch::empty());
+        let mut pair = pair(
+            (&mut memory, &mut epoch),
+            (&mut other_memory, &mut other_epoch),
+        );
+        let [first, second, third] = pair.sets;
+        let (out, into, stored) = (pair.out, pair.into, pair.stored);
+        let from = &mut pair.from;
+        let out_too = from
+            .import32(Purpose::Transfer, &mut pattern(41, 4))
+            .unwrap();
+        let mut records = [[0; RECORD_LEN]; 3];
+        let (mut end, mut end_too) = ([0; END_RECORD_LEN], [0; END_RECORD_LEN]);
+        from.export(first, out, b"move", &mut Counting, &mut records[0])
+            .unwrap();
+        from.export(third, out_too, b"move", &mut Counting, &mut records[2])
+            .unwrap();
+        from.export(second, out, b"move", &mut Counting, &mut records[1])
+            .unwrap();
+        from.end_export(out, b"move", &mut Counting, &mut end)
+            .unwrap();
+        from.end_export(out_too, b"move", &mut Counting, &mut end_too)
+            .unwrap();
+
+        let to = &mut pair.to;
+        let into_too = to.import32(Purpose::Transfer, &mut pattern(41, 4)).unwrap();
+        let first = to.receive(into, b"move", &records[0]).unwrap();
+        let third = to.receive(into_too, b"move", &records[2]).unwrap();
+        let mut record = [0x55; RECORD_LEN];
+        assert_eq!(
+            to.wrap(first, stored, b"chat", &mut Untouched, &mut record),
+            Err(Error::Unfinished)
+        );
+        assert_eq!(
+            to.export(first, into, b"move", &mut Untouched, &mut record),
+            Err(Error::Unfinished)
+        );
+        assert_eq!(to.add32(first, &mut [8; 32]), Err(Error::Unfinished));
+        assert_eq!(to.disable(first, Position::First), Err(Error::Unfinished));
+        let mut revealed = [0x55; 32];
+        assert_eq!(
+            to.reveal32(first, Position::First, Purpose::ExternalData, &mut revealed),
+            Err(Error::Unfinished)
+        );
+        assert_eq!((record, revealed), ([0x55; RECORD_LEN], [0x55; 32]));
+        let second = to.receive(into, b"move", &records[1]).unwrap();
+        let mut changed = end;
+        changed[20] ^= 1;
+        assert_eq!(
+            to.end_receive(into, b"move", &changed),
+            Err(Error::RecordRejected)
+        );
+        assert_eq!(
+            to.wrap(second, stored, b"chat", &mut Untouched, &mut record),
+            Err(Error::Unfinished)
+        );
+        to.end_receive(into, b"move", &end).unwrap();
+        for set in [first, second] {
+            to.wrap(set, stored, b"chat", &mut Counting, &mut record)
+                .unwrap();
+        }
+        assert_eq!(
+            to.wrap(third, stored, b"chat", &mut Untouched, &mut record),
+            Err(Error::Unfinished)
+        );
+        to.release(third).unwrap();
+    }
+
+    /// A key for transfers is imported or derived from words, never generated; it is neither
+    /// revealed, locked, changed nor combined, and refuses every call a stored key takes.
+    #[test]
+    fn a_key_for_transfers_serves_transfers_alone() {
+        let mut memory = [const { Slot::empty() }; 5];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        assert_eq!(
+            slots.generate(Purpose::Transfer, KeyLength::Bytes32, &mut Untouched),
+            Err(Error::WrongPurpose)
+        );
+        assert_eq!(
+            slots.import64(Purpose::Transfer, &mut [4; 64]),
+            Err(Error::WrongLength)
+        );
+        let transfer = slots.import32(Purpose::Transfer, &mut [4; 32]).unwrap();
+        let secret = slots.import32(Purpose::Wrap, &mut [5; 32]).unwrap();
+        let data = slots.import32(Purpose::ExternalData, &mut [6; 32]).unwrap();
+        let before = holdings(&slots);
+        let mut out = [0x55; 32];
+        assert_eq!(
+            slots.reveal32(transfer, Position::First, Purpose::Transfer, &mut out),
+            Err(Error::WrongPurpose)
+        );
+        let mut record = [0x55; RECORD_LEN];
+        let mut locked = [0x55; LOCK_RECORD_LEN];
+        assert_eq!(
+            slots.wrap(data, transfer, b"x", &mut Untouched, &mut record),
+            Err(Error::WrongPurpose)
+        );
+        assert_eq!(
+            slots.lock(transfer, secret, b"x", &mut Untouched, &mut locked),
+            Err(Error::WrongLevel)
+        );
+        assert_eq!(
+            slots.export(secret, transfer, b"x", &mut Untouched, &mut record),
+            Err(Error::WrongLevel)
+        );
+        assert_eq!(
+            slots.export(data, secret, b"x", &mut Untouched, &mut record),
+            Err(Error::WrongPurpose)
+        );
+        assert_eq!(
+            slots.unwrap(transfer, b"x", &record),
+            Err(Error::WrongPurpose)
+        );
+        assert_eq!(
+            slots.receive(secret, b"x", &record),
+            Err(Error::WrongPurpose)
+        );
+        assert_eq!(
+            slots.add32(transfer, &mut [7; 32]),
+            Err(Error::WrongPurpose)
+        );
+        assert_eq!(
+            slots.promote(transfer, Position::First),
+            Err(Error::WrongPurpose)
+        );
+        assert_eq!(slots.combine(secret, transfer), Err(Error::WrongPurpose));
+        assert_eq!(
+            slots.challenge(transfer, &mut out),
+            Err(Error::WrongPurpose)
+        );
+        assert_eq!(
+            (out, record, locked, holdings(&slots)),
+            (
+                [0x55; 32],
+                [0x55; RECORD_LEN],
+                [0x55; LOCK_RECORD_LEN],
+                before
+            )
+        );
+    }
+
+    /// A key for transfers is stored under a stored key and comes back as it went, a set of one
+    /// for transfers.
+    #[test]
+    fn a_key_for_transfers_is_stored_under_a_stored_key() {
+        let mut memory = [const { Slot::empty() }; 3];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let bytes = pattern::<32>(41, 3);
+        let transfer = slots
+            .import32(Purpose::Transfer, &mut bytes.clone())
+            .unwrap();
+        let mut record = [0; RECORD_LEN];
+        slots
+            .wrap(transfer, stored, b"backup key", &mut Counting, &mut record)
+            .unwrap();
+        slots.release(transfer).unwrap();
+        let transfer = slots.unwrap(stored, b"backup key", &record).unwrap();
+        assert_holds_for(
+            &slots,
+            transfer,
+            [Some((Status::Enabled, &bytes)), None, None],
+            0,
+            Purpose::Transfer,
+        );
+    }
+
+    /// The same bytes, a stored key in one set of slots and a key for transfers in another, open
+    /// neither the other's records: a record under a stored key is not received, and a record of
+    /// an export is not unwrapped.
+    #[test]
+    fn the_same_bytes_in_two_roles_open_neither_record() {
+        let bytes = pattern::<32>(43, 5);
+        let (mut memory, mut epoch) = ([const { Slot::empty() }; 3], Epoch::empty());
+        let (mut other_memory, mut other_epoch) = ([const { Slot::empty() }; 3], Epoch::empty());
+        let mut stored_side = Slots::new(&mut memory, &mut epoch, EPOCH, &mut epoch_key());
+        let mut transfer_side =
+            Slots::new(&mut other_memory, &mut other_epoch, EPOCH, &mut epoch_key());
+        let stored = stored_side
+            .import32(Purpose::Wrap, &mut bytes.clone())
+            .unwrap();
+        let stored = stored_side.store(stored);
+        let transfer = transfer_side
+            .import32(Purpose::Transfer, &mut bytes.clone())
+            .unwrap();
+        let data = stored_side
+            .import32(Purpose::ExternalData, &mut [6; 32])
+            .unwrap();
+        let mut wrapped = [0; RECORD_LEN];
+        stored_side
+            .wrap(data, stored, b"same", &mut Counting, &mut wrapped)
+            .unwrap();
+        assert_eq!(
+            transfer_side.receive(transfer, b"same", &wrapped),
+            Err(Error::RecordRejected)
+        );
+        let data = transfer_side
+            .import32(Purpose::ExternalData, &mut [7; 32])
+            .unwrap();
+        let mut exported = [0; RECORD_LEN];
+        transfer_side
+            .export(data, transfer, b"same", &mut Counting, &mut exported)
+            .unwrap();
+        assert_eq!(
+            stored_side.unwrap(stored, b"same", &exported),
+            Err(Error::RecordRejected)
+        );
+    }
+
+    /// A key for transfers carries one export at a time: while it writes one it receives none, and
+    /// the other way round, until the end; an end with no record before it is refused, and a key
+    /// released and loaded again begins afresh.
+    #[test]
+    fn a_key_for_transfers_carries_one_export_at_a_time() {
+        let (mut memory, mut epoch) = ([const { Slot::empty() }; 5], Epoch::empty());
+        let (mut other_memory, mut other_epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
+        let mut pair = pair(
+            (&mut memory, &mut epoch),
+            (&mut other_memory, &mut other_epoch),
+        );
+        let [first, second, _] = pair.sets;
+        let (out, into) = (pair.out, pair.into);
+        let mut end = [0x55; END_RECORD_LEN];
+        assert_eq!(
+            pair.from.end_export(out, b"move", &mut Untouched, &mut end),
+            Err(Error::NoTransfer)
+        );
+        assert_eq!(
+            pair.to.end_receive(into, b"move", &end),
+            Err(Error::NoTransfer)
+        );
+        let mut records = [[0; RECORD_LEN]; 2];
+        for (set, record) in [first, second].into_iter().zip(&mut records) {
+            pair.from
+                .export(set, out, b"move", &mut Counting, record)
+                .unwrap();
+        }
+        assert_eq!(
+            pair.from.receive(out, b"move", &records[0]),
+            Err(Error::Unfinished)
+        );
+        assert_eq!(
+            pair.from.end_receive(out, b"move", &end),
+            Err(Error::Unfinished)
+        );
+        pair.from
+            .end_export(out, b"move", &mut Counting, &mut end)
+            .unwrap();
+
+        let to = &mut pair.to;
+        let own = to.import32(Purpose::ExternalData, &mut [9; 32]).unwrap();
+        let received = to.receive(into, b"move", &records[0]).unwrap();
+        let mut record = [0x55; RECORD_LEN];
+        assert_eq!(
+            to.export(own, into, b"move", &mut Untouched, &mut record),
+            Err(Error::Unfinished)
+        );
+        assert_eq!(
+            to.end_export(into, b"move", &mut Untouched, &mut end),
+            Err(Error::Unfinished)
+        );
+        to.release(into).unwrap();
+        let into = to.import32(Purpose::Transfer, &mut pattern(41, 3)).unwrap();
+        assert_eq!(
+            to.receive(into, b"move", &records[0]),
+            Err(Error::DuplicateKey)
+        );
+        to.release(received).unwrap();
+        for record in &records {
+            to.receive(into, b"move", record).unwrap();
+        }
+        to.end_receive(into, b"move", &end).unwrap();
+        to.export(own, into, b"move", &mut Counting, &mut record)
+            .unwrap();
+    }
+
+    /// An export is in no epoch: a set changed in this one is exported as it is now, during a
+    /// change or not, the export saves nothing for the next epoch, and its records open after the
+    /// change is committed.
+    #[test]
+    fn an_export_saves_nothing_and_outlives_the_epoch() {
+        let (mut memory, mut epoch) = ([const { Slot::empty() }; 5], Epoch::empty());
+        let (mut other_memory, mut other_epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
+        let mut pair = pair(
+            (&mut memory, &mut epoch),
+            (&mut other_memory, &mut other_epoch),
+        );
+        let [set, _, _] = pair.sets;
+        let out = pair.out;
+        let from = &mut pair.from;
+        let stored = from
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        from.add32(set, &mut pattern(23, 9)).unwrap();
+        let mut record = [0; RECORD_LEN];
+        from.export(set, out, b"move", &mut Counting, &mut record)
+            .unwrap();
+        from.begin_epoch(&mut [0x77; 32]).unwrap();
+        let mut again = [0; RECORD_LEN];
+        from.end_export(out, b"move", &mut Counting, &mut [0; END_RECORD_LEN])
+            .unwrap();
+        from.export(set, out, b"move", &mut Counting, &mut again)
+            .unwrap();
+        let mut platform = Platform::default();
+        assert_eq!(from.commit_epoch(&mut platform), Err(Error::Unsaved));
+        let mut saved = [0; RECORD_LEN];
+        from.wrap(set, stored, b"set", &mut Counting, &mut saved)
+            .unwrap();
+        assert_eq!(from.commit_epoch(&mut platform), Ok(Erasure::Guaranteed));
+        let into = pair.into;
+        let received = pair.to.receive(into, b"move", &record).unwrap();
+        let added = pattern::<32>(23, 9);
+        let first = pattern::<32>(19, 1);
+        assert_holds(
+            &pair.to,
+            received,
+            [
+                Some((Status::Enabled, &first)),
+                Some((Status::Enabled, &added)),
+                None,
+            ],
+            0,
+        );
+    }
+
     /// A key is held in one place only: an import of a key held here, and a set that holds such a
     /// key or one key twice, are refused, and leave the source and every slot as they were.
     #[test]
@@ -4563,12 +5556,13 @@ mod stack {
         EPOCH, LOAD_NEEDS, WRAP_NEEDS, epoch_key, flipped_epoch, flipped_epoch_key,
     };
     use super::{
-        Entropy, EntropyError, Epoch, Error, Handle, Header, LAYER_LEN, LOCK_RECORD_LEN, MEMBERS,
-        Out, Position, Purpose, RECORD_LEN, Slot, Slots, Stages, Status, keyset, write_record,
+        END_RECORD_LEN, Entropy, EntropyError, Epoch, Error, Handle, Header, LAYER_LEN,
+        LOCK_RECORD_LEN, MEMBERS, Out, Position, Purpose, RECORD_LEN, Slot, Slots, Stages, Status,
+        keyset, write_record,
     };
     use crate::derive::{
-        Branch, CIPHER_STACK_WIPE, SALT, STACK_WIPE, derive_layer_key, derive_lock_key,
-        derive_wrap_key, stack::secrets,
+        Branch, CIPHER_STACK_WIPE, SALT, STACK_WIPE, derive_export_key, derive_layer_key,
+        derive_lock_key, derive_wrap_key, stack::secrets,
     };
     use crate::key::{
         Key, KeyLength,
@@ -5300,6 +6294,267 @@ mod stack {
         assert_eq!(out[..], key[..]);
     }
 
+    /// The key for transfers of the export tests: 32 bytes.
+    fn transfer_bytes(flip: u8) -> [u8; 32] {
+        pattern(71, 19, 32, flip).try_into().unwrap()
+    }
+
+    /// The child set and a key for transfers, made from `flip`ped patterns, and the record of the
+    /// export of the set under the key.
+    fn exported(
+        slots: &mut Slots<'_>,
+        flip: u8,
+    ) -> (Handle<'static>, Handle<'static>, [u8; RECORD_LEN]) {
+        let (_, child) = sets(slots, flip);
+        let transfer = slots
+            .import32(Purpose::Transfer, &mut transfer_bytes(flip))
+            .unwrap();
+        let transfer = widen(transfer);
+        let mut record = [0; RECORD_LEN];
+        slots
+            .export(child, transfer, CONTEXT, &mut Fixed, &mut record)
+            .unwrap();
+        (child, transfer, record)
+    }
+
+    /// What is measured: an export or a whole receipt, the trial of a receipt the key does not
+    /// open, or an end.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Transfer {
+        Record,
+        Receipt,
+        End,
+    }
+
+    /// The secrets the work handles on the sets made from `flip`ped patterns: the key for
+    /// transfers, the derivation of the cipher key from it, and what the cipher works with on the
+    /// record or on the end. For a whole receipt, also the derivations of the identifiers of the
+    /// child's keys.
+    fn transfer_handled(flip: u8, work: Transfer) -> Vec<Vec<u8>> {
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(
+            &mut memory,
+            &mut epoch_memory,
+            EPOCH,
+            &mut flipped_epoch_key(flip),
+        );
+        let (_, transfer, record) = exported(&mut slots, flip);
+        let bytes = transfer_bytes(flip);
+        let mut cipher_key = [0; 32];
+        derive_export_key(&key_from(&bytes), &mut cipher_key).unwrap();
+        let mut found = if work == Transfer::End {
+            let mut end = [0; END_RECORD_LEN];
+            slots
+                .end_export(transfer, CONTEXT, &mut Fixed, &mut end)
+                .unwrap();
+            let tag: [u8; 16] = end[12..].try_into().unwrap();
+            cipher_secrets(&cipher_key, &end[..12].try_into().unwrap(), &[], &tag).0
+        } else {
+            let tag: [u8; 16] = record[12 + PLAINTEXT_LEN..].try_into().unwrap();
+            let sealed = &record[12..12 + PLAINTEXT_LEN];
+            cipher_secrets(&cipher_key, &record[..12].try_into().unwrap(), sealed, &tag).0
+        };
+        found.extend(secrets(&bytes, SALT, KeyLength::Bytes32, Branch::ExportKey));
+        found.push(bytes.to_vec());
+        if work == Transfer::Receipt {
+            for bytes in child_keys(flip) {
+                found.extend(secrets(&bytes, SALT, KeyLength::Bytes32, Branch::KeyId));
+            }
+        }
+        found
+    }
+
+    fn transfer_pieces(work: Transfer) -> Vec<Vec<u8>> {
+        key_dependent(&transfer_handled(0, work), &transfer_handled(0xff, work))
+    }
+
+    #[test]
+    fn an_export_without_the_wipe_leaves_residue() {
+        let pieces = transfer_pieces(Transfer::Record);
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let (child, transfer, _) = exported(&mut slots, 0);
+        let mut record = [0; RECORD_LEN];
+        let range = below_pad(false, || {
+            slots
+                .wrap_on_stack(
+                    child,
+                    transfer,
+                    CONTEXT,
+                    &mut Fixed,
+                    Out::Export(&mut record),
+                )
+                .unwrap();
+            black_box(&record);
+        });
+        assert!(residue(range, &pieces) > 0);
+    }
+
+    #[test]
+    fn an_export_leaves_no_residue() {
+        let pieces = transfer_pieces(Transfer::Record);
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let (child, transfer, _) = exported(&mut slots, 0);
+        let mut end = [0; END_RECORD_LEN];
+        slots
+            .end_export(transfer, CONTEXT, &mut Fixed, &mut end)
+            .unwrap();
+        let mut record = [0; RECORD_LEN];
+        assert_clean(&pieces, || {
+            slots
+                .export(child, transfer, CONTEXT, &mut Fixed, &mut record)
+                .unwrap();
+            black_box(&record);
+        });
+    }
+
+    /// The key for transfers and the record of the export of the child set under it, ready to be
+    /// received in the same slots: the export ended and the set released.
+    fn to_receive(slots: &mut Slots<'_>) -> (Handle<'static>, [u8; RECORD_LEN]) {
+        let (child, transfer, record) = exported(slots, 0);
+        slots
+            .end_export(transfer, CONTEXT, &mut Fixed, &mut [0; END_RECORD_LEN])
+            .unwrap();
+        slots.release(child).unwrap();
+        (transfer, record)
+    }
+
+    #[test]
+    fn a_receipt_leaves_no_residue() {
+        let pieces = transfer_pieces(Transfer::Receipt);
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let (transfer, record) = to_receive(&mut slots);
+        assert_clean(&pieces, || {
+            black_box(slots.receive(transfer, CONTEXT, &record).unwrap());
+        });
+    }
+
+    /// A record of an export whose ciphertext was changed is decrypted under the key for transfers
+    /// before the tag fails; without the wipe that shows.
+    #[test]
+    fn a_rejected_receipt_leaves_no_residue() {
+        let pieces = transfer_pieces(Transfer::Record);
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let (transfer, mut record) = to_receive(&mut slots);
+        record[40] ^= 1;
+        let range = below_pad(false, || {
+            let refused = slots.receive_on_stack(transfer, CONTEXT, &record, seal::open);
+            assert_eq!(black_box(refused), Err(Error::RecordRejected));
+        });
+        assert!(residue(range, &pieces) > 0);
+        assert_clean(&pieces, || {
+            let refused = slots.receive(transfer, CONTEXT, &record);
+            assert_eq!(black_box(refused), Err(Error::RecordRejected));
+        });
+    }
+
+    /// Writing the end of an export and receiving it leave nothing of the key for transfers, of its
+    /// derivation or of the cipher; without the wipe they do. Each in slots of its own, so that the
+    /// end has the nonce the secrets were worked out with.
+    #[test]
+    fn an_end_leaves_no_residue() {
+        let pieces = transfer_pieces(Transfer::End);
+        let mut end = [0; END_RECORD_LEN];
+        for (wipe, receive) in [(false, false), (true, false), (true, true)] {
+            let mut memory = [const { Slot::empty() }; 4];
+            let mut epoch_memory = Epoch::empty();
+            let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+            let (child, transfer, record) = exported(&mut slots, 0);
+            if receive {
+                slots
+                    .end_export(transfer, CONTEXT, &mut Fixed, &mut end)
+                    .unwrap();
+                slots.release(child).unwrap();
+                slots.receive(transfer, CONTEXT, &record).unwrap();
+                assert_clean(&pieces, || {
+                    slots.end_receive(transfer, CONTEXT, &end).unwrap();
+                });
+            } else if wipe {
+                assert_clean(&pieces, || {
+                    slots
+                        .end_export(transfer, CONTEXT, &mut Fixed, &mut end)
+                        .unwrap();
+                    black_box(&end);
+                });
+            } else {
+                let range = below_pad(false, || {
+                    slots
+                        .end_export_on_stack(transfer, CONTEXT, &mut Fixed, &mut end)
+                        .unwrap();
+                    black_box(&end);
+                });
+                assert!(residue(range, &pieces) > 0);
+            }
+        }
+    }
+
+    /// The wipes that follow an export, its end and their receipts reach as deep as those after a
+    /// wrap, also when the call fails, and no call reaches deeper than its documentation says it
+    /// needs.
+    #[test]
+    fn transfers_wipe_and_need_the_stack_documented() {
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let (child, transfer, _) = exported(&mut slots, 0);
+        let (mut record, mut end) = ([0; RECORD_LEN], [0; END_RECORD_LEN]);
+        let mut depths = Vec::new();
+        depths.push(depth_changed(|| {
+            let failed = slots.export(child, transfer, CONTEXT, &mut Failing, &mut record);
+            assert_eq!(black_box(failed), Err(Error::EntropyFailed));
+        }));
+        depths.push(depth_changed(|| {
+            let failed = slots.end_export(transfer, CONTEXT, &mut Failing, &mut end);
+            assert_eq!(black_box(failed), Err(Error::EntropyFailed));
+        }));
+        slots
+            .end_export(transfer, CONTEXT, &mut Fixed, &mut end)
+            .unwrap();
+        depths.push(depth_changed(|| {
+            slots
+                .export(child, transfer, CONTEXT, &mut Fixed, &mut record)
+                .unwrap();
+            black_box(&record);
+        }));
+        depths.push(depth_changed(|| {
+            slots
+                .end_export(transfer, CONTEXT, &mut Fixed, &mut end)
+                .unwrap();
+            black_box(&end);
+        }));
+        slots.release(child).unwrap();
+        let mut changed = record;
+        changed[40] ^= 1;
+        depths.push(depth_changed(|| {
+            let refused = slots.receive(transfer, CONTEXT, &changed);
+            assert_eq!(black_box(refused), Err(Error::RecordRejected));
+        }));
+        depths.push(depth_changed(|| {
+            black_box(slots.receive(transfer, CONTEXT, &record).unwrap());
+        }));
+        let mut other = end;
+        other[20] ^= 1;
+        depths.push(depth_changed(|| {
+            let refused = slots.end_receive(transfer, CONTEXT, &other);
+            assert_eq!(black_box(refused), Err(Error::RecordRejected));
+        }));
+        depths.push(depth_changed(|| {
+            slots.end_receive(transfer, CONTEXT, &end).unwrap();
+        }));
+        for depth in depths {
+            assert!(depth >= CIPHER_STACK_WIPE, "{depth} bytes wiped");
+            assert!(depth <= WRAP_STACK, "{depth} bytes reached");
+        }
+    }
+
     /// The wipe that follows covers more than the cipher uses; the derivations a wrap and an
     /// unwrap run are measured with the derivation, and wiped after it besides.
     #[test]
@@ -5535,17 +6790,18 @@ mod proofs {
     use core::marker::PhantomData;
 
     use super::{
-        CIPHER_KEY_LEN, Entropy, EntropyError, Epoch, Erasure, Error, Handle, Key, KeyId,
-        KeyLength, LAYER_LEN, LOCK_RECORD_LEN, MEMBERS, NONCE_LEN, Occupancy, Out, PLAINTEXT_LEN,
-        Position, Purpose, RECORD_LEN, Rejected, Root, RootFailed, Slot, Slots, Stages, Status,
-        TAG_LEN,
+        CIPHER_KEY_LEN, Direction, END_RECORD_LEN, Entropy, EntropyError, Epoch, Erasure, Error,
+        Handle, Key, KeyId, KeyLength, Kind, LAYER_LEN, LOCK_RECORD_LEN, MEMBERS, NONCE_LEN,
+        Occupancy, Out, PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Rejected, Root, RootFailed,
+        Slot, Slots, Stages, Status, TAG_LEN,
     };
     use crate::derive::{
         Branch,
         model::{any_failed, failed, id_bytes, id_from_bytes},
         proofs::{
-            expected_challenge, expected_combined, expected_hedge, expected_key_id,
-            expected_layer_key, expected_lock_key, expected_words_key, expected_wrap_key,
+            expected_challenge, expected_combined, expected_export_key, expected_hedge,
+            expected_key_id, expected_layer_key, expected_lock_key, expected_words_key,
+            expected_wrap_key,
         },
     };
     use crate::keyset::proofs::{allowed, any_purpose, any_whole_stages};
@@ -5576,6 +6832,9 @@ mod proofs {
         unlocks: bool,
         changed: bool,
         sealed: bool,
+        pending: Option<(usize, u64)>,
+        chain: [u8; TAG_LEN],
+        direction: Direction,
     }
 
     fn snapshot(slot: &Slot) -> Snapshot {
@@ -5596,6 +6855,9 @@ mod proofs {
             unlocks: slot.unlocks,
             changed: slot.changed,
             sealed: slot.sealed,
+            pending: slot.pending,
+            chain: slot.chain,
+            direction: slot.direction,
         }
     }
 
@@ -5648,12 +6910,15 @@ mod proofs {
         (0..2).all(|index| index == changed || snapshot(&slots.memory[index]) == before[index])
     }
 
-    /// Whether the slot holds no key and no identifier at any position.
+    /// Whether the slot holds no key, no identifier at any position and no state of a transfer.
     fn wiped(slot: &Slot) -> bool {
         let now = snapshot(slot);
         now.lengths == [KeyLength::Bytes32; MEMBERS]
             && now.keys == ([0; 64], [0; 64], [0; 64])
             && now.ids == ([0; ID_LEN], [0; ID_LEN], [0; ID_LEN])
+            && now.pending.is_none()
+            && now.chain == [0; TAG_LEN]
+            && now.direction == Direction::Idle
     }
 
     fn first_free(before: &[Snapshot; 2]) -> Option<usize> {
@@ -5683,13 +6948,18 @@ mod proofs {
         out
     }
 
-    /// A slot in any state, for either purpose, with any generation and any stages whose primary is
+    /// A slot in any state, for any purpose, with any generation and any stages whose primary is
     /// enabled; when loaded, holding a key of a length its purpose takes and any identifier at each
-    /// position the stages fill, a set of one if it is for wrapping, from a secret or stored, and
-    /// changed and wrapped for the next epoch or not. A free or retired slot keeps the purpose of
-    /// the set it last held. Every load, addition and unwrap keeps a key's length one its purpose
-    /// takes, every load and unwrap makes a set for wrapping a set of one, and no change or
-    /// addition takes one, as their proofs show.
+    /// position the stages fill, a set of one unless it is for external data, from a secret or
+    /// stored if it is for wrapping, and changed and wrapped for the next epoch or not. A loaded
+    /// set for external data came in a transfer or not, under a key of either slot with any
+    /// generation; a loaded key for transfers has any chain and direction. A free or retired slot
+    /// keeps the purpose of the set it last held, and holds no state of a transfer. Every load,
+    /// addition and unwrap keeps a key's length one its purpose takes, every load and unwrap makes
+    /// a set not for external data a set of one, and no change or addition takes one. A receipt
+    /// marks only the set for external data it loads, with the slot of its key; only an export, a
+    /// receipt and their ends give a key for transfers a chain and a direction; every release
+    /// clears the state of a transfer. Their proofs show it.
     fn any_slot() -> Slot {
         any_slot_in(any_occupancy())
     }
@@ -5708,7 +6978,7 @@ mod proofs {
         slot.occupancy = occupancy;
         let purpose = any_purpose();
         slot.purpose = purpose;
-        slot.stages = if purpose == Purpose::Wrap && occupancy == Occupancy::Loaded {
+        slot.stages = if purpose != Purpose::ExternalData && occupancy == Occupancy::Loaded {
             Stages::one()
         } else {
             any_whole_stages()
@@ -5717,6 +6987,21 @@ mod proofs {
         if slot.occupancy == Occupancy::Loaded {
             slot.changed = kani::any();
             slot.sealed = kani::any();
+            slot.pending = if purpose == Purpose::ExternalData && kani::any() {
+                Some((if kani::any() { 0 } else { 1 }, kani::any()))
+            } else {
+                None
+            };
+            (slot.chain, slot.direction) = if purpose == Purpose::Transfer {
+                let direction = match kani::any::<u8>() % 3 {
+                    0 => Direction::Idle,
+                    1 => Direction::Out,
+                    _ => Direction::In,
+                };
+                (kani::any(), direction)
+            } else {
+                ([0; TAG_LEN], Direction::Idle)
+            };
             let stages = slot.stages;
             let fill = |position: usize, key: &mut Key, id: &mut KeyId| {
                 if stages.stage(position).is_some() {
@@ -5892,15 +7177,17 @@ mod proofs {
         let length = any_length();
         let (epoch_key, count) = (first_half(&slots.epoch.key), slots.epoch.drawn);
         let result = slots.generate(purpose, length, &mut entropy);
-        let unasked = result == Err(Error::NoFreeSlot) || result == Err(Error::WrongLength);
+        let unasked = result == Err(Error::NoFreeSlot)
+            || result == Err(Error::WrongLength)
+            || result == Err(Error::WrongPurpose);
         kani::assert(
             if unasked {
                 entropy.calls == 0
             } else {
                 entropy.calls == 1 && entropy.requested == length.bytes()
             },
-            "a length the purpose does not take and a full set ask the source for nothing, and \
-             otherwise it is asked once, for the length of the key",
+            "a key for transfers, a length the purpose does not take and a full set ask the source \
+             for nothing, and otherwise it is asked once, for the length of the key",
         );
         kani::assert(
             unasked || (result == Err(Error::EntropyFailed)) == entropy.failed,
@@ -6219,7 +7506,8 @@ mod proofs {
     }
 
     /// A slot in any state and with any generation whose buffers hold keys of any bytes and either
-    /// length and any identifiers at every position, loaded or not, and changed or not if loaded.
+    /// length and any identifiers at every position, loaded or not, and changed or not and in a
+    /// transfer if loaded.
     fn any_dirty_slot() -> Slot {
         let mut slot = Slot::empty();
         slot.generation = kani::any();
@@ -6240,6 +7528,13 @@ mod proofs {
         if slot.occupancy == Occupancy::Loaded {
             slot.changed = kani::any();
             slot.sealed = kani::any();
+            slot.pending = Some((kani::any(), kani::any()));
+            slot.chain = kani::any();
+            slot.direction = match kani::any::<u8>() % 3 {
+                0 => Direction::Idle,
+                1 => Direction::Out,
+                _ => Direction::In,
+            };
         }
         slot
     }
@@ -6284,7 +7579,10 @@ mod proofs {
                 slot.occupancy != Occupancy::Loaded,
                 "creating slots loads no slot",
             );
-            kani::assert(wiped(slot), "creating slots wipes every key and identifier");
+            kani::assert(
+                wiped(slot),
+                "creating slots wipes every key and identifier, and every state of a transfer",
+            );
             kani::assert(
                 !slot.changed && !slot.sealed,
                 "creating slots leaves no set changed",
@@ -6292,12 +7590,13 @@ mod proofs {
         }
     }
 
-    /// A load by import or from the platform source for either purpose, from `memory`: it takes
-    /// the first free slot, issues that slot's generation, keeps it in the slot and leaves a set of
-    /// one there: exactly the expected bytes at the first position, zero past the key's length,
-    /// enabled and the primary, with the purpose given and the identifier derived from those bytes
-    /// and their length alone, and nothing at the other positions; it fails with `WrongLength`
-    /// first for a length the purpose does not take, then with `NoFreeSlot` without a free slot,
+    /// A load by import or from the platform source for any purpose, from `memory`: it takes the
+    /// first free slot, issues that slot's generation, keeps it in the slot and leaves a set of one
+    /// there: exactly the expected bytes at the first position, zero past the key's length, enabled
+    /// and the primary, with the purpose given and the identifier derived from those bytes and
+    /// their length alone, nothing at the other positions, and no state of a transfer; a generation
+    /// fails with `WrongPurpose` first for a key for transfers; a load fails with `WrongLength`
+    /// then for a length the purpose does not take, then with `NoFreeSlot` without a free slot,
     /// with `EntropyFailed` when the source fails, with `DerivationFailed` when the derivation
     /// fails, and with `DuplicateKey` exactly when a loaded slot holds a key with that identifier,
     /// for any purpose; a failed load changes no slot, and neither a refused length nor a full set
@@ -6315,7 +7614,9 @@ mod proofs {
         let (result, expected, length, source_failed, imported) = load_any(&mut slots, purpose);
         let id = expected_key_id(&expected, length);
         kani::assert(
-            if !allowed(purpose, length) {
+            if !imported && purpose == Purpose::Transfer {
+                result == Err(Error::WrongPurpose)
+            } else if !allowed(purpose, length) {
                 result == Err(Error::WrongLength)
             } else if first_free.is_none() {
                 result == Err(Error::NoFreeSlot)
@@ -6328,10 +7629,10 @@ mod proofs {
             } else {
                 result.is_ok()
             },
-            "a load fails with WrongLength for a length its purpose does not take, then with \
-             NoFreeSlot without a free slot, with EntropyFailed when the source fails, with \
-             DerivationFailed when the derivation fails, with DuplicateKey when the key is held, \
-             and otherwise succeeds",
+            "a generation of a key for transfers fails with WrongPurpose, a load with WrongLength \
+             for a length its purpose does not take, then with NoFreeSlot without a free slot, \
+             with EntropyFailed when the source fails, with DerivationFailed when the derivation \
+             fails, with DuplicateKey when the key is held, and otherwise succeeds",
         );
         kani::cover!(
             result == Err(Error::DerivationFailed),
@@ -6340,6 +7641,10 @@ mod proofs {
         kani::cover!(
             result == Err(Error::WrongLength),
             "a key too long for its purpose is refused"
+        );
+        kani::cover!(
+            result == Err(Error::WrongPurpose),
+            "a key for transfers is not generated"
         );
         if let (Ok(handle), Some(index)) = (result, first_free) {
             let generation = snapshot_at(&before, index).generation;
@@ -6361,9 +7666,13 @@ mod proofs {
                 now.ids == (id, [0; ID_LEN], [0; ID_LEN])
                     && now.stages == Stages::one()
                     && now.purpose == purpose
-                    && now.unlocks == (imported && purpose == Purpose::Wrap),
-                "the slot keeps the purpose, a set of one and the identifier derived from its key; an \
-                 imported key for wrapping is a key from a secret, a generated one is stored",
+                    && now.unlocks == (imported && purpose == Purpose::Wrap)
+                    && now.pending.is_none()
+                    && now.chain == [0; TAG_LEN]
+                    && now.direction == Direction::Idle,
+                "the slot keeps the purpose, a set of one and the identifier derived from its key, \
+                 and no state of a transfer; an imported key for wrapping is a key from a secret, \
+                 a generated one is stored",
             );
             kani::assert(
                 unchanged_except(&slots, &before, index),
@@ -6374,6 +7683,10 @@ mod proofs {
             kani::cover!(
                 purpose == Purpose::ExternalData,
                 "a key for external data is loaded"
+            );
+            kani::cover!(
+                purpose == Purpose::Transfer,
+                "a key for transfers is imported"
             );
         } else {
             kani::assert(
@@ -6521,10 +7834,11 @@ mod proofs {
         kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
     }
 
-    /// A derivation from any bytes that twelve words stand for, from `memory`: a failure of a
-    /// derivation is `DerivationFailed`, and nothing else is, never the failure of a platform
-    /// source; a failed derivation changes no slot, and one that succeeds loads the first free slot
-    /// with the 32-byte key derived from the bytes and the identifier derived from it. The rest is
+    /// A derivation from any bytes that twelve words stand for, from `memory`, of a key from a
+    /// secret or a key for transfers: a failure of a derivation is `DerivationFailed`, and nothing
+    /// else is, never the failure of a platform source; a failed derivation changes no slot, and
+    /// one that succeeds loads the first free slot with the 32-byte key for that purpose derived
+    /// from the bytes and the identifier derived from it. The rest is
     /// the load of a generation, proven above for a source that writes any bytes and may fail.
     fn derivation_from_words(mut memory: [Slot; 2]) -> Result<Handle<'static>, Error> {
         let mut epoch = any_epoch(false);
@@ -6534,14 +7848,19 @@ mod proofs {
         };
         let before = snapshots(&slots);
         let bytes: [u8; 16] = kani::any();
-        let result = slots.derive_into(&bytes);
+        let purpose = if kani::any() {
+            Purpose::Wrap
+        } else {
+            Purpose::Transfer
+        };
+        let result = slots.derive_into(&bytes, purpose);
         kani::assert(
             (result == Err(Error::DerivationFailed)) == any_failed(),
             "a failure of a derivation is DerivationFailed, and nothing else is",
         );
         if let Ok(handle) = result {
             let now = snapshot(slot_at(&slots, handle.index));
-            let key = expected_words_key(&bytes);
+            let key = expected_words_key(&bytes, purpose);
             kani::assert(
                 first_free(&before) == Some(handle.index)
                     && now.occupancy == Occupancy::Loaded
@@ -6550,10 +7869,10 @@ mod proofs {
                     && now.keys.0[32..] == [0; 32]
                     && now.ids.0 == expected_key_id(&now.keys.0, KeyLength::Bytes32)
                     && now.stages == Stages::one()
-                    && now.purpose == Purpose::Wrap
-                    && now.unlocks,
-                "the first free slot holds the key from a secret of the bytes and the identifier \
-                 derived from it",
+                    && now.purpose == purpose
+                    && now.unlocks == (purpose == Purpose::Wrap),
+                "the first free slot holds the key for the purpose that the bytes derive, from a \
+                 secret if it is for wrapping, and the identifier derived from it",
             );
             kani::assert(
                 unchanged_except(&slots, &before, handle.index),
@@ -6566,6 +7885,10 @@ mod proofs {
             );
         }
         kani::cover!(result.is_ok(), "a key is derived from words");
+        kani::cover!(
+            result.is_ok() && purpose == Purpose::Transfer,
+            "a key for transfers is derived from words"
+        );
         kani::cover!(
             result == Err(Error::DerivationFailed),
             "the derivation fails"
@@ -6605,7 +7928,8 @@ mod proofs {
         a.iter().zip(b).all(|(x, y)| x == y)
     }
 
-    /// Any twelve words of any list of three, with the first slot free: words the list refuses
+    /// Any twelve words of any list of three, for either purpose a key from words serves, with the
+    /// first slot free: words the list refuses
     /// change no slot and derive nothing; the words are wiped exactly when the derivation succeeds;
     /// a failure of the platform source is never reported; a failed derivation changes no slot.
     /// Where the key goes, the derivations from words above prove.
@@ -6622,7 +7946,12 @@ mod proofs {
             let list = any_list();
             let mut words: Words = kani::any();
             let original = words;
-            let result = slots.derive_from_words_in(&list, &mut words);
+            let purpose = if kani::any() {
+                Purpose::Wrap
+            } else {
+                Purpose::Transfer
+            };
+            let result = slots.derive_from_words_in(&list, purpose, &mut words);
             let refused = matches!(result, Err(Error::UnknownWord | Error::InvalidChecksum));
             kani::assert(!refused || !any_failed(), "refused words derive nothing");
             kani::assert(
@@ -6653,7 +7982,7 @@ mod proofs {
                 });
                 let (read, _) = bits_of(&numbers);
                 kani::assert(
-                    snapshot(&slots.memory[0]).keys.0[..32] == expected_words_key(&read),
+                    snapshot(&slots.memory[0]).keys.0[..32] == expected_words_key(&read, purpose),
                     "the key in the slot is the one the bytes the words stand for derive",
                 );
             } else {
@@ -6727,7 +8056,7 @@ mod proofs {
             if result.is_ok() {
                 let now = snapshot(&slots.memory[0]);
                 kani::assert(
-                    now.keys.0[..32] == expected_words_key(&bytes) && now.unlocks,
+                    now.keys.0[..32] == expected_words_key(&bytes, Purpose::Wrap) && now.unlocks,
                     "the key in the slot is the one the hedged bytes derive, a key from a secret",
                 );
             } else {
@@ -6877,11 +8206,11 @@ mod proofs {
     }
 
     /// From any state of two slots, for a handle of this set naming any slot and generation, any
-    /// position and either purpose named: revealing writes exactly the 32-byte key at that position
+    /// position and any purpose named: revealing writes exactly the 32-byte key at that position
     /// into the output when the handle is live, the set and the call both name external data and
-    /// the position holds an enabled key; otherwise it is refused as `StaleHandle`, `WrongPurpose`
-    /// or `WrongStage`, in that order, and the output is left as it was. No slot changes either
-    /// way.
+    /// the position holds an enabled key of a set in no unfinished transfer; otherwise it is
+    /// refused as `StaleHandle`, `WrongPurpose`, `Unfinished` or `WrongStage`, in that order, and
+    /// the output is left as it was. No slot changes either way.
     #[kani::proof]
     #[kani::unwind(65)]
     fn only_an_enabled_key_for_external_data_is_revealed() {
@@ -6914,6 +8243,8 @@ mod proofs {
             Err(Error::StaleHandle)
         } else if purpose != Purpose::ExternalData || named.purpose != purpose {
             Err(Error::WrongPurpose)
+        } else if named.pending.is_some() {
+            Err(Error::Unfinished)
         } else if stage != Some(Status::Enabled) {
             Err(Error::WrongStage)
         } else {
@@ -6945,6 +8276,14 @@ mod proofs {
         kani::cover!(
             result == Err(Error::WrongPurpose) && named.purpose == Purpose::Wrap,
             "a key for wrapping is not revealed"
+        );
+        kani::cover!(
+            result == Err(Error::WrongPurpose) && named.purpose == Purpose::Transfer,
+            "a key for transfers is not revealed"
+        );
+        kani::cover!(
+            result == Err(Error::Unfinished),
+            "a key of an unfinished transfer is not revealed"
         );
         kani::cover!(
             result == Err(Error::WrongPurpose) && named.purpose == Purpose::ExternalData,
@@ -6979,17 +8318,19 @@ mod proofs {
         (padded(key, length), length)
     }
 
-    /// Admitting any 233 bytes of plaintext into `memory`: the set it holds goes into the first
-    /// free slot exactly when a slot is free, the bytes parse, each key's identifier is derived,
-    /// and no key is held in a loaded slot or twice in the set; then the slot holds, at each
-    /// position the plaintext fills, exactly the key it holds there with the stage it states and the
-    /// identifier derived from it, nothing at the others, and the purpose, primary and revision
-    /// the plaintext states, unchanged in this epoch, and a stored set. From a plain record, a
-    /// plaintext of another epoch or of a set for wrapping is refused as `RecordRejected`; from a
-    /// lock record, a plaintext of an epoch other than zero, of a set for external data, or of a
-    /// set for wrapping other than a set of one that has never changed. Otherwise no slot changes, and the failure is `NoFreeSlot`,
-    /// `RecordRejected`, `DerivationFailed` or `DuplicateKey`, in that order. The offsets are written
-    /// from the layout, independently of the parser.
+    /// Admitting any 233 bytes of plaintext of any kind of record into `memory`: the set it holds
+    /// goes into the first free slot exactly when a slot is free, the bytes parse, each key's
+    /// identifier is derived, and no key is held in a loaded slot or twice in the set; then the
+    /// slot holds, at each position the plaintext fills, exactly the key it holds there with the
+    /// stage it states and the identifier derived from it, nothing at the others, and the purpose,
+    /// primary and revision the plaintext states, unchanged in this epoch, a stored set and in no
+    /// transfer. From a plain record, a plaintext of another epoch or of a set for wrapping is
+    /// refused as `RecordRejected`; from a lock record, a plaintext of an epoch other than zero or
+    /// of a set not for wrapping; from a record of an export, a plaintext of an epoch other than
+    /// zero or of a set not for external data; from any, a set for wrapping or a key for transfers
+    /// other than a set of one that has never changed. Otherwise no slot changes, and the failure
+    /// is `NoFreeSlot`, `RecordRejected`, `DerivationFailed` or `DuplicateKey`, in that order. The
+    /// offsets are written from the layout, independently of the parser.
     fn admit_from(mut memory: [Slot; 2]) {
         let id = memory.as_ptr().addr();
         let changing = kani::any();
@@ -6999,10 +8340,10 @@ mod proofs {
             epoch: &mut epoch,
         };
         let plaintext: [u8; PLAINTEXT_LEN] = kani::any();
-        let lock: bool = kani::any();
+        let kind = any_kind();
         let before = snapshots(&slots);
         let first_free = first_free(&before);
-        let result = slots.admit(&plaintext, lock);
+        let result = slots.admit(&plaintext, kind);
         kani::assert(
             first_free.is_some()
                 || (result == Err(Error::NoFreeSlot) && unchanged_except(&slots, &before, 2)),
@@ -7016,14 +8357,23 @@ mod proofs {
         let parsed = crate::keyset::parse(&plaintext).map(|(_, stages, _)| stages);
         let mut named_epoch = [0; 8];
         named_epoch.copy_from_slice(&plaintext[19..27]);
-        let other_epoch =
-            u64::from_le_bytes(named_epoch) != if lock { 0 } else { slots.epoch.number };
+        let other_epoch = u64::from_le_bytes(named_epoch)
+            != if kind == Kind::Record {
+                slots.epoch.number
+            } else {
+                0
+            };
         let members = [0, 1, 2].map(|position| plaintext_key(&plaintext, position));
         let ids = members.map(|(key, length)| expected_key_id(&key, length));
         let filled = [0, 1, 2].map(|position| plaintext[35 + 66 * position] != 0);
         let mut revision = [0; 8];
         revision.copy_from_slice(&plaintext[27..35]);
-        let wrapping = plaintext[1] == 1;
+        let (wrapping, external) = (plaintext[1] == 1, plaintext[1] == 2);
+        let of_kind = match kind {
+            Kind::Record => !wrapping,
+            Kind::Lock => wrapping,
+            Kind::Export => external,
+        };
         let one = filled == [true, false, false]
             && plaintext[35] == 1
             && plaintext[2] == 0
@@ -7036,7 +8386,7 @@ mod proofs {
                     }))
         });
         kani::assert(
-            if parsed.is_err() || other_epoch || wrapping != lock || (wrapping && !one) {
+            if parsed.is_err() || other_epoch || !of_kind || (!external && !one) {
                 result == Err(Error::RecordRejected)
             } else if any_failed() {
                 result == Err(Error::DerivationFailed)
@@ -7045,9 +8395,9 @@ mod proofs {
             } else {
                 result.is_ok()
             },
-            "a plaintext is admitted exactly when it parses, names its epoch, is for wrapping exactly \
-             when it comes from a lock record and then holds one key, finds a free slot, its keys' \
-             identifiers are derived and none is held already or twice",
+            "a plaintext is admitted exactly when it parses, names its epoch, holds a set of the \
+             purposes its kind of record holds, of one key unless for external data, finds a free \
+             slot, its keys' identifiers are derived and none is held already or twice",
         );
         if let (Ok(handle), Ok(stages)) = (result, parsed) {
             let now = snapshot(slot_at(&slots, index));
@@ -7084,19 +8434,22 @@ mod proofs {
                     );
                 }
             }
-            let purpose = if plaintext[1] == 1 {
-                Purpose::Wrap
-            } else {
-                Purpose::ExternalData
+            let purpose = match plaintext[1] {
+                1 => Purpose::Wrap,
+                2 => Purpose::ExternalData,
+                _ => Purpose::Transfer,
             };
             kani::assert(
                 now.stages == stages
                     && now.stages.primary() == usize::from(plaintext[2])
                     && now.purpose == purpose
                     && !now.unlocks
-                    && !now.changed,
+                    && !now.changed
+                    && now.pending.is_none()
+                    && now.chain == [0; TAG_LEN]
+                    && now.direction == Direction::Idle,
                 "the slot keeps the primary, the revision and the purpose the plaintext states, a \
-                 stored set, unchanged in this epoch",
+                 stored set, unchanged in this epoch and in no transfer",
             );
             kani::assert(
                 unchanged_except(&slots, &before, index),
@@ -7111,6 +8464,14 @@ mod proofs {
                 "a set of external data is admitted"
             );
             kani::cover!(purpose == Purpose::Wrap, "a set for wrapping is admitted");
+            kani::cover!(
+                purpose == Purpose::Transfer,
+                "a key for transfers is admitted"
+            );
+            kani::cover!(
+                kind == Kind::Export,
+                "a set of external data is admitted from an export"
+            );
         } else {
             kani::assert(
                 unchanged_except(&slots, &before, 2),
@@ -7125,6 +8486,10 @@ mod proofs {
         kani::cover!(
             parsed.is_ok() && !other_epoch && wrapping && !one && filled == [true, false, false],
             "a set for wrapping that has changed is refused"
+        );
+        kani::cover!(
+            parsed.is_ok() && !other_epoch && kind == Kind::Export && !external,
+            "an export of a set not for external data is refused"
         );
         kani::cover!(
             result == Err(Error::DerivationFailed),
@@ -7200,18 +8565,20 @@ mod proofs {
         }
     }
 
-    /// For a loaded set for wrapping in any state, any 261-byte record, any associated data of up to
-    /// two bytes and any behaviour of the cipher its interface allows: opening tries the key of the
-    /// set, once, with the cipher key derived from it and the key of this epoch, or from it alone for
-    /// a lock record, and not at all when that derivation fails, which is `DerivationFailed`; it
-    /// leaves in the output the plaintext the cipher wrote when the cipher accepts it and it names
-    /// that key's identifier as its parent, and otherwise fails with `RecordRejected` and leaves the
-    /// output as it was.
+    /// For a loaded set in any state of the purpose records of any kind are wrapped under, any
+    /// 261-byte record, any associated data of up to two bytes and any behaviour of the cipher its
+    /// interface allows: opening tries the key of the set, once, with the cipher key derived from
+    /// it and the key of this epoch, or from it alone for a lock record and for a record of an
+    /// export, each kind with a derivation of its own, and not at all when that derivation fails,
+    /// which is `DerivationFailed`; it leaves in the output the plaintext the cipher wrote when the
+    /// cipher accepts it and it names that key's identifier as its parent, and otherwise fails with
+    /// `RecordRejected` and leaves the output as it was.
     #[kani::proof]
     #[kani::unwind(65)]
     fn opening_uses_the_key_of_the_parent() {
         let mut memory = [any_slot_in(Occupancy::Loaded)];
-        kani::assume(memory[0].purpose == Purpose::Wrap);
+        let kind = any_kind();
+        kani::assume(memory[0].purpose == kind.parent_purpose());
         let changing = kani::any();
         let mut epoch = any_epoch(changing);
         let slots = Slots {
@@ -7225,7 +8592,6 @@ mod proofs {
         let mut cipher = AnyCipher::<PLAINTEXT_LEN>::new();
         let original: [u8; PLAINTEXT_LEN] = kani::any();
         let mut found = original;
-        let lock: bool = kani::any();
 
         let result = slots.open_under(
             0,
@@ -7233,16 +8599,20 @@ mod proofs {
             &record,
             &mut found,
             &mut |key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag),
-            lock,
+            kind,
         );
         kani::assert(
             cipher.calls == usize::from(!any_failed()),
             "the key is tried once, unless its derivation fails",
         );
-        let expected = if lock {
-            expected_lock_key(&before.keys.0, before.lengths[0])
-        } else {
-            expected_wrap_key(&before.keys.0, before.lengths[0], &epoch_key)
+        let expected = match kind {
+            Kind::Record => expected_wrap_key(&before.keys.0, before.lengths[0], &epoch_key),
+            Kind::Lock => expected_lock_key(&before.keys.0, before.lengths[0]),
+            Kind::Export => {
+                let mut key = [0; 32];
+                key.copy_from_slice(&before.keys.0[..32]);
+                expected_export_key(&key)
+            }
         };
         kani::assert(
             any_failed() || (cipher.key == expected && cipher.nonce[..] == record[..NONCE_LEN]),
@@ -7261,14 +8631,30 @@ mod proofs {
              and otherwise leaves the output as it was",
         );
         kani::cover!(
-            result.is_ok() && lock,
+            result.is_ok() && kind == Kind::Lock,
             "the key from a secret opens the record"
         );
-        kani::cover!(result.is_ok() && !lock, "the stored key opens the record");
+        kani::cover!(
+            result.is_ok() && kind == Kind::Record,
+            "the stored key opens the record"
+        );
+        kani::cover!(
+            result.is_ok() && kind == Kind::Export,
+            "the key for transfers opens the record"
+        );
         kani::cover!(
             result == Err(Error::RecordRejected) && cipher.accepted,
             "the key opens the record but is not named in it"
         );
+    }
+
+    /// Any kind of record.
+    fn any_kind() -> Kind {
+        match kani::any::<u8>() % 3 {
+            0 => Kind::Record,
+            1 => Kind::Lock,
+            _ => Kind::Export,
+        }
     }
 
     /// Any context of up to two bytes.
@@ -7286,18 +8672,24 @@ mod proofs {
         }
     }
 
-    /// Unwrapping or unlocking in `memory`, for a handle of this set naming any slot and generation,
-    /// any record or lock record and any context of up to two bytes, whatever the cipher does: an
-    /// empty context, a stale parent, a parent not for wrapping, one of the other level and a full
-    /// set are refused, in that order, before anything is decrypted. An unlock opens the outer
-    /// layer once, under the key derived from the key of this epoch, and refuses it as
-    /// `StaleRecord`, decrypting nothing more, unless the cipher accepts it and it names this
-    /// epoch; the inner record it then opens is the one the outer layer holds. A refused call
-    /// changes no slot, and one that succeeds changes only the first free slot, and needs every
-    /// trial the cipher accepts and every derivation to succeed. What the trial of the parent's
-    /// key gives, `opening_uses_the_key_of_the_parent` proves. Returns the outcome and whether it
-    /// was an unlock.
-    fn unwrap_from(mut memory: [Slot; 2]) -> (Result<(), Error>, bool) {
+    /// Unwrapping, unlocking or receiving in `memory`, for a handle of this set naming any slot and
+    /// generation, any record or lock record and any context of up to two bytes, whatever the
+    /// cipher does: an empty context, a stale parent, a parent not of the purpose the kind of
+    /// record is wrapped under, one of the other level and a full set are refused, in that order,
+    /// and then a key for transfers that writes an export, before anything is decrypted. An unlock
+    /// opens the outer layer once, under the key derived
+    /// from the key of this epoch, and refuses it as `StaleRecord`, decrypting nothing more, unless
+    /// the cipher accepts it and it names this epoch; the inner record it then opens is the one the
+    /// outer layer holds. A refused call changes no slot, and one that succeeds needs every trial
+    /// the cipher accepts and every derivation to succeed, and changes only the first free slot,
+    /// and, for a receipt, the key for transfers, which takes the tag of the record as its chain and
+    /// the direction of receipts; the set received waits for the end of that key's export, by its
+    /// slot and generation, and is otherwise in no transfer, unchanged and stored. What
+    /// the trial of the parent's key gives, `opening_uses_the_key_of_the_parent` proves. A receipt
+    /// when `receipt` says so, and otherwise an unwrap or an unlock: the kinds apart cost the
+    /// solver less than together. Returns the outcome, the kind of record and the purpose of the
+    /// parent.
+    fn unwrap_from(mut memory: [Slot; 2], receipt: bool) -> (Result<(), Error>, Kind, Purpose) {
         let id = memory.as_ptr().addr();
         let mut epoch = any_epoch(kani::any());
         let mut slots = Slots {
@@ -7305,63 +8697,78 @@ mod proofs {
             epoch: &mut epoch,
         };
         let parent = forged(id);
-        let lock: bool = kani::any();
+        let kind = if receipt {
+            Kind::Export
+        } else if kani::any() {
+            Kind::Lock
+        } else {
+            Kind::Record
+        };
         let context_bytes: [u8; 2] = kani::any();
         let context = any_context(&context_bytes);
         let before = snapshots(&slots);
         let parent_live = names_loaded(&before, &parent);
         let named = snapshot_at(&before, parent.index);
-        let wrapping = parent_live && named.purpose == Purpose::Wrap;
-        let level = wrapping && named.unlocks == lock;
+        let wanted = if receipt {
+            Purpose::Transfer
+        } else {
+            Purpose::Wrap
+        };
+        let serving = parent_live && named.purpose == wanted;
+        let level = serving && named.unlocks == (kind == Kind::Lock);
         let first_free = first_free(&before);
+        let turned = receipt && named.direction == Direction::Out;
         let (epoch_key, number) = (first_half(&slots.epoch.key), slots.epoch.number);
         let mut layer = AnyCipher::<LAYER_LEN>::new();
         let mut cipher = AnyCipher::<PLAINTEXT_LEN>::new();
+        let record: [u8; RECORD_LEN] = kani::any();
 
-        let result = if lock {
-            let record: [u8; LOCK_RECORD_LEN] = kani::any();
-            slots.unlock_on_stack(
-                parent,
-                context,
-                &record,
-                |key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag),
-                |key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag),
-            )
-        } else {
-            let record: [u8; RECORD_LEN] = kani::any();
-            slots.unwrap_on_stack(parent, context, &record, |key, nonce, _, buffer, tag| {
-                cipher.open(key, nonce, buffer, tag)
-            })
+        let result = match kind {
+            Kind::Lock => {
+                let record: [u8; LOCK_RECORD_LEN] = kani::any();
+                slots.unlock_on_stack(
+                    parent,
+                    context,
+                    &record,
+                    |key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag),
+                    |key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag),
+                )
+            }
+            Kind::Record => {
+                slots.unwrap_on_stack(parent, context, &record, |key, nonce, _, buffer, tag| {
+                    cipher.open(key, nonce, buffer, tag)
+                })
+            }
+            Kind::Export => {
+                slots.receive_on_stack(parent, context, &record, |key, nonce, _, buffer, tag| {
+                    cipher.open(key, nonce, buffer, tag)
+                })
+            }
         };
-        let refused_before = context.is_empty() || !level || first_free.is_none();
+        let lock = kind == Kind::Lock;
+        // Worked out on every path, so that no proof of one kind leaves a check of another unreached.
+        let mut tag = [0; TAG_LEN];
+        tag.copy_from_slice(&record[NONCE_LEN + PLAINTEXT_LEN..]);
+        let refused_before = context.is_empty() || !level || first_free.is_none() || turned;
         kani::assert(
             if context.is_empty() {
                 result == Err(Error::InvalidContext)
             } else if !parent_live {
                 result == Err(Error::StaleHandle)
-            } else if !wrapping {
+            } else if !serving {
                 result == Err(Error::WrongPurpose)
             } else if !level {
                 result == Err(Error::WrongLevel)
             } else if first_free.is_none() {
                 result == Err(Error::NoFreeSlot)
+            } else if turned {
+                result == Err(Error::Unfinished)
             } else {
                 true
             },
-            "an unwrap and an unlock refuse a bad context, a stale parent, a parent not for \
-             wrapping, a parent of the other level and a full set",
-        );
-        kani::cover!(
-            result == Err(Error::WrongPurpose),
-            "a parent for external data is refused"
-        );
-        kani::cover!(
-            result == Err(Error::WrongLevel) && lock,
-            "a stored key unlocks nothing"
-        );
-        kani::cover!(
-            result == Err(Error::WrongLevel) && !lock,
-            "a key from a secret unwraps nothing"
+            "an unwrap, an unlock and a receipt refuse a bad context, a stale parent, a parent not \
+             of the purpose they take, a parent of the other level and a full set, and a receipt a \
+             key for transfers that writes an export",
         );
         kani::assert(
             !refused_before || (cipher.calls == 0 && layer.calls == 0),
@@ -7403,27 +8810,79 @@ mod proofs {
         kani::assert(
             match (result, first_free) {
                 (Ok(handle), Some(index)) => {
+                    let received = slot_at(&slots, index);
                     handle.index == index
                         && handle.slots == id
                         && handle.generation == snapshot_at(&before, index).generation
-                        && unchanged_except(&slots, &before, index)
+                        && if kind == Kind::Export {
+                            // The parent is loaded, so it is the slot other than the first free one:
+                            // read by a known index, a slot costs the solver one copy, not two.
+                            let other = if index == 0 { 1 } else { 0 };
+                            let mut chained = snapshot_at(&before, other);
+                            chained.chain = tag;
+                            chained.direction = Direction::In;
+                            parent.index == other
+                                && received.pending == Some((other, parent.generation))
+                                && received.chain == [0; TAG_LEN]
+                                && received.direction == Direction::Idle
+                                && !received.changed
+                                && !received.sealed
+                                && !received.unlocks
+                                && snapshot(slot_at(&slots, other)) == chained
+                        } else {
+                            unchanged_except(&slots, &before, index)
+                        }
                 }
                 _ => result.is_err() && unchanged_except(&slots, &before, 2),
             },
             "a refused call changes no slot, and one that succeeds only the first free slot, whose \
-             handle names these slots and that slot's generation",
+             handle names these slots and that slot's generation, and for a receipt the chain and \
+             direction of the key for transfers; the set received waits for that key's export to \
+             end, and is otherwise in no transfer, unchanged and stored",
         );
-        (result.map(|_| ()), lock)
+        (result.map(|_| ()), kind, named.purpose)
     }
 
-    /// The outcomes of an unwrap or an unlock that decrypts.
-    fn every_outcome((result, lock): (Result<(), Error>, bool)) {
-        kani::cover!(result.is_ok() && !lock, "a record is unwrapped");
-        kani::cover!(result.is_ok() && lock, "a lock record is unlocked");
+    /// The outcomes of an unwrap or an unlock that decrypts, and the refusals of a parent.
+    fn every_outcome((result, kind, parent): (Result<(), Error>, Kind, Purpose)) {
+        kani::cover!(
+            result.is_ok() && kind == Kind::Record,
+            "a record is unwrapped"
+        );
+        kani::cover!(
+            result.is_ok() && kind == Kind::Lock,
+            "a lock record is unlocked"
+        );
         kani::cover!(result == Err(Error::RecordRejected), "a record is rejected");
         kani::cover!(
             result == Err(Error::StaleRecord),
             "a lock record not of this epoch is refused"
+        );
+        kani::cover!(
+            result == Err(Error::WrongPurpose) && parent == Purpose::Transfer,
+            "a key for transfers unwraps nothing"
+        );
+        kani::cover!(
+            result == Err(Error::WrongLevel) && kind == Kind::Lock,
+            "a stored key unlocks nothing"
+        );
+        kani::cover!(
+            result == Err(Error::WrongLevel) && kind == Kind::Record,
+            "a key from a secret unwraps nothing"
+        );
+    }
+
+    /// The outcomes of a receipt that decrypts, and the refusal of a key not for transfers.
+    fn every_receipt((result, _, parent): (Result<(), Error>, Kind, Purpose)) {
+        kani::cover!(result.is_ok(), "a record of an export is received");
+        kani::cover!(result == Err(Error::RecordRejected), "a record is rejected");
+        kani::cover!(
+            result == Err(Error::WrongPurpose) && parent == Purpose::Wrap,
+            "a key for wrapping receives nothing"
+        );
+        kani::cover!(
+            result == Err(Error::Unfinished),
+            "a key that writes an export receives nothing"
         );
     }
 
@@ -7431,14 +8890,16 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(65)]
     fn an_unwrap_into_the_first_slot() {
-        every_outcome(into_the_first(unwrap_from));
+        every_outcome(into_the_first(|memory| unwrap_from(memory, false)));
     }
 
     /// Unwrapping with the first slot loaded.
     #[kani::proof]
     #[kani::unwind(65)]
     fn an_unwrap_past_a_loaded_slot() {
-        every_outcome(past_a(Occupancy::Loaded, unwrap_from));
+        every_outcome(past_a(Occupancy::Loaded, |memory| {
+            unwrap_from(memory, false)
+        }));
     }
 
     /// Unwrapping with the first slot retired, where a live parent leaves no slot free, so nothing
@@ -7446,24 +8907,55 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(65)]
     fn an_unwrap_past_a_retired_slot() {
-        let (result, _) = past_a(Occupancy::Retired, unwrap_from);
+        let (result, _, _) = past_a(Occupancy::Retired, |memory| unwrap_from(memory, false));
         kani::cover!(
             result == Err(Error::NoFreeSlot),
             "a live parent leaves no slot free"
         );
     }
 
+    /// Receiving with the first slot free; with the next two, any state of two slots.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_receipt_into_the_first_slot() {
+        every_receipt(into_the_first(|memory| unwrap_from(memory, true)));
+    }
+
+    /// Receiving with the first slot loaded.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_receipt_past_a_loaded_slot() {
+        every_receipt(past_a(Occupancy::Loaded, |memory| {
+            unwrap_from(memory, true)
+        }));
+    }
+
+    /// Receiving with the first slot retired, where a live key for transfers leaves no slot free.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn a_receipt_past_a_retired_slot() {
+        let (result, _, _) = past_a(Occupancy::Retired, |memory| unwrap_from(memory, true));
+        kani::cover!(
+            result == Err(Error::NoFreeSlot),
+            "a live key for transfers leaves no slot free"
+        );
+    }
+
     /// From any state of two slots and of the epoch, with a change to the next under way or not,
-    /// for handles of this set naming any slots and generations, any context of up to two bytes
-    /// and any record buffer, whatever the platform's source and the cipher do: a wrap, or a lock
-    /// when `lock` says so, changes no key, stage or epoch, and marks the set wrapped for the next
-    /// epoch only when it succeeds during a change; it writes the record only when it succeeds,
-    /// starting with the nonce the source gave last, hedged with the key the record is wrapped in
-    /// at its count; it refuses an empty context, a stale handle, a set wrapped under itself, a
-    /// parent that does not serve wrapping, a set or a parent of the wrong level, a set changed in
-    /// this epoch outside a change, and a failed source. Each draw the source answers is counted
-    /// once. Returns the outcome.
-    fn wrap_from(lock: bool) -> Result<(), Error> {
+    /// for handles of this set naming any slots and generations, any context of up to two bytes and
+    /// any record buffer, whatever the platform's source and the cipher do: a wrap, a lock or an
+    /// export, as `kind` says, changes no key, stage or epoch; a wrap or a lock marks the set
+    /// wrapped for the next epoch only when it succeeds during a change, and an export marks
+    /// nothing and gives the key for transfers the tag of the record it writes as its chain and the
+    /// direction of exports; each
+    /// writes the record only when it succeeds, starting with the nonce the source gave last,
+    /// hedged at its count with the key the record is wrapped in, or for an export the key of this
+    /// epoch; it refuses an empty context, a stale handle, a set wrapped under itself, a parent not
+    /// of the purpose the kind takes, a set or a parent of the wrong level, a set of a transfer
+    /// that has not ended or an export under a key that receives one, a set changed in this epoch
+    /// outside a change unless it is exported, and a failed source. Each draw the source answers is counted once. Returns the outcome, the set
+    /// as it was, and whether a change of epoch was under way.
+    fn wrap_from(kind: Kind) -> (Result<(), Error>, Snapshot, bool) {
         let mut memory = [any_slot(), any_slot()];
         let id = memory.as_ptr().addr();
         let changing = kani::any();
@@ -7488,25 +8980,39 @@ mod proofs {
 
         let (epoch_key, next_key) = (*slots.epoch.key.bytes(), *slots.epoch.next.bytes());
         let count = slots.epoch.drawn;
-        let result = if lock {
+        let result = if kind == Kind::Lock {
             slots.wrap_on_stack(set, parent, context, &mut entropy, Out::Lock(&mut record))
         } else {
             let mut plain: [u8; RECORD_LEN] = original[..RECORD_LEN].try_into().unwrap();
-            let result =
-                slots.wrap_on_stack(set, parent, context, &mut entropy, Out::Record(&mut plain));
+            let out = if kind == Kind::Record {
+                Out::Record(&mut plain)
+            } else {
+                Out::Export(&mut plain)
+            };
+            let result = slots.wrap_on_stack(set, parent, context, &mut entropy, out);
             record[..RECORD_LEN].copy_from_slice(&plain);
             result
         };
-        let sealing = result.is_ok() && changing;
+        let in_epoch = kind != Kind::Export;
+        let sealing = result.is_ok() && changing && in_epoch;
+        let mut chained = wrapping;
+        chained
+            .chain
+            .copy_from_slice(&record[NONCE_LEN + PLAINTEXT_LEN..RECORD_LEN]);
+        chained.direction = Direction::Out;
         kani::assert(
             if sealing {
                 unchanged_except(&slots, &before, set.index)
                     && snapshot(slot_at(&slots, set.index)) == marked(child, child.changed, true)
+            } else if result.is_ok() && !in_epoch {
+                unchanged_except(&slots, &before, parent.index)
+                    && snapshot(slot_at(&slots, parent.index)) == chained
             } else {
                 unchanged_except(&slots, &before, 2)
             },
-            "a wrap changes no key or stage, and marks the set wrapped for the next epoch only when \
-             it succeeds during a change",
+            "a wrap changes no key or stage, a wrap or a lock marks the set wrapped for the next \
+             epoch only when it succeeds during a change, and an export marks nothing and gives \
+             the chain of its key the tag of its record",
         );
         kani::assert(
             slots.epoch.number == epoch
@@ -7519,8 +9025,17 @@ mod proofs {
             slots.epoch.drawn == count.wrapping_add(u64::from(entropy.answered)),
             "a draw the source answers is counted once",
         );
-        let level =
-            !child.unlocks && (child.purpose == Purpose::Wrap) == lock && wrapping.unlocks == lock;
+        let lock = kind == Kind::Lock;
+        let parent_purpose = if in_epoch {
+            Purpose::Wrap
+        } else {
+            Purpose::Transfer
+        };
+        let level = if in_epoch {
+            !child.unlocks && (child.purpose == Purpose::Wrap) == lock && wrapping.unlocks == lock
+        } else {
+            child.purpose == Purpose::ExternalData
+        };
         kani::assert(
             if context.is_empty() {
                 result == Err(Error::InvalidContext)
@@ -7528,13 +9043,16 @@ mod proofs {
                 result == Err(Error::StaleHandle)
             } else if set.index == parent.index {
                 result == Err(Error::SameKey)
-            } else if wrapping.purpose != Purpose::Wrap {
+            } else if wrapping.purpose != parent_purpose {
                 result == Err(Error::WrongPurpose)
             } else if !level {
                 result == Err(Error::WrongLevel)
-            } else if child.changed && !changing {
+            } else if child.pending.is_some() || (!in_epoch && wrapping.direction == Direction::In)
+            {
+                result == Err(Error::Unfinished)
+            } else if in_epoch && child.changed && !changing {
                 result == Err(Error::Unsaved)
-            } else if changing && epoch == u64::MAX {
+            } else if in_epoch && changing && epoch == u64::MAX {
                 result == Err(Error::EpochExhausted)
             } else if entropy.failed {
                 result == Err(Error::EntropyFailed)
@@ -7543,13 +9061,13 @@ mod proofs {
                     || result == Err(Error::DerivationFailed)
                     || result == Err(Error::CipherFailed)
             },
-            "a wrap refuses a bad context, a stale handle, a set wrapping itself, a parent not for \
-             wrapping, a set or a parent of the wrong level, an unsaved set outside a change and a \
-             failed source",
+            "a wrap refuses a bad context, a stale handle, a set wrapping itself, a parent not of \
+             the purpose it takes, a set or a parent of the wrong level, a set of an unfinished \
+             transfer, an unsaved set outside a change unless it is exported and a failed source",
         );
         kani::cover!(
             result == Err(Error::WrongPurpose),
-            "a parent for external data is refused"
+            "a parent of another purpose is refused"
         );
         kani::cover!(
             result == Err(Error::WrongLevel),
@@ -7561,7 +9079,13 @@ mod proofs {
                 let mut drawn = [0; 12];
                 drawn.copy_from_slice(&entropy.written[..12]);
                 let mut salt = [0; 32];
-                salt.copy_from_slice(&if changing { next_key } else { epoch_key }[..32]);
+                salt.copy_from_slice(
+                    &if changing && in_epoch {
+                        next_key
+                    } else {
+                        epoch_key
+                    }[..32],
+                );
                 let last = count
                     .wrapping_add(u64::from(entropy.answered))
                     .wrapping_sub(1);
@@ -7578,10 +9102,6 @@ mod proofs {
         );
         kani::cover!(result.is_ok(), "a set is wrapped");
         kani::cover!(
-            sealing && child.changed,
-            "a changed set is wrapped for the next epoch"
-        );
-        kani::cover!(
             entropy.failed && entropy.written.iter().any(|&byte| byte != 0),
             "the source fails after writing bytes"
         );
@@ -7590,17 +9110,29 @@ mod proofs {
             result == Err(Error::DerivationFailed),
             "the derivation fails"
         );
-        result
+        (result, child, changing)
     }
 
-    /// The wrap of a set for external data.
+    /// The wrap of a set for external data or of a key for transfers.
     #[kani::proof]
     #[kani::unwind(234)]
     fn a_wrap_changes_no_slot_and_writes_only_when_it_succeeds() {
-        let result = wrap_from(false);
+        let (result, child, changing) = wrap_from(Kind::Record);
         kani::cover!(
             result == Err(Error::Unsaved),
             "a changed set is not wrapped in its epoch"
+        );
+        kani::cover!(
+            result.is_ok() && changing && child.changed,
+            "a changed set is wrapped for the next epoch"
+        );
+        kani::cover!(
+            result.is_ok() && child.purpose == Purpose::Transfer,
+            "a key for transfers is wrapped"
+        );
+        kani::cover!(
+            result == Err(Error::Unfinished),
+            "a set of an unfinished transfer is not wrapped"
         );
     }
 
@@ -7608,8 +9140,26 @@ mod proofs {
     #[kani::proof]
     #[kani::unwind(270)]
     fn a_lock_changes_no_slot_and_writes_only_when_it_succeeds() {
-        let result = wrap_from(true);
-        kani::cover!(result.is_ok(), "a stored key is locked");
+        let (result, _, changing) = wrap_from(Kind::Lock);
+        kani::cover!(
+            result.is_ok() && changing,
+            "a stored key is locked for the next epoch"
+        );
+    }
+
+    /// The export of a set for external data.
+    #[kani::proof]
+    #[kani::unwind(234)]
+    fn an_export_changes_no_set_and_writes_only_when_it_succeeds() {
+        let (result, child, changing) = wrap_from(Kind::Export);
+        kani::cover!(
+            result.is_ok() && changing && child.changed,
+            "a changed set is exported during a change of epoch"
+        );
+        kani::cover!(
+            result == Err(Error::Unfinished),
+            "a set of an unfinished transfer is not exported"
+        );
     }
 
     /// From any state of two slots and of the epoch, with a change to the next under way or not,
@@ -7715,6 +9265,227 @@ mod proofs {
             "nothing is carried outside a change"
         );
         kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
+    }
+
+    /// `before` as an end of the export under the key for transfers in slot `transfer`, whose
+    /// generation is `generation`, leaves it: that key idle with a chain of zero, and, when the end
+    /// is received, every set received under that key and generation free to be wrapped again.
+    fn ended(
+        before: Snapshot,
+        index: usize,
+        transfer: usize,
+        generation: u64,
+        received: bool,
+    ) -> Snapshot {
+        let mut after = before;
+        if received && before.pending == Some((transfer, generation)) {
+            after.pending = None;
+        }
+        if index == transfer {
+            after.chain = [0; TAG_LEN];
+            after.direction = Direction::Idle;
+        }
+        after
+    }
+
+    /// From any state of two slots and of the epoch, with a change to the next under way or not,
+    /// for a handle of this set naming any slot and generation, any context of up to two bytes and
+    /// any end, whatever the platform's source and the cipher do: ending an export, or receiving
+    /// the end of one when `receiving` says so, refuses an empty context, a stale handle, a set that
+    /// is not a key for transfers, a key that carries no export (`NoTransfer`) and one that carries
+    /// an export the other way (`Unfinished`), in that order, before anything else. The end of an
+    /// export
+    /// is written only when it succeeds, starting with the nonce the source gave, hedged with the
+    /// key of this epoch, and each draw the source answers is counted once; the end received is
+    /// opened once, under the key the key for transfers derives, with its own nonce and tag, and
+    /// rejected as `RecordRejected` unless the cipher accepts it. Either succeeds exactly then, and
+    /// then leaves the key idle with a chain of zero, and a receipt lets every set received under
+    /// that key and its generation be wrapped again; nothing else changes, no epoch either, and a
+    /// failure changes no slot. Returns the outcome, the set in the slot other than the one the handle names, and the
+    /// handle.
+    fn end_from(receiving: bool) -> (Result<(), Error>, Snapshot, Handle<'static>) {
+        let mut memory = [any_slot(), any_slot()];
+        let id = memory.as_ptr().addr();
+        let changing = kani::any();
+        let mut epoch = any_epoch(changing);
+        let mut slots = Slots {
+            memory: &mut memory,
+            epoch: &mut epoch,
+        };
+        let transfer = forged(id);
+        let context_bytes: [u8; 2] = kani::any();
+        let context = any_context(&context_bytes);
+        let before = snapshots(&slots);
+        let live = names_loaded(&before, &transfer);
+        let named = snapshot_at(&before, transfer.index);
+        let serving = live && named.purpose == Purpose::Transfer;
+        let way = if receiving {
+            Direction::In
+        } else {
+            Direction::Out
+        };
+        let (epoch_key, count) = (first_half(&slots.epoch.key), slots.epoch.drawn);
+        let (number, keys) = (
+            slots.epoch.number,
+            (*slots.epoch.key.bytes(), *slots.epoch.next.bytes()),
+        );
+        let original: [u8; END_RECORD_LEN] = kani::any();
+        let mut end = original;
+        let mut entropy = AnyEntropy::new();
+        let mut cipher = AnyCipher::<0>::new();
+
+        let result = if receiving {
+            slots.end_receive_on_stack(transfer, context, &end, |key, nonce, _, buffer, tag| {
+                cipher.open(key, nonce, buffer, tag)
+            })
+        } else {
+            slots.end_export_on_stack(transfer, context, &mut entropy, &mut end)
+        };
+        let refused_before = context.is_empty() || !serving || named.direction != way;
+        kani::assert(
+            if context.is_empty() {
+                result == Err(Error::InvalidContext)
+            } else if !live {
+                result == Err(Error::StaleHandle)
+            } else if !serving {
+                result == Err(Error::WrongPurpose)
+            } else if named.direction == Direction::Idle {
+                result == Err(Error::NoTransfer)
+            } else if named.direction != way {
+                result == Err(Error::Unfinished)
+            } else if receiving {
+                if any_failed() {
+                    result == Err(Error::DerivationFailed)
+                } else if cipher.accepted {
+                    result.is_ok()
+                } else {
+                    result == Err(Error::RecordRejected)
+                }
+            } else if entropy.failed {
+                result == Err(Error::EntropyFailed)
+            } else {
+                result.is_ok()
+                    || result == Err(Error::DerivationFailed)
+                    || result == Err(Error::CipherFailed)
+            },
+            "an end refuses a bad context, a stale handle, a key not for transfers, one that carries \
+             no export and one that carries an export the other way; a receipt succeeds exactly \
+             when the cipher accepts the end, and an export's end fails as its source, derivation \
+             or cipher do",
+        );
+        kani::assert(
+            refused_before || !any_failed() || result == Err(Error::DerivationFailed),
+            "an end that a derivation fails fails with DerivationFailed",
+        );
+        kani::assert(
+            slots.epoch.drawn == count.wrapping_add(u64::from(entropy.answered))
+                && slots.epoch.number == number
+                && slots.epoch.changing == changing
+                && (*slots.epoch.key.bytes(), *slots.epoch.next.bytes()) == keys,
+            "an end changes no epoch and no key of one, and counts once each draw the source \
+             answers",
+        );
+        let mut key = [0; 32];
+        key.copy_from_slice(&named.keys.0[..32]);
+        kani::assert(
+            !receiving
+                || if refused_before || any_failed() {
+                    cipher.calls == 0
+                } else {
+                    cipher.calls == 1
+                        && cipher.key == expected_export_key(&key)
+                        && cipher.nonce[..] == end[..NONCE_LEN]
+                        && cipher.tag[..] == end[NONCE_LEN..]
+                },
+            "an end is opened once, under the key the key for transfers derives, with its own nonce \
+             and tag",
+        );
+        // Worked out for a receipt too, so that its proof leaves no check of the export unreached.
+        let mut drawn = [0; 12];
+        drawn.copy_from_slice(&entropy.written[..12]);
+        let hedged = expected_hedge(&epoch_key, count, Branch::HedgeNonce, &drawn);
+        kani::assert(
+            if result.is_ok() && !receiving {
+                end[..NONCE_LEN] == hedged
+            } else {
+                end == original
+            },
+            "an end is written only when it succeeds, starting with the nonce hedged with the key \
+             of this epoch",
+        );
+        if result.is_ok() {
+            for index in 0..2 {
+                kani::assert(
+                    snapshot(slot_at(&slots, index))
+                        == ended(
+                            snapshot_at(&before, index),
+                            index,
+                            transfer.index,
+                            transfer.generation,
+                            receiving,
+                        ),
+                    "an end sets the chain and the direction of its key back, a receipt lets go \
+                     the sets of its export, and nothing else changes",
+                );
+            }
+        } else {
+            kani::assert(
+                unchanged_except(&slots, &before, 2),
+                "a failed end changes no slot",
+            );
+        }
+        kani::cover!(
+            result == Err(Error::WrongPurpose),
+            "a key not for transfers ends nothing"
+        );
+        kani::cover!(
+            result == Err(Error::NoTransfer),
+            "a key that carries no export ends none"
+        );
+        kani::cover!(
+            result == Err(Error::Unfinished),
+            "a key that carries an export the other way does not end it"
+        );
+        kani::cover!(
+            result == Err(Error::DerivationFailed),
+            "the derivation fails"
+        );
+        (
+            result,
+            snapshot_at(&before, 1 - transfer.index.min(1)),
+            transfer,
+        )
+    }
+
+    /// The end of an export. The seal checks the cipher on a record first, so the unwinding is that
+    /// of a wrap.
+    #[kani::proof]
+    #[kani::unwind(234)]
+    fn an_end_of_an_export_is_written_only_when_it_succeeds() {
+        let (result, _, _) = end_from(false);
+        kani::cover!(result.is_ok(), "an export is ended");
+        kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
+        kani::cover!(result == Err(Error::CipherFailed), "the cipher fails");
+    }
+
+    /// The receipt of the end of an export.
+    #[kani::proof]
+    #[kani::unwind(65)]
+    fn an_end_received_lets_go_only_the_sets_of_its_export() {
+        let (result, other, transfer) = end_from(true);
+        let own = Some((transfer.index, transfer.generation));
+        kani::cover!(
+            result.is_ok() && other.pending == own,
+            "a received set is let go"
+        );
+        kani::cover!(
+            result.is_ok() && other.pending.is_some() && other.pending != own,
+            "a set received under another key or generation waits"
+        );
+        kani::cover!(
+            result == Err(Error::RecordRejected),
+            "an end that does not open is rejected"
+        );
     }
 
     /// From any state of three slots, for handles of this set naming any slots and generations: the
@@ -8010,8 +9781,9 @@ mod proofs {
 
     /// From `memory`, with the slot `index` loaded and any position: promoting, disabling, enabling
     /// and destroying through the live handle of that slot are refused as `WrongPurpose` for a set
-    /// for wrapping, then as `EpochChanging` during a change of epoch, then as `Unsaved` if the set
-    /// has changed in this epoch, and otherwise
+    /// not for external data, then as `EpochChanging` during a change of epoch, then as
+    /// `Unfinished` for a set of a transfer that has not ended, then as `Unsaved` if the set has
+    /// changed in this epoch, and otherwise
     /// change its stages exactly as the transition of the stages gives, marking the set changed and
     /// not wrapped for the next epoch; a refusal changes nothing; a destroy wipes the key and the
     /// identifier at the position and leaves every other key as it was; the slot keeps its
@@ -8035,22 +9807,25 @@ mod proofs {
         let chosen = any_position();
         let mut expected = named.stages;
         let (result, outcome, destroying) = any_change(&mut slots, handle, chosen, &mut expected);
-        let wrapping = named.purpose == Purpose::Wrap;
-        let refused = wrapping || changing || named.changed;
+        let other_purpose = named.purpose != Purpose::ExternalData;
+        let unfinished = named.pending.is_some();
+        let refused = other_purpose || changing || unfinished || named.changed;
         kani::assert(
             result
-                == if wrapping {
+                == if other_purpose {
                     Err(Error::WrongPurpose)
                 } else if changing {
                     Err(Error::EpochChanging)
+                } else if unfinished {
+                    Err(Error::Unfinished)
                 } else if named.changed {
                     Err(Error::Unsaved)
                 } else {
                     outcome
                 },
-            "a change of a set for wrapping, during a change of epoch, or of a set changed in this \
-             epoch is refused, and otherwise succeeds exactly when the transition of the stages \
-             does, or fails as it does",
+            "a change of a set not for external data, during a change of epoch, of a set of an \
+             unfinished transfer, or of a set changed in this epoch is refused, and otherwise \
+             succeeds exactly when the transition of the stages does, or fails as it does",
         );
         let applied = result.is_ok();
         let now = snapshot(slot_at(&slots, index));
@@ -8060,9 +9835,12 @@ mod proofs {
                 && now.generation == named.generation
                 && now.purpose == named.purpose
                 && now.changed == (named.changed || applied)
-                && now.sealed == (named.sealed && !applied),
-            "the set keeps its slot, generation and purpose, its stages change as the transition \
-             gives, and a change marks it changed and not wrapped for the next epoch",
+                && now.sealed == (named.sealed && !applied)
+                && now.pending == named.pending
+                && now.chain == named.chain
+                && now.direction == named.direction,
+            "the set keeps its slot, generation, purpose and transfer, its stages change as the \
+             transition gives, and a change marks it changed and not wrapped for the next epoch",
         );
         let wiped = destroying && applied;
         for position in 0..MEMBERS {
@@ -8108,8 +9886,16 @@ mod proofs {
             "no set changes during a change of epoch"
         );
         kani::cover!(
-            result == Err(Error::WrongPurpose),
+            result == Err(Error::WrongPurpose) && named.purpose == Purpose::Wrap,
             "a set for wrapping takes no change"
+        );
+        kani::cover!(
+            result == Err(Error::WrongPurpose) && named.purpose == Purpose::Transfer,
+            "a key for transfers takes no change"
+        );
+        kani::cover!(
+            result == Err(Error::Unfinished),
+            "a set of an unfinished transfer takes no change"
         );
     }
 
@@ -8164,7 +9950,8 @@ mod proofs {
     /// of 32 bytes, any bytes, through its live handle puts it into the first empty position of
     /// the set, enabled, with the identifier derived from its bytes and its length alone, marks the
     /// set changed and not wrapped for the next epoch, and changes nothing else; it fails as
-    /// `WrongPurpose` for a set for wrapping, as `Unsaved` if the set has changed in this epoch, as
+    /// `WrongPurpose` for a set not for external data, as `Unfinished` for a set of a transfer that
+    /// has not ended, as `Unsaved` if the set has changed in this epoch, as
     /// the transition of the stages does when no position is empty or the set is exhausted, and
     /// otherwise with DerivationFailed when the derivation fails and with DuplicateKey exactly when
     /// a loaded slot holds a key with that identifier, for any purpose; the source is wiped exactly
@@ -8200,7 +9987,8 @@ mod proofs {
         let key_id = expected_key_id(&bytes, length);
         kani::assert(
             match position {
-                _ if named.purpose == Purpose::Wrap => result == Err(Error::WrongPurpose),
+                _ if named.purpose != Purpose::ExternalData => result == Err(Error::WrongPurpose),
+                _ if named.pending.is_some() => result == Err(Error::Unfinished),
                 _ if named.changed => result == Err(Error::Unsaved),
                 Err(refused) => result == Err(Error::from(refused)),
                 Ok(at) => {
@@ -8213,8 +10001,9 @@ mod proofs {
                     }
                 }
             },
-            "an addition fails as WrongPurpose for a set for wrapping, as Unsaved for a set changed \
-             in this epoch, as the stages refuse it, then with DerivationFailed when the derivation \
+            "an addition fails as WrongPurpose for a set not for external data, as Unfinished for a \
+             set of an unfinished transfer, as Unsaved for a set changed in this epoch, as the \
+             stages refuse it, then with DerivationFailed when the derivation \
              fails, with DuplicateKey when the key is held, and otherwise succeeds at the first \
              empty position",
         );
@@ -8227,9 +10016,12 @@ mod proofs {
                     && now.generation == named.generation
                     && now.purpose == named.purpose
                     && now.changed
-                    && !now.sealed,
-                "the set keeps its slot, generation and purpose, its stages gain the key, and it is \
-                 marked changed and not wrapped for the next epoch",
+                    && !now.sealed
+                    && now.pending.is_none()
+                    && now.chain == named.chain
+                    && now.direction == named.direction,
+                "the set keeps its slot, generation, purpose and transfer, its stages gain the key, \
+                 and it is marked changed and not wrapped for the next epoch",
             );
             for position in 0..MEMBERS {
                 kani::assert(
@@ -8265,7 +10057,11 @@ mod proofs {
         kani::cover!(result == Err(Error::SetFull), "the set is full");
         kani::cover!(
             result == Err(Error::WrongPurpose),
-            "a set for wrapping takes no key"
+            "a set not for external data takes no key"
+        );
+        kani::cover!(
+            result == Err(Error::Unfinished),
+            "a set of an unfinished transfer takes no key"
         );
         kani::cover!(
             result == Err(Error::DerivationFailed),
@@ -8501,11 +10297,12 @@ mod proofs {
         );
     }
 
-    /// With the first of two slots loaded, the second in any state and no change of epoch under way:
-    /// an addition of a key of either length, any bytes, through the live handle of the first, by
-    /// the code every addition runs, is refused as `WrongPurpose` for a set for wrapping, as
-    /// `Unsaved` for a set changed in this epoch, and then as `WrongLength` exactly for a length its
-    /// purpose does not take, changing nothing. No purpose takes an addition of 64 bytes.
+    /// With the first of two slots loaded, the second in any state and no change of epoch under
+    /// way: an addition of a key of either length, any bytes, through the live handle of the first,
+    /// by the code every addition runs, is refused as `WrongPurpose` for a set not for external
+    /// data, as `Unfinished` for a set of a transfer that has not ended, as `Unsaved` for a set
+    /// changed in this epoch, and then as `WrongLength` exactly for a length its purpose does not
+    /// take, changing nothing. No set takes an addition of 64 bytes.
     #[kani::proof]
     #[kani::unwind(65)]
     fn a_long_addition_in_the_first_slot() {
@@ -8529,8 +10326,10 @@ mod proofs {
             key.fill(length, &mut source)
                 .map_err(|EntropyError| Error::EntropyFailed)
         });
-        let refusal = if before[0].purpose == Purpose::Wrap {
+        let refusal = if before[0].purpose != Purpose::ExternalData {
             Some(Error::WrongPurpose)
+        } else if before[0].pending.is_some() {
+            Some(Error::Unfinished)
         } else if before[0].changed {
             Some(Error::Unsaved)
         } else if !allowed(before[0].purpose, length) {
@@ -8559,9 +10358,9 @@ mod proofs {
 
     /// From any state of two slots during a change of epoch, for a handle of this set naming any
     /// slot and generation: every change of stage and an addition are refused, as `StaleHandle` if
-    /// the handle is not live, as `WrongPurpose` for a set for wrapping, and as `EpochChanging`
-    /// otherwise; the source is left as it was, and nothing changes. A generated key goes through
-    /// the same code as the addition, which refuses before it fills the slot.
+    /// the handle is not live, as `WrongPurpose` for a set not for external data, and as
+    /// `EpochChanging` otherwise; the source is left as it was, and nothing changes. A generated
+    /// key goes through the same code as the addition, which refuses before it fills the slot.
     #[kani::proof]
     #[kani::unwind(65)]
     fn no_set_changes_during_a_change_of_epoch() {
@@ -8575,7 +10374,7 @@ mod proofs {
         let handle = forged(id);
         let live = live(&slots, id, &handle);
         let before = snapshots(&slots);
-        let wrapping = live && snapshot_at(&before, handle.index).purpose == Purpose::Wrap;
+        let wrapping = live && snapshot_at(&before, handle.index).purpose != Purpose::ExternalData;
         let (result, _, _) = any_change(&mut slots, handle, any_position(), &mut Stages::one());
         let mut source: [u8; 32] = kani::any();
         let original = source;

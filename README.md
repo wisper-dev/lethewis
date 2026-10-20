@@ -17,7 +17,7 @@ Suggestions for functionality not listed here are accepted as issues.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/rustc-1.99.0-orange.svg)
-![Readiness](https://img.shields.io/badge/readiness-32%25-orange.svg)
+![Readiness](https://img.shields.io/badge/readiness-41%25-orange.svg)
 
 ## How the keys relate
 
@@ -30,6 +30,8 @@ graph TD
     PK --> CK1["Chat key"]
     PK --> CK2["Chat key"]
     PK --> AK["Archive key<br/><i>second password or a share</i>"]
+    PK --> TK["Key for transfers<br/><i>from the words or another device</i>"]
+    TK --> X["Export of chat keys<br/><i>a backup, a second device</i>"]
     CK1 --> D1["Messages, files"]
     CK2 --> D2["Messages, files"]
     AK --> D3["History past the cut-off"]
@@ -50,16 +52,19 @@ password and the hardware secret at each unlock, and neither alone is enough.
   certainly.
 - **A key derived from a password or from twelve words comes back from them.** Destroying it does
   not reach the password or the words; destroying the profile key it opens does.
+- **An export outlives what happens on the device after it.** Its records open with its key for
+  transfers in any epoch, so destroying a chat or the profile does not reach an export made before.
+  No export tells its age: an older backup under the same words opens as a newer one does.
 - **A way in is revoked only by the next change of epoch.** A lock record left behind opens until
   the change is committed and the old root erased. Against someone who held an epoch's key while
   the record lived and knows its secret, only a new profile key helps.
 - **A challenge to the chip is as sensitive as a hash of the password.** Whoever reads one on its
   way to the chip can test guesses at the password without the chip. Wiping it after use and
   passing it only to the chip is the caller's.
-- **Wiping a value from memory does not reach every copy.** Copies left by a value move, a buffer
-  reallocation, a CPU register, swap or a crash dump are outside what this library clears. Each
-  load, addition, derivation, reveal, wrap, unwrap, lock, unlock, carry, combination and challenge
-  wipes the stack it used, as measured on x86-64 and aarch64 Linux only.
+- **Wiping a value from memory does not reach every copy.** Copies from a move, a reallocation, a
+  CPU register, swap or a crash dump are outside what this library clears. Each
+  load, addition, derivation, reveal, wrap, unwrap, lock, unlock, carry, combination, challenge,
+  export and receipt wipes the stack it used, as measured on x86-64 and aarch64 Linux only.
 - **The stack a call needs is not measured on microcontrollers.** On a target such as Cortex-M a
   call needs at least the depth of the wipe after it, which its documentation states, and an
   overflow of an unguarded stack corrupts memory silently. A derivation from a password needs at
@@ -68,9 +73,9 @@ password and the hardware secret at each unlock, and neither alone is enough.
   MiB of memory and fewer than 3 passes. Choosing parameters that take a few seconds on a device is
   the caller's, and so is bringing a password typed as text into one Unicode form.
 - **A key handed out is the caller's to wipe.** A key for external data, such as a database key,
-  leaves the library in the clear only through `Slots::reveal32`, into the caller's buffer. The
-  library does not reach that copy, nor what the engine it goes to keeps. Keys for wrapping leave in
-  the clear only as the words of a generation.
+  leaves the library in the clear only through `Slots::reveal32`. The library does not reach that
+  copy or what its engine keeps. Keys for wrapping and for transfers leave in the clear only as the
+  words of a generation.
 - **A broken random source is covered only in part.** Keys, words and nonces are hedged with the
   key of the epoch, as RFC 8937 has it: within one `Slots`, a broken source alone makes none
   predictable. Not covered: a key of the epoch from that source, a copied process or machine,

@@ -193,5 +193,22 @@ Nothing is published while the version is below 0.1.0.
 - A test of the hierarchy end to end, through the public interface. A profile key is locked under
   a password with the chip and under words, with keys of chats under it. After a change of epoch, a
   chat not wrapped again and a way in not carried open no more.
+- A third purpose, `Purpose::Transfer`: a 32-byte key that carries keys for external data to
+  another device or into a backup. It is imported from a secret shared with the other device, or
+  derived from the twelve words by `Slots::transfer_from_words`, another key than the one
+  `Slots::derive_from_words` gives. It is never generated or revealed, and is stored under a stored
+  key for wrapping.
+- `Slots::export` writes a set for external data as a record of an export, of `RECORD_LEN` bytes,
+  under a key derived from the key for transfers alone, in no epoch; each record is bound to the tag
+  of the one before. `Slots::end_export` ends the export with a record of `END_RECORD_LEN` bytes, 28.
+- `Slots::receive` loads the records of an export, in order, into free slots; a set received is
+  neither revealed, wrapped, exported nor changed until `Slots::end_receive` receives the end. A key
+  for transfers carries one export at a time, one way, and an export without records has no end.
+  New errors: `Unfinished` and `NoTransfer`.
+- Proofs with Kani 0.68.0 for exports, receipts and both ends, and tests against an export and its
+  end computed by an independent implementation. The stack is wiped after each call: 24 KiB, or 64
+  KiB; they need 25 KiB of stack, or 72 KiB.
+- Tests end to end: the keys of chats move to a second device under a shared secret, and a backup
+  under the words restores them on a new phone; an export cut short leaves nothing to keep.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

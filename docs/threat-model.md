@@ -35,6 +35,10 @@ only under the key of the epoch. A guess at a password against a lock record nee
 A key from a password can be combined with the chip's answer to a challenge derived from it: the key
 the two make needs both, so each guess at the password needs the chip of the device.
 
+A backup is an export under a key for transfers derived from the twelve words with a label of its
+own, so not the way in from the same words. It opens with the words alone, on any device and in any
+epoch: a guess at it is a guess at 128 bits. No backup is made under a password.
+
 **Intended.** Parameters tuned to seconds on the target device by the platform layer, and the
 platform layer that puts the challenge to the chip. After destruction, no call returns the key.
 
@@ -63,6 +67,10 @@ storage layer, which is outside this library.
 cannot demonstrate that a hidden profile is absent. Destruction is a setting the owner enables, and in
 some jurisdictions using it is itself an offence.
 
+An export made before the profile is destroyed still holds the keys of the chats it carried, and
+opens with its key for transfers: the words, or the secret shared with the other device. Asking the
+owner again before an export, and how long a key for transfers lives, are the application's.
+
 ### 3. A laboratory reading the flash chip
 
 **Capability.** Desoldering, reading raw flash, recovering superseded writes.
@@ -81,6 +89,10 @@ carried opens no more once the old root is erased: so a way in is revoked.
 was locked under, keeps the stored key it holds after that way in is revoked. Only a new stored key,
 with every way in locked again, stands against that.
 
+A record of an export is in no epoch: one left on flash, or a backup kept elsewhere, opens with its
+key for transfers after any change of epoch. No export tells its age, and an older backup under the
+same words opens as a newer one does: it may still hold a key destroyed since.
+
 Whether a chip really erases a key, and whether the keys it uses to wrap its own
 keys stay inside it, cannot be checked from outside. On a device without an erasable root, or where
 a platform gives two epochs the same key, old records stay readable to whoever holds the password
@@ -95,8 +107,15 @@ set of up to three keys. A key is held in one place only, whatever purpose it se
 the slots already hold, or of a set that holds one key twice, is refused.
 
 Each key wraps only at its level: a key from a secret only stored keys for wrapping, in lock
-records, and a stored key only keys for external data, in plain records. No call wraps a key from a
-secret.
+records, and a stored key only keys for external data and keys for transfers, in plain records. A key
+for transfers only exports keys for external data. No call wraps a key from a secret.
+
+The records of an export open only in the order they were written, each bound to the tag of the one
+before, and its end is bound to the last. Until that end is received, a set that came in the export
+is not revealed, wrapped, exported or changed: a cut, reordered or mixed export leaves nothing to
+keep.
+
+A key for transfers carries one export at a time, one way, and an export with no record has no end.
 
 A new key is the hedge of the platform's random bytes under the key of the epoch, written straight
 into its slot; the bytes drawn are wiped, and if the source fails or panics, so is the slot. The
@@ -107,12 +126,14 @@ buffer. The stack below the call is wiped after it, 8 KiB, or 64 KiB without opt
 test reads it back for the key.
 
 Apart from a reveal, a set leaves its slot only as one record of all its keys, encrypted with
-AES-256-GCM-SIV under a key derived from the key of the set that wraps it, bound to a context the
-caller names. Only a key for wrapping wraps and unwraps; its set holds that one key and never
-changes.
+AES-256-GCM-SIV under a key derived from the key that wraps or exports it, bound to a context the
+caller names.
 
-Before every wrap the cipher encrypts a known input of the shape of a record and must give the answer
-an independent implementation gives, or nothing is written.
+Only a key for wrapping wraps and unwraps, only a key for transfers exports and receives, and the
+set of either holds one key and never changes.
+
+Before every wrap and export the cipher encrypts a known input of the shape of a record and must give
+the answer an independent implementation gives, or nothing is written.
 
 A record is unwrapped into a slot only after its tag, its layout and the identifier of the key that
 wraps it are checked. A record that fails any of these checks is refused with one error.
@@ -130,9 +151,10 @@ two SHA-256 paths use.
 The same wipe follows a combination of two keys and a challenge to the chip, and tests read the
 stack back after each.
 
-After a wrap, an unwrap, a lock, an unlock and a carry the stack below the caller is wiped as
-well: 24 KiB, or 64 KiB without optimisation, at least twice what the cipher uses at every level
-of optimisation by the same measurement.
+The stack below the caller is wiped as well after a wrap, an unwrap, a lock, an unlock, a carry,
+an export, a receipt and either end of an export. The wipe reaches 24 KiB, or 64 KiB without
+optimisation: at least twice what the cipher uses at every level of optimisation, by the same
+measurement.
 
 Tests read the stack back after a wrap, an unwrap and an unwrap whose record fails its tag, with a set
 of three keys under a 64-byte parent. They look for pieces of every key, of the derived cipher key
@@ -142,7 +164,8 @@ They also look for the AES round keys of the derived key and of the message encr
 out by the instructions, the keystream and what the record decrypts to.
 
 Tests read the stack back the same way after a lock, an unlock, a refused unlock and a carry, for
-both layers of the record and the keys derived for them.
+both layers of the record and the keys derived for them. They do so after an export, a receipt, a
+refused receipt and both ends too, for the key for transfers and the key derived from it.
 
 The wipe on release and on creating the slots, and the refusal of a released or foreign handle, are
 proven for two slots; the statements and their limits are in [proofs.md](proofs.md).
@@ -172,6 +195,9 @@ platform keeps the old root.
 **Not defended.** Copies left by a value move, a buffer reallocation, a CPU register, swap, or a
 crash dump. A set of slots leaked instead of dropped keeps its keys in memory. A system component
 with elevated privileges is outside what process isolation provides.
+
+Whoever can call the library can export a set under a key for transfers it imported itself. That
+gives out every key of the set, the disabled ones too, which a reveal does not.
 
 The stack wipe is best effort. It does not reach registers, and it relies on the compiler keeping
 the derivation, the hedge, the reveal, the wrap and the unwrap out of their caller's frame. Its depth
@@ -252,8 +278,9 @@ elsewhere. Whether those instructions take the same time for all data is up to t
 recent Intel processors that holds only in a mode the operating system sets.
 
 On aarch64 it holds only in the data-independent timing mode. `lethewis-dit` switches it on around
-loading a key and wrapping and unwrapping a set where Linux, Android or an Apple system reports the
-feature; elsewhere, and where the system or a virtual machine hides it, the mode stays off.
+loading a key and wrapping, unwrapping, exporting and receiving a set where Linux, Android or an
+Apple system reports the feature; elsewhere, and where the system or a virtual machine hides it, the
+mode stays off.
 
 On Apple M1 and M2 the mode does not stop the data prefetcher from reading memory by its contents;
 on M3 it does. On Cortex-M3 the portable multiplication varies with its operands, and WebAssembly

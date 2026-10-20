@@ -546,15 +546,15 @@ mod tests {
         }
     }
 
-    /// The version is 1; the purpose is one of the two, and a set of external data holds only
-    /// 32-byte keys, as [`gap`] does and [`full`] does not.
+    /// The version is 1; the purpose is one of the three, and a set of external data or of a key
+    /// for transfers holds only 32-byte keys, as [`gap`] does and [`full`] does not.
     #[test]
     fn the_version_is_one_and_the_purpose_takes_its_lengths() {
         for (position, bytes, accepted) in [
             (0, full(), &[1][..]),
             (0, gap(), &[1][..]),
             (1, full(), &[1][..]),
-            (1, gap(), &[1, 2][..]),
+            (1, gap(), &[1, 2, 3][..]),
         ] {
             for value in 0..=u8::MAX {
                 let mut changed = bytes;
@@ -833,7 +833,7 @@ pub(crate) mod proofs {
     }
 
     /// Whether the position starting at `at` is one `build` can write for the purpose `purpose`:
-    /// keys of 32 or 64 bytes for 1, of 32 for 2.
+    /// keys of 32 or 64 bytes for 1, of 32 for 2 and 3.
     fn writable_position(bytes: &[u8; PLAINTEXT_LEN], at: usize, purpose: u8) -> bool {
         let stage = bytes[at];
         let length = bytes[at + 1];
@@ -851,7 +851,7 @@ pub(crate) mod proofs {
         let primary = bytes[2];
         let purpose = bytes[1];
         bytes[0] == 1
-            && (purpose == 1 || purpose == 2)
+            && (purpose == 1 || purpose == 2 || purpose == 3)
             && writable_position(bytes, POSITIONS[0], purpose)
             && writable_position(bytes, POSITIONS[1], purpose)
             && writable_position(bytes, POSITIONS[2], purpose)
@@ -893,10 +893,11 @@ pub(crate) mod proofs {
             "only the version is refused"
         );
         kani::cover!(
-            !accepted && bytes[1] > 2 && with(&bytes, 1, 1),
+            !accepted && bytes[1] > 3 && with(&bytes, 1, 1),
             "only the purpose is refused"
         );
         kani::cover!(accepted && bytes[1] == 2, "a set of external data");
+        kani::cover!(accepted && bytes[1] == 3, "a set of a key for transfers");
         kani::cover!(
             !accepted && bytes[1] == 2 && with(&bytes, 1, 1),
             "only a key too long for external data is refused"
@@ -953,12 +954,12 @@ pub(crate) mod proofs {
         stages
     }
 
-    /// Either purpose.
+    /// Any purpose.
     pub(crate) fn any_purpose() -> Purpose {
-        if kani::any() {
-            Purpose::Wrap
-        } else {
-            Purpose::ExternalData
+        match kani::any::<u8>() % 3 {
+            0 => Purpose::Wrap,
+            1 => Purpose::ExternalData,
+            _ => Purpose::Transfer,
         }
     }
 
@@ -973,7 +974,8 @@ pub(crate) mod proofs {
     }
 
     /// Whether `purpose` takes a key of `length`, as the documentation of `Purpose` states it: any
-    /// length for wrapping, 32 bytes for external data. Written apart from the code.
+    /// length for wrapping, 32 bytes for external data and for transfers. Written apart from the
+    /// code.
     pub(crate) fn allowed(purpose: Purpose, length: KeyLength) -> bool {
         purpose == Purpose::Wrap || length == KeyLength::Bytes32
     }
@@ -985,7 +987,7 @@ pub(crate) mod proofs {
         key
     }
 
-    /// For any header of either purpose, any whole stages and any keys of a length the purpose
+    /// For any header of any purpose, any whole stages and any keys of a length the purpose
     /// takes, building puts every field where the layout says, empty positions zero, and parsing
     /// gives back the same header, stages and keys. The offsets and values are written from the
     /// layout, independently of the builder and the parser.
@@ -1006,10 +1008,10 @@ pub(crate) mod proofs {
         let mut out: [u8; PLAINTEXT_LEN] = kani::any();
         build(&header, &stages, [&keys[0], &keys[1], &keys[2]], &mut out);
 
-        let purpose = if header.purpose == Purpose::Wrap {
-            1
-        } else {
-            2
+        let purpose = match header.purpose {
+            Purpose::Wrap => 1,
+            Purpose::ExternalData => 2,
+            Purpose::Transfer => 3,
         };
         kani::assert(
             out[0] == 1 && out[1] == purpose && usize::from(out[2]) == stages.primary,
@@ -1093,6 +1095,10 @@ pub(crate) mod proofs {
         kani::cover!(
             header.purpose == Purpose::ExternalData && stages.members[0].is_some(),
             "a set of external data"
+        );
+        kani::cover!(
+            header.purpose == Purpose::Transfer,
+            "a set of a key for transfers"
         );
     }
 
