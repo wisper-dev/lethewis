@@ -119,11 +119,17 @@ fn seal_checked<const N: usize>(
     aad: &[u8],
     buffer: &mut [u8; N],
 ) -> Result<[u8; TAG_LEN], SealFailed> {
+    #[cfg(kani)]
+    let given = model::head(buffer);
     let sealed = if answers(known) {
         encrypt(key, nonce, aad, buffer)
     } else {
         Err(SealFailed)
     };
+    #[cfg(kani)]
+    if let Ok(tag) = &sealed {
+        model::keep_seal::<N>(key, nonce, aad, (&given, &model::head(buffer)), tag);
+    }
     if sealed.is_err() {
         #[cfg(kani)]
         model::note_seal_failed();
@@ -199,9 +205,145 @@ use model::{decrypt, encrypt};
 /// What stands in for AES-256-GCM-SIV under Kani.
 #[cfg(kani)]
 pub(crate) mod model {
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-    use super::{KEY_LEN, NONCE_LEN, Rejected, SealFailed, TAG_LEN};
+    use super::{KEY_LEN, NONCE_LEN, PLAINTEXT_LEN, Rejected, SealFailed, TAG_LEN};
+
+    /// The places the model keeps a seal in: the last seal of the plaintext of a record, or of
+    /// nothing, and the last seal of anything longer, a layer; and how many first bytes of their
+    /// plaintext and of what they wrote, and of their associated data.
+    pub(crate) const RECORD: usize = 0;
+    pub(crate) const LAYER: usize = 1;
+    const KEPT: usize = 2;
+    pub(crate) const HEAD: usize = 32;
+    pub(crate) const AAD_HEAD: usize = 23;
+
+    /// What the first seals that succeeded were given and gave, so that a proof can follow them:
+    /// the key, the nonce, the associated data at the places a proof reads it, the first bytes of
+    /// the plaintext and of what was written, and the tag. Kept in words of eight bytes: a store
+    /// per byte multiplies the proofs' work.
+    static SEALED: [AtomicBool; KEPT] = [const { AtomicBool::new(false) }; KEPT];
+    static KEYS: [[AtomicU64; 4]; KEPT] = [const { [const { AtomicU64::new(0) }; 4] }; KEPT];
+    static NONCES: [[AtomicU64; 2]; KEPT] = [const { [const { AtomicU64::new(0) }; 2] }; KEPT];
+    static AADS: [[AtomicU64; 3]; KEPT] = [const { [const { AtomicU64::new(0) }; 3] }; KEPT];
+    static AAD_LENS: [AtomicUsize; KEPT] = [const { AtomicUsize::new(0) }; KEPT];
+    static GIVEN: [[AtomicU64; 4]; KEPT] = [const { [const { AtomicU64::new(0) }; 4] }; KEPT];
+    static WRITTEN: [[AtomicU64; 4]; KEPT] = [const { [const { AtomicU64::new(0) }; 4] }; KEPT];
+    static TAGS: [[AtomicU64; 2]; KEPT] = [const { [const { AtomicU64::new(0) }; 2] }; KEPT];
+
+    /// What a seal was given and gave: the key, the nonce, the first bytes of the associated data,
+    /// zero past its end, and its length, the first bytes of the plaintext and of what was written,
+    /// and the tag.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Sealed {
+        pub(crate) key: [u8; KEY_LEN],
+        pub(crate) nonce: [u8; NONCE_LEN],
+        pub(crate) aad: [u8; AAD_HEAD],
+        pub(crate) aad_len: usize,
+        pub(crate) given: [u8; HEAD],
+        pub(crate) written: [u8; HEAD],
+        pub(crate) tag: [u8; TAG_LEN],
+    }
+
+    /// The first bytes of `buffer`, or zeros for a shorter one.
+    pub(super) fn head<const N: usize>(buffer: &[u8; N]) -> [u8; HEAD] {
+        buffer.first_chunk::<HEAD>().copied().unwrap_or([0; HEAD])
+    }
+
+    /// Keeps what a seal of `N` bytes that succeeded was given and gave, in the place its length
+    /// takes: the place is known when the proof is built, so that the model reads and writes no
+    /// place the proof has to work out.
+    pub(super) fn keep_seal<const N: usize>(
+        key: &[u8; KEY_LEN],
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        (given, written): (&[u8; HEAD], &[u8; HEAD]),
+        tag: &[u8; TAG_LEN],
+    ) {
+        let at = if N == PLAINTEXT_LEN || N == 0 {
+            RECORD
+        } else {
+            LAYER
+        };
+        let aad_head: [u8; AAD_HEAD] =
+            core::array::from_fn(|place| aad.get(place).copied().unwrap_or(0));
+        if let (
+            Some(keys),
+            Some(nonces),
+            Some(aads),
+            Some(length),
+            Some(givens),
+            Some(writtens),
+            Some(tags),
+            Some(sealed),
+        ) = (
+            KEYS.get(at),
+            NONCES.get(at),
+            AADS.get(at),
+            AAD_LENS.get(at),
+            GIVEN.get(at),
+            WRITTEN.get(at),
+            TAGS.get(at),
+            SEALED.get(at),
+        ) {
+            keep(keys, key);
+            keep(nonces, nonce);
+            keep(aads, &aad_head);
+            length.store(aad.len(), Ordering::Relaxed);
+            keep(givens, given);
+            keep(writtens, written);
+            keep(tags, tag);
+            sealed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a seal that succeeded is kept at `at`.
+    pub(crate) fn kept_at(at: usize) -> bool {
+        SEALED
+            .get(at)
+            .is_some_and(|sealed| sealed.load(Ordering::Relaxed))
+    }
+
+    /// What the last seal that succeeded and is kept at `at` was given and gave.
+    pub(crate) fn sealed(at: usize) -> Sealed {
+        Sealed {
+            key: KEYS.get(at).map_or([0; KEY_LEN], kept),
+            nonce: NONCES.get(at).map_or([0; NONCE_LEN], kept),
+            aad: AADS.get(at).map_or([0; AAD_HEAD], kept),
+            aad_len: AAD_LENS
+                .get(at)
+                .map_or(0, |length| length.load(Ordering::Relaxed)),
+            given: GIVEN.get(at).map_or([0; HEAD], kept),
+            written: WRITTEN.get(at).map_or([0; HEAD], kept),
+            tag: TAGS.get(at).map_or([0; TAG_LEN], kept),
+        }
+    }
+
+    /// Keeps `bytes`, at most 32, in `words`, least significant byte first.
+    fn keep<const N: usize, const W: usize>(words: &[AtomicU64; W], bytes: &[u8; N]) {
+        let mut padded = [0; 32];
+        if let Some(to) = padded.get_mut(..N) {
+            to.copy_from_slice(bytes);
+        }
+        for (word, chunk) in words.iter().zip(padded.chunks_exact(8)) {
+            let mut eight = [0; 8];
+            eight.copy_from_slice(chunk);
+            word.store(u64::from_le_bytes(eight), Ordering::Relaxed);
+        }
+    }
+
+    /// The `N` bytes kept in `words`.
+    fn kept<const N: usize, const W: usize>(words: &[AtomicU64; W]) -> [u8; N] {
+        let mut padded = [0; 32];
+        for (word, chunk) in words.iter().zip(padded.chunks_exact_mut(8)) {
+            chunk.copy_from_slice(&word.load(Ordering::Relaxed).to_le_bytes());
+        }
+        let mut bytes = [0; N];
+        if let Some(from) = padded.get(..N) {
+            bytes.copy_from_slice(from);
+        }
+        bytes
+    }
 
     /// Whether the last decryption was rejected, so a proof can tell a rejection by the cipher from
     /// one the code makes up.

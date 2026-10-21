@@ -7046,10 +7046,11 @@ mod proofs {
     use core::marker::PhantomData;
 
     use super::{
-        ArchivePublic, CIPHER_KEY_LEN, Direction, END_RECORD_LEN, Entropy, EntropyError, Epoch,
-        Erasure, Error, Handle, Key, KeyId, KeyLength, Kind, LAYER_LEN, LOCK_RECORD_LEN, MEMBERS,
-        NONCE_LEN, Occupancy, Out, PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Rejected, Root,
-        RootFailed, SealFailed, Slot, Slots, Stages, Status, TAG_LEN, opening, sealing,
+        ArchivePublic, CIPHER_KEY_LEN, Direction, END_LABEL, END_RECORD_LEN, EXPORT_LABEL, Entropy,
+        EntropyError, Epoch, Erasure, Error, Handle, Key, KeyId, KeyLength, Kind, LAYER_LEN,
+        LOCK_RECORD_LEN, MEMBERS, NONCE_LEN, Occupancy, Out, PLAINTEXT_LEN, Position, Purpose,
+        RECORD_LEN, Rejected, Root, RootFailed, SealFailed, Slot, Slots, Stages, Status, TAG_LEN,
+        opening, sealing,
     };
     use crate::derive::{
         Branch,
@@ -9101,22 +9102,30 @@ mod proofs {
                 parent,
                 context,
                 &record,
-                opening(|key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag)),
-                opening(|key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag)),
+                opening(|key, nonce, aad, buffer, tag| {
+                    layer.open_bound(key, nonce, aad, buffer, tag)
+                }),
+                opening(|key, nonce, aad, buffer, tag| {
+                    cipher.open_bound(key, nonce, aad, buffer, tag)
+                }),
             )
         } else if kind == Kind::Record {
             slots.unwrap_on_stack(
                 parent,
                 context,
                 &record,
-                opening(|key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag)),
+                opening(|key, nonce, aad, buffer, tag| {
+                    cipher.open_bound(key, nonce, aad, buffer, tag)
+                }),
             )
         } else {
             slots.receive_on_stack(
                 parent,
                 context,
                 &record,
-                opening(|key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag)),
+                opening(|key, nonce, aad, buffer, tag| {
+                    cipher.open_bound(key, nonce, aad, buffer, tag)
+                }),
             )
         };
         let lock = kind == Kind::Lock;
@@ -9147,6 +9156,17 @@ mod proofs {
         kani::assert(
             !refused_before || (cipher.calls == 0 && layer.calls == 0),
             "those refusals come before any decryption",
+        );
+        let bound = if receipt {
+            Bound::chained(EXPORT_LABEL, &named.chain, context)
+        } else {
+            Bound::to(context)
+        };
+        kani::assert(
+            (cipher.calls == 0 || cipher.aad == bound)
+                && (layer.calls == 0 || layer.aad == Bound::to(context)),
+            "a record is opened bound to its context, a record of an export also to the chain of \
+             its key",
         );
         let current = layer.accepted && layer.written[..8] == number.to_le_bytes();
         let layer_key = expected_layer_key(&epoch_key);
@@ -9486,6 +9506,64 @@ mod proofs {
             !any_failed() || result == Err(Error::DerivationFailed),
             "a wrap that a derivation fails fails with DerivationFailed",
         );
+        kani::assert(
+            (result == Err(Error::CipherFailed)) == seal::model::any_seal_failed(),
+            "a wrap fails with CipherFailed exactly when a seal fails",
+        );
+        let (inner, layer) = (
+            seal::model::sealed(seal::model::RECORD),
+            seal::model::sealed(seal::model::LAYER),
+        );
+        let mut salt = [0; 32];
+        salt.copy_from_slice(
+            &if changing && in_epoch {
+                next_key
+            } else {
+                epoch_key
+            }[..32],
+        );
+        let record_key = match kind {
+            Kind::Record => expected_wrap_key(&wrapping.keys.0, wrapping.lengths[0], &salt),
+            Kind::Lock => expected_lock_key(&wrapping.keys.0, wrapping.lengths[0]),
+            Kind::Export | Kind::ArchiveKey => expected_export_key(&key_head(&wrapping)),
+        };
+        let named = if changing {
+            epoch.wrapping_add(1)
+        } else {
+            epoch
+        };
+        let bound = if in_epoch {
+            Bound::to(context)
+        } else {
+            Bound::chained(EXPORT_LABEL, &wrapping.chain, context)
+        };
+        kani::assert(
+            result.is_err()
+                || (seal::model::kept_at(seal::model::RECORD)
+                    && seal::model::kept_at(seal::model::LAYER) == lock
+                    && inner.key == record_key
+                    && Bound::kept(&inner) == bound
+                    && inner.given[1] == child.purpose as u8
+                    && inner.given[3..19] == wrapping.ids.0
+                    && if lock {
+                        layer.key == expected_layer_key(&salt)
+                            && Bound::kept(&layer) == Bound::to(context)
+                            && layer.given[..8] == named.to_le_bytes()
+                            && layer.given[8..20] == inner.nonce
+                            && layer.given[20..32] == inner.written[..12]
+                            && record[..NONCE_LEN] == layer.nonce
+                            && record[NONCE_LEN..NONCE_LEN + 32] == layer.written
+                            && record[LOCK_RECORD_LEN - TAG_LEN..] == layer.tag
+                    } else {
+                        record[..NONCE_LEN] == inner.nonce
+                            && record[NONCE_LEN..NONCE_LEN + 32] == inner.written
+                            && record[RECORD_LEN - TAG_LEN..RECORD_LEN] == inner.tag
+                    }),
+            "a wrap seals the set, naming its purpose and its parent, under the key derived for its \
+             kind and bound to its context, an export also to the chain of its key, and writes the \
+             nonce, what the cipher wrote and the tag; a lock seals that record and the number of \
+             its epoch under the key of that epoch",
+        );
         kani::cover!(result.is_ok(), "a set is wrapped");
         kani::cover!(
             entropy.failed && entropy.written.iter().any(|&byte| byte != 0),
@@ -9607,7 +9685,7 @@ mod proofs {
             &mut entropy,
             &from,
             &mut to,
-            opening(|key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag)),
+            opening(|key, nonce, aad, buffer, tag| layer.open_bound(key, nonce, aad, buffer, tag)),
         );
         kani::assert(
             unchanged_except(&slots, &before, 2)
@@ -9648,8 +9726,29 @@ mod proofs {
             layer.calls <= 1
                 && (layer.calls == 0
                     || (layer.key == expected_layer_key(&epoch_key)
-                        && layer.nonce[..] == from[..NONCE_LEN])),
-            "the record is opened once, under the key of this epoch and with its own nonce",
+                        && layer.nonce[..] == from[..NONCE_LEN]
+                        && layer.aad == Bound::to(context))),
+            "the record is opened once, under the key of this epoch, with its own nonce and bound \
+             to its context",
+        );
+        kani::assert(
+            (result == Err(Error::CipherFailed)) == seal::model::any_seal_failed(),
+            "a carry fails with CipherFailed exactly when its seal fails",
+        );
+        let carried = seal::model::sealed(seal::model::LAYER);
+        kani::assert(
+            result.is_err()
+                || (seal::model::kept_at(seal::model::LAYER)
+                    && carried.key == expected_layer_key(&next_key)
+                    && Bound::kept(&carried) == Bound::to(context)
+                    && carried.given[..8] == number.wrapping_add(1).to_le_bytes()
+                    && carried.given[8..] == layer.written[8..32]
+                    && to[..NONCE_LEN] == carried.nonce
+                    && to[NONCE_LEN..NONCE_LEN + 32] == carried.written
+                    && to[LOCK_RECORD_LEN - TAG_LEN..] == carried.tag),
+            "a carry seals the record it opened with the number of the next epoch, under the key of \
+             that epoch and bound to its context, and writes the nonce, what the cipher wrote and \
+             the tag",
         );
         kani::assert(
             if result.is_ok() {
@@ -9766,6 +9865,35 @@ mod proofs {
                 head: aad.first_chunk::<21>().copied().unwrap_or([0; 21]),
                 length: aad.len(),
                 tail: [aad.get(21).copied(), aad.get(22).copied()],
+            }
+        }
+
+        /// The associated data of a record of an export or of its end, `label`, bound to `context`,
+        /// of up to two bytes, and chained to `chain`, written out from the layout: the label, the
+        /// version, the length of the context, the chain, and the context.
+        fn chained(label: &[u8; 19], chain: &[u8; TAG_LEN], context: &[u8]) -> Self {
+            let mut head = [0; 21];
+            head[..19].copy_from_slice(label);
+            head[19] = 1;
+            head[20] = u8::try_from(context.len()).unwrap_or(0);
+            Self {
+                head,
+                length: context.len().wrapping_add(21 + TAG_LEN),
+                tail: [Some(chain[0]), Some(chain[1])],
+            }
+        }
+
+        /// The associated data a seal of the model of the cipher was given, as the model keeps it.
+        fn kept(sealed: &seal::model::Sealed) -> Self {
+            let mut head = [0; 21];
+            head.copy_from_slice(&sealed.aad[..21]);
+            Self {
+                head,
+                length: sealed.aad_len,
+                tail: [
+                    (sealed.aad_len > 21).then_some(sealed.aad[21]),
+                    (sealed.aad_len > 22).then_some(sealed.aad[22]),
+                ],
             }
         }
 
@@ -10504,8 +10632,8 @@ mod proofs {
             context,
             &record,
             &xwing::KNOWN,
-            opening(|key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag)),
-            opening(|key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag)),
+            opening(|key, nonce, aad, buffer, tag| layer.open_bound(key, nonce, aad, buffer, tag)),
+            opening(|key, nonce, aad, buffer, tag| cipher.open_bound(key, nonce, aad, buffer, tag)),
         );
         let (archive, stored) = (
             snapshot_at(&named, store.index),
@@ -10572,8 +10700,10 @@ mod proofs {
                         &layer.given,
                         &record[NONCE_LEN..NONCE_LEN + ARCHIVE_LAYER_LEN],
                     )
-                    && layer.tag[..] == record[NONCE_LEN + ARCHIVE_LAYER_LEN..]),
-            "the outer layer is opened with the nonce, the ciphertext and the tag of the record",
+                    && layer.tag[..] == record[NONCE_LEN + ARCHIVE_LAYER_LEN..]
+                    && layer.aad == Bound::to(context)),
+            "the outer layer is opened with the nonce, the ciphertext and the tag of the record, \
+             bound to its context",
         );
         kani::assert(
             cipher.calls <= 1
@@ -10590,8 +10720,10 @@ mod proofs {
             cipher.calls == 0
                 || (cipher.nonce[..] == inner[..NONCE_LEN]
                     && same_bytes(&cipher.given, &inner[NONCE_LEN..NONCE_LEN + PLAINTEXT_LEN])
-                    && cipher.tag[..] == inner[NONCE_LEN + PLAINTEXT_LEN..]),
-            "the seed is opened with the nonce, the ciphertext and the tag of the inner layer",
+                    && cipher.tag[..] == inner[NONCE_LEN + PLAINTEXT_LEN..]
+                    && cipher.aad == Bound::to(context)),
+            "the seed is opened with the nonce, the ciphertext and the tag of the inner layer, \
+             bound to its context",
         );
         kani::assert(
             epoch_snapshot(&slots) == epoch_before,
@@ -10767,6 +10899,40 @@ mod proofs {
              nonce of its inner layer and the nonce it starts with, hedged with the key of the epoch \
              it is written in",
         );
+        kani::assert(
+            !seal::model::any_seal_failed() || result == Err(Error::CipherFailed),
+            "a creation fails with CipherFailed when a seal fails",
+        );
+        let (inner, layer) = (
+            seal::model::sealed(seal::model::RECORD),
+            seal::model::sealed(seal::model::LAYER),
+        );
+        let written_in = if changing {
+            number.wrapping_add(1)
+        } else {
+            number
+        };
+        kani::assert(
+            result.is_err()
+                || (seal::model::kept_at(seal::model::RECORD)
+                    && seal::model::kept_at(seal::model::LAYER)
+                    && inner.key == expected_archive_key(&key_head(&archive))
+                    && Bound::kept(&inner) == Bound::to(context)
+                    && inner.given[1] == Purpose::Archive as u8
+                    && inner.given[3..19] == archive.ids.0
+                    && inner.given[19..27] == [0; 8]
+                    && layer.key
+                        == expected_archive_layer_key(&stored.keys.0, stored.lengths[0], &writing)
+                    && Bound::kept(&layer) == Bound::to(context)
+                    && layer.given[..8] == written_in.to_le_bytes()
+                    && record[..NONCE_LEN] == layer.nonce
+                    && record[NONCE_LEN..NONCE_LEN + 32] == layer.written
+                    && record[ARCHIVE_KEY_RECORD_LEN - TAG_LEN..] == layer.tag),
+            "a creation seals the seed, as a set of the archive of epoch zero naming its store, \
+             under the key of the store, and then the layer that names the epoch it is written in \
+             under the key of the profile and that epoch, both bound to the context, and writes the \
+             nonce, what the cipher wrote and the tag",
+        );
         kani::cover!(result.is_ok(), "an archive key is created");
         kani::cover!(
             result.is_ok() && changing,
@@ -10832,7 +10998,7 @@ mod proofs {
             context,
             &mut entropy,
             (&from, &mut to),
-            opening(|key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag)),
+            opening(|key, nonce, aad, buffer, tag| layer.open_bound(key, nonce, aad, buffer, tag)),
         );
         kani::assert(
             unchanged_except(&slots, &before, 2)
@@ -10898,9 +11064,35 @@ mod proofs {
                             stored.lengths[0],
                             &epoch_key,
                         )
-                        && layer.nonce[..] == from[..NONCE_LEN])),
-            "the record is opened once, under the key of the first stored key and this epoch, and \
-             with its own nonce",
+                        && layer.nonce[..] == from[..NONCE_LEN]
+                        && layer.aad == Bound::to(context))),
+            "the record is opened once, under the key of the first stored key and this epoch, with \
+             its own nonce and bound to its context",
+        );
+        kani::assert(
+            !seal::model::any_seal_failed() || result == Err(Error::CipherFailed),
+            "a carry of an archive key fails with CipherFailed when its seal fails",
+        );
+        let next_stored = snapshot_at(&before, next_profile.index);
+        let carried = seal::model::sealed(seal::model::LAYER);
+        kani::assert(
+            result.is_err()
+                || (seal::model::kept_at(seal::model::LAYER)
+                    && carried.key
+                        == expected_archive_layer_key(
+                            &next_stored.keys.0,
+                            next_stored.lengths[0],
+                            &next_key,
+                        )
+                    && Bound::kept(&carried) == Bound::to(context)
+                    && carried.given[..8] == number.wrapping_add(1).to_le_bytes()
+                    && carried.given[8..] == layer.written[8..32]
+                    && to[..NONCE_LEN] == carried.nonce
+                    && to[NONCE_LEN..NONCE_LEN + 32] == carried.written
+                    && to[ARCHIVE_KEY_RECORD_LEN - TAG_LEN..] == carried.tag),
+            "a carry of an archive key seals what it opened with the number of the next epoch, \
+             under the key of the second stored key and that epoch and bound to its context, and \
+             writes the nonce, what the cipher wrote and the tag",
         );
         kani::assert(
             if result.is_ok() {
@@ -11001,7 +11193,9 @@ mod proofs {
                 transfer,
                 context,
                 &end,
-                opening(|key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag)),
+                opening(|key, nonce, aad, buffer, tag| {
+                    cipher.open_bound(key, nonce, aad, buffer, tag)
+                }),
             )
         } else {
             slots.end_export_on_stack(transfer, context, &mut entropy, &mut end)
@@ -11061,9 +11255,26 @@ mod proofs {
                         && cipher.key == expected_export_key(&key)
                         && cipher.nonce[..] == end[..NONCE_LEN]
                         && cipher.tag[..] == end[NONCE_LEN..]
+                        && cipher.aad == Bound::chained(END_LABEL, &named.chain, context)
                 },
             "an end is opened once, under the key the key for transfers derives, with its own nonce \
-             and tag",
+             and tag, bound to its context and chained to its key",
+        );
+        kani::assert(
+            (result == Err(Error::CipherFailed)) == seal::model::any_seal_failed(),
+            "an end fails with CipherFailed exactly when its seal fails",
+        );
+        let sealed = seal::model::sealed(seal::model::RECORD);
+        kani::assert(
+            receiving
+                || result.is_err()
+                || (seal::model::kept_at(seal::model::RECORD)
+                    && sealed.key == expected_export_key(&key)
+                    && Bound::kept(&sealed) == Bound::chained(END_LABEL, &named.chain, context)
+                    && end[..NONCE_LEN] == sealed.nonce
+                    && end[NONCE_LEN..] == sealed.tag),
+            "an end of an export is sealed under the key the key for transfers derives, bound to its \
+             context and chained to its key, and writes the nonce and the tag",
         );
         // Worked out for a receipt too, so that its proof leaves no check of the export unreached.
         let mut drawn = [0; 12];

@@ -240,6 +240,9 @@ Nothing is published while the version is below 0.1.0.
   0.68.0 for the four calls, and tests against records an independent implementation computes.
 - Tests check on every machine, not only on aarch64, that each call starts its derivations,
   Argon2id, ciphers and operations of X-Wing inside the switch of data-independent timing.
+- The proofs of wraps, locks, exports, their carries and ends, and of archive keys follow what each
+  seal and opening is given: the key, the associated data, and the nonce, output and tag a record
+  holds; a call fails with `Error::CipherFailed` exactly when a seal fails.
 - Outside the proofs and the tests, the calls seal and open with AES-256-GCM-SIV only and ask
   X-Wing for the known answer of its draft only: a build has nothing else they could be given.
 - The tests that read back the stack after the calls on archive keys and on records of an archive
