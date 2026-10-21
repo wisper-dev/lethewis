@@ -6999,10 +6999,12 @@ mod proofs {
                 None
             };
             (slot.chain, slot.direction) = if purpose == Purpose::Transfer {
-                let direction = match kani::any::<u8>() % 3 {
-                    0 => Direction::Idle,
-                    1 => Direction::Out,
-                    _ => Direction::In,
+                let direction = if kani::any() {
+                    Direction::Idle
+                } else if kani::any() {
+                    Direction::Out
+                } else {
+                    Direction::In
                 };
                 (kani::any(), direction)
             } else {
@@ -8813,10 +8815,11 @@ mod proofs {
             refused_before || !any_failed() || result == Err(Error::DerivationFailed),
             "a call that a derivation fails fails with DerivationFailed",
         );
+        let after = snapshots(&slots);
         kani::assert(
             match (result, first_free) {
                 (Ok(handle), Some(index)) => {
-                    let received = slot_at(&slots, index);
+                    let received = snapshot_at(&after, index);
                     handle.index == index
                         && handle.slots == id
                         && handle.generation == snapshot_at(&before, index).generation
@@ -8834,12 +8837,12 @@ mod proofs {
                                 && !received.changed
                                 && !received.sealed
                                 && !received.unlocks
-                                && snapshot(slot_at(&slots, other)) == chained
+                                && snapshot_at(&after, other) == chained
                         } else {
-                            unchanged_except(&slots, &before, index)
+                            unchanged_but(&after, &before, index)
                         }
                 }
-                _ => result.is_err() && unchanged_except(&slots, &before, 2),
+                _ => result.is_err() && unchanged_but(&after, &before, 2),
             },
             "a refused call changes no slot, and one that succeeds only the first free slot, whose \
              handle names these slots and that slot's generation, and for a receipt the chain and \
