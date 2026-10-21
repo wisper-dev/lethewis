@@ -161,8 +161,8 @@ impl<'a> Slots<'a> {
                 context,
                 record,
                 &KNOWN,
-                seal::open,
-                seal::open,
+                seal::Aes,
+                seal::Aes,
             )
         });
         wipe_archive_stack();
@@ -262,7 +262,7 @@ impl<'a> Slots<'a> {
                 context,
                 entropy,
                 (from, to),
-                seal::open,
+                seal::Aes,
             )
         });
         wipe_archive_stack();
@@ -547,7 +547,7 @@ pub(super) fn open_archive_layer(
         parts = (*nonce, *layer, tag);
     }
     let (nonce, mut layer, tag) = parts;
-    let opened = open(&layer_key, &nonce, aad, &mut layer, &tag).is_ok();
+    let opened = open.open(&layer_key, &nonce, aad, &mut layer, &tag).is_ok();
     wipe(&mut layer_key);
     let mut current = false;
     if opened

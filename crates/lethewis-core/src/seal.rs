@@ -24,6 +24,9 @@ pub(crate) struct SealFailed;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Rejected;
 
+/// AES-256-GCM-SIV, as the calls of the slots seal and open with it: [`seal`] and [`open`].
+pub(crate) struct Aes;
+
 /// An input of the shape of a record, and what AES-256-GCM-SIV makes of it.
 struct Known {
     key: [u8; KEY_LEN],

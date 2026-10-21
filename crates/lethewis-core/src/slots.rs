@@ -264,48 +264,127 @@ pub struct Slots<'a> {
     epoch: &'a mut Epoch,
 }
 
-/// What opens a sealed plaintext of `N` bytes: AES-256-GCM-SIV, or a model of it in the proofs.
-trait Open<const N: usize>:
-    FnMut(
-    &[u8; CIPHER_KEY_LEN],
-    &[u8; NONCE_LEN],
-    &[u8],
-    &mut [u8; N],
-    &[u8; TAG_LEN],
-) -> Result<(), Rejected>
-{
+/// What opens a sealed plaintext of `N` bytes: AES-256-GCM-SIV, which is all a build outside the
+/// proofs and the tests has, or a model of it in them.
+trait Open<const N: usize> {
+    fn open(
+        &mut self,
+        key: &[u8; CIPHER_KEY_LEN],
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        buffer: &mut [u8; N],
+        tag: &[u8; TAG_LEN],
+    ) -> Result<(), Rejected>;
 }
 
-impl<F, const N: usize> Open<N> for F where
+impl<const N: usize> Open<N> for seal::Aes {
+    fn open(
+        &mut self,
+        key: &[u8; CIPHER_KEY_LEN],
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        buffer: &mut [u8; N],
+        tag: &[u8; TAG_LEN],
+    ) -> Result<(), Rejected> {
+        seal::open(key, nonce, aad, buffer, tag)
+    }
+}
+
+#[cfg(any(test, kani))]
+impl<F, const N: usize> Open<N> for F
+where
     F: FnMut(
         &[u8; CIPHER_KEY_LEN],
         &[u8; NONCE_LEN],
         &[u8],
         &mut [u8; N],
         &[u8; TAG_LEN],
-    ) -> Result<(), Rejected>
+    ) -> Result<(), Rejected>,
 {
+    fn open(
+        &mut self,
+        key: &[u8; CIPHER_KEY_LEN],
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        buffer: &mut [u8; N],
+        tag: &[u8; TAG_LEN],
+    ) -> Result<(), Rejected> {
+        self(key, nonce, aad, buffer, tag)
+    }
 }
 
-/// What seals a plaintext of `N` bytes: AES-256-GCM-SIV, or a model of it in the proofs.
-trait Seal<const N: usize>:
-    FnMut(
-    &[u8; CIPHER_KEY_LEN],
-    &[u8; NONCE_LEN],
-    &[u8],
-    &mut [u8; N],
-) -> Result<[u8; TAG_LEN], SealFailed>
-{
+/// What seals a plaintext of `N` bytes: AES-256-GCM-SIV, which is all a build outside the proofs
+/// and the tests has, or a model of it in them.
+trait Seal<const N: usize> {
+    fn seal(
+        &mut self,
+        key: &[u8; CIPHER_KEY_LEN],
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        buffer: &mut [u8; N],
+    ) -> Result<[u8; TAG_LEN], SealFailed>;
 }
 
-impl<F, const N: usize> Seal<N> for F where
+impl<const N: usize> Seal<N> for seal::Aes {
+    fn seal(
+        &mut self,
+        key: &[u8; CIPHER_KEY_LEN],
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        buffer: &mut [u8; N],
+    ) -> Result<[u8; TAG_LEN], SealFailed> {
+        seal::seal(key, nonce, aad, buffer)
+    }
+}
+
+#[cfg(any(test, kani))]
+impl<F, const N: usize> Seal<N> for F
+where
     F: FnMut(
         &[u8; CIPHER_KEY_LEN],
         &[u8; NONCE_LEN],
         &[u8],
         &mut [u8; N],
-    ) -> Result<[u8; TAG_LEN], SealFailed>
+    ) -> Result<[u8; TAG_LEN], SealFailed>,
 {
+    fn seal(
+        &mut self,
+        key: &[u8; CIPHER_KEY_LEN],
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        buffer: &mut [u8; N],
+    ) -> Result<[u8; TAG_LEN], SealFailed> {
+        self(key, nonce, aad, buffer)
+    }
+}
+
+/// `open`, as the stand-in for the cipher it is in the proofs and the tests.
+#[cfg(any(test, kani))]
+fn opening<F, const N: usize>(open: F) -> F
+where
+    F: FnMut(
+        &[u8; CIPHER_KEY_LEN],
+        &[u8; NONCE_LEN],
+        &[u8],
+        &mut [u8; N],
+        &[u8; TAG_LEN],
+    ) -> Result<(), Rejected>,
+{
+    open
+}
+
+/// `seal`, as the stand-in for the cipher it is in the proofs.
+#[cfg(kani)]
+fn sealing<F, const N: usize>(seal: F) -> F
+where
+    F: FnMut(
+        &[u8; CIPHER_KEY_LEN],
+        &[u8; NONCE_LEN],
+        &[u8],
+        &mut [u8; N],
+    ) -> Result<[u8; TAG_LEN], SealFailed>,
+{
+    seal
 }
 
 /// Where a wrap writes: the record of a set under a stored key for wrapping, the lock record of a
@@ -1043,7 +1122,7 @@ impl<'a> Slots<'a> {
         record: &[u8; RECORD_LEN],
     ) -> Result<Handle<'a>, Error> {
         let unwrapped =
-            crate::timing::with(|| self.unwrap_on_stack(parent, context, record, seal::open));
+            crate::timing::with(|| self.unwrap_on_stack(parent, context, record, seal::Aes));
         wipe_cipher_stack();
         unwrapped
     }
@@ -1096,7 +1175,7 @@ impl<'a> Slots<'a> {
         record: &[u8; RECORD_LEN],
     ) -> Result<Handle<'a>, Error> {
         let received =
-            crate::timing::with(|| self.receive_on_stack(transfer, context, record, seal::open));
+            crate::timing::with(|| self.receive_on_stack(transfer, context, record, seal::Aes));
         wipe_cipher_stack();
         received
     }
@@ -1158,7 +1237,7 @@ impl<'a> Slots<'a> {
         end: &[u8; END_RECORD_LEN],
     ) -> Result<(), Error> {
         let ended =
-            crate::timing::with(|| self.end_receive_on_stack(transfer, context, end, seal::open));
+            crate::timing::with(|| self.end_receive_on_stack(transfer, context, end, seal::Aes));
         wipe_cipher_stack();
         ended
     }
@@ -1190,7 +1269,9 @@ impl<'a> Slots<'a> {
         {
             (nonce, tag) = (*given_nonce, given_tag);
         }
-        let opened = open(&cipher_key, &nonce, associated.bytes(), &mut [], &tag).is_ok();
+        let opened = open
+            .open(&cipher_key, &nonce, associated.bytes(), &mut [], &tag)
+            .is_ok();
         wipe(&mut cipher_key);
         if !opened {
             return Err(Error::RecordRejected);
@@ -1235,7 +1316,7 @@ impl<'a> Slots<'a> {
         record: &[u8; LOCK_RECORD_LEN],
     ) -> Result<Handle<'a>, Error> {
         let unlocked = crate::timing::with(|| {
-            self.unlock_on_stack(parent, context, record, seal::open, seal::open)
+            self.unlock_on_stack(parent, context, record, seal::Aes, seal::Aes)
         });
         wipe_cipher_stack();
         unlocked
@@ -1332,7 +1413,9 @@ impl<'a> Slots<'a> {
             return Err(Error::DerivationFailed);
         }
         let (nonce, mut sealed, tag) = split_record(record);
-        let opened = open(&cipher_key, &nonce, aad, &mut sealed, &tag).is_ok();
+        let opened = open
+            .open(&cipher_key, &nonce, aad, &mut sealed, &tag)
+            .is_ok();
         wipe(&mut cipher_key);
         let named = opened && id.is(keyset::parent_of(&sealed));
         if named {
@@ -1414,7 +1497,7 @@ impl<'a> Slots<'a> {
         to: &mut [u8; LOCK_RECORD_LEN],
     ) -> Result<(), Error> {
         let carried =
-            crate::timing::with(|| self.carry_on_stack(context, entropy, from, to, seal::open));
+            crate::timing::with(|| self.carry_on_stack(context, entropy, from, to, seal::Aes));
         wipe_cipher_stack();
         carried
     }
@@ -2106,7 +2189,7 @@ fn open_layer(
         parts = (*nonce, *layer, tag);
     }
     let (nonce, mut layer, tag) = parts;
-    let opened = open(&layer_key, &nonce, aad, &mut layer, &tag).is_ok();
+    let opened = open.open(&layer_key, &nonce, aad, &mut layer, &tag).is_ok();
     wipe(&mut layer_key);
     let mut current = false;
     if opened
@@ -2185,7 +2268,8 @@ mod tests {
         AssociatedData, CIPHER_KEY_LEN, END_RECORD_LEN, Entropy, EntropyError, Epoch, Erasure,
         Error, Handle, Header, KeyLength, LAYER_LEN, LOCK_RECORD_LEN, MEMBERS, Occupancy,
         PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Root, RootFailed, Slot, Slots, Stages,
-        Status, derive_layer_key, derive_lock_key, derive_wrap_key, keyset, seal, write_record,
+        Status, derive_layer_key, derive_lock_key, derive_wrap_key, keyset, opening, seal,
+        write_record,
     };
     use crate::derive::{CIPHER_STACK_WIPE, KeyId, STACK_WIPE, derive_key_id};
     use crate::key::{
@@ -3796,10 +3880,10 @@ mod tests {
                 parent,
                 b"chat 7",
                 &record,
-                |key, nonce, aad, buffer, tag| {
+                opening(|key, nonce, aad, buffer, tag| {
                     tried += 1;
                     seal::open(key, nonce, aad, buffer, tag)
-                },
+                }),
             );
             assert_eq!((tried, result.map(|_| ())), (1, expected));
             if let Ok(handle) = result {
@@ -6965,7 +7049,7 @@ mod proofs {
         ArchivePublic, CIPHER_KEY_LEN, Direction, END_RECORD_LEN, Entropy, EntropyError, Epoch,
         Erasure, Error, Handle, Key, KeyId, KeyLength, Kind, LAYER_LEN, LOCK_RECORD_LEN, MEMBERS,
         NONCE_LEN, Occupancy, Out, PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Rejected, Root,
-        RootFailed, SealFailed, Slot, Slots, Stages, Status, TAG_LEN,
+        RootFailed, SealFailed, Slot, Slots, Stages, Status, TAG_LEN, opening, sealing,
     };
     use crate::derive::{
         Branch,
@@ -8877,7 +8961,7 @@ mod proofs {
             &aad,
             &record,
             &mut found,
-            &mut |key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag),
+            &mut opening(|key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag)),
             kind,
         );
         kani::assert(
@@ -9017,17 +9101,23 @@ mod proofs {
                 parent,
                 context,
                 &record,
-                |key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag),
-                |key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag),
+                opening(|key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag)),
+                opening(|key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag)),
             )
         } else if kind == Kind::Record {
-            slots.unwrap_on_stack(parent, context, &record, |key, nonce, _, buffer, tag| {
-                cipher.open(key, nonce, buffer, tag)
-            })
+            slots.unwrap_on_stack(
+                parent,
+                context,
+                &record,
+                opening(|key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag)),
+            )
         } else {
-            slots.receive_on_stack(parent, context, &record, |key, nonce, _, buffer, tag| {
-                cipher.open(key, nonce, buffer, tag)
-            })
+            slots.receive_on_stack(
+                parent,
+                context,
+                &record,
+                opening(|key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag)),
+            )
         };
         let lock = kind == Kind::Lock;
         // Worked out on every path, so that no proof of one kind leaves a check of another unreached.
@@ -9517,7 +9607,7 @@ mod proofs {
             &mut entropy,
             &from,
             &mut to,
-            |key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag),
+            opening(|key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag)),
         );
         kani::assert(
             unchanged_except(&slots, &before, 2)
@@ -9802,7 +9892,7 @@ mod proofs {
             profile,
             context,
             &record,
-            |key, nonce, aad, buffer, tag| layer.open_bound(key, nonce, aad, buffer, tag),
+            opening(|key, nonce, aad, buffer, tag| layer.open_bound(key, nonce, aad, buffer, tag)),
         );
         kani::assert(
             unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
@@ -9931,7 +10021,7 @@ mod proofs {
             &mut entropy,
             (&mut record, &mut data_key),
             &xwing::KNOWN,
-            |key, nonce, aad, buffer| sealer.seal(key, nonce, aad, buffer),
+            sealing(|key, nonce, aad, buffer| sealer.seal(key, nonce, aad, buffer)),
         );
         let draws = count.wrapping_add(u64::from(entropy.source.answered));
         kani::assert(
@@ -10050,7 +10140,7 @@ mod proofs {
             &mut entropy,
             (&mut record, &mut data_key),
             &xwing::KNOWN,
-            |key, nonce, aad, buffer| sealer.seal(key, nonce, aad, buffer),
+            sealing(|key, nonce, aad, buffer| sealer.seal(key, nonce, aad, buffer)),
         );
         let chat = snapshot_at(&before, seal.index);
         if result.is_ok() {
@@ -10125,7 +10215,7 @@ mod proofs {
             context,
             (&record, &mut data_key),
             &xwing::KNOWN,
-            |key, nonce, aad, buffer, tag| cipher.open_bound(key, nonce, aad, buffer, tag),
+            opening(|key, nonce, aad, buffer, tag| cipher.open_bound(key, nonce, aad, buffer, tag)),
         );
         kani::assert(
             unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
@@ -10267,8 +10357,8 @@ mod proofs {
             context,
             &mut entropy,
             (&record, &mut out),
-            |key, nonce, aad, buffer, tag| cipher.open_bound(key, nonce, aad, buffer, tag),
-            |key, nonce, aad, buffer| sealer.seal(key, nonce, aad, buffer),
+            opening(|key, nonce, aad, buffer, tag| cipher.open_bound(key, nonce, aad, buffer, tag)),
+            sealing(|key, nonce, aad, buffer| sealer.seal(key, nonce, aad, buffer)),
         );
         let draws = count.wrapping_add(u64::from(entropy.answered));
         kani::assert(
@@ -10414,8 +10504,8 @@ mod proofs {
             context,
             &record,
             &xwing::KNOWN,
-            |key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag),
-            |key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag),
+            opening(|key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag)),
+            opening(|key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag)),
         );
         let (archive, stored) = (
             snapshot_at(&named, store.index),
@@ -10742,7 +10832,7 @@ mod proofs {
             context,
             &mut entropy,
             (&from, &mut to),
-            |key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag),
+            opening(|key, nonce, _, buffer, tag| layer.open(key, nonce, buffer, tag)),
         );
         kani::assert(
             unchanged_except(&slots, &before, 2)
@@ -10907,9 +10997,12 @@ mod proofs {
         let mut cipher = AnyCipher::<0>::new();
 
         let result = if receiving {
-            slots.end_receive_on_stack(transfer, context, &end, |key, nonce, _, buffer, tag| {
-                cipher.open(key, nonce, buffer, tag)
-            })
+            slots.end_receive_on_stack(
+                transfer,
+                context,
+                &end,
+                opening(|key, nonce, _, buffer, tag| cipher.open(key, nonce, buffer, tag)),
+            )
         } else {
             slots.end_export_on_stack(transfer, context, &mut entropy, &mut end)
         };

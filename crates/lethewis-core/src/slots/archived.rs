@@ -69,7 +69,7 @@ impl<'a> Slots<'a> {
         record: &[u8; ARCHIVE_KEY_RECORD_LEN],
     ) -> Result<ArchivePublic<'a>, Error> {
         let read = crate::timing::with(|| {
-            self.archive_public_key_on_stack(profile, context, record, seal::open)
+            self.archive_public_key_on_stack(profile, context, record, seal::Aes)
         });
         wipe_archive_stack();
         read
@@ -149,7 +149,7 @@ impl<'a> Slots<'a> {
                 entropy,
                 (record, data_key),
                 &KNOWN,
-                seal::seal,
+                seal::Aes,
             )
         });
         wipe_archive_stack();
@@ -253,7 +253,7 @@ impl<'a> Slots<'a> {
                 context,
                 (record, data_key),
                 &KNOWN,
-                seal::open,
+                seal::Aes,
             )
         });
         wipe_archive_stack();
@@ -347,8 +347,8 @@ impl<'a> Slots<'a> {
                 context,
                 entropy,
                 (record, out),
-                seal::open,
-                seal::seal,
+                seal::Aes,
+                seal::Aes,
             )
         });
         wipe_archive_stack();
@@ -437,7 +437,7 @@ fn seal_archived(
         *ciphertext_out = *ciphertext;
         *check_out = *check;
     }
-    let tag = seal_with(&cipher_key, &nonce, aad, &mut sealed);
+    let tag = seal_with.seal(&cipher_key, &nonce, aad, &mut sealed);
     wipe(&mut cipher_key);
     let tag = tag.map_err(|_| Error::CipherFailed)?;
     if let Some((nonce_out, rest)) = out.split_first_chunk_mut::<NONCE_LEN>()
@@ -473,7 +473,7 @@ fn open_archived(
         parts = (*nonce, *layer, tag);
     }
     let (nonce, mut layer, tag) = parts;
-    let opened = open(&cipher_key, &nonce, aad, &mut layer, &tag);
+    let opened = open.open(&cipher_key, &nonce, aad, &mut layer, &tag);
     wipe(&mut cipher_key);
     opened.map_err(|_| Error::RecordRejected)?;
     *sealed = layer;
