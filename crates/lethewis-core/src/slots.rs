@@ -5541,28 +5541,30 @@ mod tests {
         parent
     }
 
-    /// The plaintext of a random set for either purpose at a random revision naming `named`, at
-    /// times with a key held in `held` or one key twice, left as built, wholly random or with one
-    /// byte changed. A set of external data mostly holds 32-byte keys, as it has to, and one for
-    /// wrapping is half the time a set of one that has never changed, as it has to be.
+    /// The plaintext of a random set for wrapping, external data, transfers or a chat's archive, at a
+    /// random revision naming `named`, at times with a key held in `held` or one key twice, left as
+    /// built, wholly random or with one byte changed. A set not for wrapping mostly holds 32-byte
+    /// keys, as it has to, and one not for external data is half the time a set of one that has
+    /// never changed, as it has to be.
     fn random_plaintext(
         random: &mut Random,
         named: [u8; 16],
         held: &[Vec<u8>],
     ) -> [u8; PLAINTEXT_LEN] {
-        let purpose = if random.below(2) == 0 {
-            Purpose::Wrap
-        } else {
-            Purpose::ExternalData
-        };
-        let one = purpose == Purpose::Wrap && random.below(2) == 0;
+        let purpose = [
+            Purpose::Wrap,
+            Purpose::ExternalData,
+            Purpose::Transfer,
+            Purpose::ArchiveSeal,
+        ][random.below(4)];
+        let one = purpose != Purpose::ExternalData && random.below(2) == 0;
         let (stages, primary) = if one {
             ([Some(Status::Enabled), None, None], 0)
         } else {
             random_stages(random)
         };
         let mut keys: Vec<Vec<u8>> = (0..MEMBERS).map(|_| random.key()).collect();
-        if purpose == Purpose::ExternalData && random.below(4) != 0 {
+        if purpose != Purpose::Wrap && random.below(4) != 0 {
             for key in &mut keys {
                 key.truncate(32);
             }
@@ -5592,15 +5594,16 @@ mod tests {
         plaintext
     }
 
-    /// The keys of `plaintext` by position, if slots in the epoch `EPOCH` accept it: version 1,
-    /// purpose 1 or 2, that epoch, each position zero throughout or stage 1 or 2 with length 32 or
-    /// 64, only 32 for purpose 2, and zeros past the key, and an enabled key at the primary
-    /// position, and purpose 2: a plain record holds no set for wrapping. Read from the layout, not
-    /// by the parser.
+    /// The keys of `plaintext` by position, if slots in the epoch `EPOCH` accept it from a plain
+    /// record: version 1, purpose 2, 3 or 6, the ones a plain record holds, that epoch, each
+    /// position zero throughout or stage 1 or 2 with 32 bytes and zeros past them, an enabled key at
+    /// the primary position, and for purposes 3 and 6 one enabled key at the first position in a
+    /// set that never changed. Read from the layout, not by the parser.
     fn accepted_keys(plaintext: &[u8; PLAINTEXT_LEN]) -> Option<[Option<Vec<u8>>; MEMBERS]> {
         let primary = usize::from(plaintext[2]);
+        let purpose = plaintext[1];
         if plaintext[0] != 1
-            || !(plaintext[1] == 1 || plaintext[1] == 2)
+            || ![2, 3, 6].contains(&purpose)
             || plaintext[19..27] != EPOCH.to_le_bytes()
             || primary >= MEMBERS
             || plaintext[35 + 66 * primary] != 1
@@ -5610,19 +5613,19 @@ mod tests {
         let mut keys: [Option<Vec<u8>>; MEMBERS] = Default::default();
         for (at, key) in keys.iter_mut().enumerate() {
             let position = &plaintext[35 + 66 * at..35 + 66 * (at + 1)];
-            let length = usize::from(position[1]);
             match position[0] {
                 0 if position.iter().all(|&byte| byte == 0) => {}
-                1 | 2
-                    if (length == 32 || (length == 64 && plaintext[1] == 1))
-                        && position[2 + length..].iter().all(|&byte| byte == 0) =>
-                {
-                    *key = Some(position[2..2 + length].to_vec());
+                1 | 2 if position[1] == 32 && position[34..].iter().all(|&byte| byte == 0) => {
+                    *key = Some(position[2..34].to_vec());
                 }
                 _ => return None,
             }
         }
-        (plaintext[1] == 2).then_some(keys)
+        let one = primary == 0
+            && plaintext[35] == 1
+            && keys[1..].iter().all(Option::is_none)
+            && plaintext[27..35] == [0; 8];
+        (purpose == 2 || one).then_some(keys)
     }
 
     /// The slot that holds the set of an accepted `plaintext`, as the layout states it.
@@ -5653,9 +5656,7 @@ mod tests {
         }
         let revision = u64::from_le_bytes(plaintext[27..35].try_into().unwrap());
         holding.5 = Stages::from_parts(stages, usize::from(plaintext[2]), revision);
-        if plaintext[1] == 2 {
-            holding.6 = Purpose::ExternalData;
-        }
+        holding.6 = Purpose::from_byte(plaintext[1]).unwrap();
         holding
     }
 
