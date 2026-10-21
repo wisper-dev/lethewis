@@ -3,11 +3,6 @@
 
 //! X-Wing, the hybrid of ML-KEM-768 and X25519, as version 11 of its Internet-Draft specifies.
 
-#![cfg_attr(
-    kani,
-    expect(dead_code, reason = "no proof encapsulates or decapsulates")
-)]
-
 #[cfg(not(kani))]
 use ml_kem::{
     B32, Ciphertext, Decapsulate, DecapsulationKey, EncapsulationKey, Key, KeyExport, MlKem768,
@@ -451,14 +446,28 @@ pub(crate) fn answers(known: &Known) -> bool {
 }
 
 #[cfg(kani)]
-pub(crate) use model::{KNOWN, Known, answers, public_key};
+pub(crate) use model::{KNOWN, Known, answers, decapsulate, encapsulate, public_key};
 
 /// What stands in for X-Wing under Kani.
 #[cfg(kani)]
 pub(crate) mod model {
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-    use super::{PUBLIC_LEN, SEED_LEN};
+    use super::{
+        CIPHERTEXT_LEN, InvalidPublicKey, PUBLIC_LEN, RANDOMNESS_LEN, SEED_LEN, SHARED_LEN,
+    };
+
+    /// What the last encapsulation or decapsulation was given and gave, so that a proof can follow
+    /// it: the randomness or the seed, the first bytes of the public key and of the ciphertext,
+    /// which the model of HKDF reads only so far, and the shared secret.
+    static RANDOMNESS: [AtomicU8; RANDOMNESS_LEN] = [const { AtomicU8::new(0) }; RANDOMNESS_LEN];
+    static SEED: [AtomicU8; SEED_LEN] = [const { AtomicU8::new(0) }; SEED_LEN];
+    static PUBLIC: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
+    static CIPHERTEXT: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
+    static SHARED: [AtomicU8; SHARED_LEN] = [const { AtomicU8::new(0) }; SHARED_LEN];
+    /// Whether the last encapsulation refused its public key, and whether any decapsulation ran.
+    static REFUSED: AtomicBool = AtomicBool::new(false);
+    static DECAPSULATED: AtomicBool = AtomicBool::new(false);
 
     /// Whether the last self-test was given the known answer, so that a proof can tell a refusal
     /// of X-Wing from one the code makes up.
@@ -488,6 +497,102 @@ pub(crate) mod model {
     /// Whether the last self-test was given the known answer.
     pub(crate) fn answered() -> bool {
         ANSWERED.load(Ordering::Relaxed)
+    }
+
+    /// Any ciphertext and shared secret, or a refusal of the public key at will, writing neither.
+    pub(crate) fn encapsulate(
+        public: &[u8; PUBLIC_LEN],
+        randomness: &[u8; RANDOMNESS_LEN],
+        ciphertext: &mut [u8; CIPHERTEXT_LEN],
+        shared: &mut [u8; SHARED_LEN],
+    ) -> Result<(), InvalidPublicKey> {
+        keep(&RANDOMNESS, randomness);
+        if let Some(head) = public.first_chunk() {
+            keep(&PUBLIC, head);
+        }
+        let refused = kani::any::<bool>();
+        REFUSED.store(refused, Ordering::Relaxed);
+        if refused {
+            return Err(InvalidPublicKey);
+        }
+        *ciphertext = kani::any();
+        *shared = kani::any();
+        keep_ciphertext(ciphertext);
+        keep(&SHARED, shared);
+        Ok(())
+    }
+
+    /// Any shared secret.
+    pub(crate) fn decapsulate(
+        seed: &[u8; SEED_LEN],
+        ciphertext: &[u8; CIPHERTEXT_LEN],
+        shared: &mut [u8; SHARED_LEN],
+    ) {
+        DECAPSULATED.store(true, Ordering::Relaxed);
+        keep(&SEED, seed);
+        keep_ciphertext(ciphertext);
+        *shared = kani::any();
+        keep(&SHARED, shared);
+    }
+
+    /// Keeps `bytes` in `kept`. They are copied out first: a loop over bytes behind a pointer the
+    /// proof does not pin down unwinds as far as the proof allows.
+    fn keep<const N: usize>(kept: &[AtomicU8; N], bytes: &[u8; N]) {
+        let bytes = *bytes;
+        for (to, byte) in kept.iter().zip(bytes) {
+            to.store(byte, Ordering::Relaxed);
+        }
+    }
+
+    /// Keeps the first bytes of `ciphertext`.
+    fn keep_ciphertext(ciphertext: &[u8; CIPHERTEXT_LEN]) {
+        if let Some(head) = ciphertext.first_chunk() {
+            keep(&CIPHERTEXT, head);
+        }
+    }
+
+    /// The bytes kept in `kept`.
+    fn kept<const N: usize>(kept: &[AtomicU8; N]) -> [u8; N] {
+        let mut bytes = [0; N];
+        for (to, from) in bytes.iter_mut().zip(kept) {
+            *to = from.load(Ordering::Relaxed);
+        }
+        bytes
+    }
+
+    /// Whether the last encapsulation refused its public key.
+    pub(crate) fn refused() -> bool {
+        REFUSED.load(Ordering::Relaxed)
+    }
+
+    /// Whether any decapsulation ran.
+    pub(crate) fn decapsulated() -> bool {
+        DECAPSULATED.load(Ordering::Relaxed)
+    }
+
+    /// The randomness the last encapsulation was given.
+    pub(crate) fn randomness() -> [u8; RANDOMNESS_LEN] {
+        kept(&RANDOMNESS)
+    }
+
+    /// The seed the last decapsulation was given.
+    pub(crate) fn seed() -> [u8; SEED_LEN] {
+        kept(&SEED)
+    }
+
+    /// The first bytes of the public key the last encapsulation was given.
+    pub(crate) fn public_head() -> [u8; 32] {
+        kept(&PUBLIC)
+    }
+
+    /// The first bytes of the ciphertext of the last encapsulation, or of the last one decapsulated.
+    pub(crate) fn ciphertext_head() -> [u8; 32] {
+        kept(&CIPHERTEXT)
+    }
+
+    /// The shared secret the last encapsulation or decapsulation gave.
+    pub(crate) fn shared() -> [u8; SHARED_LEN] {
+        kept(&SHARED)
     }
 }
 

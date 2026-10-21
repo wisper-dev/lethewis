@@ -122,6 +122,8 @@ fn seal_checked<const N: usize>(
         Err(SealFailed)
     };
     if sealed.is_err() {
+        #[cfg(kani)]
+        model::note_seal_failed();
         wipe(buffer);
     }
     sealed
@@ -210,18 +212,21 @@ pub(crate) mod model {
         if kani::any() {
             Ok(kani::any())
         } else {
-            ENCRYPTION_FAILED.store(true, Ordering::Relaxed);
             Err(SealFailed)
         }
     }
 
-    /// Whether any encryption has failed, so that a proof can tell a success from one the code
-    /// makes up after a failure.
-    static ENCRYPTION_FAILED: AtomicBool = AtomicBool::new(false);
+    /// Whether any seal has failed, the check on a known input or the encryption, so that a proof
+    /// can tell a success from one the code makes up after a failure.
+    static SEAL_FAILED: AtomicBool = AtomicBool::new(false);
 
-    /// Whether any encryption has failed.
-    pub(crate) fn any_encryption_failed() -> bool {
-        ENCRYPTION_FAILED.load(Ordering::Relaxed)
+    pub(super) fn note_seal_failed() {
+        SEAL_FAILED.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether any seal has failed.
+    pub(crate) fn any_seal_failed() -> bool {
+        SEAL_FAILED.load(Ordering::Relaxed)
     }
 
     /// Decryption writes any bytes, then accepts or rejects at will and records which.

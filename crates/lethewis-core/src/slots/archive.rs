@@ -342,7 +342,7 @@ impl<'a> Slots<'a> {
     }
 
     /// The slot of the stored key for wrapping that `profile` refers to.
-    fn profile_key(&self, profile: Handle<'a>) -> Result<usize, Error> {
+    pub(super) fn profile_key(&self, profile: Handle<'a>) -> Result<usize, Error> {
         let index = self.serving(profile, Purpose::Wrap)?;
         if self.memory.get(index).is_none_or(|stored| stored.unlocks) {
             return Err(Error::WrongLevel);
@@ -352,7 +352,7 @@ impl<'a> Slots<'a> {
 }
 
 /// Wipes the stack below the caller's frame, as deep as X-Wing and the layers of a record reach.
-fn wipe_archive_stack() {
+pub(super) fn wipe_archive_stack() {
     // The wipe ends in inline assembly, which Kani cannot model.
     #[cfg(not(kani))]
     zeroize::zeroize_stack::<{ xwing::STACK_WIPE }>();
@@ -438,8 +438,8 @@ fn seed_gives(
 }
 
 /// The 32 bytes of the seed of an archive key.
-fn seed_of(seed: &Key) -> Option<&[u8; SEED_LEN]> {
-    seed.material().and_then(|bytes| bytes.try_into().ok())
+pub(super) fn seed_of(seed: &Key) -> Option<&[u8; SEED_LEN]> {
+    seed.as32()
 }
 
 /// Whether two public keys are the same, compared in pieces no longer than a key.
@@ -448,7 +448,9 @@ fn same_public(a: &[u8; PUBLIC_LEN], b: &[u8; PUBLIC_LEN]) -> bool {
 }
 
 /// The identifier, the public key and the inner record that `body` holds.
-fn split_body(body: &[u8; ARCHIVE_BODY_LEN]) -> ([u8; ID_LEN], [u8; PUBLIC_LEN], [u8; RECORD_LEN]) {
+pub(super) fn split_body(
+    body: &[u8; ARCHIVE_BODY_LEN],
+) -> ([u8; ID_LEN], [u8; PUBLIC_LEN], [u8; RECORD_LEN]) {
     let mut parts = ([0; ID_LEN], [0; PUBLIC_LEN], [0; RECORD_LEN]);
     if let Some((id, rest)) = body.split_first_chunk::<ID_LEN>()
         && let Some((public, inner)) = rest.split_first_chunk::<PUBLIC_LEN>()
@@ -517,7 +519,7 @@ fn seal_archive_layer(
 /// Opens the record of an archive key `record` under the key derived from the stored key for
 /// wrapping `stored` and the key of the epoch `epoch_key`, and keeps what it holds after the number
 /// in `body` if it names `number`; otherwise `StaleRecord`, and `body` is left as it was.
-fn open_archive_layer(
+pub(super) fn open_archive_layer(
     (stored, epoch_key, number): (&Key, &Key, u64),
     aad: &[u8],
     record: &[u8; ARCHIVE_KEY_RECORD_LEN],
@@ -572,8 +574,8 @@ mod tests {
     use crate::slots::write_record;
     use crate::xwing::{self, wrong_known};
     use crate::{
-        Entropy, EntropyError, Epoch, Erasure, Error, Handle, KeyLength, Position, Purpose,
-        RECORD_LEN, Root, RootFailed, Slot, Slots, seal,
+        ARCHIVE_RECORD_LEN, Entropy, EntropyError, Epoch, Erasure, Error, Handle, KeyLength,
+        Position, Purpose, RECORD_LEN, Root, RootFailed, Slot, Slots, seal,
     };
 
     struct Platform;
@@ -977,7 +979,10 @@ mod tests {
     /// of any length, the stored key of the archive generated as the first draw, a 64-byte stored
     /// key for wrapping, the record in "archive" from the next three draws, and the carry as the
     /// fifth, into an epoch whose key is the key of the test epoch with every bit flipped; then a
-    /// second archive key created during that change, from the next three draws.
+    /// second archive key created during that change, from the next three draws. Once that epoch
+    /// is committed, a key of a chat for its archive from the ninth draw, a batch of "chat" archived
+    /// to the second archive key from the next two, another key of a chat from the twelfth, and the
+    /// record moved to it with the thirteenth.
     const KNOWN_RECORD: &str = concat!(
         "5afbf61400553277f85274b83481e92fd244717a764ba72c32cb4e9f94ecee18",
         "8552df95b427d9e53df937982ca0676a9548ce2a72bdae4799e73418fa5a9a8b",
@@ -1128,6 +1133,85 @@ mod tests {
         "7a52a98a8dfdf6551ccf74e33394f795cff7ef166ce217a054cc9fe6994b8dbe",
         "87618af444dc3ff099d8556423f9b072d88e370a6342884d0f",
     );
+    const KNOWN_DATA_KEY: &str = "ba34462d533d6e56240e071de9f8bddbcad2f84ed47bb5302beabd72218ba99f";
+    const KNOWN_ARCHIVED: &str = concat!(
+        "1550e151dd86770fb739bab0756873bacddd76f929e8ab4fcd5a9fd4a6634b75",
+        "87329bfe1ffdaffc7052e20c9aca10bd5a7d6d424320e8388798f8f1a3c966ef",
+        "02bc87be02f4b4be4607d0a0a3307e65cb0468c4e70b3436c93ae71770d52d40",
+        "12bfdae94e87dfd17f1782385835522ce637849cef7ee59f49d421fe1a9e86a1",
+        "8848056a9d0d5f97dc9d01f69415c3af44758606cd72c65bbddba4591684da2d",
+        "5fe587b676210b4d68a0ed0d956a082144f250c4c19b22b73b780cc11bcb945a",
+        "84f5d4025f2ed0d9f78ca966f847fd017c70e7b42cfc4b6e031ca3f96c55ec25",
+        "bdd64a2cec4d13d5f5b9b1cc999c828391645fb61a13c326db2ac51f5fc72ff7",
+        "1921fe50762534e5e5074cc87164638e6aa1d9cb75beed4f7667fb18a73163f9",
+        "e4a143b55bb2e2909203b46a1f2cfff7e1786bb7710533a3596cbfa48129a0ca",
+        "2e832ae55f1d9f783d98ba9a1cff9766af59b7530933458560e201249eee9f0e",
+        "c182cc4d15d0e850629ad85b776e4cf818241b1b4f6112ab1d3e809dec2924a5",
+        "0d055a353dc28f4c27cff19c9afdd9c9fceeda6bb338749eb0b625f2d527100a",
+        "24cc35235b4d9e71e7c61a3b289af5564804e528c334ccee4f9288edc7638e54",
+        "2bb3a3399869cf6d6a1547e4a8829e6e5b170a5c593e1439afcaa1610cb42f16",
+        "4af592f50a5c07a247e5f51db44a5336d97f150244d9d0e8a466561408e43eee",
+        "7955beadfd6bc2a73388e9e98cf2754574263289cc340e3d0fb7d4c345f5aef1",
+        "efecd9a251d1b2d88751a667eaea6c98e87e6212dc2d55704f68413f740dbdb9",
+        "7f29fa5fba44a4410a4679c10a703e4769deb28f61f946dbfeba110ac6b6ddf2",
+        "bd846c4cc62196a68a2278328976af822d1507696337e00a662bf53030f87738",
+        "e230909ac5ecd0ff2ec9816ebd379d8265c8e2adbc372f7f0d425a0aa84ad435",
+        "419275551335804179dff9de8b47d34ecf135958cb4d505705e1646947dbac3f",
+        "427f0c78dc61927782d6e9b2658b961f358fc4c119fcbdfc66910f6ee4d5ecf6",
+        "990510438640161003a566d0374c465fef7f467ae0530bc9f699e46ffd72f82f",
+        "cdbd3f07c1188651b84eea328b6809c599a4781273d099337fbec3b1108584d8",
+        "e1480cef3f5d8c6f9f4c74aeda04d2eeb02c7021a60afb67640edaeca60140a2",
+        "53f7ed9519665742108e19070b7d67e6c0e9501f3be0c060cc8208c500428253",
+        "4e57f5d8084b0f29cff50ec280fdea5c97213a207830699bd59710edf8d566b1",
+        "fb60c6260a6e4ae6a193dcaa6565eb68583aa99e6119aa97c44e6f79e1b37550",
+        "e3f97603228c76fbb9ddb85e80098d67f7e4c2f0f9edf424c9a01a456b355181",
+        "bdf03801d71526085b2541e6a356474400c7f569035de5fa5f4ff5b10506a403",
+        "2c3a2b5c36940d9160a1c2f6ad4e61b8c20d20a0af2187d466ded55d1c34fa30",
+        "5a162b35919e77229b6ae7df0878eea5e5d789151ca169de97116ced2e32f453",
+        "63506a2224ccc88150a292cb3d0f4bb41d3095374931714506b5d92895459c34",
+        "ee0cbb1bcda826a86456a733774baf0d34db5dd28cb2feee94fff658e5d66e1d",
+        "958a7c4bbfe697e130a1375331624fe9b2dd5e7aa29bff3093f48e9dbcb1472f",
+        "043ea0e4fa89fdc875614387fb502a69e13ddbe4e91bff7e63212cf9",
+    );
+    const KNOWN_MOVED: &str = concat!(
+        "4063a1dbd80d6757dd56d8ea8d539389f855f04c030a74fb88abd21fa8b2f447",
+        "29714cf76bdaa54325cc3a14ce44f478a514e5fcdfc82412b063f3d6a3a4c7d0",
+        "00f618e201fe1d0b0b182729c1768ba77fa0c4b49f25b8e0ec21ed89cd6aa190",
+        "5ba794bf88d55154bac7a15df1a3a2f8f154b659588ec43cc46a43b1929dd374",
+        "c6fb404983d56b68fb353ef3097691b5d6bd45df8c740896fd3136bd74a48684",
+        "1a9f62c02417e7252e1836addb0f8180b0843f302462ffe0ba392ddeca18d016",
+        "40de5821a6eda891a3b5124aed85a640062282fafa6bd075c0213d759a4bec8a",
+        "5b7c3a6eb9ef75f07f5fb6c7781fd989f6139d898ce4d7be5b3b8da61d622221",
+        "d75865c4759d570aede5f8d4301b49c84a0da36f33396a2126fa3ec29137b273",
+        "40751a7087d8751ed606f392fc0b96b5c023e7ce33f075c4b35c0c76c656e3af",
+        "6e2a674937fee75c927759870d7107aec6a0bdb0952fdde4405ee2e249709470",
+        "04df70a996cda52b3193f71d67649a0f3b62ab3755184d0285fe81b8dc7ba6c5",
+        "412dec46add0e9edf631d7470e9d38000ab0cc98eab727fae4e2da4710a684e3",
+        "6a05cfd3f88009bd5cd5f1be8c846308f6a4b3bea891b7bd7e780d82c8360c0a",
+        "2ffc4db41f5ccfafc8e5a2c40793cf36e2c5840c2d8548325ef22ac6bb41cd73",
+        "b51af37c7614bff1feb9f37cdf49efa3e04cc371cf763c51404705b57534c957",
+        "6e33c70308a667c5b83b3976c3c6fe312f23e419deef3c7c17da78816822ad75",
+        "a8ed83421a0e84cb75922e08bbf8c6609f940f22c944abe0f2b2648fd758b879",
+        "8d41493098b60525964083770cf0618cb297df0bb37c34f0d41da8bbe13461b5",
+        "e2760e2caea37323f4d2c9456180891ffbff5047e9b1f3630af6b5e28984ff8d",
+        "89e0dc4fea708ac196e8d2ac0b1a5b59a210585ef5a9dc6f5c618072aeb9045b",
+        "e5e1107da155cfb6406fb3c7b7fe01f3699325e9bab75e1e4ead4184696dfc18",
+        "bb74d1f6ddcde5726a2aa3b3e055b981a73d5bc48f4d099c57db2b2203e4b8fd",
+        "8d7b46cafe23040154c19efc98f8883e920ae2256d6d66cf22283c99c2ffca0f",
+        "21939196d73e6e18f84e3a6e82ca91c75fc2ffca13f81895e569192a6ac8db5e",
+        "598d68a9d856231ebf644fb35fd6022c9012ff23565a20efdc6f70883339d0ef",
+        "522ed9e9f6f1c049d1aaa6cc12c3f4cc5a7c84cfacbe10d0dba0bb3788fded18",
+        "469cae567ffddda33cc5a4258a792334cf0223a30898206c1d3e0172456526c4",
+        "71df8db25f1631f13ea94653d7e86a122e4a58eef1aff37882f3a08db2cf7b08",
+        "34855b0e575faa8b84e648b3d42d509df39619fd7bd04f74daa644f2ca5321b9",
+        "ea178f795817549e97a6341201e05759e1a6d0833c5a382d3e72597f9624e93c",
+        "0e8e33bb42d0999e838fd7fb78f6bb9491f98bc73826ac11f8a489c1bee6fb5c",
+        "9fc7c6bdbd83270da2426c09280af8b917f4ffbbde203d62bedfa63e70f9a17c",
+        "016874bd90e7364f149b1a62fd0b01a722ed633c10c941e64e3550cfb2d29779",
+        "6d5c48c2d92769bc89fba33f82a5d1d22c604b1ee19e6971ac1a6ba7c15a189d",
+        "383a3ecb2ea648036842a0e00a2bb6a649c8e71275701f574d6fd261348665ea",
+        "8d1db027ec36b65217c411a6f7cef4a8762609e3afc9545a7fd98494",
+    );
 
     /// Gives `pattern(17, 5)` for a draw of any length.
     struct Pattern;
@@ -1140,13 +1224,13 @@ mod tests {
     }
 
     #[expect(clippy::arithmetic_side_effects, reason = "a test decodes hex")]
-    fn archive_hex(text: &str) -> [u8; ARCHIVE_KEY_RECORD_LEN] {
+    fn archive_hex<const N: usize>(text: &str) -> [u8; N] {
         core::array::from_fn(|at| u8::from_str_radix(&text[2 * at..2 * at + 2], 16).unwrap())
     }
 
     #[test]
-    fn records_of_an_archive_key_match_ones_computed_independently() {
-        let mut memory = [const { Slot::empty() }; 4];
+    fn records_of_the_archive_match_ones_computed_independently() {
+        let mut memory = [const { Slot::empty() }; 6];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let store = slots
@@ -1190,6 +1274,41 @@ mod tests {
                 .unwrap();
             slots.release(key).unwrap();
         }
+        let chat = slots
+            .generate(Purpose::ArchiveSeal, KeyLength::Bytes32, &mut Pattern)
+            .unwrap();
+        let public = slots
+            .archive_public_key(profile, b"archive", &created)
+            .unwrap();
+        let (mut archived, mut data_key) = ([0; ARCHIVE_RECORD_LEN], [0; 32]);
+        slots
+            .archive(
+                chat,
+                &public,
+                b"chat",
+                &mut Pattern,
+                &mut archived,
+                &mut data_key,
+            )
+            .unwrap();
+        assert_eq!(data_key, archive_hex(KNOWN_DATA_KEY));
+        assert_eq!(archived, archive_hex(KNOWN_ARCHIVED));
+        let other = slots
+            .generate(Purpose::ArchiveSeal, KeyLength::Bytes32, &mut Pattern)
+            .unwrap();
+        let mut moved = [0; ARCHIVE_RECORD_LEN];
+        slots
+            .reseal_archive(chat, other, b"chat", &mut Pattern, &archived, &mut moved)
+            .unwrap();
+        assert_eq!(moved, archive_hex(KNOWN_MOVED));
+        let key = slots
+            .load_archive_key(store, profile, b"archive", &created)
+            .unwrap();
+        let mut opened = [0; 32];
+        slots
+            .open_archive(key, other, b"chat", &moved, &mut opened)
+            .unwrap();
+        assert_eq!(opened, data_key);
     }
 }
 

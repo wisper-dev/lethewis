@@ -16,7 +16,8 @@ pub enum Error {
     /// A value could not be derived from a key.
     DerivationFailed,
     /// The record does not open with the key of the parent set and this context, holds a plaintext
-    /// this version of the library cannot read, or names a key other than the one that opens it.
+    /// this version of the library cannot read, or names a key other than the one that opens it;
+    /// or X-Wing refuses the public key of an archive key.
     RecordRejected,
     /// A key set cannot wrap itself.
     SameKey,
@@ -67,12 +68,16 @@ pub enum Error {
     /// for external data.
     WrongLevel,
     /// The lock record or the record of an archive key does not open in this epoch for this
-    /// context: it was not written or carried into it, or it was changed.
+    /// context: it was not written or carried into it, or it was changed; or the public key of an
+    /// archive key was read from other slots or in another epoch.
     StaleRecord,
     /// The record of an archive key holds an identifier or a public key other than the ones its seed
-    /// gives: the record was changed by someone who held the key of the epoch and the stored key it
-    /// is under.
+    /// gives, changed by someone who held the key of the epoch and the stored key it is under; or
+    /// the record of a batch fails its check, archived to another public key or changed under the
+    /// key of its chat.
     PublicKeyMismatch,
+    /// The record of an archive was written to another archive key.
+    WrongArchiveKey,
     /// A transfer has not ended: the set came in an export whose end has not been received, and is
     /// neither revealed, wrapped, exported nor changed until then, or the key for transfers carries
     /// an export the other way.
@@ -124,6 +129,7 @@ impl fmt::Display for Error {
             Self::WrongLevel => "wrong level",
             Self::StaleRecord => "stale record",
             Self::PublicKeyMismatch => "public key mismatch",
+            Self::WrongArchiveKey => "wrong archive key",
             Self::Unfinished => "unfinished transfer",
             Self::NoTransfer => "no transfer",
         })
@@ -172,6 +178,8 @@ mod tests {
         assert_eq!(Error::WrongLength.to_string(), "wrong key length");
         assert_eq!(Error::WrongLevel.to_string(), "wrong level");
         assert_eq!(Error::StaleRecord.to_string(), "stale record");
+        assert_eq!(Error::PublicKeyMismatch.to_string(), "public key mismatch");
+        assert_eq!(Error::WrongArchiveKey.to_string(), "wrong archive key");
         assert_eq!(Error::Unfinished.to_string(), "unfinished transfer");
         assert_eq!(Error::NoTransfer.to_string(), "no transfer");
     }

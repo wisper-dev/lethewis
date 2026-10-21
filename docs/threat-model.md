@@ -57,6 +57,13 @@ A challenge read on its way to the chip lets guesses at the password run without
 none of its lock records and locks it under no key again. Once the change is committed, the old root
 erased and no slot holds the key, the password still derives its key, and that key opens nothing.
 
+History past a cut-off is archived to an archive key. Its seed opens only under a stored key of
+the archive, which lies only in lock records: under a second password with the chip, or under
+shares, as the application chooses.
+
+The main password opens the outer layers and shows that an archive exists, not what its batches
+hold, as long as the random source was sound when they were archived.
+
 **Intended.** Give each profile its own entry key, so that a second password derives a different
 profile's key rather than part of the same one.
 
@@ -124,6 +131,15 @@ A load refuses a record whose identifier or public key the seed does not give: w
 key of the epoch and the profile's stored key cannot make the archive key load with a public key of
 their own. Before each creation and load, X-Wing must give the known answer of its draft.
 
+A batch of history is archived to the public key the record of the archive key holds. The key of
+the batch is derived from the shared secret of an encapsulation, with its ciphertext as the salt.
+
+The record of the archive holds that ciphertext under the key of the chat for its archive, in no
+epoch. The key of the batch comes back only with the archive key and that key of the chat.
+
+A record of the archive moves to another key of the chat without the archive key. A key of a chat
+not carried into the next epoch, with the records still under it, takes their batches with it.
+
 The records of an export open only in the order they were written, each bound to the tag of the one
 before, and its end is bound to the last. Until that end is received, a set that came in the export
 is not revealed, wrapped, exported or changed: a cut, reordered or mixed export leaves nothing to
@@ -181,9 +197,11 @@ Tests read the stack back the same way after a lock, an unlock, a refused unlock
 both layers of the record and the keys derived for them. They do so after an export, a receipt, a
 refused receipt and both ends too, for the key for transfers and the key derived from it.
 
-After a creation, a load and a carry of an archive key the stack is wiped 96 KiB deep, or 224 KiB
-without optimisation: at least twice what each uses. Tests read it back for the seed, what X-Wing
-expands it to and both stored keys; the inner values of ML-KEM-768 and X25519 are not looked for.
+After each call on an archive key or a record of the archive the stack is wiped 96 KiB deep, or
+224 KiB without optimisation: at least twice what each uses.
+
+Tests read it back for the seed, what X-Wing expands it to, the stored keys, the keys of chats, the
+shared secret and the key of a batch. The inner values of ML-KEM-768 and X25519 are not looked for.
 
 The wipe on release and on creating the slots, and the refusal of a released or foreign handle, are
 proven for two slots; the statements and their limits are in [proofs.md](proofs.md).
@@ -208,11 +226,28 @@ destroyed, wiped with its identifier. A record of its set wrapped afterwards doe
 wrapped before still does, and opens until the next epoch is committed, then only while the
 platform keeps the old root.
 
+A record of the archive keeps a check of the shared secret: a batch archived to a public key other
+than its archive key's is refused when it is opened, and gives no key.
+
 **Intended.** Drop keys from memory when the device locks.
 
 **Not defended.** Copies left by a value move, a buffer reallocation, a CPU register, swap, or a
 crash dump. A set of slots leaked instead of dropped keeps its keys in memory. A system component
 with elevated privileges is outside what process isolation provides.
+
+Whoever holds the key of the epoch and the profile's stored key can change the public key in the
+record of the archive key. Batches archived until its next load go to their key; they come from
+chats whose keys that holder reads already.
+
+The archive keeps batches secret but does not prove where they came from. Whoever holds the key of
+a chat for its archive and the public key can write records and batches that open as genuine.
+
+Against whoever holds the key of the epoch and the key of a chat, the secrecy of a batch rests on
+the platform's random source when it is archived. With a broken source, they can work out the
+randomness of the encapsulation, and from it and the public key the key of the batch.
+
+Profiles that share an epoch and a root are not kept apart: a change of epoch made from one carries
+none of the other's records, and those open no more once it is committed and the old root erased.
 
 Whoever can call the library can export a set under a key for transfers it imported itself. That
 gives out every key of the set, the disabled ones too, which a reveal does not.

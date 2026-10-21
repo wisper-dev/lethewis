@@ -228,5 +228,15 @@ Nothing is published while the version is below 0.1.0.
   or 232 KiB.
 - Proofs with Kani 0.68.0 for the creation, the load and the carry of an archive key, and tests
   against records computed by an independent implementation, the public key of X-Wing included.
+- Records of an archive, `ARCHIVE_RECORD_LEN` bytes, 1180: `Slots::archive` encapsulates to an
+  archive key, gives the key of the batch and writes the ciphertext and a check of the shared
+  secret under the key of a chat for its archive. `Slots::reseal_archive` moves the record to
+  another key of the chat.
+- `Slots::open_archive` gives the key of a batch back with the archive key. It fails with
+  `Error::WrongArchiveKey` for a record of another archive key and with `Error::PublicKeyMismatch`
+  for a batch archived to another public key.
+- `Slots::archive_public_key` reads the public key of an archive key, as `ArchivePublic`, from
+  its record under the profile's stored key, for those slots and that epoch only. Proofs with Kani
+  0.68.0 for the four calls, and tests against records an independent implementation computes.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

@@ -58,13 +58,19 @@ password and the hardware secret at each unlock, and neither alone is enough.
 - **A way in is revoked only by the next change of epoch.** A lock record left behind opens until
   the change is committed and the old root erased. Against someone who held an epoch's key while
   the record lived and knows its secret, only a new profile key helps.
+- **A changed public key of an archive key is found only at its next load.** Whoever holds the key
+  of the epoch and the profile's stored key can change it in its record. Batches archived until
+  then go to their key and no longer open under the archive key; they come from chats whose keys
+  that holder reads already.
+- **The archive keeps batches secret but does not prove where they came from,** and their secrecy
+  against whoever holds the main password rests on the random source when they are archived.
 - **A challenge to the chip is as sensitive as a hash of the password.** Whoever reads one on its
   way to the chip can test guesses at the password without the chip. Wiping it after use and
   passing it only to the chip is the caller's.
 - **Wiping a value from memory does not reach every copy.** Copies from a move, a reallocation, a
   register, swap or a crash dump are beyond this library. Each load, addition,
   derivation, reveal, wrap, unwrap, lock, unlock, carry, combination, challenge, export, receipt
-  and call on an archive key wipes the stack it used, as measured on x86-64 and aarch64 Linux.
+  and call on an archive wipes the stack it used, as measured on x86-64 and aarch64 Linux.
 - **The stack a call needs is not measured on microcontrollers.** On a target such as Cortex-M a
   call needs at least the depth of the wipe after it, which its documentation states, and an
   overflow of an unguarded stack corrupts memory silently. A derivation from a password needs at

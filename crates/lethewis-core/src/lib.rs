@@ -62,8 +62,11 @@ pub use error::Error;
 pub use key::KeyLength;
 pub use keyset::Position;
 pub use password::{MemoryBlock, PASSWORD_PARAMS_LEN, PasswordParams};
-pub use record::{ARCHIVE_KEY_RECORD_LEN, END_RECORD_LEN, LOCK_RECORD_LEN, Purpose, RECORD_LEN};
-pub use slots::{Handle, Slot, Slots};
+pub use record::{
+    ARCHIVE_KEY_RECORD_LEN, ARCHIVE_RECORD_LEN, END_RECORD_LEN, LOCK_RECORD_LEN, Purpose,
+    RECORD_LEN,
+};
+pub use slots::{ArchivePublic, Handle, Slot, Slots};
 pub use words::{WORD_COUNT, WORD_LEN, Words};
 
 #[cfg(test)]
