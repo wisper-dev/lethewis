@@ -213,5 +213,9 @@ Nothing is published while the version is below 0.1.0.
 - Dependencies: `ml-kem` 0.3.3, `x25519-dalek` 3.0.0, `sha3` 0.12.0 and `shake` 0.1.0 or later
   compatible versions, without default features and with their `zeroize` features and the `hazmat`
   feature of `ml-kem`, for X-Wing, the hybrid of ML-KEM-768 and X25519.
+- Three purposes of the archive: `Purpose::Archive`, the seed of an archive key;
+  `Purpose::ArchiveWrap`, a stored key of the archive, kept only in lock records, that wraps no
+  set; and `Purpose::ArchiveSeal`, a key of a chat for its archive, under a stored key for wrapping.
+  None of them is imported or derived from a password or words, and the seed is not generated.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

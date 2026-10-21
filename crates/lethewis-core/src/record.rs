@@ -46,9 +46,10 @@ const _: () = assert!(AAD_HEAD + TAG_LEN + MAX_CONTEXT == AAD_CAPACITY);
 #[repr(u8)]
 pub enum Purpose {
     /// A key of 32 or 64 bytes that wraps other keys. Its set holds this one key and never changes.
-    /// A key from a secret, such as a password, wraps only stored keys for wrapping, which
-    /// [`Slots::lock`](crate::Slots::lock) keeps under it; a stored key wraps only keys for
-    /// external data and keys for transfers. Leaves the library only wrapped, or as the words
+    /// A key from a secret, such as a password, wraps only stored keys, for wrapping or of the
+    /// archive, which [`Slots::lock`](crate::Slots::lock) keeps under it; a stored key for wrapping
+    /// wraps only keys for external data, keys for transfers and keys of chats for their archives.
+    /// Leaves the library only wrapped, or as the words
     /// [`Slots::generate_words`](crate::Slots::generate_words) writes once; a key from a secret
     /// gives out a [`Slots::challenge`](crate::Slots::challenge) derived from it.
     Wrap = 1,
@@ -62,6 +63,16 @@ pub enum Purpose {
     /// stored key for wrapping. Its set holds this one key and never changes; it leaves the library
     /// only wrapped, or as the words a generation writes.
     Transfer = 3,
+    /// The seed of an X-Wing key pair, 32 bytes, that keeps old history: whoever holds the public
+    /// key writes records that only this key opens. Only the record of an archive key creates it,
+    /// and it lies in no other record. It never leaves the library.
+    Archive = 4,
+    /// A stored key of 32 bytes that wraps only the seed of an archive key. It lies only in lock
+    /// records, and leaves the library only wrapped.
+    ArchiveWrap = 5,
+    /// A key of 32 bytes for the outer layer of the records of an archive, one for each chat. It is
+    /// stored under a stored key for wrapping, and leaves the library only wrapped.
+    ArchiveSeal = 6,
 }
 
 impl Purpose {
@@ -70,6 +81,9 @@ impl Purpose {
             1 => Some(Self::Wrap),
             2 => Some(Self::ExternalData),
             3 => Some(Self::Transfer),
+            4 => Some(Self::Archive),
+            5 => Some(Self::ArchiveWrap),
+            6 => Some(Self::ArchiveSeal),
             _ => None,
         }
     }
@@ -78,8 +92,26 @@ impl Purpose {
     pub(crate) const fn takes(self, length: KeyLength) -> bool {
         match self {
             Self::Wrap => true,
-            Self::ExternalData | Self::Transfer => matches!(length, KeyLength::Bytes32),
+            Self::ExternalData
+            | Self::Transfer
+            | Self::Archive
+            | Self::ArchiveWrap
+            | Self::ArchiveSeal => matches!(length, KeyLength::Bytes32),
         }
+    }
+
+    /// Whether a key for this purpose may come from the caller's bytes: imported, or derived from a
+    /// password or words.
+    pub(crate) const fn imported(self) -> bool {
+        matches!(self, Self::Wrap | Self::ExternalData | Self::Transfer)
+    }
+
+    /// Whether a key for this purpose may be generated from the platform's source alone.
+    pub(crate) const fn generated(self) -> bool {
+        matches!(
+            self,
+            Self::Wrap | Self::ExternalData | Self::ArchiveWrap | Self::ArchiveSeal
+        )
     }
 }
 

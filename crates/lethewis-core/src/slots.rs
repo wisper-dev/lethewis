@@ -31,7 +31,7 @@ pub struct Slot {
     stages: Stages,
     purpose: Purpose,
     /// The set is a key from a secret the caller holds: it is never wrapped, and wraps only stored
-    /// keys for wrapping.
+    /// keys, for wrapping or of the archive.
     unlocks: bool,
     generation: u64,
     occupancy: Occupancy,
@@ -278,7 +278,7 @@ impl<F, const N: usize> Open<N> for F where
 }
 
 /// Where a wrap writes: the record of a set under a stored key for wrapping, the lock record of a
-/// stored key for wrapping, or a record of an export.
+/// stored key, or a record of an export.
 enum Out<'r> {
     Record(&'r mut [u8; RECORD_LEN]),
     Lock(&'r mut [u8; LOCK_RECORD_LEN]),
@@ -305,6 +305,18 @@ enum Kind {
 }
 
 impl Kind {
+    /// Whether a record of this kind may hold a set for `purpose`.
+    const fn holds(self, purpose: Purpose) -> bool {
+        match self {
+            Self::Record => matches!(
+                purpose,
+                Purpose::ExternalData | Purpose::Transfer | Purpose::ArchiveSeal
+            ),
+            Self::Lock => matches!(purpose, Purpose::Wrap | Purpose::ArchiveWrap),
+            Self::Export => matches!(purpose, Purpose::ExternalData),
+        }
+    }
+
     /// The purpose of the key a record of this kind is wrapped under.
     const fn parent_purpose(self) -> Purpose {
         match self {
@@ -346,14 +358,19 @@ impl<'a> Slots<'a> {
     ///
     /// # Errors
     ///
-    /// [`Error::NoFreeSlot`] if no slot is free, [`Error::DerivationFailed`] if the identifier of
-    /// the key cannot be derived, and [`Error::DuplicateKey`] if these slots hold the key already.
-    /// `source` is then left as it was, and no slot changes.
+    /// [`Error::WrongPurpose`] if `purpose` is [`Purpose::Archive`], [`Purpose::ArchiveWrap`] or
+    /// [`Purpose::ArchiveSeal`], whose keys only the library creates, [`Error::NoFreeSlot`] if no
+    /// slot is free, [`Error::DerivationFailed`] if the identifier of the key cannot be derived, and
+    /// [`Error::DuplicateKey`] if these slots hold the key already. `source` is then left as it
+    /// was, and no slot changes.
     pub fn import32(
         &mut self,
         purpose: Purpose,
         source: &mut [u8; 32],
     ) -> Result<Handle<'a>, Error> {
+        if !purpose.imported() {
+            return Err(Error::WrongPurpose);
+        }
         let secret = purpose == Purpose::Wrap;
         let handle = self.load_new(purpose, KeyLength::Bytes32, secret, |first, _| {
             first.copy32(source);
@@ -373,8 +390,10 @@ impl<'a> Slots<'a> {
     ///
     /// # Errors
     ///
-    /// [`Error::WrongLength`] if `purpose` takes no 64-byte key, [`Error::NoFreeSlot`] if no slot
-    /// is free, [`Error::DerivationFailed`] if the identifier of the key cannot be derived, and
+    /// [`Error::WrongPurpose`] if `purpose` is [`Purpose::Archive`], [`Purpose::ArchiveWrap`] or
+    /// [`Purpose::ArchiveSeal`], whose keys only the library creates, [`Error::WrongLength`] if
+    /// `purpose` takes no 64-byte key, [`Error::NoFreeSlot`] if no slot is free,
+    /// [`Error::DerivationFailed`] if the identifier of the key cannot be derived, and
     /// [`Error::DuplicateKey`] if these slots hold the key already. `source` is then left as it
     /// was, and no slot changes.
     pub fn import64(
@@ -382,6 +401,9 @@ impl<'a> Slots<'a> {
         purpose: Purpose,
         source: &mut [u8; 64],
     ) -> Result<Handle<'a>, Error> {
+        if !purpose.imported() {
+            return Err(Error::WrongPurpose);
+        }
         let secret = purpose == Purpose::Wrap;
         let handle = self.load_new(purpose, KeyLength::Bytes64, secret, |first, _| {
             first.copy64(source);
@@ -405,7 +427,8 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::WrongPurpose`] if `purpose` is [`Purpose::Transfer`], whose key the other device
-    /// has to share, [`Error::WrongLength`] if `purpose` takes no key of `length`,
+    /// has to share, or [`Purpose::Archive`], whose seed only the record of an archive key
+    /// creates, [`Error::WrongLength`] if `purpose` takes no key of `length`,
     /// [`Error::NoFreeSlot`] if no slot is free, [`Error::EntropyFailed`] if `entropy` fails,
     /// [`Error::DerivationFailed`] if the key or its identifier cannot be derived, and
     /// [`Error::DuplicateKey`] if these slots hold the key already. No slot changes then.
@@ -419,7 +442,7 @@ impl<'a> Slots<'a> {
         length: KeyLength,
         entropy: &mut (impl Entropy + ?Sized),
     ) -> Result<Handle<'a>, Error> {
-        if purpose == Purpose::Transfer {
+        if !purpose.generated() {
             return Err(Error::WrongPurpose);
         }
         self.load_new(purpose, length, false, |first, epoch| {
@@ -447,6 +470,9 @@ impl<'a> Slots<'a> {
         length: KeyLength,
         source: &mut (impl Entropy + ?Sized),
     ) -> Result<Handle<'a>, Error> {
+        if !purpose.imported() {
+            return Err(Error::WrongPurpose);
+        }
         self.load_new(purpose, length, purpose == Purpose::Wrap, |first, _| {
             first
                 .fill(length, source)
@@ -639,8 +665,8 @@ impl<'a> Slots<'a> {
         challenged.map_err(|_| Error::DerivationFailed)
     }
 
-    /// Wraps the set for external data or the key for transfers that `set` refers to under the
-    /// stored key for wrapping that `parent` refers to and writes the record into `record`, in this
+    /// Wraps the set for external data, the key for transfers or the key of a chat for its archive
+    /// that `set` refers to under the stored key for wrapping that `parent` refers to and writes the record into `record`, in this
     /// epoch, or in the next while a change to it is under way. The record holds every key of the
     /// set, its stage and which key is the primary, and opens only with that key and the same
     /// `context`, which names the place the record is kept, from 1 to 255 bytes. The nonce comes
@@ -657,7 +683,8 @@ impl<'a> Slots<'a> {
     /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
     /// [`Error::SameKey`] if both refer to the same set, [`Error::WrongPurpose`] if the set
     /// `parent` refers to does not serve [`Purpose::Wrap`], [`Error::WrongLevel`] if the set `set`
-    /// refers to serves it, or `parent` refers to a key from a secret, [`Error::Unfinished`] if the
+    /// refers to is of another purpose, or `parent` refers to a key from a secret,
+    /// [`Error::Unfinished`] if the
     /// set `set` refers to came in a transfer whose end has not been received, [`Error::Unsaved`]
     /// if it has changed in this epoch and no change to the next is under way,
     /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if the nonce cannot
@@ -678,7 +705,8 @@ impl<'a> Slots<'a> {
         wrapped
     }
 
-    /// Locks the stored key for wrapping that `set` refers to under the key from a secret that
+    /// Locks the stored key, for wrapping or of the archive, that `set` refers to under the key from
+    /// a secret that
     /// `parent` refers to, and writes the lock record into `record`, in this epoch, or in the next
     /// while a change to it is under way. The record has two layers, both bound to `context`, from
     /// 1 to 255 bytes, for good. The inner one opens only with the key from a secret, whatever the
@@ -697,7 +725,7 @@ impl<'a> Slots<'a> {
     /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
     /// [`Error::SameKey`] if both refer to the same set, [`Error::WrongPurpose`] if the set
     /// `parent` refers to does not serve [`Purpose::Wrap`], [`Error::WrongLevel`] if `set` does not
-    /// refer to a stored key for wrapping or `parent` to a key from a secret,
+    /// refer to a stored key, for wrapping or of the archive, or `parent` to a key from a secret,
     /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if a nonce cannot
     /// be hedged or a key that encrypts a layer cannot be derived, and [`Error::CipherFailed`] if
     /// the cipher gives a known input a wrong answer or fails. `record` is then left as it was.
@@ -730,9 +758,9 @@ impl<'a> Slots<'a> {
             return Err(Error::WrongPurpose);
         }
         let level = match kind {
-            Kind::Record => child.purpose != Purpose::Wrap && !wrapping.unlocks,
-            Kind::Lock => child.purpose == Purpose::Wrap && !child.unlocks && wrapping.unlocks,
-            Kind::Export => child.purpose == Purpose::ExternalData,
+            Kind::Record => kind.holds(child.purpose) && !wrapping.unlocks,
+            Kind::Lock => kind.holds(child.purpose) && !child.unlocks && wrapping.unlocks,
+            Kind::Export => kind.holds(child.purpose),
         };
         if !level {
             return Err(Error::WrongLevel);
@@ -955,8 +983,9 @@ impl<'a> Slots<'a> {
     }
 
     /// Unwraps `record` with the stored key for wrapping that `parent` refers to and the `context`
-    /// it was wrapped for, into a free slot. The set, of external data or a key for transfers,
-    /// comes out with the purpose, keys, stages and primary the record holds.
+    /// it was wrapped for, into a free slot. The set, of external data, a key for transfers or a
+    /// key of a chat for its archive, comes out with the purpose, keys, stages and primary the
+    /// record holds.
     ///
     /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
@@ -972,8 +1001,8 @@ impl<'a> Slots<'a> {
     /// [`Error::DerivationFailed`] if a value cannot be derived from a key,
     /// [`Error::RecordRejected`] if the record does not open with the key of the parent, this
     /// context and the key of this epoch, names a key other than the one that opens it or another
-    /// epoch, or holds a set for wrapping, a key for transfers other than one key that has never
-    /// changed, or a plaintext this version of the library cannot read,
+    /// epoch, or holds a set of another purpose, a set not for external data other than one key
+    /// that has never changed, or a plaintext this version of the library cannot read,
     /// and [`Error::DuplicateKey`] if these slots hold a key of the set already or the set holds
     /// one key twice. No slot changes then.
     pub fn unwrap(
@@ -1148,8 +1177,8 @@ impl<'a> Slots<'a> {
     }
 
     /// Unlocks the lock record `record` with the key from a secret that `parent` refers to and the
-    /// `context` it was locked for, into a free slot: the stored key for wrapping it holds comes
-    /// out as a set of one.
+    /// `context` it was locked for, into a free slot: the stored key, for wrapping or of the
+    /// archive, it holds comes out as a set of one.
     ///
     /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
@@ -1291,9 +1320,10 @@ impl<'a> Slots<'a> {
     }
 
     /// Loads the key set a record's plaintext holds into a free slot, if one is and the plaintext
-    /// parses: from a record of this epoch, a set of external data or a key for transfers; from a
-    /// lock record, a stored key for wrapping; from a record of an export, a set of external data.
-    /// A set of a key for transfers or for wrapping is a set of one that has never changed.
+    /// parses and its purpose is one that `kind` holds: from a record of this epoch, a set of
+    /// external data, a key for transfers or a key of a chat for its archive; from a lock record, a
+    /// stored key, for wrapping or of the archive; from a record of an export, a set of external
+    /// data. A set not for external data is a set of one that has never changed.
     fn admit(&mut self, plaintext: &[u8; PLAINTEXT_LEN], kind: Kind) -> Result<Handle<'a>, Error> {
         if !self.has_free() {
             return Err(Error::NoFreeSlot);
@@ -1304,13 +1334,8 @@ impl<'a> Slots<'a> {
         } else {
             0
         };
-        let held = match kind {
-            Kind::Record => header.purpose != Purpose::Wrap,
-            Kind::Lock => header.purpose == Purpose::Wrap,
-            Kind::Export => header.purpose == Purpose::ExternalData,
-        };
         if header.epoch != epoch
-            || !held
+            || !kind.holds(header.purpose)
             || (header.purpose != Purpose::ExternalData && !stages.is_one())
         {
             return Err(Error::RecordRejected);
@@ -3979,6 +4004,96 @@ mod tests {
         }
         assert_eq!(slots.memory[2].occupancy, Occupancy::Free);
         assert!(slots.unlock(secret, b"profile", &record).is_ok());
+    }
+
+    /// The keys of the archive lie only where their records allow: none is imported, the seed is
+    /// not generated, a stored key of the archive only in a lock record, a key of a chat for its
+    /// archive only under a stored key for wrapping; a stored key of the archive wraps no set.
+    #[test]
+    fn the_keys_of_the_archive_lie_only_where_their_records_allow() {
+        let mut memory = [const { Slot::empty() }; 5];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        for purpose in [Purpose::Archive, Purpose::ArchiveWrap, Purpose::ArchiveSeal] {
+            let mut short = pattern(5, 1);
+            assert_eq!(
+                slots.import32(purpose, &mut short),
+                Err(Error::WrongPurpose)
+            );
+            assert_eq!(short, pattern(5, 1));
+            let mut long = [7; 64];
+            assert_eq!(slots.import64(purpose, &mut long), Err(Error::WrongPurpose));
+            assert_eq!(long, [7; 64]);
+        }
+        assert_eq!(
+            slots.generate(Purpose::Archive, KeyLength::Bytes32, &mut Counting),
+            Err(Error::WrongPurpose)
+        );
+        assert_eq!(
+            slots.generate(Purpose::ArchiveSeal, KeyLength::Bytes64, &mut Counting),
+            Err(Error::WrongLength)
+        );
+        let secret = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
+        let stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let archive = slots
+            .generate(Purpose::ArchiveWrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let seal = slots
+            .generate(Purpose::ArchiveSeal, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let mut record = [0; RECORD_LEN];
+        assert_eq!(
+            slots.wrap(archive, stored, b"archive", &mut Counting, &mut record),
+            Err(Error::WrongLevel)
+        );
+        assert_eq!(
+            slots.wrap(seal, archive, b"chat", &mut Counting, &mut record),
+            Err(Error::WrongPurpose)
+        );
+        let mut lock = [0; LOCK_RECORD_LEN];
+        assert_eq!(
+            slots.lock(seal, secret, b"chat", &mut Counting, &mut lock),
+            Err(Error::WrongLevel)
+        );
+        slots
+            .wrap(seal, stored, b"chat", &mut Counting, &mut record)
+            .unwrap();
+        slots
+            .lock(archive, secret, b"archive", &mut Counting, &mut lock)
+            .unwrap();
+        slots.release(seal).unwrap();
+        slots.release(archive).unwrap();
+        let seal = slots.unwrap(stored, b"chat", &record).unwrap();
+        assert_eq!(slots.memory[seal.index].purpose, Purpose::ArchiveSeal);
+        let archive = slots.unlock(secret, b"archive", &lock).unwrap();
+        assert_eq!(slots.memory[archive.index].purpose, Purpose::ArchiveWrap);
+        assert!(!slots.memory[archive.index].unlocks);
+        let mut out = [0; 32];
+        assert_eq!(
+            slots.reveal32(seal, Position::First, Purpose::ArchiveSeal, &mut out),
+            Err(Error::WrongPurpose)
+        );
+        assert_eq!(
+            slots.reveal32(archive, Position::First, Purpose::ArchiveWrap, &mut out),
+            Err(Error::WrongPurpose)
+        );
+        assert_eq!(out, [0; 32]);
+        assert_eq!(
+            slots.add32(seal, &mut pattern(9, 1)),
+            Err(Error::WrongPurpose)
+        );
+        assert_eq!(slots.combine(archive, secret), Err(Error::WrongPurpose));
+        assert_eq!(slots.challenge(archive, &mut out), Err(Error::WrongPurpose));
+        slots.release(stored).unwrap();
+        let transfer = slots
+            .import32(Purpose::Transfer, &mut pattern(11, 2))
+            .unwrap();
+        assert_eq!(
+            slots.export(seal, transfer, b"chat", &mut Counting, &mut record),
+            Err(Error::WrongLevel)
+        );
     }
 
     /// A lock record is carried into the next epoch without its key from a secret, which no slot
@@ -7598,12 +7713,43 @@ mod proofs {
         }
     }
 
+    /// Whether a key for `purpose` may come from the caller's bytes, as the documentation of the
+    /// purposes states it: a key for wrapping, for external data or for transfers. Written apart
+    /// from the code.
+    fn takes_bytes(purpose: Purpose) -> bool {
+        purpose == Purpose::Wrap || purpose == Purpose::ExternalData || purpose == Purpose::Transfer
+    }
+
+    /// Whether a key for `purpose` may be generated from the platform's source alone, as the
+    /// documentation of the purposes states it: any but a key for transfers and an archive seed.
+    /// Written apart from the code.
+    fn generated_alone(purpose: Purpose) -> bool {
+        purpose != Purpose::Transfer && purpose != Purpose::Archive
+    }
+
+    /// Whether a record under a stored key may hold a set for `purpose`, as the documentation of the
+    /// purposes states it: external data, transfers and the outer layers of an archive. Written
+    /// apart from the code.
+    fn kept_in_a_record(purpose: Purpose) -> bool {
+        purpose == Purpose::ExternalData
+            || purpose == Purpose::Transfer
+            || purpose == Purpose::ArchiveSeal
+    }
+
+    /// Whether a lock record may hold a set for `purpose`, as the documentation of the purposes
+    /// states it: a stored key for wrapping, or for wrapping the seed of an archive key. Written
+    /// apart from the code.
+    fn kept_in_a_lock(purpose: Purpose) -> bool {
+        purpose == Purpose::Wrap || purpose == Purpose::ArchiveWrap
+    }
+
     /// A load by import or from the platform source for any purpose, from `memory`: it takes the
     /// first free slot, issues that slot's generation, keeps it in the slot and leaves a set of one
     /// there: exactly the expected bytes at the first position, zero past the key's length, enabled
     /// and the primary, with the purpose given and the identifier derived from those bytes and
-    /// their length alone, nothing at the other positions, and no state of a transfer; a generation
-    /// fails with `WrongPurpose` first for a key for transfers; a load fails with `WrongLength`
+    /// their length alone, nothing at the other positions, and no state of a transfer; an import
+    /// fails with `WrongPurpose` first for a key only the library creates, and a generation for a key
+    /// for transfers or an archive seed; a load fails with `WrongLength`
     /// then for a length the purpose does not take, then with `NoFreeSlot` without a free slot,
     /// with `EntropyFailed` when the source fails, with `DerivationFailed` when the derivation
     /// fails, and with `DuplicateKey` exactly when a loaded slot holds a key with that identifier,
@@ -7622,7 +7768,11 @@ mod proofs {
         let (result, expected, length, source_failed, imported) = load_any(&mut slots, purpose);
         let id = expected_key_id(&expected, length);
         kani::assert(
-            if !imported && purpose == Purpose::Transfer {
+            if !(if imported {
+                takes_bytes(purpose)
+            } else {
+                generated_alone(purpose)
+            }) {
                 result == Err(Error::WrongPurpose)
             } else if !allowed(purpose, length) {
                 result == Err(Error::WrongLength)
@@ -7637,8 +7787,9 @@ mod proofs {
             } else {
                 result.is_ok()
             },
-            "a generation of a key for transfers fails with WrongPurpose, a load with WrongLength \
-             for a length its purpose does not take, then with NoFreeSlot without a free slot, \
+            "an import of a key only the library creates, and a generation of a key for transfers \
+             or of the seed of an archive key, fail with WrongPurpose, a load with WrongLength for \
+             a length its purpose does not take, then with NoFreeSlot without a free slot, \
              with EntropyFailed when the source fails, with DerivationFailed when the derivation \
              fails, with DuplicateKey when the key is held, and otherwise succeeds",
         );
@@ -7651,8 +7802,12 @@ mod proofs {
             "a key too long for its purpose is refused"
         );
         kani::cover!(
-            result == Err(Error::WrongPurpose),
-            "a key for transfers is not generated"
+            result == Err(Error::WrongPurpose) && imported,
+            "a key only the library creates is not imported"
+        );
+        kani::cover!(
+            result == Err(Error::WrongPurpose) && !imported,
+            "a key for transfers or an archive seed is not generated"
         );
         if let (Ok(handle), Some(index)) = (result, first_free) {
             let generation = snapshot_at(&before, index).generation;
@@ -7695,6 +7850,10 @@ mod proofs {
             kani::cover!(
                 purpose == Purpose::Transfer,
                 "a key for transfers is imported"
+            );
+            kani::cover!(
+                purpose == Purpose::ArchiveWrap || purpose == Purpose::ArchiveSeal,
+                "a stored key of the archive or a key of a chat for its archive is generated"
             );
         } else {
             kani::assert(
@@ -8332,10 +8491,11 @@ mod proofs {
     /// slot holds, at each position the plaintext fills, exactly the key it holds there with the
     /// stage it states and the identifier derived from it, nothing at the others, and the purpose,
     /// primary and revision the plaintext states, unchanged in this epoch, a stored set and in no
-    /// transfer. From a plain record, a plaintext of another epoch or of a set for wrapping is
-    /// refused as `RecordRejected`; from a lock record, a plaintext of an epoch other than zero or
-    /// of a set not for wrapping; from a record of an export, a plaintext of an epoch other than
-    /// zero or of a set not for external data; from any, a set for wrapping or a key for transfers
+    /// transfer. From a plain record, a plaintext of another epoch or of a set other than for
+    /// external data, for transfers or of a chat for its archive is refused as `RecordRejected`;
+    /// from a lock record, a plaintext of an epoch other than zero or of a set other than a stored
+    /// key for wrapping or for the archive; from a record of an export, a plaintext of an epoch
+    /// other than zero or of a set not for external data; from any, a set not for external data
     /// other than a set of one that has never changed. Otherwise no slot changes, and the failure
     /// is `NoFreeSlot`, `RecordRejected`, `DerivationFailed` or `DuplicateKey`, in that order. The
     /// offsets are written from the layout, independently of the parser.
@@ -8377,11 +8537,20 @@ mod proofs {
         let mut revision = [0; 8];
         revision.copy_from_slice(&plaintext[27..35]);
         let (wrapping, external) = (plaintext[1] == 1, plaintext[1] == 2);
-        let of_kind = match kind {
-            Kind::Record => !wrapping,
-            Kind::Lock => wrapping,
-            Kind::Export => external,
+        let named = match plaintext[1] {
+            1 => Some(Purpose::Wrap),
+            2 => Some(Purpose::ExternalData),
+            3 => Some(Purpose::Transfer),
+            4 => Some(Purpose::Archive),
+            5 => Some(Purpose::ArchiveWrap),
+            6 => Some(Purpose::ArchiveSeal),
+            _ => None,
         };
+        let of_kind = named.is_some_and(|purpose| match kind {
+            Kind::Record => kept_in_a_record(purpose),
+            Kind::Lock => kept_in_a_lock(purpose),
+            Kind::Export => purpose == Purpose::ExternalData,
+        });
         let one = filled == [true, false, false]
             && plaintext[35] == 1
             && plaintext[2] == 0
@@ -8442,15 +8611,14 @@ mod proofs {
                     );
                 }
             }
-            let purpose = match plaintext[1] {
-                1 => Purpose::Wrap,
-                2 => Purpose::ExternalData,
-                _ => Purpose::Transfer,
-            };
+            kani::assert(
+                Some(now.purpose) == named,
+                "the slot keeps the purpose the plaintext states",
+            );
+            let purpose = now.purpose;
             kani::assert(
                 now.stages == stages
                     && now.stages.primary() == usize::from(plaintext[2])
-                    && now.purpose == purpose
                     && !now.unlocks
                     && !now.changed
                     && now.pending.is_none()
@@ -8480,6 +8648,14 @@ mod proofs {
                 kind == Kind::Export,
                 "a set of external data is admitted from an export"
             );
+            kani::cover!(
+                purpose == Purpose::ArchiveSeal,
+                "a key of a chat for its archive is admitted"
+            );
+            kani::cover!(
+                purpose == Purpose::ArchiveWrap,
+                "a stored key of the archive is admitted"
+            );
         } else {
             kani::assert(
                 unchanged_except(&slots, &before, 2),
@@ -8498,6 +8674,10 @@ mod proofs {
         kani::cover!(
             parsed.is_ok() && !other_epoch && kind == Kind::Export && !external,
             "an export of a set not for external data is refused"
+        );
+        kani::cover!(
+            parsed.is_ok() && !other_epoch && named == Some(Purpose::Archive),
+            "an archive seed is refused by every record of a set"
         );
         kani::cover!(
             result == Err(Error::DerivationFailed),
@@ -9042,7 +9222,13 @@ mod proofs {
             Purpose::Transfer
         };
         let level = if in_epoch {
-            !child.unlocks && (child.purpose == Purpose::Wrap) == lock && wrapping.unlocks == lock
+            !child.unlocks
+                && if lock {
+                    kept_in_a_lock(child.purpose)
+                } else {
+                    kept_in_a_record(child.purpose)
+                }
+                && wrapping.unlocks == lock
         } else {
             child.purpose == Purpose::ExternalData
         };
@@ -9078,6 +9264,10 @@ mod proofs {
         kani::cover!(
             result == Err(Error::WrongPurpose),
             "a parent of another purpose is refused"
+        );
+        kani::cover!(
+            result == Err(Error::WrongPurpose) && wrapping.purpose == Purpose::ArchiveWrap,
+            "a stored key of the archive wraps no set"
         );
         kani::cover!(
             result == Err(Error::WrongLevel),
@@ -9123,7 +9313,8 @@ mod proofs {
         (result, child, changing)
     }
 
-    /// The wrap of a set for external data or of a key for transfers.
+    /// The wrap of a set for external data, of a key for transfers or of a key of a chat for its
+    /// archive.
     #[kani::proof]
     #[kani::unwind(234)]
     fn a_wrap_changes_no_slot_and_writes_only_when_it_succeeds() {
@@ -9141,19 +9332,35 @@ mod proofs {
             "a key for transfers is wrapped"
         );
         kani::cover!(
+            result.is_ok() && child.purpose == Purpose::ArchiveSeal,
+            "a key of a chat for its archive is wrapped"
+        );
+        kani::cover!(
+            result == Err(Error::WrongLevel) && child.purpose == Purpose::ArchiveWrap,
+            "a stored key of the archive is refused by a plain record"
+        );
+        kani::cover!(
             result == Err(Error::Unfinished),
             "a set of an unfinished transfer is not wrapped"
         );
     }
 
-    /// The lock of a stored key for wrapping.
+    /// The lock of a stored key, for wrapping or of the archive.
     #[kani::proof]
     #[kani::unwind(270)]
     fn a_lock_changes_no_slot_and_writes_only_when_it_succeeds() {
-        let (result, _, changing) = wrap_from(Kind::Lock);
+        let (result, child, changing) = wrap_from(Kind::Lock);
         kani::cover!(
             result.is_ok() && changing,
             "a stored key is locked for the next epoch"
+        );
+        kani::cover!(
+            result.is_ok() && child.purpose == Purpose::ArchiveWrap,
+            "a stored key of the archive is locked"
+        );
+        kani::cover!(
+            result == Err(Error::WrongLevel) && child.purpose == Purpose::ArchiveSeal,
+            "a key of a chat for its archive is refused by a lock record"
         );
     }
 
@@ -9169,6 +9376,10 @@ mod proofs {
         kani::cover!(
             result == Err(Error::Unfinished),
             "a set of an unfinished transfer is not exported"
+        );
+        kani::cover!(
+            result == Err(Error::WrongLevel) && child.purpose == Purpose::ArchiveSeal,
+            "a key of a chat for its archive is not exported"
         );
     }
 

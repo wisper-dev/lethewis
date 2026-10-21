@@ -60,9 +60,10 @@ pub enum Error {
     WrongPurpose,
     /// The purpose takes no key of this length.
     WrongLength,
-    /// The set is not of the level the call takes: a key from a secret wraps only stored keys for
-    /// wrapping, which wrap only keys for external data and keys for transfers; a key for transfers
-    /// exports only keys for external data.
+    /// The set is not of the level the call takes: a key from a secret wraps only stored keys, for
+    /// wrapping or of the archive; a stored key for wrapping wraps only keys for external data, keys
+    /// for transfers and keys of chats for their archives; a key for transfers exports only keys
+    /// for external data.
     WrongLevel,
     /// The lock record does not open in this epoch for this context: it was not locked or carried
     /// into it, or it was changed.

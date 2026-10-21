@@ -28,8 +28,8 @@ writes stand for 128 bits of the platform's random source, hedged with the key o
 cannot be guessed. Other words derive another key, under which no record wrapped under the first
 key opens.
 
-A key for wrapping from a password, from words or imported is never wrapped. It wraps only a stored
-key for wrapping, in a lock record of two layers: the inner one opens only under that key, the outer
+A key for wrapping from a password, from words or imported is never wrapped. It wraps only stored
+keys, in lock records of two layers: the inner one opens only under that key, the outer
 only under the key of the epoch. A guess at a password against a lock record needs that epoch's key too.
 
 A key from a password can be combined with the chip's answer to a challenge derived from it: the key
@@ -106,9 +106,13 @@ and the flash.
 set of up to three keys. A key is held in one place only, whatever purpose it serves: a load of a key
 the slots already hold, or of a set that holds one key twice, is refused.
 
-Each key wraps only at its level: a key from a secret only stored keys for wrapping, in lock
-records, and a stored key only keys for external data and keys for transfers, in plain records. A key
-for transfers only exports keys for external data. No call wraps a key from a secret.
+Each key wraps only at its level. A key from a secret wraps only stored keys, for wrapping or of
+the archive, in lock records, and no call wraps a key from a secret.
+
+A stored key for wrapping wraps only keys for external data, for transfers and of chats for their
+archives, in plain records; a stored key of the archive wraps no set. A key for transfers only
+exports keys for external data. No key of the archive is imported or derived from a password or
+words.
 
 The records of an export open only in the order they were written, each bound to the tag of the one
 before, and its end is bound to the last. Until that end is received, a set that came in the export

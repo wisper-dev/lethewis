@@ -1895,7 +1895,10 @@ pub(crate) mod proofs {
             0 => None,
             1 => Some(Purpose::Wrap),
             2 => Some(Purpose::ExternalData),
-            _ => Some(Purpose::Transfer),
+            3 => Some(Purpose::Transfer),
+            4 => Some(Purpose::Archive),
+            5 => Some(Purpose::ArchiveWrap),
+            _ => Some(Purpose::ArchiveSeal),
         }
     }
 
