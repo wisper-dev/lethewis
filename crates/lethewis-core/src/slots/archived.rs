@@ -1357,11 +1357,16 @@ mod stack {
 
     use shake::{ExtendableOutput, Shake256, Update, XofReader};
 
+    use super::super::archive::stack::layer_secrets;
+    use super::super::stack::keying_secrets;
     use super::{ARCHIVE_RECORD_LEN, ARCHIVED_LEN, ArchivePublic, open_archived, split_archived};
+    use crate::derive::stack::secrets_of;
+    use crate::derive::{Branch, SALT, derive_archive_randomness, derive_archive_seal_key, hedge};
     use crate::key::tests::{Counting, Failing};
     use crate::record::AssociatedData;
-    use crate::residue::{assert_clean, depth_changed, key_dependent};
+    use crate::residue::{assert_clean, below_pad, depth_changed, key_dependent, residue};
     use crate::slots::tests::{EPOCH, flipped_epoch_key};
+    use crate::xwing::stack::{encapsulation_secrets, seed_secrets};
     use crate::{
         ARCHIVE_KEY_RECORD_LEN, Epoch, Error, Handle, KeyLength, Purpose, Slot, Slots, seal, xwing,
     };
@@ -1422,8 +1427,14 @@ mod stack {
     );
 
     /// Those slots, with the record of the archive key, the public key it holds, a record of a
-    /// batch archived to it under the first key of a chat, the key of the batch, and the bytes of
-    /// the keys, of the expanded seed and of the shared secret.
+    /// batch archived to it under the first key of a chat, the key of the batch, and what the calls
+    /// on it handle: the keys, the seed and what X-Wing makes of it, the randomness of the
+    /// encapsulation and what X-Wing makes of that, the shared secret, the key of the batch, and
+    /// what the cipher of the record and the derivation of its key handle.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the secrets of every call are gathered at once"
+    )]
     fn archived<'a>(memory: &'a mut [Slot], epoch: &'a mut Epoch, flip: u8) -> Archived<'a> {
         let mut slots = Slots::new(memory, epoch, EPOCH, &mut flipped_epoch_key(flip));
         let generate = |slots: &mut Slots<'a>, purpose| {
@@ -1442,6 +1453,7 @@ mod stack {
         let public = slots
             .archive_public_key(stored, b"archive", &key_record)
             .unwrap();
+        let count = slots.epoch.drawn;
         let (mut record, mut data_key) = ([0; ARCHIVE_RECORD_LEN], [0; 32]);
         slots
             .archive(
@@ -1456,6 +1468,12 @@ mod stack {
         let key = slots
             .load_archive_key(store, stored, b"archive", &key_record)
             .unwrap();
+        let keys = (
+            slots.memory[stored.index].wrapping_key().0,
+            slots.memory[store.index].wrapping_key().0,
+            &slots.epoch.key,
+        );
+        let layers = layer_secrets(keys, &key_record);
         slots.release(store).unwrap();
         let bytes = |slots: &Slots<'_>, handle: Handle<'_>| {
             slots.memory[handle.index].wrapping_key().0.bytes()[..32].to_vec()
@@ -1487,6 +1505,35 @@ mod stack {
         );
         secrets.push(shared.to_vec());
         secrets.push(data_key.to_vec());
+        secrets.extend(seed_secrets(secrets[3].as_slice().try_into().unwrap()));
+        secrets.extend(layers);
+        let chat_key = slots.memory[chat.index].wrapping_key().0;
+        let drawn: [u8; 64] = core::array::from_fn(|at| u8::try_from(at).unwrap().wrapping_add(1));
+        let mut hedged = [0; 64];
+        hedge(
+            &slots.epoch.key,
+            count,
+            Branch::HedgeEncaps,
+            &drawn,
+            &mut hedged,
+        )
+        .unwrap();
+        let mut randomness = [0; 64];
+        derive_archive_randomness(chat_key, &hedged, &mut randomness).unwrap();
+        secrets.extend([hedged.to_vec(), randomness.to_vec()]);
+        secrets.extend(encapsulation_secrets(&public.public, &randomness));
+        let mut seal_key = [0; 32];
+        derive_archive_seal_key(chat_key, &mut seal_key).unwrap();
+        let (nonce, tag) = (
+            record[..12].try_into().unwrap(),
+            record[1164..].try_into().unwrap(),
+        );
+        secrets.extend(keying_secrets(&seal_key, nonce, tag, ARCHIVED_LEN));
+        secrets.extend(secrets_of(
+            chat_key.material().unwrap(),
+            SALT,
+            Branch::ArchiveSeal,
+        ));
         (
             slots,
             [stored, chat, other, key],
@@ -1496,6 +1543,139 @@ mod stack {
         )
     }
 
+    /// What moving the record of a batch from the slots [`archived`] makes with `flip` to the second
+    /// key of a chat handles to seal it: the cipher of the moved record and the derivation of its
+    /// key.
+    fn moved_secrets(flip: u8) -> Vec<Vec<u8>> {
+        let (mut memory, mut epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
+        let (mut slots, [_, chat, other_chat, _], _, record, _) =
+            archived(&mut memory, &mut epoch, flip);
+        let mut moved = [0; ARCHIVE_RECORD_LEN];
+        slots
+            .reseal_archive(
+                chat,
+                other_chat,
+                b"chat",
+                &mut Counting,
+                &record,
+                &mut moved,
+            )
+            .unwrap();
+        let other = slots.memory[other_chat.index].wrapping_key().0;
+        let mut seal_key = [0; 32];
+        derive_archive_seal_key(other, &mut seal_key).unwrap();
+        let (nonce, tag) = (
+            moved[..12].try_into().unwrap(),
+            moved[1164..].try_into().unwrap(),
+        );
+        let mut secrets = keying_secrets(&seal_key, nonce, tag, ARCHIVED_LEN);
+        secrets.extend(secrets_of(
+            other.material().unwrap(),
+            SALT,
+            Branch::ArchiveSeal,
+        ));
+        secrets
+    }
+
+    /// Fresh slots over `memory` in the state [`archived`] archives its batch in, with its keys and
+    /// the public key of its archive key.
+    fn before_archiving<'a>(
+        memory: &'a mut [Slot],
+        epoch: &'a mut Epoch,
+    ) -> (Slots<'a>, Handle<'a>, ArchivePublic<'a>) {
+        let mut slots = Slots::new(memory, epoch, EPOCH, &mut flipped_epoch_key(0));
+        let mut generate = |purpose| {
+            slots
+                .generate(purpose, KeyLength::Bytes32, &mut Counting)
+                .unwrap()
+        };
+        let stored = generate(Purpose::Wrap);
+        let store = generate(Purpose::ArchiveWrap);
+        let chat = generate(Purpose::ArchiveSeal);
+        generate(Purpose::ArchiveSeal);
+        let mut created = [0; ARCHIVE_KEY_RECORD_LEN];
+        slots
+            .create_archive_key(store, stored, b"archive", &mut Counting, &mut created)
+            .unwrap();
+        let public = slots
+            .archive_public_key(stored, b"archive", &created)
+            .unwrap();
+        (slots, chat, public)
+    }
+
+    /// Reading a public key, archiving, opening and moving a record without the wipe after them
+    /// leave on the stack some of what they handle, so that the test below can tell the wipe from
+    /// its absence. Archiving runs from the state [`archived`] archives in, so it handles the same
+    /// values.
+    #[test]
+    fn the_calls_on_records_of_an_archive_without_the_wipe_leave_residue() {
+        let (mut memory, mut other) = ([const { Slot::empty() }; 6], [const { Slot::empty() }; 6]);
+        let (mut epoch, mut other_epoch) = (Epoch::empty(), Epoch::empty());
+        let (.., mut others) = archived(&mut other, &mut other_epoch, 0x5a);
+        let (mut slots, [stored, chat, other_chat, key], (key_record, _), record, mut secrets) =
+            archived(&mut memory, &mut epoch, 0);
+        secrets.extend(moved_secrets(0));
+        others.extend(moved_secrets(0x5a));
+        let pieces = key_dependent(&secrets, &others);
+        let known = xwing::unanswered();
+        let range = below_pad(false, || {
+            black_box(
+                slots
+                    .archive_public_key_on_stack(stored, b"archive", &key_record, seal::open)
+                    .unwrap(),
+            );
+        });
+        assert!(residue(range, &pieces) > 0, "a reading");
+        let mut data_key = [0; 32];
+        let range = below_pad(false, || {
+            slots
+                .open_archive_on_stack(
+                    (key, chat),
+                    b"chat",
+                    (&record, &mut data_key),
+                    &known,
+                    seal::open,
+                )
+                .unwrap();
+            black_box(&data_key);
+        });
+        assert!(residue(range, &pieces) > 0, "an opening");
+        let mut moved = [0; ARCHIVE_RECORD_LEN];
+        let range = below_pad(false, || {
+            slots
+                .reseal_archive_on_stack(
+                    (chat, other_chat),
+                    b"chat",
+                    &mut Counting,
+                    (&record, &mut moved),
+                    seal::open,
+                    seal::seal,
+                )
+                .unwrap();
+            black_box(&moved);
+        });
+        assert!(residue(range, &pieces) > 0, "a move");
+        let (mut again, mut again_epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
+        let (mut slots, chat, public) = before_archiving(&mut again, &mut again_epoch);
+        let mut written = ([0; ARCHIVE_RECORD_LEN], [0; 32]);
+        let range = below_pad(false, || {
+            slots
+                .archive_on_stack(
+                    chat,
+                    &public,
+                    b"chat",
+                    &mut Counting,
+                    (&mut written.0, &mut written.1),
+                    &known,
+                    seal::seal,
+                )
+                .unwrap();
+            black_box(&written);
+        });
+        assert_eq!(written.0, record);
+        assert!(residue(range, &pieces) > 0, "an archiving");
+    }
+
     /// Reading a public key, archiving, opening and moving a record leave none of the keys, the
     /// expanded seed, the shared secret or the key of the batch on the stack: archiving runs again
     /// from the same state, so it makes the same record.
@@ -1503,9 +1683,11 @@ mod stack {
     fn the_calls_on_records_of_an_archive_leave_no_key_on_the_stack() {
         let (mut memory, mut other) = ([const { Slot::empty() }; 6], [const { Slot::empty() }; 6]);
         let (mut epoch, mut other_epoch) = (Epoch::empty(), Epoch::empty());
-        let (mut slots, [stored, chat, other_chat, key], (key_record, _), record, secrets) =
+        let (mut slots, [stored, chat, other_chat, key], (key_record, _), record, mut secrets) =
             archived(&mut memory, &mut epoch, 0);
-        let (.., others) = archived(&mut other, &mut other_epoch, 0x5a);
+        let (.., mut others) = archived(&mut other, &mut other_epoch, 0x5a);
+        secrets.extend(moved_secrets(0));
+        others.extend(moved_secrets(0x5a));
         let pieces = key_dependent(&secrets, &others);
         assert_ne!(pieces.len(), 0);
         assert_clean(&pieces, || {

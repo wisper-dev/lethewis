@@ -488,7 +488,7 @@ compile error.
 | a load of an archive key that looks for a free slot only after it decrypts | `a_load_of_an_archive_key_refuses_its_parents_before_it_decrypts` |
 | a carry of an archive key past the last epoch, or one that seals under the key of this epoch | `a_carry_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds` |
 | a seed of an archive key checked for its epoch or for being alone only together with its purpose | `a_load_of_an_archive_key_checks_its_public_key`, unit tests |
-| a creation, a load or a carry of an archive key without the wipe after it | no proof: the test that checks how deep the wipes after the calls on an archive key reach, with and without optimisation |
+| a creation, a load or a carry of an archive key without the wipe after it | no proof: the test that checks how deep the wipes after the calls on an archive key reach, with and without optimisation, and the one that reads back what they leave on the stack |
 | a call on an archive key documented with less stack than it reaches | no proof: the test that measures how deep each call on an archive key reaches |
 | a public key read under a key from a secret or under the key of the next epoch | `a_public_key_is_read_from_its_record`, unit tests |
 | an archive or an opening that skips the self-test of X-Wing | `an_archive_writes_only_when_it_succeeds`, `an_opened_archive_gives_its_key_only_under_its_archive_key` |
@@ -507,7 +507,7 @@ compile error.
 | a reseal that does not check the purpose of its target, or opens under its second key | `a_reseal_changes_nothing_but_its_output`, unit tests |
 | a reseal that writes under its first key | `a_reseal_changes_nothing_but_its_output`, unit tests |
 | records of an archive under a label of another name, or a check derived from half the shared secret | no proof: the unit tests against records an independent implementation computes |
-| a call on a record of an archive without the wipe after it, or documented with less stack than it reaches | no proof: the tests that check how deep the wipes reach and how deep each call reaches, with and without optimisation |
+| a call on a record of an archive without the wipe after it, or documented with less stack than it reaches | no proof: the tests that check how deep the wipes reach and how deep each call reaches, with and without optimisation, and the one that reads back what the calls leave on the stack |
 | a record of an archive with its tag lost or a zero nonce | `an_archive_seals_its_identifier_ciphertext_and_check`, `a_reseal_changes_nothing_but_its_output` |
 | a public key read, a record opened, or a record moved without the context of the record | `a_public_key_is_read_from_its_record`, `an_opened_archive_gives_its_key_only_under_its_archive_key`, `a_reseal_changes_nothing_but_its_output` |
 | an archive that makes up a refusal of the public key, or a seal that makes up a failure | `an_archive_writes_only_when_it_succeeds`, `a_reseal_changes_nothing_but_its_output` |

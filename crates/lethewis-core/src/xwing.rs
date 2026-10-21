@@ -1050,16 +1050,60 @@ mod tests {
 
 #[cfg(test)]
 #[cfg(any(target_os = "linux", target_os = "android"))]
-mod stack {
+pub(crate) mod stack {
     extern crate std;
 
     use core::hint::black_box;
+    use std::vec::Vec;
+
+    use sha3::{Digest, Sha3_256, Sha3_512};
 
     use super::{
         ANSWER, CIPHERTEXT_LEN, PUBLIC_LEN, SHARED_LEN, STACK_WIPE, agrees, answers, decapsulate,
         encapsulate, public_key, unanswered,
     };
     use crate::residue::depth_changed;
+
+    /// What X-Wing handles with `seed` besides the seed: its expansion, the noise seed of ML-KEM,
+    /// sigma of FIPS 203, and the private key of X25519 as the curve takes it.
+    pub(crate) fn seed_secrets(seed: &[u8; 32]) -> Vec<Vec<u8>> {
+        let mut expanded = [0; 96];
+        super::expand(seed, &mut expanded);
+        let sigma = Sha3_512::new()
+            .chain_update(&expanded[..32])
+            .chain_update([3])
+            .finalize();
+        std::vec![
+            expanded.to_vec(),
+            sigma[32..].to_vec(),
+            clamped(expanded[64..].try_into().unwrap()).to_vec(),
+        ]
+    }
+
+    /// What an encapsulation to `public` with `randomness` handles besides the randomness: the
+    /// ephemeral key of X25519 as the curve takes it, the shared secret of X25519, and the shared
+    /// secret and the randomness r of ML-KEM, FIPS 203, algorithm 17.
+    pub(crate) fn encapsulation_secrets(
+        public: &[u8; 1216],
+        randomness: &[u8; 64],
+    ) -> Vec<Vec<u8>> {
+        let ephemeral: [u8; 32] = randomness[32..].try_into().unwrap();
+        let shared = x25519_dalek::x25519(ephemeral, public[1184..].try_into().unwrap());
+        let hashed = Sha3_256::digest(&public[..1184]);
+        let kr = Sha3_512::new()
+            .chain_update(&randomness[..32])
+            .chain_update(hashed)
+            .finalize();
+        std::vec![clamped(ephemeral).to_vec(), shared.to_vec(), kr.to_vec(),]
+    }
+
+    /// A private key of X25519 with the bits RFC 7748 clears and sets.
+    fn clamped(mut key: [u8; 32]) -> [u8; 32] {
+        key[0] &= 0xf8;
+        key[31] &= 0x7f;
+        key[31] |= 0x40;
+        key
+    }
 
     /// The wipe covers more than any operation uses, the self-test asked for the first time
     /// included, and not needlessly more.

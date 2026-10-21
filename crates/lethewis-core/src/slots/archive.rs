@@ -1762,7 +1762,7 @@ mod tests {
 
 #[cfg(test)]
 #[cfg(any(target_os = "linux", target_os = "android"))]
-mod stack {
+pub(super) mod stack {
     extern crate std;
 
     use core::hint::black_box;
@@ -1772,11 +1772,20 @@ mod stack {
 
     use shake::{ExtendableOutput, Shake256, Update, XofReader};
 
+    use super::super::stack::keying_secrets;
     use super::ARCHIVE_KEY_RECORD_LEN;
+    use crate::derive::stack::secrets_of;
+    use crate::derive::{Branch, SALT, derive_archive_key, derive_archive_layer_key};
+    use crate::key::Key;
     use crate::key::tests::{Counting, Failing};
-    use crate::residue::{assert_clean, depth_changed, key_dependent};
+    use crate::record::AssociatedData;
+    use crate::residue::{assert_clean, below_pad, depth_changed, key_dependent, residue};
     use crate::slots::tests::{EPOCH, flipped_epoch_key};
-    use crate::{Epoch, Error, Handle, KeyLength, Purpose, Slot, Slots, seal, xwing};
+    use crate::xwing::stack::seed_secrets;
+    use crate::{
+        Epoch, Erasure, Error, Handle, KeyLength, Purpose, Root, RootFailed, Slot, Slots, seal,
+        xwing,
+    };
 
     /// The stack each call needs, and the depth of the wipe after it, in KiB, in an optimised build
     /// and in one without optimisation.
@@ -1818,9 +1827,91 @@ mod stack {
         }
     }
 
+    struct Platform;
+
+    impl Root for Platform {
+        fn switch(&mut self, _: u64) -> Result<(), RootFailed> {
+            Ok(())
+        }
+
+        fn erase(&mut self, _: u64) -> Erasure {
+            Erasure::Guaranteed
+        }
+    }
+
+    /// What opening the record of an archive key under the stored keys `stored` and `store` and the
+    /// key of the epoch `epoch` handles: AES-256-GCM-SIV on both layers, the plaintext of the inner
+    /// one, which holds the seed, and the derivations of the keys of both layers.
+    pub(in crate::slots) fn layer_secrets(
+        (stored, store, epoch): (&Key, &Key, &Key),
+        record: &[u8; ARCHIVE_KEY_RECORD_LEN],
+    ) -> Vec<Vec<u8>> {
+        let aad = AssociatedData::new(b"archive").unwrap();
+        let mut layer_key = [0; 32];
+        derive_archive_layer_key(stored, epoch, &mut layer_key).unwrap();
+        let (nonce, rest) = record.split_at(12);
+        let (layer, tag) = rest.split_at(1501);
+        let (nonce, tag) = (nonce.try_into().unwrap(), tag.try_into().unwrap());
+        let mut layer = <[u8; 1501]>::try_from(layer).unwrap();
+        seal::open(&layer_key, nonce, aad.bytes(), &mut layer, tag).unwrap();
+        let mut secrets = keying_secrets(&layer_key, nonce, tag, 1501);
+        secrets.extend(secrets_of(
+            stored.material().unwrap(),
+            epoch.material().unwrap(),
+            Branch::ArchiveLayer,
+        ));
+        let (inner_nonce, rest) = layer[1240..].split_at(12);
+        let (sealed, inner_tag) = rest.split_at(233);
+        let (inner_nonce, inner_tag) = (
+            inner_nonce.try_into().unwrap(),
+            inner_tag.try_into().unwrap(),
+        );
+        let mut inner_key = [0; 32];
+        derive_archive_key(store, &mut inner_key).unwrap();
+        let mut plaintext = <[u8; 233]>::try_from(sealed).unwrap();
+        seal::open(
+            &inner_key,
+            inner_nonce,
+            aad.bytes(),
+            &mut plaintext,
+            inner_tag,
+        )
+        .unwrap();
+        secrets.extend(keying_secrets(&inner_key, inner_nonce, inner_tag, 233));
+        secrets.extend(secrets_of(
+            store.material().unwrap(),
+            SALT,
+            Branch::ArchiveKey,
+        ));
+        secrets.push(plaintext.to_vec());
+        secrets
+    }
+
+    /// What sealing the outer layer of `carried` under the stored key `stored` and the key of the
+    /// next epoch `next` handles.
+    fn carried_secrets(
+        stored: &Key,
+        next: &Key,
+        carried: &[u8; ARCHIVE_KEY_RECORD_LEN],
+    ) -> Vec<Vec<u8>> {
+        let mut layer_key = [0; 32];
+        derive_archive_layer_key(stored, next, &mut layer_key).unwrap();
+        let nonce = carried[..12].try_into().unwrap();
+        let tag = carried[1513..].try_into().unwrap();
+        let mut secrets = keying_secrets(&layer_key, nonce, tag, 1501);
+        secrets.extend(secrets_of(
+            stored.material().unwrap(),
+            next.material().unwrap(),
+            Branch::ArchiveLayer,
+        ));
+        secrets
+    }
+
     /// Slots over `memory` in an epoch whose key `flip` changes, with a stored key for wrapping and
-    /// one of the archive, the record of an archive key under them, and the bytes of the three keys
-    /// and of the expanded seed.
+    /// one of the archive, the record of an archive key under them, and what a creation, a load and
+    /// a carry of it handle: the three keys, the expansion of the seed and what X-Wing makes of it,
+    /// and what opening the record handles; then a change to the next epoch under way, and the
+    /// record carried into it and what that handles.
     fn archive<'a>(
         memory: &'a mut [Slot],
         epoch: &'a mut Epoch,
@@ -1848,18 +1939,126 @@ mod stack {
         let mut secrets = [stored, store, key]
             .map(|handle| slots.memory[handle.index].wrapping_key().0.bytes()[..32].to_vec())
             .to_vec();
+        let seed: [u8; 32] = secrets[2].as_slice().try_into().unwrap();
         // What X-Wing expands the seed to: the seed of ML-KEM, d and z, and the key of X25519.
         let mut shake = Shake256::default();
-        shake.update(&secrets[2]);
+        shake.update(&seed);
         let mut expanded = [0; 96];
         shake.finalize_xof().read(&mut expanded);
         secrets.push(expanded.to_vec());
+        secrets.extend(seed_secrets(&seed));
+        let keys = (
+            slots.memory[stored.index].wrapping_key().0,
+            slots.memory[store.index].wrapping_key().0,
+            &slots.epoch.key,
+        );
+        secrets.extend(layer_secrets(keys, &record));
         slots.release(key).unwrap();
+        slots.begin_epoch(&mut [8; 32]).unwrap();
+        let mut carried = [0; ARCHIVE_KEY_RECORD_LEN];
+        slots
+            .carry_archive_key(
+                stored,
+                stored,
+                b"archive",
+                &mut Counting,
+                &record,
+                &mut carried,
+            )
+            .unwrap();
+        secrets.extend(carried_secrets(
+            slots.memory[stored.index].wrapping_key().0,
+            &slots.epoch.next,
+            &carried,
+        ));
+        assert_eq!(slots.abandon_epoch(&mut Platform), Ok(Erasure::Guaranteed));
         (slots, [store, stored], record, secrets)
     }
 
-    /// A creation, a load and a carry leave none of the seed, its expansion or the two stored keys on
-    /// the stack: the creation runs again from the same state, so it makes the same seed.
+    /// Fresh slots over `memory` in the state [`archive`] creates its archive key in, with the
+    /// stored keys it makes.
+    fn before_creation<'a>(
+        memory: &'a mut [Slot],
+        epoch: &'a mut Epoch,
+    ) -> (Slots<'a>, [Handle<'a>; 2]) {
+        let mut slots = Slots::new(memory, epoch, EPOCH, &mut flipped_epoch_key(0));
+        let stored = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        let store = slots
+            .generate(Purpose::ArchiveWrap, KeyLength::Bytes32, &mut Counting)
+            .unwrap();
+        (slots, [store, stored])
+    }
+
+    /// A creation, a load and a carry without the wipe after them leave on the stack some of what
+    /// they handle, so that the tests below can tell the wipe from its absence. Each runs from the
+    /// state [`archive`] runs it from, so it handles the same values.
+    #[test]
+    fn the_calls_on_an_archive_key_without_the_wipe_leave_residue() {
+        let (mut memory, mut other) = ([const { Slot::empty() }; 4], [const { Slot::empty() }; 4]);
+        let (mut epoch, mut other_epoch) = (Epoch::empty(), Epoch::empty());
+        let (_, _, _, others) = archive(&mut other, &mut other_epoch, 0x5a);
+        let (_, _, record, secrets) = archive(&mut memory, &mut epoch, 0);
+        let pieces = key_dependent(&secrets, &others);
+        let known = xwing::unanswered();
+        let (mut again, mut again_epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
+        let (mut slots, [store, stored]) = before_creation(&mut again, &mut again_epoch);
+        let mut written = [0; ARCHIVE_KEY_RECORD_LEN];
+        let range = below_pad(false, || {
+            slots
+                .create_archive_key_on_stack(
+                    store,
+                    stored,
+                    b"archive",
+                    &mut Counting,
+                    &mut written,
+                    &known,
+                )
+                .unwrap();
+            black_box(&written);
+        });
+        assert_eq!(written, record);
+        assert!(residue(range, &pieces) > 0, "a creation");
+        let mut key = None;
+        let range = below_pad(false, || {
+            key = Some(
+                slots
+                    .load_archive_key_on_stack(
+                        store,
+                        stored,
+                        b"archive",
+                        &record,
+                        &known,
+                        seal::open,
+                        seal::open,
+                    )
+                    .unwrap(),
+            );
+        });
+        assert!(residue(range, &pieces) > 0, "a load");
+        slots.release(key.unwrap()).unwrap();
+        slots.begin_epoch(&mut [8; 32]).unwrap();
+        let range = below_pad(false, || {
+            slots
+                .carry_archive_key_on_stack(
+                    stored,
+                    stored,
+                    b"archive",
+                    &mut Counting,
+                    (&record, &mut written),
+                    seal::open,
+                )
+                .unwrap();
+            black_box(&written);
+        });
+        assert!(residue(range, &pieces) > 0, "a carry");
+    }
+
+    /// A creation, a load and a carry leave none of what they handle on the stack: the three keys,
+    /// the seed and what X-Wing makes of it, the keys, keystreams and plaintext of the cipher and
+    /// the derivations of its keys. The creation and the carry run again from the same state, so
+    /// they make the same records.
     #[test]
     fn the_calls_on_an_archive_key_leave_no_key_on_the_stack() {
         let (mut memory, mut other) = ([const { Slot::empty() }; 4], [const { Slot::empty() }; 4]);
@@ -1867,7 +2066,6 @@ mod stack {
         let (mut slots, [store, stored], record, secrets) = archive(&mut memory, &mut epoch, 0);
         let (_, _, _, others) = archive(&mut other, &mut other_epoch, 0x5a);
         let pieces = key_dependent(&secrets, &others);
-        assert_ne!(pieces.len(), 0);
         assert_clean(&pieces, || {
             black_box(
                 slots
@@ -1876,18 +2074,7 @@ mod stack {
             );
         });
         let (mut again, mut again_epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
-        let mut slots = Slots::new(
-            &mut again,
-            &mut again_epoch,
-            EPOCH,
-            &mut flipped_epoch_key(0),
-        );
-        let stored = slots
-            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
-            .unwrap();
-        let store = slots
-            .generate(Purpose::ArchiveWrap, KeyLength::Bytes32, &mut Counting)
-            .unwrap();
+        let (mut slots, [store, stored]) = before_creation(&mut again, &mut again_epoch);
         let mut created = [0; ARCHIVE_KEY_RECORD_LEN];
         assert_clean(&pieces, || {
             slots
@@ -1896,6 +2083,10 @@ mod stack {
             black_box(&created);
         });
         assert_eq!(created, record);
+        let key = slots
+            .load_archive_key(store, stored, b"archive", &record)
+            .unwrap();
+        slots.release(key).unwrap();
         slots.begin_epoch(&mut [8; 32]).unwrap();
         let mut carried = [0; ARCHIVE_KEY_RECORD_LEN];
         assert_clean(&pieces, || {

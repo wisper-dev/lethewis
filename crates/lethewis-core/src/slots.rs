@@ -5854,6 +5854,27 @@ mod stack {
         block.into()
     }
 
+    /// What AES-256-GCM-SIV handles for a record of `length` sealed bytes under `key` with `nonce`
+    /// and `tag`, but its plaintext: the key and its round keys, the keys of the message and the
+    /// round keys of the one that encrypts, and the keystream.
+    pub(super) fn keying_secrets(
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        tag: &[u8; 16],
+        length: usize,
+    ) -> Vec<Vec<u8>> {
+        let (mac_key, enc_key) = message_keys(key, nonce);
+        let mut secrets = std::vec![
+            key.to_vec(),
+            mac_key.to_vec(),
+            enc_key.to_vec(),
+            keystream_of(&enc_key, tag, length),
+        ];
+        secrets.extend(round_keys(key));
+        secrets.extend(round_keys(&enc_key));
+        secrets
+    }
+
     /// The keys AES-256-GCM-SIV derives for one message, RFC 8452, section 4: the POLYVAL key and
     /// the encryption key.
     fn message_keys(key: &[u8; 32], nonce: &[u8; 12]) -> ([u8; 16], [u8; 32]) {
