@@ -10,6 +10,12 @@ dependency-criteria = { base64ct = "safe-to-deploy" }
 [policy.cpufeatures]
 dependency-criteria = { libc = "safe-to-deploy" }
 
+[policy.curve25519-dalek]
+dependency-criteria = { fiat-crypto = "safe-to-deploy", rustc_version = "safe-to-deploy" }
+
+[policy.curve25519-dalek-derive]
+dependency-criteria = { proc-macro2 = "safe-to-deploy", quote = "safe-to-deploy", syn = "safe-to-deploy" }
+
 [policy.hybrid-array]
 dependency-criteria = { typenum = "safe-to-deploy" }
 
@@ -19,3 +25,6 @@ criteria = "read-in-full"
 [policy.lethewis-dit]
 criteria = "read-in-full"
 dependency-criteria = { libc = "safe-to-deploy" }
+
+[policy.num-traits]
+dependency-criteria = { autocfg = "safe-to-deploy" }

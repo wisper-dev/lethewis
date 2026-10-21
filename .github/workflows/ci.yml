@@ -421,7 +421,7 @@ jobs:
         # The runners have the instructions these use; the portable code is a path of its own, and
         # without them the hash and the cipher use a different amount of stack.
         env:
-          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
           LETHEWIS_BACK_ENDS: portable
         run: |
           cargo test --workspace --all-features --locked
@@ -431,7 +431,7 @@ jobs:
         # The stack the hash and the cipher use, and so the depth the wipes have to reach, changes
         # with the level.
         env:
-          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
         run: |
           for level in 1 2 s z; do
             export CARGO_PROFILE_RELEASE_OPT_LEVEL=$level
@@ -461,7 +461,7 @@ jobs:
         run: |
           features=$(grep -m1 '^Features' /proc/cpuinfo)
           echo "$features"
-          for feature in aes pmull sha2; do
+          for feature in aes pmull sha2 sha3; do
             grep -qw "$feature" <<<"$features" || { echo "::error::no $feature on this runner"; exit 1; }
           done
           # What the system reports about data-independent timing, which the tests compare with what
@@ -476,7 +476,7 @@ jobs:
 
       - name: Tests, software SHA-256, AES and POLYVAL
         env:
-          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
           LETHEWIS_BACK_ENDS: portable
         run: |
           cargo test --workspace --all-features --locked
@@ -484,7 +484,7 @@ jobs:
 
       - name: Core tests at the other levels of optimisation
         env:
-          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
         run: |
           for level in 1 2 s z; do
             export CARGO_PROFILE_RELEASE_OPT_LEVEL=$level
@@ -527,8 +527,9 @@ jobs:
       - name: The runner has the instructions of the hardware paths
         run: |
           sysctl hw.optional.arm.FEAT_AES hw.optional.arm.FEAT_PMULL hw.optional.arm.FEAT_SHA256 \
+            hw.optional.arm.FEAT_SHA3 \
             hw.optional.arm.FEAT_DIT || true
-          for feature in FEAT_AES FEAT_PMULL FEAT_SHA256; do
+          for feature in FEAT_AES FEAT_PMULL FEAT_SHA256 FEAT_SHA3; do
             [ "$(sysctl -n "hw.optional.arm.$feature")" = 1 ] ||
               { echo "::error::no $feature on this runner"; exit 1; }
           done
@@ -543,7 +544,7 @@ jobs:
 
       - name: Tests, software SHA-256, AES and POLYVAL
         env:
-          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
           LETHEWIS_BACK_ENDS: portable
         run: |
           cargo test --workspace --all-features --locked

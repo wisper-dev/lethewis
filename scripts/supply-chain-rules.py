@@ -39,8 +39,9 @@ UNSAFE_LINTS = {
 # Crates that handle key material: every locked version read in full, never lowered in a policy.
 HANDLE_SECRETS = {
     "aead", "aes", "aes-gcm-siv", "argon2", "blake2", "block-buffer", "cipher", "cmov", "ctr",
-    "ctutils", "digest", "hkdf", "hmac", "hybrid-array", "inout", "polyval", "sha2",
-    "universal-hash", "zeroize",
+    "ctutils", "curve25519-dalek", "digest", "hkdf", "hmac", "hybrid-array", "inout", "keccak",
+    "ml-kem", "module-lattice", "polyval", "sha2", "sha3", "shake", "sponge-cursor", "subtle",
+    "universal-hash", "x25519-dalek", "zeroize",
 }
 
 

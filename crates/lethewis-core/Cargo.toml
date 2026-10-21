@@ -52,6 +52,20 @@ polyval = { version = "0.7.3", default-features = false, features = [
 blake2 = { version = "0.11.0", default-features = false, features = [
   "zeroize",
 ] }
+# X-Wing: ML-KEM-768 with X25519. Default features bring in `alloc`; `hazmat` makes encapsulation
+# from given randomness part of the documented interface.
+ml-kem = { version = "0.3.3", default-features = false, features = [
+  "hazmat",
+  "zeroize",
+] }
+# Default features bring in the precomputed tables of the base point.
+x25519-dalek = { version = "3.0.0", default-features = false, features = [
+  "zeroize",
+] }
+# SHA3-256 and SHAKE256 of X-Wing; `zeroize` wipes the sponge. Default features bring in `alloc`,
+# and for `sha3` also `oid`.
+sha3 = { version = "0.12.0", default-features = false, features = ["zeroize"] }
+shake = { version = "0.1.0", default-features = false, features = ["zeroize"] }
 
 [lints]
 workspace = true

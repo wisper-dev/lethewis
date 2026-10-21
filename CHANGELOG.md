@@ -210,5 +210,8 @@ Nothing is published while the version is below 0.1.0.
   KiB; they need 25 KiB of stack, or 72 KiB.
 - Tests end to end: the keys of chats move to a second device under a shared secret, and a backup
   under the words restores them on a new phone; an export cut short leaves nothing to keep.
+- Dependencies: `ml-kem` 0.3.3, `x25519-dalek` 3.0.0, `sha3` 0.12.0 and `shake` 0.1.0 or later
+  compatible versions, without default features and with their `zeroize` features and the `hazmat`
+  feature of `ml-kem`, for X-Wing, the hybrid of ML-KEM-768 and X25519.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main
