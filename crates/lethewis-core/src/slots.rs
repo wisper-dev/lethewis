@@ -10550,7 +10550,8 @@ mod proofs {
     /// only when it succeeds, starting with the nonce the source gave last, hedged with the key of
     /// the epoch it is written in. It refuses an empty context, a stale handle, a store not of the
     /// archive or a profile not for wrapping, a key from a secret as the profile, a change to the
-    /// last epoch and a wrong answer of X-Wing before it asks the source, and then a failed source.
+    /// last epoch and a wrong answer of X-Wing before it asks the source, then a failed source, and
+    /// a new key pair that does not agree with itself before it draws again.
     #[kani::proof]
     #[kani::unwind(1530)]
     fn a_creation_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds() {
@@ -10627,6 +10628,21 @@ mod proofs {
             "a creation fails with DerivationFailed exactly when a derivation fails, and succeeds \
              only when every seal does",
         );
+        let (paired, agreed) = (xwing::model::paired(), xwing::model::agreed());
+        let (pair_seed, pair_public) = xwing::model::pair();
+        kani::assert(
+            if result.is_ok() {
+                paired && agreed
+            } else {
+                !paired || agreed || (result == Err(Error::CipherFailed) && entropy.calls == 1)
+            },
+            "a creation succeeds only when its new key pair agrees with itself, and fails as \
+             CipherFailed before it draws again when it does not",
+        );
+        kani::assert(
+            !paired || pair_public == pair_seed,
+            "the key pair checked is a seed and the public key it gives",
+        );
         let writing = if changing { next_key } else { epoch_key };
         kani::assert(
             if result.is_ok() {
@@ -10662,6 +10678,10 @@ mod proofs {
         );
         kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
         kani::cover!(result == Err(Error::DerivationFailed), "a derivation fails");
+        kani::cover!(
+            paired && !agreed,
+            "a key pair that does not agree with itself creates nothing"
+        );
     }
 
     /// From any state of two slots and of the epoch, with a change to the next under way or not,

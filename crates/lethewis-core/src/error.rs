@@ -23,8 +23,8 @@ pub enum Error {
     SameKey,
     /// The context is empty or longer than 255 bytes.
     InvalidContext,
-    /// The cipher or X-Wing gave a known input a wrong answer, or the cipher refused the input, so
-    /// nothing was written.
+    /// The cipher or X-Wing gave a known input a wrong answer, a new key pair of X-Wing did not agree
+    /// with itself, or the cipher refused the input, so nothing was written.
     CipherFailed,
     /// A key of the set is held here already, or the set holds one key twice: a key is held in one
     /// place only.

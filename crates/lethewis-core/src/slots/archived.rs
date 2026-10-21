@@ -115,7 +115,7 @@ impl<'a> Slots<'a> {
     /// 1 to 255 bytes, in no epoch; only that key and the archive key give the key of the batch
     /// back, with [`Slots::open_archive`]. The randomness of the encapsulation and the nonce come
     /// from `entropy`, hedged with the key of this epoch, the randomness also with the key of the
-    /// chat. X-Wing gives a known answer first.
+    /// chat. X-Wing gives a known answer first, once in a process.
     ///
     /// Needs 100 KiB of stack, or 232 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 96 KiB, or 224 KiB, deep,
@@ -220,7 +220,7 @@ impl<'a> Slots<'a> {
     /// `context` it was written for: the record opens with the key of the chat for its archive that
     /// `seal` refers to, and the key of the batch is derived from the shared secret the archive key
     /// that `archive` refers to gives its ciphertext, if the record's check of that secret holds.
-    /// X-Wing gives a known answer first.
+    /// X-Wing gives a known answer first, once in a process.
     ///
     /// Needs 100 KiB of stack, or 232 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 96 KiB, or 224 KiB, deep,
@@ -1574,7 +1574,8 @@ mod stack {
         assert_eq!(written.0, record);
     }
 
-    /// The wipes cover more than the calls use, and not needlessly more.
+    /// The wipes cover more than the calls use, with the self-test of X-Wing asked for the first
+    /// time, and not needlessly more.
     #[test]
     fn the_wipes_are_deeper_than_the_calls_on_records_of_an_archive() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
@@ -1588,6 +1589,7 @@ mod stack {
             );
         });
         let mut written = ([0; ARCHIVE_RECORD_LEN], [0; 32]);
+        let (first, second) = (xwing::unanswered(), xwing::unanswered());
         let archived = depth_changed(|| {
             slots
                 .archive_on_stack(
@@ -1596,7 +1598,7 @@ mod stack {
                     b"chat",
                     &mut Counting,
                     (&mut written.0, &mut written.1),
-                    &xwing::KNOWN,
+                    &first,
                     seal::seal,
                 )
                 .unwrap();
@@ -1608,7 +1610,7 @@ mod stack {
                     (key, chat),
                     b"chat",
                     (&record, &mut written.1),
-                    &xwing::KNOWN,
+                    &second,
                     seal::open,
                 )
                 .unwrap();

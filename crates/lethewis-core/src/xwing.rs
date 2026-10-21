@@ -12,6 +12,9 @@ use ml_kem::{
 use x25519_dalek::{X25519_BASEPOINT_BYTES, x25519};
 
 #[cfg(not(kani))]
+use core::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(not(kani))]
 use crate::key::wipe;
 
 /// The size of a private key, the seed both key pairs expand from.
@@ -186,7 +189,7 @@ fn join<const N: usize, const A: usize, const B: usize>(
 
 /// A seed and randomness, and what X-Wing makes of them.
 #[cfg(not(kani))]
-pub(crate) struct Known {
+pub(crate) struct Answer {
     seed: [u8; SEED_LEN],
     public: [u8; PUBLIC_LEN],
     randomness: [u8; RANDOMNESS_LEN],
@@ -194,10 +197,30 @@ pub(crate) struct Known {
     shared: [u8; SHARED_LEN],
 }
 
-/// The first test vector of the draft.
+/// An answer X-Wing has to give, and whether it has given it in this process.
+#[cfg(not(kani))]
+pub(crate) struct Known {
+    answer: &'static Answer,
+    given: AtomicBool,
+}
+
+#[cfg(not(kani))]
+impl Known {
+    const fn of(answer: &'static Answer) -> Self {
+        Self {
+            answer,
+            given: AtomicBool::new(false),
+        }
+    }
+}
+
+/// The first test vector of the draft, which X-Wing has to give once in a process.
+#[cfg(not(kani))]
+pub(crate) static KNOWN: Known = Known::of(&ANSWER);
+
 #[cfg(not(kani))]
 #[rustfmt::skip]
-pub(crate) const KNOWN: Known = Known {
+const ANSWER: Answer = Answer {
     seed: [
         0x7f, 0x9c, 0x2b, 0xa4, 0xe8, 0x8f, 0x82, 0x7d, 0x61, 0x60, 0x45, 0x50,
         0x76, 0x05, 0x85, 0x3e, 0xd7, 0x3b, 0x80, 0x93, 0xf6, 0xef, 0xbc, 0x88,
@@ -418,35 +441,91 @@ pub(crate) const KNOWN: Known = Known {
     ],
 };
 
+#[cfg(test)]
+extern crate std;
+
+/// [`KNOWN`] as X-Wing has not given it yet.
+#[cfg(test)]
+pub(crate) fn unanswered() -> Known {
+    Known::of(&ANSWER)
+}
+
+/// `answer`, which X-Wing has not given yet.
+#[cfg(test)]
+pub(crate) fn known(answer: Answer) -> Known {
+    Known::of(std::boxed::Box::leak(std::boxed::Box::new(answer)))
+}
+
 /// [`KNOWN`] with its shared secret changed, which X-Wing does not give.
 #[cfg(test)]
 pub(crate) fn wrong_known() -> Known {
-    let mut wrong = Known { ..KNOWN };
+    let mut wrong = ANSWER;
     if let Some(first) = wrong.shared.first_mut() {
         *first ^= 1;
     }
-    wrong
+    known(wrong)
 }
 
 /// Whether X-Wing gives `known`, which is [`KNOWN`] but in tests: the public key of its seed, the
-/// ciphertext and shared secret of its randomness, and the shared secret of that ciphertext.
+/// ciphertext and shared secret of its randomness, and the shared secret of that ciphertext. Once it
+/// has, `known` keeps that, and X-Wing is not asked for it again.
 #[cfg(not(kani))]
 pub(crate) fn answers(known: &Known) -> bool {
+    if known.given.load(Ordering::Relaxed) {
+        return true;
+    }
+    let known_answer = known.answer;
     let mut public = [0; PUBLIC_LEN];
-    public_key(&known.seed, &mut public);
+    public_key(&known_answer.seed, &mut public);
     let (mut ciphertext, mut shared, mut opened) =
         ([0; CIPHERTEXT_LEN], [0; SHARED_LEN], [0; SHARED_LEN]);
-    let encapsulated = encapsulate(&public, &known.randomness, &mut ciphertext, &mut shared);
-    decapsulate(&known.seed, &known.ciphertext, &mut opened);
-    public == known.public
+    let encapsulated = encapsulate(
+        &public,
+        &known_answer.randomness,
+        &mut ciphertext,
+        &mut shared,
+    );
+    decapsulate(&known_answer.seed, &known_answer.ciphertext, &mut opened);
+    let answered = public == known_answer.public
         && encapsulated.is_ok()
-        && ciphertext == known.ciphertext
-        && shared == known.shared
-        && opened == known.shared
+        && ciphertext == known_answer.ciphertext
+        && shared == known_answer.shared
+        && opened == known_answer.shared;
+    if answered {
+        known.given.store(true, Ordering::Relaxed);
+    }
+    answered
+}
+
+/// Whether the key pair of `seed` agrees with itself: an encapsulation to `public` and the
+/// decapsulation of its ciphertext with `seed` give one shared secret. A pair that does not makes
+/// X-Wing untrusted, and `known` is asked for again.
+#[cfg(not(kani))]
+pub(crate) fn agrees(known: &Known, seed: &[u8; SEED_LEN], public: &[u8; PUBLIC_LEN]) -> bool {
+    let (mut ciphertext, mut shared, mut opened) =
+        ([0; CIPHERTEXT_LEN], [0; SHARED_LEN], [0; SHARED_LEN]);
+    let encapsulated = encapsulate(
+        public,
+        &known.answer.randomness,
+        &mut ciphertext,
+        &mut shared,
+    );
+    decapsulate(seed, &ciphertext, &mut opened);
+    let differ = shared
+        .iter()
+        .zip(opened)
+        .fold(0, |differ, (a, b)| differ | (a ^ b));
+    wipe(&mut shared);
+    wipe(&mut opened);
+    let agreed = encapsulated.is_ok() && differ == 0;
+    if !agreed {
+        known.given.store(false, Ordering::Relaxed);
+    }
+    agreed
 }
 
 #[cfg(kani)]
-pub(crate) use model::{KNOWN, Known, answers, decapsulate, encapsulate, public_key};
+pub(crate) use model::{KNOWN, Known, agrees, answers, decapsulate, encapsulate, public_key};
 
 /// What stands in for X-Wing under Kani.
 #[cfg(kani)]
@@ -472,6 +551,12 @@ pub(crate) mod model {
     /// Whether the last self-test was given the known answer, so that a proof can tell a refusal
     /// of X-Wing from one the code makes up.
     static ANSWERED: AtomicBool = AtomicBool::new(false);
+    /// Whether a key pair was checked, whether it agreed with itself, and the seed and the first
+    /// bytes of the public key it was.
+    static PAIRED: AtomicBool = AtomicBool::new(false);
+    static AGREED: AtomicBool = AtomicBool::new(false);
+    static PAIR_SEED: [AtomicU8; SEED_LEN] = [const { AtomicU8::new(0) }; SEED_LEN];
+    static PAIR_PUBLIC: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
 
     /// The known answer, which the model does not read.
     pub(crate) struct Known;
@@ -497,6 +582,33 @@ pub(crate) mod model {
     /// Whether the last self-test was given the known answer.
     pub(crate) fn answered() -> bool {
         ANSWERED.load(Ordering::Relaxed)
+    }
+
+    /// A key pair agrees with itself or not, at will, and the model records which, and the pair.
+    pub(crate) fn agrees(_: &Known, seed: &[u8; SEED_LEN], public: &[u8; PUBLIC_LEN]) -> bool {
+        keep(&PAIR_SEED, seed);
+        if let Some(head) = public.first_chunk() {
+            keep(&PAIR_PUBLIC, head);
+        }
+        let agreed = kani::any();
+        PAIRED.store(true, Ordering::Relaxed);
+        AGREED.store(agreed, Ordering::Relaxed);
+        agreed
+    }
+
+    /// Whether a key pair was checked.
+    pub(crate) fn paired() -> bool {
+        PAIRED.load(Ordering::Relaxed)
+    }
+
+    /// Whether the last key pair checked agreed with itself.
+    pub(crate) fn agreed() -> bool {
+        AGREED.load(Ordering::Relaxed)
+    }
+
+    /// The seed and the first bytes of the public key of the last key pair checked.
+    pub(crate) fn pair() -> ([u8; SEED_LEN], [u8; 32]) {
+        (kept(&PAIR_SEED), kept(&PAIR_PUBLIC))
     }
 
     /// Any ciphertext and shared secret, or a refusal of the public key at will, writing neither.
@@ -607,9 +719,11 @@ mod tests {
 
     use std::vec::Vec;
 
+    use core::sync::atomic::Ordering;
+
     use super::{
-        CIPHERTEXT_LEN, InvalidPublicKey, KNOWN, Known, PUBLIC_LEN, SHARED_LEN, answers,
-        decapsulate, encapsulate, public_key,
+        ANSWER, Answer, CIPHERTEXT_LEN, InvalidPublicKey, Known, PUBLIC_LEN, SHARED_LEN, agrees,
+        answers, decapsulate, encapsulate, known, public_key, unanswered, wrong_known,
     };
 
     /// The second and third test vectors of the draft: seed, public key, randomness, ciphertext and
@@ -771,14 +885,16 @@ mod tests {
     }
 
     fn vectors() -> Vec<Known> {
-        let mut all = std::vec![Known { ..KNOWN }];
+        let mut all = std::vec![unanswered()];
         all.extend(
-            VECTORS.map(|[seed, public, randomness, ciphertext, shared]| Known {
-                seed: array(seed),
-                public: array(public),
-                randomness: array(randomness),
-                ciphertext: array(ciphertext),
-                shared: array(shared),
+            VECTORS.map(|[seed, public, randomness, ciphertext, shared]| {
+                known(Answer {
+                    seed: array(seed),
+                    public: array(public),
+                    randomness: array(randomness),
+                    ciphertext: array(ciphertext),
+                    shared: array(shared),
+                })
             }),
         );
         all
@@ -788,14 +904,23 @@ mod tests {
     fn x_wing_gives_the_vectors_of_the_draft() {
         for known in vectors() {
             let mut public = [0; PUBLIC_LEN];
-            public_key(&known.seed, &mut public);
-            assert_eq!(public, known.public);
+            public_key(&known.answer.seed, &mut public);
+            assert_eq!(public, known.answer.public);
             let (mut ciphertext, mut shared) = ([0; CIPHERTEXT_LEN], [0; SHARED_LEN]);
-            encapsulate(&public, &known.randomness, &mut ciphertext, &mut shared).unwrap();
-            assert_eq!((ciphertext, shared), (known.ciphertext, known.shared));
+            encapsulate(
+                &public,
+                &known.answer.randomness,
+                &mut ciphertext,
+                &mut shared,
+            )
+            .unwrap();
+            assert_eq!(
+                (ciphertext, shared),
+                (known.answer.ciphertext, known.answer.shared)
+            );
             let mut opened = [0; SHARED_LEN];
-            decapsulate(&known.seed, &ciphertext, &mut opened);
-            assert_eq!(opened, known.shared);
+            decapsulate(&known.answer.seed, &ciphertext, &mut opened);
+            assert_eq!(opened, known.answer.shared);
         }
     }
 
@@ -810,11 +935,11 @@ mod tests {
     fn every_changed_bit_of_a_ciphertext_gives_another_shared_secret() {
         let mut seen = std::collections::HashSet::new();
         for bit in 0..CIPHERTEXT_LEN * 8 {
-            let mut ciphertext = KNOWN.ciphertext;
+            let mut ciphertext = ANSWER.ciphertext;
             ciphertext[bit / 8] ^= 1 << (bit % 8);
             let mut shared = [0; SHARED_LEN];
-            decapsulate(&KNOWN.seed, &ciphertext, &mut shared);
-            assert_ne!(shared, KNOWN.shared, "bit {bit}");
+            decapsulate(&ANSWER.seed, &ciphertext, &mut shared);
+            assert_ne!(shared, ANSWER.shared, "bit {bit}");
             assert!(seen.insert(shared), "bit {bit}");
         }
     }
@@ -823,10 +948,10 @@ mod tests {
     /// the ciphertext, as an independent implementation computes it with X25519 and the combiner.
     #[test]
     fn a_changed_ciphertext_gives_the_secret_of_implicit_rejection() {
-        let mut ciphertext = KNOWN.ciphertext;
+        let mut ciphertext = ANSWER.ciphertext;
         ciphertext[0] ^= 1;
         let mut shared = [0; SHARED_LEN];
-        decapsulate(&KNOWN.seed, &ciphertext, &mut shared);
+        decapsulate(&ANSWER.seed, &ciphertext, &mut shared);
         assert_eq!(
             shared,
             array::<SHARED_LEN>("0a403cbc6fe416a9d0582a3328819905fb512902a6a52ce32819cf80aaf2a9e8")
@@ -838,7 +963,7 @@ mod tests {
     #[test]
     fn a_public_key_with_an_unreduced_value_is_refused() {
         for (at, low, high) in [(0, 0x01, 0x0d), (0, 0xff, 0x0f), (1150, 0, 0)] {
-            let mut public = KNOWN.public;
+            let mut public = ANSWER.public;
             if at == 0 {
                 public[0] = low;
                 public[1] = (public[1] & 0xf0) | high;
@@ -848,7 +973,7 @@ mod tests {
             }
             let (mut ciphertext, mut shared) = ([0x5a; CIPHERTEXT_LEN], [0xa5; SHARED_LEN]);
             assert_eq!(
-                encapsulate(&public, &KNOWN.randomness, &mut ciphertext, &mut shared),
+                encapsulate(&public, &ANSWER.randomness, &mut ciphertext, &mut shared),
                 Err(InvalidPublicKey)
             );
             assert_eq!(
@@ -860,23 +985,59 @@ mod tests {
 
     #[test]
     fn x_wing_gives_the_known_answer() {
-        assert!(answers(&KNOWN));
+        assert!(answers(&unanswered()));
     }
 
     #[test]
     fn a_wrong_known_answer_fails_the_self_test() {
         for field in 0..5 {
             for at in [0, 17, 31] {
-                let mut known = Known { ..KNOWN };
+                let mut answer = ANSWER;
                 match field {
-                    0 => known.seed[at] ^= 1,
-                    1 => known.public[at * 37] ^= 1,
-                    2 => known.randomness[at * 2] ^= 1,
-                    3 => known.ciphertext[at * 35] ^= 1,
-                    _ => known.shared[at] ^= 1,
+                    0 => answer.seed[at] ^= 1,
+                    1 => answer.public[at * 37] ^= 1,
+                    2 => answer.randomness[at * 2] ^= 1,
+                    3 => answer.ciphertext[at * 35] ^= 1,
+                    _ => answer.shared[at] ^= 1,
                 }
-                assert!(!answers(&known), "field {field}, byte {at}");
+                assert!(!answers(&known(answer)), "field {field}, byte {at}");
             }
+        }
+    }
+
+    /// A known answer once given is not asked for again; a wrong one is asked for each time.
+    #[test]
+    fn a_known_answer_is_asked_for_until_it_is_given() {
+        let known = unanswered();
+        assert!(answers(&known));
+        assert!(known.given.load(Ordering::Relaxed));
+        let wrong = wrong_known();
+        assert!(!answers(&wrong));
+        assert!(!wrong.given.load(Ordering::Relaxed));
+        assert!(!answers(&wrong));
+    }
+
+    /// A seed agrees with its own public key only, and a pair that does not makes the known
+    /// answer asked for again.
+    #[test]
+    fn a_key_pair_agrees_with_itself_only() {
+        let known = unanswered();
+        assert!(answers(&known));
+        assert!(agrees(&known, &ANSWER.seed, &ANSWER.public));
+        let mut other = [0; PUBLIC_LEN];
+        public_key(&[7; 32], &mut other);
+        assert!(agrees(&known, &[7; 32], &other));
+        assert!(known.given.load(Ordering::Relaxed));
+        let mut unreduced = ANSWER.public;
+        unreduced[..2].copy_from_slice(&[0xff, 0xff]);
+        for (seed, public) in [
+            (ANSWER.seed, other),
+            ([7; 32], ANSWER.public),
+            (ANSWER.seed, unreduced),
+        ] {
+            assert!(answers(&known));
+            assert!(!agrees(&known, &seed, &public));
+            assert!(!known.given.load(Ordering::Relaxed));
         }
     }
 }
@@ -889,25 +1050,27 @@ mod stack {
     use core::hint::black_box;
 
     use super::{
-        CIPHERTEXT_LEN, KNOWN, PUBLIC_LEN, SHARED_LEN, STACK_WIPE, answers, decapsulate,
-        encapsulate, public_key,
+        ANSWER, CIPHERTEXT_LEN, PUBLIC_LEN, SHARED_LEN, STACK_WIPE, agrees, answers, decapsulate,
+        encapsulate, public_key, unanswered,
     };
     use crate::residue::depth_changed;
 
-    /// The wipe covers more than any operation uses, and not needlessly more.
+    /// The wipe covers more than any operation uses, the self-test asked for the first time
+    /// included, and not needlessly more.
     #[test]
     fn the_wipe_is_deeper_than_x_wing() {
+        let known = unanswered();
         let used = [
             depth_changed(|| {
                 let mut public = [0; PUBLIC_LEN];
-                public_key(black_box(&KNOWN.seed), &mut public);
+                public_key(black_box(&ANSWER.seed), &mut public);
                 black_box(&public);
             }),
             depth_changed(|| {
                 let (mut ciphertext, mut shared) = ([0; CIPHERTEXT_LEN], [0; SHARED_LEN]);
                 let encapsulated = encapsulate(
-                    black_box(&KNOWN.public),
-                    &KNOWN.randomness,
+                    black_box(&ANSWER.public),
+                    &ANSWER.randomness,
                     &mut ciphertext,
                     &mut shared,
                 );
@@ -915,11 +1078,14 @@ mod stack {
             }),
             depth_changed(|| {
                 let mut shared = [0; SHARED_LEN];
-                decapsulate(black_box(&KNOWN.seed), &KNOWN.ciphertext, &mut shared);
+                decapsulate(black_box(&ANSWER.seed), &ANSWER.ciphertext, &mut shared);
                 black_box(&shared);
             }),
             depth_changed(|| {
-                black_box(answers(black_box(&KNOWN)));
+                black_box(answers(black_box(&known)));
+            }),
+            depth_changed(|| {
+                black_box(agrees(&known, black_box(&ANSWER.seed), &ANSWER.public));
             }),
         ];
         std::println!("X-Wing uses {used:?} bytes of stack");

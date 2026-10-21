@@ -29,7 +29,9 @@ impl<'a> Slots<'a> {
     /// key, and opens only with the stored key for wrapping that `profile` refers to and the key of
     /// the epoch; [`Slots::carry_archive_key`] moves it on to the next epoch without the stored key
     /// of the archive. The seed is derived from that stored key and bytes from `entropy`, hedged
-    /// with the key of the epoch, as the nonces are.
+    /// with the key of the epoch, as the nonces are. X-Wing gives a known answer first, once in a
+    /// process, and the new key pair has to agree with itself: an encapsulation to its public key
+    /// and the decapsulation with its seed give one secret.
     ///
     /// Needs 100 KiB of stack, or 232 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 96 KiB, or 224 KiB, deep,
@@ -44,9 +46,9 @@ impl<'a> Slots<'a> {
     /// [`Purpose::ArchiveWrap`] or the one `profile` refers to [`Purpose::Wrap`],
     /// [`Error::WrongLevel`] if `profile` refers to a key from a secret, [`Error::EpochExhausted`]
     /// if a change to the last epoch is under way, [`Error::CipherFailed`] if X-Wing or the cipher
-    /// gives a known input a wrong answer or the cipher fails, [`Error::EntropyFailed`] if
-    /// `entropy` fails, and [`Error::DerivationFailed`] if a value cannot be derived from a key.
-    /// `record` is then left as it was.
+    /// gives a known input a wrong answer, the new key pair does not agree with itself or the
+    /// cipher fails, [`Error::EntropyFailed`] if `entropy` fails, and [`Error::DerivationFailed`]
+    /// if a value cannot be derived from a key. `record` is then left as it was.
     pub fn create_archive_key(
         &mut self,
         store: Handle<'a>,
@@ -106,7 +108,7 @@ impl<'a> Slots<'a> {
         wipe(&mut seed_bytes);
         let written = derived.map_err(|_| Error::DerivationFailed).and_then(|()| {
             write_archive_key(
-                &seed,
+                (&seed, known),
                 (archive_key, archive_id),
                 (stored.wrapping_key().0, epoch_key, number),
                 (entropy, drawn),
@@ -121,9 +123,10 @@ impl<'a> Slots<'a> {
     /// Loads the archive key whose record is `record`, for the `context` it was written for, into
     /// a free slot: the record opens with the stored key for wrapping that `profile` refers to and
     /// the key of this epoch, and its seed with the stored key of the archive that `store` refers
-    /// to. X-Wing gives a known answer first, and the public key in the record is then the one the
-    /// seed gives; otherwise the record was changed by someone who held the key of the epoch and
-    /// the stored key for wrapping, and the call fails with [`Error::PublicKeyMismatch`].
+    /// to. X-Wing gives a known answer first, once in a process, and the public key in the record is
+    /// then the one the seed gives; otherwise the record was changed by someone who held the key of
+    /// the epoch and the stored key for wrapping, and the call fails with
+    /// [`Error::PublicKeyMismatch`].
     ///
     /// Needs 100 KiB of stack, or 232 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 96 KiB, or 224 KiB, deep,
@@ -358,11 +361,12 @@ pub(super) fn wipe_archive_stack() {
     zeroize::zeroize_stack::<{ xwing::STACK_WIPE }>();
 }
 
-/// Writes the record of the archive key `seed`: its inner layer under `archive`, the stored key of
-/// the archive and its identifier, its outer layer under `outer`, a stored key for wrapping, the
-/// key of an epoch and its number. The nonces come from `entropy`, hedged with that epoch's key.
+/// Writes the record of the archive key `seed`, once its key pair agrees with itself, which makes
+/// `known` asked for again if it does not: its inner layer under `archive`, the stored key of the
+/// archive and its identifier, its outer layer under `outer`, a stored key for wrapping, the key of
+/// an epoch and its number. The nonces come from `entropy`, hedged with that epoch's key.
 fn write_archive_key(
-    seed: &Key,
+    (seed, known): (&Key, &Known),
     (archive, archive_id): (&Key, &KeyId),
     outer: (&Key, &Key, u64),
     (entropy, drawn): (&mut (impl Entropy + ?Sized), &mut u64),
@@ -373,8 +377,12 @@ fn write_archive_key(
     let mut id = KeyId::empty();
     derive_key_id(seed, &mut id).map_err(|_| Error::DerivationFailed)?;
     let mut public = [0; PUBLIC_LEN];
-    if let Some(seed) = seed_of(seed) {
+    let agrees = seed_of(seed).is_some_and(|seed| {
         xwing::public_key(seed, &mut public);
+        xwing::agrees(known, seed, &public)
+    });
+    if !agrees {
+        return Err(Error::CipherFailed);
     }
     let mut nonce = [0; NONCE_LEN];
     hedged_draw(entropy, epoch_key, drawn, Branch::HedgeNonce, &mut nonce)?;
@@ -1902,12 +1910,14 @@ mod stack {
         });
     }
 
-    /// The wipes cover more than the calls use, and not needlessly more.
+    /// The wipes cover more than the calls use, with the self-test of X-Wing asked for the first
+    /// time, and not needlessly more.
     #[test]
     fn the_wipes_are_deeper_than_the_calls_on_an_archive_key() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
         let (mut slots, [store, stored], record, _) = archive(&mut memory, &mut epoch, 0);
         let mut written = [0; ARCHIVE_KEY_RECORD_LEN];
+        let (first, second) = (xwing::unanswered(), xwing::unanswered());
         let created = depth_changed(|| {
             slots
                 .create_archive_key_on_stack(
@@ -1916,7 +1926,7 @@ mod stack {
                     b"archive",
                     &mut Counting,
                     &mut written,
-                    &xwing::KNOWN,
+                    &first,
                 )
                 .unwrap();
             black_box(&written);
@@ -1929,7 +1939,7 @@ mod stack {
                         stored,
                         b"archive",
                         &record,
-                        &xwing::KNOWN,
+                        &second,
                         seal::open,
                         seal::open,
                     )

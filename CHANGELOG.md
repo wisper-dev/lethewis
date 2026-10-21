@@ -223,9 +223,9 @@ Nothing is published while the version is below 0.1.0.
 - `Slots::load_archive_key` loads an archive key and refuses a public key its seed does not give,
   with `Error::PublicKeyMismatch`. `Slots::carry_archive_key` carries its record into the next epoch
   without the stored key of the archive.
-- X-Wing gives the known answer of its draft before each creation and load of an archive key. The
-  stack is wiped after each call on an archive key: 96 KiB, or 224 KiB; they need 100 KiB of stack,
-  or 232 KiB.
+- X-Wing gives the known answer of its draft once in a process, before its first use, and the key
+  pair of a new archive key has to agree with itself. The stack is wiped after each call on an
+  archive key: 96 KiB, or 224 KiB; they need 100 KiB of stack, or 232 KiB.
 - Proofs with Kani 0.68.0 for the creation, the load and the carry of an archive key, and tests
   against records computed by an independent implementation, the public key of X-Wing included.
 - Records of an archive, `ARCHIVE_RECORD_LEN` bytes, 1180: `Slots::archive` encapsulates to an

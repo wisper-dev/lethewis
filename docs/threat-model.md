@@ -129,7 +129,12 @@ stored key and the epoch's key.
 
 A load refuses a record whose identifier or public key the seed does not give: whoever holds the
 key of the epoch and the profile's stored key cannot make the archive key load with a public key of
-their own. Before each creation and load, X-Wing must give the known answer of its draft.
+their own.
+
+X-Wing gives the known answer of its draft once in a process, before its first use. The key pair of
+a new archive key must agree with itself, or a fault while its public key is derived would write a
+record whose archived batches could never be opened. A pair that does not makes X-Wing give the
+known answer again.
 
 A batch of history is archived to the public key the record of the archive key holds. The key of
 the batch is derived from the shared secret of an encapsulation, with its ciphertext as the salt.
