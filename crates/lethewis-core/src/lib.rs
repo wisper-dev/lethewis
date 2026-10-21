@@ -33,13 +33,10 @@ macro_rules! assert_not_impl {
     };
 }
 
-// Under Kani the wipe is plain stores, the derivation and the cipher are models and X-Wing is left
-// out, so these go unused there.
+// Under Kani the wipe is plain stores and the derivation and the cipher are models, so these go
+// unused there.
 #[cfg(kani)]
-use {
-    aes_gcm_siv as _, argon2 as _, ctutils as _, hkdf as _, ml_kem as _, sha2 as _, sha3 as _,
-    shake as _, x25519_dalek as _, zeroize as _,
-};
+use {aes_gcm_siv as _, argon2 as _, ctutils as _, hkdf as _, sha2 as _, zeroize as _};
 // Depended on only for their zeroize feature.
 use {aes as _, blake2 as _, polyval as _};
 

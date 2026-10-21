@@ -52,6 +52,9 @@ polyval = { version = "0.7.3", default-features = false, features = [
 blake2 = { version = "0.11.0", default-features = false, features = [
   "zeroize",
 ] }
+
+# X-Wing is left out of the proofs, so Kani builds none of its code.
+[target.'cfg(not(kani))'.dependencies]
 # X-Wing: ML-KEM-768 with X25519. Default features bring in `alloc`; `hazmat` makes encapsulation
 # from given randomness part of the documented interface.
 ml-kem = { version = "0.3.3", default-features = false, features = [
