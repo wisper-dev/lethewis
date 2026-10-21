@@ -7033,11 +7033,10 @@ mod proofs {
     use core::marker::PhantomData;
 
     use super::{
-        ArchivePublic, CIPHER_KEY_LEN, Direction, END_LABEL, END_RECORD_LEN, EXPORT_LABEL, Entropy,
-        EntropyError, Epoch, Erasure, Error, Handle, Key, KeyId, KeyLength, Kind, LAYER_LEN,
-        LOCK_RECORD_LEN, MEMBERS, NONCE_LEN, Occupancy, Out, PLAINTEXT_LEN, Position, Purpose,
-        RECORD_LEN, Rejected, Root, RootFailed, SealFailed, Slot, Slots, Stages, Status, TAG_LEN,
-        opening,
+        ArchivePublic, CIPHER_KEY_LEN, Direction, END_RECORD_LEN, Entropy, EntropyError, Epoch,
+        Erasure, Error, Handle, Key, KeyId, KeyLength, Kind, LAYER_LEN, LOCK_RECORD_LEN, MEMBERS,
+        NONCE_LEN, Occupancy, Out, PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Rejected, Root,
+        RootFailed, SealFailed, Slot, Slots, Stages, Status, TAG_LEN, opening,
     };
 
     /// `seal`, as the stand-in for the cipher it is in the proofs.
@@ -9157,11 +9156,11 @@ mod proofs {
             !refused_before || (cipher.calls == 0 && layer.calls == 0),
             "those refusals come before any decryption",
         );
-        let bound = if receipt {
-            Bound::chained(EXPORT_LABEL, &named.chain, context)
-        } else {
-            Bound::to(context)
-        };
+        let (in_a_record, in_an_export) = (
+            Bound::to(context),
+            Bound::chained(b"lethewis key export", &named.chain, context),
+        );
+        let bound = if receipt { in_an_export } else { in_a_record };
         kani::assert(
             (cipher.calls == 0 || cipher.aad == bound)
                 && (layer.calls == 0 || layer.aad == Bound::to(context)),
@@ -9522,21 +9521,34 @@ mod proofs {
                 epoch_key
             }[..32],
         );
+        // What a check could fail on is worked out on every path, so that no proof of one kind
+        // leaves a check of another unreached.
+        let (length, head) = (wrapping.lengths[0], key_head(&wrapping));
         let record_key = match kind {
-            Kind::Record => expected_wrap_key(&wrapping.keys.0, wrapping.lengths[0], &salt),
-            Kind::Lock => expected_lock_key(&wrapping.keys.0, wrapping.lengths[0]),
-            Kind::Export | Kind::ArchiveKey => expected_export_key(&key_head(&wrapping)),
+            Kind::Record => expected_wrap_key(&wrapping.keys.0, length, &salt),
+            Kind::Lock => expected_lock_key(&wrapping.keys.0, length),
+            Kind::Export | Kind::ArchiveKey => expected_export_key(&head),
+        };
+        let mut written = [0; 32];
+        written.copy_from_slice(&record[NONCE_LEN..NONCE_LEN + 32]);
+        let (mut tag_of_a_record, mut tag_of_a_lock) = ([0; TAG_LEN], [0; TAG_LEN]);
+        tag_of_a_record.copy_from_slice(&record[RECORD_LEN - TAG_LEN..RECORD_LEN]);
+        tag_of_a_lock.copy_from_slice(&record[LOCK_RECORD_LEN - TAG_LEN..]);
+        let (outer, tag) = if lock {
+            (layer, tag_of_a_lock)
+        } else {
+            (inner, tag_of_a_record)
         };
         let named = if changing {
             epoch.wrapping_add(1)
         } else {
             epoch
         };
-        let bound = if in_epoch {
-            Bound::to(context)
-        } else {
-            Bound::chained(EXPORT_LABEL, &wrapping.chain, context)
-        };
+        let (in_a_record, in_an_export) = (
+            Bound::to(context),
+            Bound::chained(b"lethewis key export", &wrapping.chain, context),
+        );
+        let bound = if in_epoch { in_a_record } else { in_an_export };
         kani::assert(
             result.is_err()
                 || (seal::model::kept_at(seal::model::RECORD)
@@ -9547,21 +9559,16 @@ mod proofs {
                     && inner.given[3..19] == wrapping.ids.0
                     && inner.given[19..27]
                         == if kind == Kind::Record { named } else { 0 }.to_le_bytes()
-                    && if lock {
-                        layer.key == expected_layer_key(&salt)
+                    && (!lock
+                        || (layer.key == expected_layer_key(&salt)
                             && Bound::kept(&layer) == Bound::to(context)
                             && layer.given[..8] == named.to_le_bytes()
                             && layer.given[8..20] == inner.nonce
                             && layer.given[20..32] == inner.written[..12]
-                            && layer.given_end == inner.tag
-                            && record[..NONCE_LEN] == layer.nonce
-                            && record[NONCE_LEN..NONCE_LEN + 32] == layer.written
-                            && record[LOCK_RECORD_LEN - TAG_LEN..] == layer.tag
-                    } else {
-                        record[..NONCE_LEN] == inner.nonce
-                            && record[NONCE_LEN..NONCE_LEN + 32] == inner.written
-                            && record[RECORD_LEN - TAG_LEN..RECORD_LEN] == inner.tag
-                    }),
+                            && layer.given_end == inner.tag))
+                    && record[..NONCE_LEN] == outer.nonce
+                    && written == outer.written
+                    && tag == outer.tag),
             "a wrap seals the set, naming its purpose and its parent, under the key derived for its \
              kind and bound to its context, an export also to the chain of its key, and writes the \
              nonce, what the cipher wrote and the tag; a lock seals that record and the number of \
@@ -11263,7 +11270,8 @@ mod proofs {
                         && cipher.key == expected_export_key(&key)
                         && cipher.nonce[..] == end[..NONCE_LEN]
                         && cipher.tag[..] == end[NONCE_LEN..]
-                        && cipher.aad == Bound::chained(END_LABEL, &named.chain, context)
+                        && cipher.aad
+                            == Bound::chained(b"lethewis export end", &named.chain, context)
                 },
             "an end is opened once, under the key the key for transfers derives, with its own nonce \
              and tag, bound to its context and chained to its key",
@@ -11278,7 +11286,8 @@ mod proofs {
                 || result.is_err()
                 || (seal::model::kept_at(seal::model::RECORD)
                     && sealed.key == expected_export_key(&key)
-                    && Bound::kept(&sealed) == Bound::chained(END_LABEL, &named.chain, context)
+                    && Bound::kept(&sealed)
+                        == Bound::chained(b"lethewis export end", &named.chain, context)
                     && end[..NONCE_LEN] == sealed.nonce
                     && end[NONCE_LEN..] == sealed.tag),
             "an end of an export is sealed under the key the key for transfers derives, bound to its \

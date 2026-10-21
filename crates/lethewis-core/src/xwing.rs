@@ -517,13 +517,9 @@ pub(crate) fn agrees(known: &Known, seed: &[u8; SEED_LEN], public: &[u8; PUBLIC_
         &mut shared,
     );
     decapsulate(seed, &ciphertext, &mut opened);
-    let differ = shared
-        .iter()
-        .zip(opened)
-        .fold(0, |differ, (a, b)| differ | (a ^ b));
+    let agreed = encapsulated.is_ok() && shared == opened;
     wipe(&mut shared);
     wipe(&mut opened);
-    let agreed = encapsulated.is_ok() && differ == 0;
     if !agreed {
         known.given.store(false, Ordering::Relaxed);
     }

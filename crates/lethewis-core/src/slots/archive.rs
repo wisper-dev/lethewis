@@ -986,9 +986,10 @@ mod tests {
         assert_eq!(slots.memory[5].occupancy, Occupancy::Free);
     }
 
-    /// Every changed bit of the record of an archive key is refused by the reading of its public key
-    /// and by the carry, which open it as the load does, and the carry writes nothing; without
-    /// optimisation, where the cipher is slow, one bit of every byte.
+    /// Every changed bit of the record of an archive key is refused by the reading of its public key,
+    /// which opens it as the load and the carry do; without optimisation, where the cipher is slow,
+    /// one bit of every byte. A changed byte at each end of each part of it is refused by the carry,
+    /// which writes nothing then.
     #[test]
     #[expect(clippy::integer_division, reason = "a test picks bits of a record")]
     fn every_changed_bit_of_the_record_of_an_archive_key_is_refused() {
@@ -1000,8 +1001,6 @@ mod tests {
         slots
             .create_archive_key(archive, stored, b"archive", &mut Counting, &mut record)
             .unwrap();
-        slots.begin_epoch(&mut [8; 32]).unwrap();
-        let mut carried = [7; ARCHIVE_KEY_RECORD_LEN];
         let bits = (0..ARCHIVE_KEY_RECORD_LEN * 8)
             .filter(|bit| !cfg!(lethewis_unoptimised) || bit % 8 == bit / 8 % 8);
         for bit in bits {
@@ -1014,6 +1013,18 @@ mod tests {
                 Err(Error::StaleRecord),
                 "bit {bit}"
             );
+        }
+        assert!(
+            slots
+                .archive_public_key(stored, b"archive", &record)
+                .is_ok()
+        );
+        slots.begin_epoch(&mut [8; 32]).unwrap();
+        let mut carried = [7; ARCHIVE_KEY_RECORD_LEN];
+        // The nonce, the epoch, the identifier, the public key, the inner layer and the tag.
+        for at in [0, 11, 12, 19, 20, 35, 36, 1251, 1252, 1512, 1513, 1528] {
+            let mut changed = record;
+            changed[at] ^= 0x80;
             assert_eq!(
                 slots.carry_archive_key(
                     stored,
@@ -1024,15 +1035,10 @@ mod tests {
                     &mut carried
                 ),
                 Err(Error::StaleRecord),
-                "bit {bit}"
+                "byte {at}"
             );
-            assert_eq!(carried, [7; ARCHIVE_KEY_RECORD_LEN], "bit {bit}");
+            assert_eq!(carried, [7; ARCHIVE_KEY_RECORD_LEN], "byte {at}");
         }
-        assert!(
-            slots
-                .archive_public_key(stored, b"archive", &record)
-                .is_ok()
-        );
         assert_eq!(
             slots.carry_archive_key(
                 stored,
