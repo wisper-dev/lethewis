@@ -120,7 +120,7 @@ fn seal_checked<const N: usize>(
     buffer: &mut [u8; N],
 ) -> Result<[u8; TAG_LEN], SealFailed> {
     #[cfg(kani)]
-    let given = model::head(buffer);
+    let given = (model::head(buffer), model::end(buffer));
     let sealed = if answers(known) {
         encrypt(key, nonce, aad, buffer)
     } else {
@@ -128,7 +128,13 @@ fn seal_checked<const N: usize>(
     };
     #[cfg(kani)]
     if let Ok(tag) = &sealed {
-        model::keep_seal::<N>(key, nonce, aad, (&given, &model::head(buffer)), tag);
+        model::keep_seal::<N>(
+            key,
+            nonce,
+            aad,
+            (&given.0, &given.1, &model::head(buffer)),
+            tag,
+        );
     }
     if sealed.is_err() {
         #[cfg(kani)]
@@ -209,31 +215,34 @@ pub(crate) mod model {
 
     use super::{KEY_LEN, NONCE_LEN, PLAINTEXT_LEN, Rejected, SealFailed, TAG_LEN};
 
-    /// The places the model keeps a seal in: the last seal of the plaintext of a record, or of
-    /// nothing, and the last seal of anything longer, a layer; and how many first bytes of their
-    /// plaintext and of what they wrote, and of their associated data.
+    /// The places the model keeps a seal in, by the length of what is sealed: the last seal of the
+    /// plaintext of a record, or of nothing, and the last seal of any other length, which in the
+    /// proofs that read it is a layer; and how many bytes of the plaintext, of what was written and
+    /// of the associated data the model keeps: the associated data as far as a context of two
+    /// bytes reaches.
     pub(crate) const RECORD: usize = 0;
     pub(crate) const LAYER: usize = 1;
     const KEPT: usize = 2;
     pub(crate) const HEAD: usize = 32;
-    pub(crate) const AAD_HEAD: usize = 23;
+    pub(crate) const AAD_HEAD: usize = 39;
 
-    /// What the first seals that succeeded were given and gave, so that a proof can follow them:
-    /// the key, the nonce, the associated data at the places a proof reads it, the first bytes of
-    /// the plaintext and of what was written, and the tag. Kept in words of eight bytes: a store
-    /// per byte multiplies the proofs' work.
+    /// What the last seal that succeeded in each place was given and gave, so that a proof can
+    /// follow it: the key, the nonce, the first bytes of the associated data and its length, the
+    /// first and the last bytes of the plaintext, the first bytes of what was written, and the tag.
+    /// Kept in words of eight bytes: a store per byte multiplies the proofs' work.
     static SEALED: [AtomicBool; KEPT] = [const { AtomicBool::new(false) }; KEPT];
     static KEYS: [[AtomicU64; 4]; KEPT] = [const { [const { AtomicU64::new(0) }; 4] }; KEPT];
     static NONCES: [[AtomicU64; 2]; KEPT] = [const { [const { AtomicU64::new(0) }; 2] }; KEPT];
-    static AADS: [[AtomicU64; 3]; KEPT] = [const { [const { AtomicU64::new(0) }; 3] }; KEPT];
+    static AADS: [[AtomicU64; 5]; KEPT] = [const { [const { AtomicU64::new(0) }; 5] }; KEPT];
     static AAD_LENS: [AtomicUsize; KEPT] = [const { AtomicUsize::new(0) }; KEPT];
     static GIVEN: [[AtomicU64; 4]; KEPT] = [const { [const { AtomicU64::new(0) }; 4] }; KEPT];
+    static ENDS: [[AtomicU64; 2]; KEPT] = [const { [const { AtomicU64::new(0) }; 2] }; KEPT];
     static WRITTEN: [[AtomicU64; 4]; KEPT] = [const { [const { AtomicU64::new(0) }; 4] }; KEPT];
     static TAGS: [[AtomicU64; 2]; KEPT] = [const { [const { AtomicU64::new(0) }; 2] }; KEPT];
 
     /// What a seal was given and gave: the key, the nonce, the first bytes of the associated data,
-    /// zero past its end, and its length, the first bytes of the plaintext and of what was written,
-    /// and the tag.
+    /// zero past its end, and its length, the first and the last bytes of the plaintext, the first
+    /// bytes of what was written, and the tag.
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub(crate) struct Sealed {
         pub(crate) key: [u8; KEY_LEN],
@@ -241,6 +250,7 @@ pub(crate) mod model {
         pub(crate) aad: [u8; AAD_HEAD],
         pub(crate) aad_len: usize,
         pub(crate) given: [u8; HEAD],
+        pub(crate) given_end: [u8; TAG_LEN],
         pub(crate) written: [u8; HEAD],
         pub(crate) tag: [u8; TAG_LEN],
     }
@@ -250,6 +260,14 @@ pub(crate) mod model {
         buffer.first_chunk::<HEAD>().copied().unwrap_or([0; HEAD])
     }
 
+    /// The last bytes of `buffer`, as many as a tag, or zeros for a shorter one.
+    pub(super) fn end<const N: usize>(buffer: &[u8; N]) -> [u8; TAG_LEN] {
+        buffer
+            .last_chunk::<TAG_LEN>()
+            .copied()
+            .unwrap_or([0; TAG_LEN])
+    }
+
     /// Keeps what a seal of `N` bytes that succeeded was given and gave, in the place its length
     /// takes: the place is known when the proof is built, so that the model reads and writes no
     /// place the proof has to work out.
@@ -257,7 +275,7 @@ pub(crate) mod model {
         key: &[u8; KEY_LEN],
         nonce: &[u8; NONCE_LEN],
         aad: &[u8],
-        (given, written): (&[u8; HEAD], &[u8; HEAD]),
+        (given, given_end, written): (&[u8; HEAD], &[u8; TAG_LEN], &[u8; HEAD]),
         tag: &[u8; TAG_LEN],
     ) {
         let at = if N == PLAINTEXT_LEN || N == 0 {
@@ -273,6 +291,7 @@ pub(crate) mod model {
             Some(aads),
             Some(length),
             Some(givens),
+            Some(ends),
             Some(writtens),
             Some(tags),
             Some(sealed),
@@ -282,6 +301,7 @@ pub(crate) mod model {
             AADS.get(at),
             AAD_LENS.get(at),
             GIVEN.get(at),
+            ENDS.get(at),
             WRITTEN.get(at),
             TAGS.get(at),
             SEALED.get(at),
@@ -291,6 +311,7 @@ pub(crate) mod model {
             keep(aads, &aad_head);
             length.store(aad.len(), Ordering::Relaxed);
             keep(givens, given);
+            keep(ends, given_end);
             keep(writtens, written);
             keep(tags, tag);
             sealed.store(true, Ordering::Relaxed);
@@ -314,14 +335,15 @@ pub(crate) mod model {
                 .get(at)
                 .map_or(0, |length| length.load(Ordering::Relaxed)),
             given: GIVEN.get(at).map_or([0; HEAD], kept),
+            given_end: ENDS.get(at).map_or([0; TAG_LEN], kept),
             written: WRITTEN.get(at).map_or([0; HEAD], kept),
             tag: TAGS.get(at).map_or([0; TAG_LEN], kept),
         }
     }
 
-    /// Keeps `bytes`, at most 32, in `words`, least significant byte first.
+    /// Keeps `bytes`, at most 40, in `words`, least significant byte first.
     fn keep<const N: usize, const W: usize>(words: &[AtomicU64; W], bytes: &[u8; N]) {
-        let mut padded = [0; 32];
+        let mut padded = [0; 40];
         if let Some(to) = padded.get_mut(..N) {
             to.copy_from_slice(bytes);
         }
@@ -334,7 +356,7 @@ pub(crate) mod model {
 
     /// The `N` bytes kept in `words`.
     fn kept<const N: usize, const W: usize>(words: &[AtomicU64; W]) -> [u8; N] {
-        let mut padded = [0; 32];
+        let mut padded = [0; 40];
         for (word, chunk) in words.iter().zip(padded.chunks_exact_mut(8)) {
             chunk.copy_from_slice(&word.load(Ordering::Relaxed).to_le_bytes());
         }

@@ -373,20 +373,6 @@ where
     open
 }
 
-/// `seal`, as the stand-in for the cipher it is in the proofs.
-#[cfg(kani)]
-fn sealing<F, const N: usize>(seal: F) -> F
-where
-    F: FnMut(
-        &[u8; CIPHER_KEY_LEN],
-        &[u8; NONCE_LEN],
-        &[u8],
-        &mut [u8; N],
-    ) -> Result<[u8; TAG_LEN], SealFailed>,
-{
-    seal
-}
-
 /// Where a wrap writes: the record of a set under a stored key for wrapping, the lock record of a
 /// stored key, or a record of an export.
 enum Out<'r> {
@@ -7051,8 +7037,21 @@ mod proofs {
         EntropyError, Epoch, Erasure, Error, Handle, Key, KeyId, KeyLength, Kind, LAYER_LEN,
         LOCK_RECORD_LEN, MEMBERS, NONCE_LEN, Occupancy, Out, PLAINTEXT_LEN, Position, Purpose,
         RECORD_LEN, Rejected, Root, RootFailed, SealFailed, Slot, Slots, Stages, Status, TAG_LEN,
-        opening, sealing,
+        opening,
     };
+
+    /// `seal`, as the stand-in for the cipher it is in the proofs.
+    fn sealing<F, const N: usize>(seal: F) -> F
+    where
+        F: FnMut(
+            &[u8; CIPHER_KEY_LEN],
+            &[u8; NONCE_LEN],
+            &[u8],
+            &mut [u8; N],
+        ) -> Result<[u8; TAG_LEN], SealFailed>,
+    {
+        seal
+    }
     use crate::derive::{
         Branch,
         model::{any_failed, failed, id_bytes, id_from_bytes},
@@ -9546,12 +9545,15 @@ mod proofs {
                     && Bound::kept(&inner) == bound
                     && inner.given[1] == child.purpose as u8
                     && inner.given[3..19] == wrapping.ids.0
+                    && inner.given[19..27]
+                        == if kind == Kind::Record { named } else { 0 }.to_le_bytes()
                     && if lock {
                         layer.key == expected_layer_key(&salt)
                             && Bound::kept(&layer) == Bound::to(context)
                             && layer.given[..8] == named.to_le_bytes()
                             && layer.given[8..20] == inner.nonce
                             && layer.given[20..32] == inner.written[..12]
+                            && layer.given_end == inner.tag
                             && record[..NONCE_LEN] == layer.nonce
                             && record[NONCE_LEN..NONCE_LEN + 32] == layer.written
                             && record[LOCK_RECORD_LEN - TAG_LEN..] == layer.tag
@@ -9744,6 +9746,7 @@ mod proofs {
                     && Bound::kept(&carried) == Bound::to(context)
                     && carried.given[..8] == number.wrapping_add(1).to_le_bytes()
                     && carried.given[8..] == layer.written[8..32]
+                    && carried.given_end[..] == layer.written[LAYER_LEN - TAG_LEN..]
                     && to[..NONCE_LEN] == carried.nonce
                     && to[NONCE_LEN..NONCE_LEN + 32] == carried.written
                     && to[LOCK_RECORD_LEN - TAG_LEN..] == carried.tag),
@@ -9843,29 +9846,41 @@ mod proofs {
         kani::cover!(result == Err(Error::NoFreeSlot), "a load needs a free slot");
     }
 
-    /// The associated data a cipher was given, read at fixed places: the label and the two bytes
-    /// after it, the length, and the two bytes after those.
+    /// The associated data a cipher was given, as far as a context of up to two bytes reaches: its
+    /// first bytes, zero past its end, and its length.
     #[derive(Clone, Copy, PartialEq, Eq)]
     struct Bound {
-        head: [u8; 21],
+        bytes: [u8; seal::model::AAD_HEAD],
         length: usize,
-        tail: [Option<u8>; 2],
     }
 
     impl Bound {
         const fn none() -> Self {
             Self {
-                head: [0; 21],
+                bytes: [0; seal::model::AAD_HEAD],
                 length: 0,
-                tail: [None; 2],
             }
         }
 
         fn of(aad: &[u8]) -> Self {
             Self {
-                head: aad.first_chunk::<21>().copied().unwrap_or([0; 21]),
+                bytes: core::array::from_fn(|at| aad.get(at).copied().unwrap_or(0)),
                 length: aad.len(),
-                tail: [aad.get(21).copied(), aad.get(22).copied()],
+            }
+        }
+
+        /// The associated data of a record bound to `context`, of up to two bytes, written out from
+        /// the layout: the label, the version, the length of the context, and the context.
+        fn to(context: &[u8]) -> Self {
+            let mut bytes = [0; seal::model::AAD_HEAD];
+            bytes[..19].copy_from_slice(b"lethewis key record");
+            bytes[19] = 1;
+            bytes[20] = u8::try_from(context.len()).unwrap_or(0);
+            bytes[21] = context.first().copied().unwrap_or(0);
+            bytes[22] = context.get(1).copied().unwrap_or(0);
+            Self {
+                bytes,
+                length: context.len().wrapping_add(21),
             }
         }
 
@@ -9873,42 +9888,24 @@ mod proofs {
         /// of up to two bytes, and chained to `chain`, written out from the layout: the label, the
         /// version, the length of the context, the chain, and the context.
         fn chained(label: &[u8; 19], chain: &[u8; TAG_LEN], context: &[u8]) -> Self {
-            let mut head = [0; 21];
-            head[..19].copy_from_slice(label);
-            head[19] = 1;
-            head[20] = u8::try_from(context.len()).unwrap_or(0);
+            let mut bytes = [0; seal::model::AAD_HEAD];
+            bytes[..19].copy_from_slice(label);
+            bytes[19] = 1;
+            bytes[20] = u8::try_from(context.len()).unwrap_or(0);
+            bytes[21..37].copy_from_slice(chain);
+            bytes[37] = context.first().copied().unwrap_or(0);
+            bytes[38] = context.get(1).copied().unwrap_or(0);
             Self {
-                head,
+                bytes,
                 length: context.len().wrapping_add(21 + TAG_LEN),
-                tail: [Some(chain[0]), Some(chain[1])],
             }
         }
 
         /// The associated data a seal of the model of the cipher was given, as the model keeps it.
         fn kept(sealed: &seal::model::Sealed) -> Self {
-            let mut head = [0; 21];
-            head.copy_from_slice(&sealed.aad[..21]);
             Self {
-                head,
+                bytes: sealed.aad,
                 length: sealed.aad_len,
-                tail: [
-                    (sealed.aad_len > 21).then_some(sealed.aad[21]),
-                    (sealed.aad_len > 22).then_some(sealed.aad[22]),
-                ],
-            }
-        }
-
-        /// The associated data of a record bound to `context`, of up to two bytes, written out from
-        /// the layout: the label, the version, the length of the context, and the context.
-        fn to(context: &[u8]) -> Self {
-            let mut head = [0; 21];
-            head[..19].copy_from_slice(b"lethewis key record");
-            head[19] = 1;
-            head[20] = u8::try_from(context.len()).unwrap_or(0);
-            Self {
-                head,
-                length: context.len().wrapping_add(21),
-                tail: [context.first().copied(), context.get(1).copied()],
             }
         }
     }
@@ -10904,6 +10901,14 @@ mod proofs {
             !seal::model::any_seal_failed() || result == Err(Error::CipherFailed),
             "a creation fails with CipherFailed when a seal fails",
         );
+        kani::assert(
+            result != Err(Error::CipherFailed)
+                || seal::model::any_seal_failed()
+                || !xwing_answered()
+                || (paired && !agreed),
+            "a creation fails with CipherFailed only when a seal fails, X-Wing gives a wrong answer \
+             or the new key pair does not agree with itself",
+        );
         let (inner, layer) = (
             seal::model::sealed(seal::model::RECORD),
             seal::model::sealed(seal::model::LAYER),
@@ -10926,6 +10931,7 @@ mod proofs {
                         == expected_archive_layer_key(&stored.keys.0, stored.lengths[0], &writing)
                     && Bound::kept(&layer) == Bound::to(context)
                     && layer.given[..8] == written_in.to_le_bytes()
+                    && layer.given_end == inner.tag
                     && record[..NONCE_LEN] == layer.nonce
                     && record[NONCE_LEN..NONCE_LEN + 32] == layer.written
                     && record[ARCHIVE_KEY_RECORD_LEN - TAG_LEN..] == layer.tag),
@@ -11071,8 +11077,8 @@ mod proofs {
              its own nonce and bound to its context",
         );
         kani::assert(
-            !seal::model::any_seal_failed() || result == Err(Error::CipherFailed),
-            "a carry of an archive key fails with CipherFailed when its seal fails",
+            (result == Err(Error::CipherFailed)) == seal::model::any_seal_failed(),
+            "a carry of an archive key fails with CipherFailed exactly when its seal fails",
         );
         let next_stored = snapshot_at(&before, next_profile.index);
         let carried = seal::model::sealed(seal::model::LAYER);
@@ -11088,6 +11094,7 @@ mod proofs {
                     && Bound::kept(&carried) == Bound::to(context)
                     && carried.given[..8] == number.wrapping_add(1).to_le_bytes()
                     && carried.given[8..] == layer.written[8..32]
+                    && carried.given_end[..] == layer.written[ARCHIVE_LAYER_LEN - TAG_LEN..]
                     && to[..NONCE_LEN] == carried.nonce
                     && to[NONCE_LEN..NONCE_LEN + 32] == carried.written
                     && to[ARCHIVE_KEY_RECORD_LEN - TAG_LEN..] == carried.tag),
