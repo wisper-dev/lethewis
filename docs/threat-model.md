@@ -81,7 +81,8 @@ on flash from an earlier epoch no longer opens, even with the password; the comm
 surely it was erased.
 
 A lock record is carried into a new epoch without the key from a secret that opens it, and one not
-carried opens no more once the old root is erased: so a way in is revoked.
+carried opens no more once the old root is erased: so a way in is revoked. The record of an archive
+key is carried with the profile's stored keys, without the stored key of the archive.
 
 **Intended.** A platform layer whose root the hardware erases.
 
@@ -110,9 +111,18 @@ Each key wraps only at its level. A key from a secret wraps only stored keys, fo
 the archive, in lock records, and no call wraps a key from a secret.
 
 A stored key for wrapping wraps only keys for external data, for transfers and of chats for their
-archives, in plain records; a stored key of the archive wraps no set. A key for transfers only
-exports keys for external data. No key of the archive is imported or derived from a password or
-words.
+archives, in plain records; a stored key of the archive wraps only the seed of an archive key. A key
+for transfers only exports keys for external data. No key of the archive is imported or derived from
+a password or words.
+
+An archive key is a key of X-Wing, the hybrid of ML-KEM-768 and X25519, version 11 of its
+Internet-Draft. The inner layer of its record holds the seed under a stored key of the archive, in
+any epoch. The outer one holds that layer, the identifier and the public key under the profile's
+stored key and the epoch's key.
+
+A load refuses a record whose identifier or public key the seed does not give: whoever holds the
+key of the epoch and the profile's stored key cannot make the archive key load with a public key of
+their own. Before each creation and load, X-Wing must give the known answer of its draft.
 
 The records of an export open only in the order they were written, each bound to the tag of the one
 before, and its end is bound to the last. Until that end is received, a set that came in the export
@@ -170,6 +180,10 @@ out by the instructions, the keystream and what the record decrypts to.
 Tests read the stack back the same way after a lock, an unlock, a refused unlock and a carry, for
 both layers of the record and the keys derived for them. They do so after an export, a receipt, a
 refused receipt and both ends too, for the key for transfers and the key derived from it.
+
+After a creation, a load and a carry of an archive key the stack is wiped 96 KiB deep, or 224 KiB
+without optimisation: at least twice what each uses. Tests read it back for the seed, what X-Wing
+expands it to and both stored keys; the inner values of ML-KEM-768 and X25519 are not looked for.
 
 The wipe on release and on creating the slots, and the refusal of a released or foreign handle, are
 proven for two slots; the statements and their limits are in [proofs.md](proofs.md).
@@ -286,6 +300,9 @@ loading a key and wrapping, unwrapping, exporting and receiving a set where Linu
 Apple system reports the feature; elsewhere, and where the system or a virtual machine hides it, the
 mode stays off.
 
+The mode is on around creating, loading and carrying an archive key as well. ML-KEM-768 and X25519
+run on portable code whose timing this library does not check.
+
 On Apple M1 and M2 the mode does not stop the data prefetcher from reading memory by its contents;
 on M3 it does. On Cortex-M3 the portable multiplication varies with its operands, and WebAssembly
 makes no promise.
@@ -321,6 +338,8 @@ switches the mode on around reading and writing words as well.
 ## Known gaps
 
 - No external audit has been performed.
+- X-Wing is specified by an Internet-Draft, not a standard, and the ML-KEM code it runs on has had no
+  independent audit.
 - Deniable storage is outside this library, which supplies keys to it and makes no claim about it.
 - Reproducible builds for native code inside an Android application: no published recipe was found.
   A CI job measures reproducibility of the Rust build.

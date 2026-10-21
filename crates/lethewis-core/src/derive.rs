@@ -32,6 +32,9 @@ const EPOCH_LAYER: &[u8; 11] = b"epoch layer";
 const COMBINED: &[u8; 12] = b"combined key";
 const CHALLENGE: &[u8; 9] = b"challenge";
 const EXPORT_KEY: &[u8; 10] = b"export key";
+const ARCHIVE_KEY: &[u8; 11] = b"archive key";
+const ARCHIVE_LAYER: &[u8; 13] = b"archive layer";
+const ARCHIVE_SEED: &[u8; 12] = b"archive seed";
 /// The count of a draw, after the bytes the source gave, in the material a hedge extracts.
 const COUNT_LEN: usize = 8;
 /// How many bytes twelve words stand for.
@@ -76,6 +79,14 @@ pub(crate) enum Branch {
     /// The key that encrypts the records of an export, and the record that ends one, under a key
     /// for transfers.
     ExportKey,
+    /// The key that encrypts the seed of an archive key under a stored key of the archive, whatever
+    /// the epoch.
+    ArchiveKey,
+    /// The key that encrypts the outer layer of the record of an archive key, under a stored key for
+    /// wrapping, in an epoch.
+    ArchiveLayer,
+    /// The seed of an archive key, from hedged bytes and a stored key of the archive.
+    ArchiveSeed,
 }
 
 /// The purpose each branch is derived for.
@@ -86,8 +97,11 @@ pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
         | Branch::FromWords
         | Branch::LockKey
         | Branch::EpochLayer
-        | Branch::Combined => Some(Purpose::Wrap),
+        | Branch::Combined
+        | Branch::ArchiveLayer => Some(Purpose::Wrap),
         Branch::ExportKey => Some(Purpose::Transfer),
+        Branch::ArchiveKey => Some(Purpose::ArchiveWrap),
+        Branch::ArchiveSeed => Some(Purpose::Archive),
         Branch::KeyId
         | Branch::HedgeKey
         | Branch::HedgeWords
@@ -243,6 +257,47 @@ pub(crate) fn derive_layer_key(
     out: &mut [u8; CIPHER_KEY_LEN],
 ) -> Result<(), DerivationFailed> {
     derive(epoch, SALT, Some(Purpose::Wrap), Branch::EpochLayer, out)
+}
+
+/// Derives the key that encrypts the seeds the stored key of the archive `key` wraps, in any epoch.
+pub(crate) fn derive_archive_key(
+    key: &Key,
+    out: &mut [u8; CIPHER_KEY_LEN],
+) -> Result<(), DerivationFailed> {
+    derive(
+        key,
+        SALT,
+        Some(Purpose::ArchiveWrap),
+        Branch::ArchiveKey,
+        out,
+    )
+}
+
+/// Derives the key that encrypts the outer layer of the records of archive keys under the stored
+/// key for wrapping `key` in the epoch whose key is `epoch`.
+pub(crate) fn derive_archive_layer_key(
+    key: &Key,
+    epoch: &Key,
+    out: &mut [u8; CIPHER_KEY_LEN],
+) -> Result<(), DerivationFailed> {
+    let salt = epoch.material().ok_or(DerivationFailed)?;
+    derive(key, salt, Some(Purpose::Wrap), Branch::ArchiveLayer, out)
+}
+
+/// Derives the seed of an archive key from `hedged`, bytes of the platform's source hedged with the
+/// key of the epoch, as the salt and the stored key of the archive `key`.
+pub(crate) fn derive_archive_seed(
+    key: &Key,
+    hedged: &[u8; 32],
+    out: &mut [u8; 32],
+) -> Result<(), DerivationFailed> {
+    derive(
+        key,
+        hedged,
+        Some(Purpose::Archive),
+        Branch::ArchiveSeed,
+        out,
+    )
 }
 
 /// Fills `out` with the key for `purpose` that the bytes twelve words stand for, `entropy`, derive:
@@ -705,7 +760,10 @@ pub(crate) mod stack {
             | Branch::EpochLayer
             | Branch::Combined
             | Branch::Challenge
-            | Branch::ExportKey => 32,
+            | Branch::ExportKey
+            | Branch::ArchiveKey
+            | Branch::ArchiveLayer
+            | Branch::ArchiveSeed => 32,
         };
         let length = u8::try_from(key.len()).unwrap();
         let (label, used) = label(purpose, length, branch, out_len).unwrap();
@@ -1262,6 +1320,9 @@ fn label(
         Branch::Combined => joined(head, COMBINED),
         Branch::Challenge => joined(head, CHALLENGE),
         Branch::ExportKey => joined(head, EXPORT_KEY),
+        Branch::ArchiveKey => joined(head, ARCHIVE_KEY),
+        Branch::ArchiveLayer => joined(head, ARCHIVE_LAYER),
+        Branch::ArchiveSeed => joined(head, ARCHIVE_SEED),
     }
 }
 
@@ -1293,9 +1354,10 @@ mod tests {
     use sha2::Sha256;
 
     use super::{
-        Branch, CHALLENGE, COMBINED, DerivationFailed, EPOCH_LAYER, EXPORT_KEY, FROM_WORDS,
-        HEDGE_KEY, HEDGE_NONCE, HEDGE_WORDS, Hedged, KEY_ID, KeyId, LOCK_KEY, SALT, WRAP_KEY,
-        derive, derive_from_words, derive_key_id, hedge, label, purpose_of,
+        ARCHIVE_KEY, ARCHIVE_LAYER, ARCHIVE_SEED, Branch, CHALLENGE, COMBINED, DerivationFailed,
+        EPOCH_LAYER, EXPORT_KEY, FROM_WORDS, HEDGE_KEY, HEDGE_NONCE, HEDGE_WORDS, Hedged, KEY_ID,
+        KeyId, LOCK_KEY, SALT, WRAP_KEY, derive, derive_from_words, derive_key_id, hedge, label,
+        purpose_of,
     };
     use crate::entropy::{Entropy, EntropyError};
     use crate::key::{Key, KeyLength};
@@ -1678,6 +1740,9 @@ mod tests {
             Branch::Combined,
             Branch::Challenge,
             Branch::ExportKey,
+            Branch::ArchiveKey,
+            Branch::ArchiveLayer,
+            Branch::ArchiveSeed,
         ] {
             let (_, used) = label(purpose_of(branch), 64, branch, 32).unwrap();
             let name = match branch {
@@ -1692,6 +1757,9 @@ mod tests {
                 Branch::Combined => COMBINED.len(),
                 Branch::Challenge => CHALLENGE.len(),
                 Branch::ExportKey => EXPORT_KEY.len(),
+                Branch::ArchiveKey => ARCHIVE_KEY.len(),
+                Branch::ArchiveLayer => ARCHIVE_LAYER.len(),
+                Branch::ArchiveSeed => ARCHIVE_SEED.len(),
             };
             assert_eq!(used, 14 + name);
         }
@@ -1742,6 +1810,28 @@ pub(crate) mod proofs {
             fold(SALT, &key[..length.bytes()], &label[..used], &mut id);
         });
         id
+    }
+
+    /// The key the model of HKDF gives the outer layer of the record of an archive key from the
+    /// first `length` bytes of the stored key for wrapping `key` in the epoch whose key is `epoch`,
+    /// worked out in the same way.
+    pub(crate) fn expected_archive_layer_key(
+        key: &[u8; 64],
+        length: KeyLength,
+        epoch: &[u8; 32],
+    ) -> [u8; CIPHER_KEY_LEN] {
+        let mut out = [0; CIPHER_KEY_LEN];
+        let length_byte = length_to_byte(length);
+        let _ = label(
+            Some(Purpose::Wrap),
+            length_byte,
+            Branch::ArchiveLayer,
+            CIPHER_KEY_LEN,
+        )
+        .map(|(label, used)| {
+            fold(epoch, &key[..length.bytes()], &label[..used], &mut out);
+        });
+        out
     }
 
     /// The key the model of HKDF gives a record's cipher from the first `length` bytes of the
@@ -1824,6 +1914,22 @@ pub(crate) mod proofs {
         out
     }
 
+    /// The key the model of HKDF gives the inner layer of the record of an archive key from the
+    /// stored key of the archive `key`, worked out in the same way.
+    pub(crate) fn expected_archive_key(key: &[u8; 32]) -> [u8; CIPHER_KEY_LEN] {
+        let mut out = [0; CIPHER_KEY_LEN];
+        let _ = label(
+            Some(Purpose::ArchiveWrap),
+            32,
+            Branch::ArchiveKey,
+            CIPHER_KEY_LEN,
+        )
+        .map(|(label, used)| {
+            fold(SALT, key, &label[..used], &mut out);
+        });
+        out
+    }
+
     /// The key the model of HKDF gives the records of an export, and the record that ends one,
     /// from the key for transfers `key`, worked out in the same way.
     pub(crate) fn expected_export_key(key: &[u8; 32]) -> [u8; CIPHER_KEY_LEN] {
@@ -1866,7 +1972,10 @@ pub(crate) mod proofs {
             7 => Branch::EpochLayer,
             8 => Branch::Combined,
             9 => Branch::Challenge,
-            _ => Branch::ExportKey,
+            10 => Branch::ExportKey,
+            11 => Branch::ArchiveKey,
+            12 => Branch::ArchiveLayer,
+            _ => Branch::ArchiveSeed,
         }
     }
 

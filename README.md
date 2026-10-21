@@ -62,9 +62,9 @@ password and the hardware secret at each unlock, and neither alone is enough.
   way to the chip can test guesses at the password without the chip. Wiping it after use and
   passing it only to the chip is the caller's.
 - **Wiping a value from memory does not reach every copy.** Copies from a move, a reallocation, a
-  CPU register, swap or a crash dump are outside what this library clears. Each
-  load, addition, derivation, reveal, wrap, unwrap, lock, unlock, carry, combination, challenge,
-  export and receipt wipes the stack it used, as measured on x86-64 and aarch64 Linux only.
+  register, swap or a crash dump are beyond this library. Each load, addition,
+  derivation, reveal, wrap, unwrap, lock, unlock, carry, combination, challenge, export, receipt
+  and call on an archive key wipes the stack it used, as measured on x86-64 and aarch64 Linux.
 - **The stack a call needs is not measured on microcontrollers.** On a target such as Cortex-M a
   call needs at least the depth of the wipe after it, which its documentation states, and an
   overflow of an unguarded stack corrupts memory silently. A derivation from a password needs at

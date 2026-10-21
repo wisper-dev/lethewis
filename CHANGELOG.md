@@ -214,8 +214,19 @@ Nothing is published while the version is below 0.1.0.
   compatible versions, without default features and with their `zeroize` features and the `hazmat`
   feature of `ml-kem`, for X-Wing, the hybrid of ML-KEM-768 and X25519.
 - Three purposes of the archive: `Purpose::Archive`, the seed of an archive key;
-  `Purpose::ArchiveWrap`, a stored key of the archive, kept only in lock records, that wraps no
-  set; and `Purpose::ArchiveSeal`, a key of a chat for its archive, under a stored key for wrapping.
-  None of them is imported or derived from a password or words, and the seed is not generated.
+  `Purpose::ArchiveWrap`, a stored key of the archive, kept only in lock records, that wraps only
+  seeds; and `Purpose::ArchiveSeal`, a key of a chat for its archive, under a stored key for
+  wrapping. None is imported or derived from a password or words; no seed is generated.
+- Archive keys of X-Wing. `Slots::create_archive_key` writes the record of a new one,
+  `ARCHIVE_KEY_RECORD_LEN` bytes, 1529: its seed under a stored key of the archive, and that layer
+  with its identifier and public key under the profile's stored key and the key of the epoch.
+- `Slots::load_archive_key` loads an archive key and refuses a public key its seed does not give,
+  with `Error::PublicKeyMismatch`. `Slots::carry_archive_key` carries its record into the next epoch
+  without the stored key of the archive.
+- X-Wing gives the known answer of its draft before each creation and load of an archive key. The
+  stack is wiped after each call on an archive key: 96 KiB, or 224 KiB; they need 100 KiB of stack,
+  or 232 KiB.
+- Proofs with Kani 0.68.0 for the creation, the load and the carry of an archive key, and tests
+  against records computed by an independent implementation, the public key of X-Wing included.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

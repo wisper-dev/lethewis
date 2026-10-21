@@ -4,8 +4,8 @@
 //! X-Wing, the hybrid of ML-KEM-768 and X25519, as version 11 of its Internet-Draft specifies.
 
 #![cfg_attr(
-    not(all(test, any(target_os = "linux", target_os = "android"))),
-    expect(dead_code, reason = "used by the archive key")
+    kani,
+    expect(dead_code, reason = "no proof encapsulates or decapsulates")
 )]
 
 #[cfg(not(kani))]
@@ -37,8 +37,8 @@ const EXPANDED_LEN: usize = 96;
 #[cfg(not(kani))]
 const LABEL: &[u8; 6] = b"\\.//^\\";
 
-/// How many bytes of stack an operation with X-Wing is followed by a wipe of: at least twice what it
-/// uses, as a test measures in each build.
+/// How many bytes of stack an operation with X-Wing or on an archive key is followed by a wipe of: at
+/// least twice what it uses, as tests measure in each build.
 #[cfg(all(not(kani), not(lethewis_unoptimised)))]
 pub(crate) const STACK_WIPE: usize = 98_304;
 #[cfg(all(not(kani), lethewis_unoptimised))]
@@ -423,6 +423,16 @@ pub(crate) const KNOWN: Known = Known {
     ],
 };
 
+/// [`KNOWN`] with its shared secret changed, which X-Wing does not give.
+#[cfg(test)]
+pub(crate) fn wrong_known() -> Known {
+    let mut wrong = Known { ..KNOWN };
+    if let Some(first) = wrong.shared.first_mut() {
+        *first ^= 1;
+    }
+    wrong
+}
+
 /// Whether X-Wing gives `known`, which is [`KNOWN`] but in tests: the public key of its seed, the
 /// ciphertext and shared secret of its randomness, and the shared secret of that ciphertext.
 #[cfg(not(kani))]
@@ -438,6 +448,47 @@ pub(crate) fn answers(known: &Known) -> bool {
         && ciphertext == known.ciphertext
         && shared == known.shared
         && opened == known.shared
+}
+
+#[cfg(kani)]
+pub(crate) use model::{KNOWN, Known, answers, public_key};
+
+/// What stands in for X-Wing under Kani.
+#[cfg(kani)]
+pub(crate) mod model {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{PUBLIC_LEN, SEED_LEN};
+
+    /// Whether the last self-test was given the known answer, so that a proof can tell a refusal
+    /// of X-Wing from one the code makes up.
+    static ANSWERED: AtomicBool = AtomicBool::new(false);
+
+    /// The known answer, which the model does not read.
+    pub(crate) struct Known;
+
+    pub(crate) const KNOWN: Known = Known;
+
+    /// X-Wing is beyond Kani. The public key of a seed is the seed and then zeros: one seed gives
+    /// one public key, and two seeds two.
+    pub(crate) fn public_key(seed: &[u8; SEED_LEN], public: &mut [u8; PUBLIC_LEN]) {
+        *public = [0; PUBLIC_LEN];
+        if let Some(first) = public.first_chunk_mut::<SEED_LEN>() {
+            *first = *seed;
+        }
+    }
+
+    /// The known answer is given or not, at will, and the model records which.
+    pub(crate) fn answers(_: &Known) -> bool {
+        let answered = kani::any();
+        ANSWERED.store(answered, Ordering::Relaxed);
+        answered
+    }
+
+    /// Whether the last self-test was given the known answer.
+    pub(crate) fn answered() -> bool {
+        ANSWERED.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]

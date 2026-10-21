@@ -210,8 +210,18 @@ pub(crate) mod model {
         if kani::any() {
             Ok(kani::any())
         } else {
+            ENCRYPTION_FAILED.store(true, Ordering::Relaxed);
             Err(SealFailed)
         }
+    }
+
+    /// Whether any encryption has failed, so that a proof can tell a success from one the code
+    /// makes up after a failure.
+    static ENCRYPTION_FAILED: AtomicBool = AtomicBool::new(false);
+
+    /// Whether any encryption has failed.
+    pub(crate) fn any_encryption_failed() -> bool {
+        ENCRYPTION_FAILED.load(Ordering::Relaxed)
     }
 
     /// Decryption writes any bytes, then accepts or rejects at will and records which.
@@ -231,6 +241,27 @@ pub(crate) mod model {
     /// Whether the last decryption was rejected.
     pub(crate) fn rejected() -> bool {
         REJECTED.load(Ordering::Relaxed)
+    }
+
+    /// Whether `refuse` was asked to decrypt.
+    static ASKED: AtomicBool = AtomicBool::new(false);
+
+    /// Rejects every decryption and records that one was asked, so that a proof can show that the
+    /// code decrypts nothing.
+    pub(crate) fn refuse<const N: usize>(
+        _: &[u8; KEY_LEN],
+        _: &[u8; NONCE_LEN],
+        _: &[u8],
+        _: &mut [u8; N],
+        _: &[u8; TAG_LEN],
+    ) -> Result<(), Rejected> {
+        ASKED.store(true, Ordering::Relaxed);
+        Err(Rejected)
+    }
+
+    /// Whether `refuse` was asked to decrypt.
+    pub(crate) fn asked() -> bool {
+        ASKED.load(Ordering::Relaxed)
     }
 }
 

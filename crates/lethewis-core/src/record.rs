@@ -3,6 +3,7 @@
 
 use crate::key::{CAPACITY, KeyLength};
 use crate::seal::{NONCE_LEN, TAG_LEN};
+use crate::xwing::PUBLIC_LEN;
 
 /// The size of a record's plaintext in bytes: a key set.
 pub(crate) const PLAINTEXT_LEN: usize = 233;
@@ -18,6 +19,14 @@ pub(crate) const LAYER_LEN: usize = 8 + RECORD_LEN;
 /// The size of the record that ends an export in bytes: the nonce and the tag of an empty
 /// plaintext.
 pub const END_RECORD_LEN: usize = 28;
+/// The size of the record of an archive key in bytes: the nonce, the number of the epoch, the
+/// identifier and the public key of the archive key and the record of its seed, encrypted
+/// together, and the tag.
+pub const ARCHIVE_KEY_RECORD_LEN: usize = 1529;
+/// What the outer layer of the record of an archive key holds after the number of its epoch.
+pub(crate) const ARCHIVE_BODY_LEN: usize = ID_LEN + PUBLIC_LEN + RECORD_LEN;
+/// The size of what that outer layer encrypts.
+pub(crate) const ARCHIVE_LAYER_LEN: usize = 8 + ARCHIVE_BODY_LEN;
 /// The longest context a record can be bound to, in bytes.
 pub(crate) const MAX_CONTEXT: usize = 255;
 const LABEL_LEN: usize = 19;
@@ -37,6 +46,7 @@ pub(crate) const VERSION: u8 = 1;
 const _: () = assert!(NONCE_LEN + PLAINTEXT_LEN + TAG_LEN == RECORD_LEN);
 const _: () = assert!(NONCE_LEN + LAYER_LEN + TAG_LEN == LOCK_RECORD_LEN);
 const _: () = assert!(NONCE_LEN + TAG_LEN == END_RECORD_LEN);
+const _: () = assert!(NONCE_LEN + ARCHIVE_LAYER_LEN + TAG_LEN == ARCHIVE_KEY_RECORD_LEN);
 const _: () = assert!(AAD_HEAD + TAG_LEN + MAX_CONTEXT == AAD_CAPACITY);
 
 /// What a key may be used for: a class of operations together with its algorithm. It is given when

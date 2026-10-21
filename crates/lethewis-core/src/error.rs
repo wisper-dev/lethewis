@@ -22,7 +22,8 @@ pub enum Error {
     SameKey,
     /// The context is empty or longer than 255 bytes.
     InvalidContext,
-    /// The cipher gave a known input a wrong answer or refused the input, so nothing was written.
+    /// The cipher or X-Wing gave a known input a wrong answer, or the cipher refused the input, so
+    /// nothing was written.
     CipherFailed,
     /// A key of the set is held here already, or the set holds one key twice: a key is held in one
     /// place only.
@@ -65,9 +66,13 @@ pub enum Error {
     /// for transfers and keys of chats for their archives; a key for transfers exports only keys
     /// for external data.
     WrongLevel,
-    /// The lock record does not open in this epoch for this context: it was not locked or carried
-    /// into it, or it was changed.
+    /// The lock record or the record of an archive key does not open in this epoch for this
+    /// context: it was not written or carried into it, or it was changed.
     StaleRecord,
+    /// The record of an archive key holds an identifier or a public key other than the ones its seed
+    /// gives: the record was changed by someone who held the key of the epoch and the stored key it
+    /// is under.
+    PublicKeyMismatch,
     /// A transfer has not ended: the set came in an export whose end has not been received, and is
     /// neither revealed, wrapped, exported nor changed until then, or the key for transfers carries
     /// an export the other way.
@@ -118,6 +123,7 @@ impl fmt::Display for Error {
             Self::WrongLength => "wrong key length",
             Self::WrongLevel => "wrong level",
             Self::StaleRecord => "stale record",
+            Self::PublicKeyMismatch => "public key mismatch",
             Self::Unfinished => "unfinished transfer",
             Self::NoTransfer => "no transfer",
         })
