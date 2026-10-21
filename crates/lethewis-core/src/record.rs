@@ -15,13 +15,20 @@ pub const LOCK_RECORD_LEN: usize = 297;
 /// The size of what the outer layer of a lock record encrypts: the number of the epoch and the
 /// record.
 pub(crate) const LAYER_LEN: usize = 8 + RECORD_LEN;
+/// The size of the record that ends an export in bytes: the nonce and the tag of an empty
+/// plaintext.
+pub const END_RECORD_LEN: usize = 28;
 /// The longest context a record can be bound to, in bytes.
 pub(crate) const MAX_CONTEXT: usize = 255;
-const AAD_LABEL: &[u8; 19] = b"lethewis key record";
-/// The label, the version, the length of the context and the longest context.
-const AAD_CAPACITY: usize = 276;
+const LABEL_LEN: usize = 19;
+const AAD_LABEL: &[u8; LABEL_LEN] = b"lethewis key record";
+pub(crate) const EXPORT_LABEL: &[u8; LABEL_LEN] = b"lethewis key export";
+pub(crate) const END_LABEL: &[u8; LABEL_LEN] = b"lethewis export end";
+/// The label, the version, the length of the context, the tag a chain of records goes on from and
+/// the longest context.
+const AAD_CAPACITY: usize = 292;
 /// The label and the two bytes after it.
-const AAD_HEAD: usize = AAD_LABEL.len() + 2;
+const AAD_HEAD: usize = LABEL_LEN + 2;
 /// The size of a key identifier in bytes.
 pub(crate) const ID_LEN: usize = 16;
 /// The version of the record format, in the associated data and in the plaintext.
@@ -29,7 +36,8 @@ pub(crate) const VERSION: u8 = 1;
 
 const _: () = assert!(NONCE_LEN + PLAINTEXT_LEN + TAG_LEN == RECORD_LEN);
 const _: () = assert!(NONCE_LEN + LAYER_LEN + TAG_LEN == LOCK_RECORD_LEN);
-const _: () = assert!(AAD_LABEL.len() + 2 + MAX_CONTEXT == AAD_CAPACITY);
+const _: () = assert!(NONCE_LEN + TAG_LEN == END_RECORD_LEN);
+const _: () = assert!(AAD_HEAD + TAG_LEN + MAX_CONTEXT == AAD_CAPACITY);
 
 /// What a key may be used for: a class of operations together with its algorithm. It is given when
 /// the key is loaded and never changes.
@@ -39,8 +47,8 @@ const _: () = assert!(AAD_LABEL.len() + 2 + MAX_CONTEXT == AAD_CAPACITY);
 pub enum Purpose {
     /// A key of 32 or 64 bytes that wraps other keys. Its set holds this one key and never changes.
     /// A key from a secret, such as a password, wraps only stored keys for wrapping, which
-    /// [`Slots::lock`](crate::Slots::lock) keeps under it; a stored key wraps only keys for external
-    /// data. Leaves the library only wrapped, or as the words
+    /// [`Slots::lock`](crate::Slots::lock) keeps under it; a stored key wraps only keys for
+    /// external data and keys for transfers. Leaves the library only wrapped, or as the words
     /// [`Slots::generate_words`](crate::Slots::generate_words) writes once; a key from a secret
     /// gives out a [`Slots::challenge`](crate::Slots::challenge) derived from it.
     Wrap = 1,
@@ -48,6 +56,12 @@ pub enum Purpose {
     /// wraps no key, and leaves the library only as a record wrapped by another key or through
     /// [`Slots::reveal32`](crate::Slots::reveal32) naming this purpose.
     ExternalData = 2,
+    /// A key of 32 bytes that carries keys for external data to another device or into a backup:
+    /// it wraps them into records of an export, which open with this key alone, in any epoch. It
+    /// comes from a secret shared with the other device, or from words, and is stored under a
+    /// stored key for wrapping. Its set holds this one key and never changes; it leaves the library
+    /// only wrapped, or as the words a generation writes.
+    Transfer = 3,
 }
 
 impl Purpose {
@@ -55,6 +69,7 @@ impl Purpose {
         match byte {
             1 => Some(Self::Wrap),
             2 => Some(Self::ExternalData),
+            3 => Some(Self::Transfer),
             _ => None,
         }
     }
@@ -63,7 +78,7 @@ impl Purpose {
     pub(crate) const fn takes(self, length: KeyLength) -> bool {
         match self {
             Self::Wrap => true,
-            Self::ExternalData => matches!(length, KeyLength::Bytes32),
+            Self::ExternalData | Self::Transfer => matches!(length, KeyLength::Bytes32),
         }
     }
 }
@@ -140,6 +155,33 @@ impl AssociatedData {
         Ok(Self { bytes, len })
     }
 
+    /// The associated data of a record of an export, or of the record that ends one, as `label`
+    /// says: the label, the version, the length of the context, `chain`, which is the tag of the
+    /// record before or zero for the first, and the context.
+    pub(crate) fn chained(&self, label: &[u8; LABEL_LEN], chain: &[u8; TAG_LEN]) -> Self {
+        let mut bytes = [0; AAD_CAPACITY];
+        // The context moves with the zeros past it, so that every copy is of a fixed length.
+        if let Some((head, rest)) = bytes.split_first_chunk_mut::<AAD_HEAD>()
+            && let Some((tag, context)) = rest.split_first_chunk_mut::<TAG_LEN>()
+            && let Some((old_head, old_rest)) = self.bytes.split_first_chunk::<AAD_HEAD>()
+            && let (Some(context), Some(old_context)) = (
+                context.first_chunk_mut::<MAX_CONTEXT>(),
+                old_rest.first_chunk::<MAX_CONTEXT>(),
+            )
+        {
+            *head = *old_head;
+            if let Some((new_label, _)) = head.split_first_chunk_mut::<LABEL_LEN>() {
+                *new_label = *label;
+            }
+            *tag = *chain;
+            *context = *old_context;
+        }
+        Self {
+            bytes,
+            len: self.len.saturating_add(TAG_LEN),
+        }
+    }
+
     pub(crate) fn bytes(&self) -> &[u8] {
         self.bytes.split_at(self.len.min(AAD_CAPACITY)).0
     }
@@ -168,7 +210,9 @@ pub(crate) fn lanes(key: &[u8; CAPACITY]) -> Option<[u128; 4]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssociatedData, InvalidContext};
+    extern crate std;
+
+    use super::{AssociatedData, END_LABEL, EXPORT_LABEL, InvalidContext};
 
     #[test]
     fn associated_data_are_the_label_the_version_the_length_and_the_context() {
@@ -181,5 +225,24 @@ mod tests {
         assert!(associated.bytes().ends_with(&longest));
         assert_eq!(AssociatedData::new(b"").err(), Some(InvalidContext));
         assert_eq!(AssociatedData::new(&[7; 256]).err(), Some(InvalidContext));
+    }
+
+    #[test]
+    fn chained_associated_data_put_the_tag_before_the_context() {
+        let chain: [u8; 16] = core::array::from_fn(|at| u8::try_from(at).unwrap() | 0x80);
+        let chained = AssociatedData::new(b"ab")
+            .unwrap()
+            .chained(EXPORT_LABEL, &chain);
+        let mut expected = b"lethewis key export\x01\x02".to_vec();
+        expected.extend_from_slice(&chain);
+        expected.extend_from_slice(b"ab");
+        assert_eq!(chained.bytes(), &expected[..]);
+        let longest = [7; 255];
+        let chained = AssociatedData::new(&longest)
+            .unwrap()
+            .chained(END_LABEL, &[0; 16]);
+        assert_eq!(chained.bytes().len(), 19 + 2 + 16 + 255);
+        assert!(chained.bytes().starts_with(b"lethewis export end\x01\xff"));
+        assert!(chained.bytes().ends_with(&longest));
     }
 }

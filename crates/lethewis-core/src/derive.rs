@@ -31,6 +31,7 @@ const LOCK_KEY: &[u8; 8] = b"lock key";
 const EPOCH_LAYER: &[u8; 11] = b"epoch layer";
 const COMBINED: &[u8; 12] = b"combined key";
 const CHALLENGE: &[u8; 9] = b"challenge";
+const EXPORT_KEY: &[u8; 10] = b"export key";
 /// The count of a draw, after the bytes the source gave, in the material a hedge extracts.
 const COUNT_LEN: usize = 8;
 /// How many bytes twelve words stand for.
@@ -72,6 +73,9 @@ pub(crate) enum Branch {
     Combined,
     /// The challenge to a chip from a key from a secret.
     Challenge,
+    /// The key that encrypts the records of an export, and the record that ends one, under a key
+    /// for transfers.
+    ExportKey,
 }
 
 /// The purpose each branch is derived for.
@@ -83,6 +87,7 @@ pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
         | Branch::LockKey
         | Branch::EpochLayer
         | Branch::Combined => Some(Purpose::Wrap),
+        Branch::ExportKey => Some(Purpose::Transfer),
         Branch::KeyId
         | Branch::HedgeKey
         | Branch::HedgeWords
@@ -222,6 +227,15 @@ pub(crate) fn derive_challenge(key: &Key, out: &mut [u8; 32]) -> Result<(), Deri
     derive(key, SALT, None, Branch::Challenge, out)
 }
 
+/// Derives the key that encrypts the records of an export, and the record that ends one, under the
+/// key for transfers `key`, in any epoch.
+pub(crate) fn derive_export_key(
+    key: &Key,
+    out: &mut [u8; CIPHER_KEY_LEN],
+) -> Result<(), DerivationFailed> {
+    derive(key, SALT, Some(Purpose::Transfer), Branch::ExportKey, out)
+}
+
 /// Derives the key that encrypts the outer layer of the lock records of the epoch whose key is
 /// `epoch`.
 pub(crate) fn derive_layer_key(
@@ -231,16 +245,17 @@ pub(crate) fn derive_layer_key(
     derive(epoch, SALT, Some(Purpose::Wrap), Branch::EpochLayer, out)
 }
 
-/// Fills `out` with the wrapping key that the bytes twelve words stand for, `entropy`, derive:
-/// HKDF-Extract with the salt of identifiers, then HKDF-Expand with a label of its own. Then the
-/// stack the derivation used is wiped, whether it succeeded or not.
+/// Fills `out` with the key for `purpose` that the bytes twelve words stand for, `entropy`, derive:
+/// HKDF-Extract with the salt of identifiers, then HKDF-Expand with a label of its own, which names
+/// the purpose. Then the stack the derivation used is wiped, whether it succeeded or not.
 pub(crate) fn derive_from_words(
     entropy: &[u8; WORDS_ENTROPY_LEN],
+    purpose: Purpose,
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
     #[cfg(test)]
     timing::note();
-    let derived = words_on_stack(entropy, out);
+    let derived = words_on_stack(entropy, purpose, out);
     wipe_stack();
     derived
 }
@@ -249,10 +264,11 @@ pub(crate) fn derive_from_words(
 #[inline(never)]
 fn words_on_stack(
     entropy: &[u8; WORDS_ENTROPY_LEN],
+    purpose: Purpose,
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
     let length = u8::try_from(WORDS_ENTROPY_LEN).map_err(|_| DerivationFailed)?;
-    let (label, used) = label(Some(Purpose::Wrap), length, Branch::FromWords, out.len())?;
+    let (label, used) = label(Some(purpose), length, Branch::FromWords, out.len())?;
     let info = label.get(..used).ok_or(DerivationFailed)?;
     // The model of HKDF fills a 32-byte output from the first 32 bytes of the key.
     #[cfg(kani)]
@@ -668,6 +684,16 @@ pub(crate) mod stack {
     /// The same for a derivation of `branch` from the whole of `key`: a key of 16, 32 or 64 bytes,
     /// or the material of a hedge.
     pub(crate) fn secrets_of(key: &[u8], salt: &[u8], branch: Branch) -> Vec<Vec<u8>> {
+        secrets_for(key, salt, branch, purpose_of(branch))
+    }
+
+    /// The same for a derivation for `purpose`, or for none.
+    pub(crate) fn secrets_for(
+        key: &[u8],
+        salt: &[u8],
+        branch: Branch,
+        purpose: Option<Purpose>,
+    ) -> Vec<Vec<u8>> {
         // A hedge takes the bytes drawn and an 8-byte count, and gives as many bytes as were drawn.
         let out_len = match branch {
             Branch::KeyId | Branch::HedgeWords => 16,
@@ -678,10 +704,11 @@ pub(crate) mod stack {
             | Branch::LockKey
             | Branch::EpochLayer
             | Branch::Combined
-            | Branch::Challenge => 32,
+            | Branch::Challenge
+            | Branch::ExportKey => 32,
         };
         let length = u8::try_from(key.len()).unwrap();
-        let (label, used) = label(purpose_of(branch), length, branch, out_len).unwrap();
+        let (label, used) = label(purpose, length, branch, out_len).unwrap();
         let info = &label[..used];
         let (prk, expander) = Hkdf::<Sha256>::extract(Some(salt), key);
         let mut output = [0; 32];
@@ -1234,6 +1261,7 @@ fn label(
         Branch::EpochLayer => joined(head, EPOCH_LAYER),
         Branch::Combined => joined(head, COMBINED),
         Branch::Challenge => joined(head, CHALLENGE),
+        Branch::ExportKey => joined(head, EXPORT_KEY),
     }
 }
 
@@ -1265,9 +1293,9 @@ mod tests {
     use sha2::Sha256;
 
     use super::{
-        Branch, CHALLENGE, COMBINED, DerivationFailed, EPOCH_LAYER, FROM_WORDS, HEDGE_KEY,
-        HEDGE_NONCE, HEDGE_WORDS, Hedged, KEY_ID, KeyId, LOCK_KEY, SALT, WRAP_KEY, derive,
-        derive_from_words, derive_key_id, hedge, label, purpose_of,
+        Branch, CHALLENGE, COMBINED, DerivationFailed, EPOCH_LAYER, EXPORT_KEY, FROM_WORDS,
+        HEDGE_KEY, HEDGE_NONCE, HEDGE_WORDS, Hedged, KEY_ID, KeyId, LOCK_KEY, SALT, WRAP_KEY,
+        derive, derive_from_words, derive_key_id, hedge, label, purpose_of,
     };
     use crate::entropy::{Entropy, EntropyError};
     use crate::key::{Key, KeyLength};
@@ -1385,16 +1413,18 @@ mod tests {
     #[test]
     fn a_derivation_from_words_is_hkdf_with_the_salt_and_its_label() {
         let entropy: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).unwrap());
-        let mut ours = [0; 32];
-        derive_from_words(&entropy, &mut ours).unwrap();
-        let mut info = b"lethewis".to_vec();
-        info.extend_from_slice(&[1, 1, 16, 32, 0, 10]);
-        info.extend_from_slice(b"from words");
-        let mut direct = [0; 32];
-        Hkdf::<Sha256>::new(Some(b"lethewis derivation salt v1"), &entropy)
-            .expand(&info, &mut direct)
-            .unwrap();
-        assert_eq!(ours, direct);
+        for purpose in [Purpose::Wrap, Purpose::Transfer] {
+            let mut ours = [0; 32];
+            derive_from_words(&entropy, purpose, &mut ours).unwrap();
+            let mut info = b"lethewis".to_vec();
+            info.extend_from_slice(&[1, purpose as u8, 16, 32, 0, 10]);
+            info.extend_from_slice(b"from words");
+            let mut direct = [0; 32];
+            Hkdf::<Sha256>::new(Some(b"lethewis derivation salt v1"), &entropy)
+                .expand(&info, &mut direct)
+                .unwrap();
+            assert_eq!(ours, direct, "{purpose:?}");
+        }
     }
 
     /// Outputs computed by an independent implementation of HKDF-SHA-256 from the documented salt
@@ -1441,6 +1471,11 @@ mod tests {
                 KeyLength::Bytes32,
                 Branch::Challenge,
                 "0477373f3a3672a9f939bd9be82544eeccf23ab0b19b091e86b93ebb3ad348de",
+            ),
+            (
+                KeyLength::Bytes32,
+                Branch::ExportKey,
+                "6aaf2c5908b557f37b9d8f978b7e1562d1ed11fe0140b4b0f141fdd84cc631eb",
             ),
         ];
         for (length, branch, expected) in cases {
@@ -1642,6 +1677,7 @@ mod tests {
             Branch::EpochLayer,
             Branch::Combined,
             Branch::Challenge,
+            Branch::ExportKey,
         ] {
             let (_, used) = label(purpose_of(branch), 64, branch, 32).unwrap();
             let name = match branch {
@@ -1655,6 +1691,7 @@ mod tests {
                 Branch::EpochLayer => EPOCH_LAYER.len(),
                 Branch::Combined => COMBINED.len(),
                 Branch::Challenge => CHALLENGE.len(),
+                Branch::ExportKey => EXPORT_KEY.len(),
             };
             assert_eq!(used, 14 + name);
         }
@@ -1787,12 +1824,31 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The wrapping key the model of HKDF gives from the bytes twelve words stand for, worked out
-    /// in the same way.
-    pub(crate) fn expected_words_key(bytes: &[u8; WORDS_ENTROPY_LEN]) -> [u8; 32] {
+    /// The key the model of HKDF gives the records of an export, and the record that ends one,
+    /// from the key for transfers `key`, worked out in the same way.
+    pub(crate) fn expected_export_key(key: &[u8; 32]) -> [u8; CIPHER_KEY_LEN] {
+        let mut out = [0; CIPHER_KEY_LEN];
+        let _ = label(
+            Some(Purpose::Transfer),
+            32,
+            Branch::ExportKey,
+            CIPHER_KEY_LEN,
+        )
+        .map(|(label, used)| {
+            fold(SALT, key, &label[..used], &mut out);
+        });
+        out
+    }
+
+    /// The key for `purpose` the model of HKDF gives from the bytes twelve words stand for, worked
+    /// out in the same way.
+    pub(crate) fn expected_words_key(
+        bytes: &[u8; WORDS_ENTROPY_LEN],
+        purpose: Purpose,
+    ) -> [u8; 32] {
         let mut out = [0; 32];
         let length = WORDS_ENTROPY_LEN as u8;
-        let _ = label(Some(Purpose::Wrap), length, Branch::FromWords, 32).map(|(label, used)| {
+        let _ = label(Some(purpose), length, Branch::FromWords, 32).map(|(label, used)| {
             fold(SALT, &twice(bytes), &label[..used], &mut out);
         });
         out
@@ -1809,7 +1865,8 @@ pub(crate) mod proofs {
             6 => Branch::LockKey,
             7 => Branch::EpochLayer,
             8 => Branch::Combined,
-            _ => Branch::Challenge,
+            9 => Branch::Challenge,
+            _ => Branch::ExportKey,
         }
     }
 
@@ -1832,12 +1889,13 @@ pub(crate) mod proofs {
         out
     }
 
-    /// Either purpose, or none.
+    /// Any purpose, or none.
     fn any_purpose() -> Option<Purpose> {
         match kani::any::<u8>() {
             0 => None,
             1 => Some(Purpose::Wrap),
-            _ => Some(Purpose::ExternalData),
+            2 => Some(Purpose::ExternalData),
+            _ => Some(Purpose::Transfer),
         }
     }
 

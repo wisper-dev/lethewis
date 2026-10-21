@@ -3,15 +3,16 @@
 
 //! The hierarchy of keys end to end, through the public interface alone: ways in from a password
 //! with the chip and from words, a profile key locked under each, keys of chats under the profile
-//! key, and a change of epoch that destroys a chat and revokes a way in replaced by another. Each
-//! block of slots stands for a run of the application, which keeps between runs only its records,
+//! key, a change of epoch that destroys a chat and revokes a way in replaced by another, and the
+//! keys of chats carried to another device and into a backup under the words. Each block of slots
+//! stands for a run of the application on one device, which keeps between runs only its records,
 //! the password parameters, and the number and root of the epoch.
 
 use hkdf::Hkdf;
 use lethewis_core::{
-    Entropy, EntropyError, Epoch, Erasure, Error, Handle, KeyLength, LOCK_RECORD_LEN, MemoryBlock,
-    PasswordParams, Position, Purpose, RECORD_LEN, Root, RootFailed, Slot, Slots, WORD_COUNT,
-    WORD_LEN, Words,
+    END_RECORD_LEN, Entropy, EntropyError, Epoch, Erasure, Error, Handle, KeyLength,
+    LOCK_RECORD_LEN, MemoryBlock, PasswordParams, Position, Purpose, RECORD_LEN, Root, RootFailed,
+    Slot, Slots, WORD_COUNT, WORD_LEN, Words,
 };
 use sha2::Sha256;
 use zeroize::Zeroize;
@@ -280,4 +281,164 @@ fn a_change_of_epoch_destroys_a_chat_and_revokes_a_replaced_way_in() {
     );
     assert_eq!(left_behind(2, &kept), Err(Error::StaleRecord));
     assert_eq!(left_behind(1, &kept), Ok(destroyed_key));
+}
+
+/// The secret both devices share once they agree on it, as a key agreement gives it.
+const SHARED: [u8; 32] = [0x2e; 32];
+
+/// The records of an export and its end.
+struct Export {
+    records: Vec<[u8; RECORD_LEN]>,
+    end: [u8; END_RECORD_LEN],
+}
+
+/// Exports the chats in `chats`, under `profile`, under the key for transfers `transfer`.
+fn export_chats<'a>(
+    slots: &mut Slots<'a>,
+    source: &mut Source,
+    (profile, transfer): (Handle<'a>, Handle<'a>),
+    chats: &[(&[u8], [u8; RECORD_LEN])],
+) -> Result<Export, Error> {
+    let mut export = Export {
+        records: Vec::new(),
+        end: [0; END_RECORD_LEN],
+    };
+    for (context, record) in chats {
+        let chat = slots.unwrap(profile, context, record)?;
+        let mut out = [0; RECORD_LEN];
+        slots.export(chat, transfer, b"chats", source, &mut out)?;
+        slots.release(chat)?;
+        export.records.push(out);
+    }
+    slots.end_export(transfer, b"chats", source, &mut export.end)?;
+    Ok(export)
+}
+
+/// Receives `export` under `transfer` and wraps each chat under `profile`, in the order the chats
+/// went out, once the end is received; returns the records of the chats on this device.
+fn receive_chats<'a>(
+    slots: &mut Slots<'a>,
+    source: &mut Source,
+    (profile, transfer): (Handle<'a>, Handle<'a>),
+    export: &Export,
+) -> Result<Vec<[u8; RECORD_LEN]>, Error> {
+    let mut chats = Vec::new();
+    for record in &export.records {
+        chats.push(slots.receive(transfer, b"chats", record)?);
+    }
+    slots.end_receive(transfer, b"chats", &export.end)?;
+    let mut records = Vec::new();
+    for chat in chats {
+        let mut record = [0; RECORD_LEN];
+        slots.wrap(chat, profile, b"chat", source, &mut record)?;
+        slots.release(chat)?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+/// The chats of the first run go to a second device in another epoch under a secret both share:
+/// there they come under its own profile key; an export cut short leaves nothing to keep.
+#[test]
+fn chats_move_to_a_second_device() {
+    let mut source = Source(3);
+    let kept = first_run(&mut source).unwrap();
+    let chats = [
+        (b"chat 1".as_slice(), kept.chats[0]),
+        (b"chat 2".as_slice(), kept.chats[1]),
+    ];
+    let export = {
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut root(1));
+        let old = slots.import32(Purpose::Wrap, &mut passkey(OLD)).unwrap();
+        let profile = slots.unlock(old, b"passkey", &kept.by_old).unwrap();
+        let transfer = slots
+            .import32(Purpose::Transfer, &mut SHARED.clone())
+            .unwrap();
+        export_chats(&mut slots, &mut source, (profile, transfer), &chats).unwrap()
+    };
+    let mut memory = [const { Slot::empty() }; 5];
+    let mut epoch = Epoch::empty();
+    let mut slots = Slots::new(&mut memory, &mut epoch, 7, &mut root(7));
+    let profile = slots
+        .generate(Purpose::Wrap, KeyLength::Bytes32, &mut source)
+        .unwrap();
+    let transfer = slots
+        .import32(Purpose::Transfer, &mut SHARED.clone())
+        .unwrap();
+    let first = slots
+        .receive(transfer, b"chats", &export.records[0])
+        .unwrap();
+    let mut record = [0; RECORD_LEN];
+    assert_eq!(
+        slots.end_receive(transfer, b"chats", &export.end),
+        Err(Error::RecordRejected),
+        "the end does not open while a record is missing"
+    );
+    assert_eq!(
+        slots.wrap(first, profile, b"chat", &mut source, &mut record),
+        Err(Error::Unfinished)
+    );
+    let second = slots
+        .receive(transfer, b"chats", &export.records[1])
+        .unwrap();
+    slots.end_receive(transfer, b"chats", &export.end).unwrap();
+    slots.release(transfer).unwrap();
+    for (chat, key) in [first, second].into_iter().zip(kept.keys) {
+        slots
+            .wrap(chat, profile, b"chat", &mut source, &mut record)
+            .unwrap();
+        slots.release(chat).unwrap();
+        assert_eq!(chat_key(&mut slots, profile, b"chat", &record), Ok(key));
+    }
+}
+
+/// A backup under the words of the first run: the device keeps its key for transfers under the
+/// profile key and writes the backup without the words; a new phone restores it from the words
+/// alone. A backup made before a chat is destroyed keeps that chat, and an older backup under the
+/// same words opens as well as a newer one: no backup tells its age.
+#[test]
+fn a_backup_under_the_words_restores_on_a_new_phone() {
+    let mut source = Source(4);
+    let kept = first_run(&mut source).unwrap();
+    let mut words = kept.words;
+    let mut backup_key = [0; RECORD_LEN];
+    let chats = [
+        (b"chat 1".as_slice(), kept.chats[0]),
+        (b"chat 2".as_slice(), kept.chats[1]),
+    ];
+    let (older, newer) = {
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut root(1));
+        let old = slots.import32(Purpose::Wrap, &mut passkey(OLD)).unwrap();
+        let profile = slots.unlock(old, b"passkey", &kept.by_old).unwrap();
+        slots.release(old).unwrap();
+        let transfer = slots.transfer_from_words(&mut words.clone()).unwrap();
+        slots
+            .wrap(transfer, profile, b"backup", &mut source, &mut backup_key)
+            .unwrap();
+        slots.release(transfer).unwrap();
+        let transfer = slots.unwrap(profile, b"backup", &backup_key).unwrap();
+        let older =
+            export_chats(&mut slots, &mut source, (profile, transfer), &chats[..1]).unwrap();
+        let newer = export_chats(&mut slots, &mut source, (profile, transfer), &chats).unwrap();
+        (older, newer)
+    };
+    for (backup, keys) in [(&newer, &kept.keys[..]), (&older, &kept.keys[..1])] {
+        let mut memory = [const { Slot::empty() }; 5];
+        let mut epoch = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut root(9));
+        let profile = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut source)
+            .unwrap();
+        let transfer = slots.transfer_from_words(&mut words.clone()).unwrap();
+        let restored = receive_chats(&mut slots, &mut source, (profile, transfer), backup).unwrap();
+        for (record, key) in restored.iter().zip(keys) {
+            assert_eq!(chat_key(&mut slots, profile, b"chat", record), Ok(*key));
+        }
+        assert_eq!(restored.len(), keys.len());
+    }
+    words.zeroize();
 }

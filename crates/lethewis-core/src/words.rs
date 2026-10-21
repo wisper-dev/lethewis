@@ -116,7 +116,28 @@ impl<'a> Slots<'a> {
     /// [`Error::DuplicateKey`] if these slots hold the key already. `words` is then left as it
     /// was, and no slot changes.
     pub fn derive_from_words(&mut self, words: &mut Words) -> Result<Handle<'a>, Error> {
-        self.derive_from_words_in(&LIST, words)
+        self.derive_from_words_in(&LIST, Purpose::Wrap, words)
+    }
+
+    /// Derives from `words` a key for transfers into a free slot, as a set of one whose key is the
+    /// primary, and wipes `words`: the key of a backup, which opens with the words alone. It is
+    /// another key than the one [`Self::derive_from_words`] derives from the same words, and the
+    /// words are read as there.
+    ///
+    /// Needs 10 KiB of stack, or 72 KiB when this crate is built without optimisation or with
+    /// `--cfg lethewis_unoptimised`: the derivation of the key, the derivation of its identifier,
+    /// the whole load and the whole call are each followed by a wipe of 8 KiB, or 64 KiB, below
+    /// them. A build that optimises this crate but not the hash code it calls has to set that flag.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnknownWord`] if a word is not one of the list, [`Error::InvalidChecksum`] if the
+    /// words are of the list but their checksum does not hold, [`Error::NoFreeSlot`] if no slot is
+    /// free, [`Error::DerivationFailed`] if the key or its identifier cannot be derived, and
+    /// [`Error::DuplicateKey`] if these slots hold the key already. `words` is then left as it
+    /// was, and no slot changes.
+    pub fn transfer_from_words(&mut self, words: &mut Words) -> Result<Handle<'a>, Error> {
+        self.derive_from_words_in(&LIST, Purpose::Transfer, words)
     }
 
     pub(crate) fn generate_words_from<const N: usize>(
@@ -144,7 +165,7 @@ impl<'a> Slots<'a> {
     ) -> Result<Handle<'a>, Error> {
         let mut bytes = [0; WORDS_ENTROPY_LEN];
         let generated = lethewis_dit::with(|| self.draw(entropy, Branch::HedgeWords, &mut bytes))
-            .and_then(|()| self.derive_into(&bytes));
+            .and_then(|()| self.derive_into(&bytes, Purpose::Wrap));
         if generated.is_ok() {
             lethewis_dit::with(|| encode(list, &bytes, words));
         }
@@ -154,9 +175,10 @@ impl<'a> Slots<'a> {
     pub(crate) fn derive_from_words_in<const N: usize>(
         &mut self,
         list: &[u64; N],
+        purpose: Purpose,
         words: &mut Words,
     ) -> Result<Handle<'a>, Error> {
-        let derived = self.derive_from_words_on_stack(list, words);
+        let derived = self.derive_from_words_on_stack(list, purpose, words);
         wipe_stack();
         if derived.is_ok() {
             for word in words.iter_mut() {
@@ -172,35 +194,42 @@ impl<'a> Slots<'a> {
     fn derive_from_words_on_stack<const N: usize>(
         &mut self,
         list: &[u64; N],
+        purpose: Purpose,
         words: &Words,
     ) -> Result<Handle<'a>, Error> {
         let mut bytes = [0; WORDS_ENTROPY_LEN];
         lethewis_dit::with(|| decode(list, words, &mut bytes))
-            .and_then(|()| self.derive_into(&bytes))
+            .and_then(|()| self.derive_into(&bytes, purpose))
     }
 
-    /// Loads the wrapping key that `bytes`, which twelve words stand for, derive into a free slot:
-    /// a key from words is loaded as a generated one is.
+    /// Loads the key for `purpose` that `bytes`, which twelve words stand for, derive into a free
+    /// slot: a key from words is loaded as a generated one is.
     pub(crate) fn derive_into(
         &mut self,
         bytes: &[u8; WORDS_ENTROPY_LEN],
+        purpose: Purpose,
     ) -> Result<Handle<'a>, Error> {
-        self.load_derived(Purpose::Wrap, KeyLength::Bytes32, &mut FromWords { bytes })
-            .map_err(|error| match error {
-                Error::EntropyFailed => Error::DerivationFailed,
-                other => other,
-            })
+        self.load_derived(
+            purpose,
+            KeyLength::Bytes32,
+            &mut FromWords { bytes, purpose },
+        )
+        .map_err(|error| match error {
+            Error::EntropyFailed => Error::DerivationFailed,
+            other => other,
+        })
     }
 }
 
 /// The derivation from words as the source of a key's bytes.
 struct FromWords<'b> {
     bytes: &'b [u8; WORDS_ENTROPY_LEN],
+    purpose: Purpose,
 }
 
 impl Entropy for FromWords<'_> {
     fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
-        derive_from_words(self.bytes, dest).map_err(|_| EntropyError)
+        derive_from_words(self.bytes, self.purpose, dest).map_err(|_| EntropyError)
     }
 }
 
@@ -403,6 +432,7 @@ pub(crate) mod tests {
     use crate::epoch::Epoch;
     use crate::error::Error;
     use crate::key::tests::{Counting, Failing, Random, Recording, from_environment};
+    use crate::keyset::Position;
     use crate::record::Purpose;
     use crate::slots::{Slot, Slots};
 
@@ -461,6 +491,27 @@ pub(crate) mod tests {
         (
             "9e885d952ad362caeb4efe34a8e91bd2",
             "e2a150255ec1b3081079bf0b8b31150f6e5d186abcc746beb6bd97a17327ff3a",
+        ),
+    ];
+
+    /// Keys for transfers from the same words, computed in the same way: the purpose in the label
+    /// is that of transfers.
+    const TRANSFER_KEYS: [(&str, &str); 4] = [
+        (
+            "00000000000000000000000000000000",
+            "7b20d3696ecb531dcb3db43f393829f4c9badc6607154f430858e2a1a9c38ab0",
+        ),
+        (
+            "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+            "0b19b8a8320459de77e66333d31b08eb649cfc680dcf78e4b6eb3e141f0caa14",
+        ),
+        (
+            "ffffffffffffffffffffffffffffffff",
+            "33d4a5e2d0c76086768fdb15037b5b17a6b53836e9619d28e958e09be62dd26d",
+        ),
+        (
+            "9e885d952ad362caeb4efe34a8e91bd2",
+            "cfc11e5c74a5c7f026f1b7c7ff00e285b9eb27e62f4edc3df0c43bdb769eb7b4",
         ),
     ];
 
@@ -680,6 +731,56 @@ pub(crate) mod tests {
         }
     }
 
+    /// The key for transfers from words is that of another implementation, a key for transfers,
+    /// beside the key from a secret from the same words, and refused like it.
+    #[test]
+    fn a_key_for_transfers_from_words_matches_another_implementation() {
+        for ((bytes, transfer), (_, secret)) in TRANSFER_KEYS.into_iter().zip(KEYS) {
+            let mut memory = [const { Slot::empty() }; 3];
+            let mut epoch = Epoch::empty();
+            let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut [9; 32]);
+            let mut words = words_for(&unhex(bytes));
+            let mut kept = words;
+            slots.derive_from_words(&mut kept).unwrap();
+            let derived = slots.transfer_from_words(&mut words).unwrap();
+            assert_eq!(words, [[0; WORD_LEN]; WORD_COUNT]);
+            assert_eq!(
+                slots
+                    .import32(Purpose::Transfer, &mut unhex(transfer))
+                    .err(),
+                Some(Error::DuplicateKey),
+                "{bytes}"
+            );
+            assert_eq!(
+                slots.import32(Purpose::Wrap, &mut unhex(secret)).err(),
+                Some(Error::DuplicateKey),
+                "{bytes}"
+            );
+            let mut out = [0; 32];
+            assert_eq!(
+                slots
+                    .reveal32(derived, Position::First, Purpose::Transfer, &mut out)
+                    .err(),
+                Some(Error::WrongPurpose)
+            );
+            assert_eq!(
+                slots.challenge(derived, &mut out).err(),
+                Some(Error::WrongPurpose)
+            );
+        }
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut epoch = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut [9; 32]);
+        let mut words = words_for(&unhex(TRANSFER_KEYS[0].0));
+        words[3] = *b"zzzz\0\0\0\0";
+        let before = words;
+        assert_eq!(
+            slots.transfer_from_words(&mut words).err(),
+            Some(Error::UnknownWord)
+        );
+        assert_eq!(words, before);
+    }
+
     #[test]
     fn generated_words_derive_the_generated_key() {
         let mut memory = [const { Slot::empty() }; 2];
@@ -793,13 +894,15 @@ mod stack {
     use super::{LIST, Words, bits_of, decode, encode, find_in};
     use crate::derive::direct::hedged_directly;
     use crate::derive::stack::{
-        block_forms, epoch_bytes, hash_forms, secrets, secrets_of, state_after, state_forms,
+        block_forms, epoch_bytes, hash_forms, secrets, secrets_for, secrets_of, state_after,
+        state_forms,
     };
     use crate::derive::{Branch, SALT, STACK_WIPE, derive_from_words};
     use crate::entropy::{Entropy, EntropyError};
     use crate::epoch::Epoch;
     use crate::error::Error;
     use crate::key::KeyLength;
+    use crate::record::Purpose;
     use crate::residue::{assert_clean, below_pad, depth_changed, key_dependent, residue};
     use crate::slots::{Slot, Slots};
 
@@ -861,25 +964,29 @@ mod stack {
         std::vec![bytes.to_vec(), reversed, numbers]
     }
 
-    /// The secrets a derivation from the words of `bytes` handles: the bytes and the numbers of the
-    /// words; the words laid out together; those of their checksum; those of HKDF from the bytes;
-    /// and those of the identifier of the key.
-    fn derivation_secrets(bytes: &[u8; 16]) -> Vec<Vec<u8>> {
+    /// The secrets a derivation from the words of `bytes` of a key for `purpose` handles: the bytes
+    /// and the numbers of the words; the words laid out together; those of their checksum; those
+    /// of HKDF from the bytes; and those of the identifier of the key.
+    fn derivation_secrets(bytes: &[u8; 16], purpose: Purpose) -> Vec<Vec<u8>> {
         let mut found = bytes_and_numbers(bytes);
         found.push(words_for(bytes).concat());
         found.extend(checksum_secrets(bytes));
-        found.extend(secrets_of(bytes, SALT, Branch::FromWords));
+        found.extend(secrets_for(bytes, SALT, Branch::FromWords, Some(purpose)));
         let mut key = [0; 64];
-        derive_from_words(bytes, &mut key[..32]).unwrap();
+        derive_from_words(bytes, purpose, &mut key[..32]).unwrap();
         found.extend(secrets(&key, SALT, KeyLength::Bytes32, Branch::KeyId));
         found
     }
 
-    fn pieces() -> Vec<Vec<u8>> {
+    fn pieces_for(purpose: Purpose) -> Vec<Vec<u8>> {
         key_dependent(
-            &derivation_secrets(&bytes()),
-            &derivation_secrets(&other_bytes()),
+            &derivation_secrets(&bytes(), purpose),
+            &derivation_secrets(&other_bytes(), purpose),
         )
+    }
+
+    fn pieces() -> Vec<Vec<u8>> {
+        pieces_for(Purpose::Wrap)
     }
 
     fn slots_of<'a>(memory: &'a mut [Slot], epoch: &'a mut Epoch) -> Slots<'a> {
@@ -919,6 +1026,20 @@ mod stack {
         assert_clean(&pieces, || {
             let mut words = given;
             slots.derive_from_words(&mut words).unwrap();
+            black_box(&words);
+        });
+    }
+
+    #[test]
+    fn a_key_for_transfers_from_words_leaves_no_residue() {
+        let pieces = pieces_for(Purpose::Transfer);
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut epoch = Epoch::empty();
+        let mut slots = slots_of(&mut memory, &mut epoch);
+        let given = words_for(&bytes());
+        assert_clean(&pieces, || {
+            let mut words = given;
+            slots.transfer_from_words(&mut words).unwrap();
             black_box(&words);
         });
     }
@@ -979,7 +1100,7 @@ mod stack {
         let found = |bytes: &[u8; 16], epoch: &[u8; 32]| {
             let mut material = bytes.to_vec();
             material.extend_from_slice(&0_u64.to_le_bytes());
-            let mut found = derivation_secrets(&hedged(bytes, epoch));
+            let mut found = derivation_secrets(&hedged(bytes, epoch), Purpose::Wrap);
             found.extend(secrets_of(&material, epoch, Branch::HedgeWords));
             found.push(bytes.to_vec());
             found
@@ -1076,14 +1197,14 @@ mod stack {
         }
     }
 
-    /// The documentation of both calls states the stack they need and the depth of the wipe after
+    /// The documentation of every call states the stack it needs and the depth of the wipe after
     /// them, and that depth is the library's.
     #[test]
     fn the_documentation_states_the_stack_the_calls_need() {
         let build = usize::from(cfg!(lethewis_unoptimised));
         assert_eq!(WIPES[build] * 1024, STACK_WIPE);
         let source = include_str!("words.rs");
-        for call in ["generate_words", "derive_from_words"] {
+        for call in ["generate_words", "derive_from_words", "transfer_from_words"] {
             let at = source.find(&std::format!("    pub fn {call}(")).unwrap();
             let mut lines: Vec<&str> = source[..at]
                 .lines()
