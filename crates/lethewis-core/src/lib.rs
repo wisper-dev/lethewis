@@ -53,6 +53,7 @@ mod record;
 mod residue;
 mod seal;
 mod slots;
+mod timing;
 mod words;
 mod xwing;
 

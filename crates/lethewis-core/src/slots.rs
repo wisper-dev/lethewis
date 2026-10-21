@@ -595,7 +595,7 @@ impl<'a> Slots<'a> {
     /// slot is free, [`Error::DerivationFailed`] if the key or its identifier cannot be derived,
     /// and [`Error::DuplicateKey`] if these slots hold the new key already. No slot changes then.
     pub fn combine(&mut self, key: Handle<'a>, salt: Handle<'a>) -> Result<Handle<'a>, Error> {
-        let combined = lethewis_dit::with(|| self.combine_on_stack(key, salt));
+        let combined = crate::timing::with(|| self.combine_on_stack(key, salt));
         wipe_stack();
         combined
     }
@@ -672,7 +672,7 @@ impl<'a> Slots<'a> {
     /// if it is not a key from a secret, and [`Error::DerivationFailed`] if the challenge cannot be
     /// derived. `out` is then left as it was.
     pub fn challenge(&self, set: Handle<'a>, out: &mut [u8; 32]) -> Result<(), Error> {
-        let challenged = lethewis_dit::with(|| self.challenge_on_stack(set, out));
+        let challenged = crate::timing::with(|| self.challenge_on_stack(set, out));
         wipe_stack();
         challenged
     }
@@ -733,7 +733,7 @@ impl<'a> Slots<'a> {
         entropy: &mut (impl Entropy + ?Sized),
         record: &mut [u8; RECORD_LEN],
     ) -> Result<(), Error> {
-        let wrapped = lethewis_dit::with(|| {
+        let wrapped = crate::timing::with(|| {
             self.wrap_on_stack(set, parent, context, entropy, Out::Record(record))
         });
         wipe_cipher_stack();
@@ -772,7 +772,7 @@ impl<'a> Slots<'a> {
         entropy: &mut (impl Entropy + ?Sized),
         record: &mut [u8; LOCK_RECORD_LEN],
     ) -> Result<(), Error> {
-        let locked = lethewis_dit::with(|| {
+        let locked = crate::timing::with(|| {
             self.wrap_on_stack(set, parent, context, entropy, Out::Lock(record))
         });
         wipe_cipher_stack();
@@ -845,7 +845,7 @@ impl<'a> Slots<'a> {
         entropy: &mut (impl Entropy + ?Sized),
         record: &mut [u8; RECORD_LEN],
     ) -> Result<(), Error> {
-        let exported = lethewis_dit::with(|| {
+        let exported = crate::timing::with(|| {
             self.wrap_on_stack(set, transfer, context, entropy, Out::Export(record))
         });
         wipe_cipher_stack();
@@ -881,7 +881,7 @@ impl<'a> Slots<'a> {
         end: &mut [u8; END_RECORD_LEN],
     ) -> Result<(), Error> {
         let ended =
-            lethewis_dit::with(|| self.end_export_on_stack(transfer, context, entropy, end));
+            crate::timing::with(|| self.end_export_on_stack(transfer, context, entropy, end));
         wipe_cipher_stack();
         ended
     }
@@ -1043,7 +1043,7 @@ impl<'a> Slots<'a> {
         record: &[u8; RECORD_LEN],
     ) -> Result<Handle<'a>, Error> {
         let unwrapped =
-            lethewis_dit::with(|| self.unwrap_on_stack(parent, context, record, seal::open));
+            crate::timing::with(|| self.unwrap_on_stack(parent, context, record, seal::open));
         wipe_cipher_stack();
         unwrapped
     }
@@ -1096,7 +1096,7 @@ impl<'a> Slots<'a> {
         record: &[u8; RECORD_LEN],
     ) -> Result<Handle<'a>, Error> {
         let received =
-            lethewis_dit::with(|| self.receive_on_stack(transfer, context, record, seal::open));
+            crate::timing::with(|| self.receive_on_stack(transfer, context, record, seal::open));
         wipe_cipher_stack();
         received
     }
@@ -1158,7 +1158,7 @@ impl<'a> Slots<'a> {
         end: &[u8; END_RECORD_LEN],
     ) -> Result<(), Error> {
         let ended =
-            lethewis_dit::with(|| self.end_receive_on_stack(transfer, context, end, seal::open));
+            crate::timing::with(|| self.end_receive_on_stack(transfer, context, end, seal::open));
         wipe_cipher_stack();
         ended
     }
@@ -1234,7 +1234,7 @@ impl<'a> Slots<'a> {
         context: &[u8],
         record: &[u8; LOCK_RECORD_LEN],
     ) -> Result<Handle<'a>, Error> {
-        let unlocked = lethewis_dit::with(|| {
+        let unlocked = crate::timing::with(|| {
             self.unlock_on_stack(parent, context, record, seal::open, seal::open)
         });
         wipe_cipher_stack();
@@ -1414,7 +1414,7 @@ impl<'a> Slots<'a> {
         to: &mut [u8; LOCK_RECORD_LEN],
     ) -> Result<(), Error> {
         let carried =
-            lethewis_dit::with(|| self.carry_on_stack(context, entropy, from, to, seal::open));
+            crate::timing::with(|| self.carry_on_stack(context, entropy, from, to, seal::open));
         wipe_cipher_stack();
         carried
     }
@@ -1514,7 +1514,7 @@ impl<'a> Slots<'a> {
         fill: impl FnOnce(&mut [Key; MEMBERS], &mut Epoch) -> Result<(), Error>,
     ) -> Result<Handle<'a>, Error> {
         // The copy of the key and the checks after its derivation run above the derivation's wipe.
-        let loaded = lethewis_dit::with(|| self.load_in_slot(purpose, stages, secret, fill));
+        let loaded = crate::timing::with(|| self.load_in_slot(purpose, stages, secret, fill));
         wipe_stack();
         loaded
     }
@@ -1775,7 +1775,7 @@ impl<'a> Slots<'a> {
         length: KeyLength,
         fill: impl FnOnce(&mut Key, &mut Epoch) -> Result<(), Error>,
     ) -> Result<Position, Error> {
-        let added = lethewis_dit::with(|| self.add_in_slot(set, length, fill));
+        let added = crate::timing::with(|| self.add_in_slot(set, length, fill));
         wipe_stack();
         added
     }
@@ -2228,100 +2228,93 @@ mod tests {
     assert_not_impl!(Epoch: Clone, PartialEq, Default);
 
     /// Every import, generation, wrap, unwrap, lock, unlock, challenge, combination, carry, export
-    /// and receipt derives, and every call on words reads and writes them, with data-independent
-    /// timing on,
-    /// where the processor and the operating system offer it.
+    /// and receipt derives and runs the cipher, and every call on words reads and writes them,
+    /// inside the switch of data-independent timing, and with the mode on where the processor and
+    /// the operating system offer it.
     #[test]
     fn every_call_that_derives_holds_data_independent_timing() {
-        use crate::derive::timing::seen;
+        use crate::timing::timed;
         assert!(!lethewis_dit::active(), "the mode is off before the work");
-        let _ = seen();
         let mut memory = [const { Slot::empty() }; 7];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let parent = slots.import64(Purpose::Wrap, &mut [7; 64]).unwrap();
+        let parent = timed(|| slots.import64(Purpose::Wrap, &mut [7; 64]).unwrap());
         let parent = slots.store(parent);
-        assert_eq!(seen(), Some(true));
-        let key = slots.import32(Purpose::ExternalData, &mut [9; 32]).unwrap();
-        assert_eq!(seen(), Some(true));
-        slots
-            .generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting)
-            .unwrap();
-        assert_eq!(seen(), Some(true));
+        let key = timed(|| slots.import32(Purpose::ExternalData, &mut [9; 32]).unwrap());
+        timed(|| {
+            slots
+                .generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting)
+                .unwrap()
+        });
         let mut record = [0; RECORD_LEN];
-        slots
-            .wrap(key, parent, b"context", &mut Counting, &mut record)
-            .unwrap();
-        assert_eq!(seen(), Some(true));
+        timed(|| {
+            slots
+                .wrap(key, parent, b"context", &mut Counting, &mut record)
+                .unwrap();
+        });
         slots.release(key).unwrap();
-        let set = slots.unwrap(parent, b"context", &record).unwrap();
-        assert_eq!(seen(), Some(true));
-        slots.add32(set, &mut [3; 32]).unwrap();
-        assert_eq!(seen(), Some(true));
+        let set = timed(|| slots.unwrap(parent, b"context", &record).unwrap());
+        timed(|| slots.add32(set, &mut [3; 32]).unwrap());
         slots.settle();
         slots.release(set).unwrap();
-        let set = slots.import32(Purpose::ExternalData, &mut [5; 32]).unwrap();
-        let _ = seen();
-        slots
-            .add_generated(set, KeyLength::Bytes32, &mut Counting)
-            .unwrap();
-        assert_eq!(seen(), Some(true));
+        let set = timed(|| slots.import32(Purpose::ExternalData, &mut [5; 32]).unwrap());
+        timed(|| {
+            slots
+                .add_generated(set, KeyLength::Bytes32, &mut Counting)
+                .unwrap();
+        });
         slots.settle();
         slots.release(set).unwrap();
         let mut words = [[0; 8]; 12];
-        let set = slots.generate_words(&mut Counting, &mut words).unwrap();
-        assert_eq!(seen(), Some(true));
+        let set = timed(|| slots.generate_words(&mut Counting, &mut words).unwrap());
         let mut kept = words;
         slots.release(set).unwrap();
-        slots.derive_from_words(&mut words).unwrap();
-        assert_eq!(seen(), Some(true));
-        let secret = slots.import32(Purpose::Wrap, &mut [6; 32]).unwrap();
-        let stored = slots
-            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
-            .unwrap();
-        let _ = seen();
+        timed(|| slots.derive_from_words(&mut words).unwrap());
+        let secret = timed(|| slots.import32(Purpose::Wrap, &mut [6; 32]).unwrap());
+        let stored = timed(|| {
+            slots
+                .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+                .unwrap()
+        });
         let mut locked = [0; LOCK_RECORD_LEN];
-        slots
-            .lock(stored, secret, b"context", &mut Counting, &mut locked)
-            .unwrap();
-        assert_eq!(seen(), Some(true));
+        timed(|| {
+            slots
+                .lock(stored, secret, b"context", &mut Counting, &mut locked)
+                .unwrap();
+        });
         slots.release(stored).unwrap();
-        slots.unlock(secret, b"context", &locked).unwrap();
-        assert_eq!(seen(), Some(true));
-        let answer = slots.import32(Purpose::Wrap, &mut [7; 32]).unwrap();
+        timed(|| slots.unlock(secret, b"context", &locked).unwrap());
+        let answer = timed(|| slots.import32(Purpose::Wrap, &mut [7; 32]).unwrap());
         let mut challenge = [0; 32];
-        slots.challenge(secret, &mut challenge).unwrap();
-        assert_eq!(seen(), Some(true));
-        let combined = slots.combine(secret, answer).unwrap();
-        assert_eq!(seen(), Some(true));
+        timed(|| slots.challenge(secret, &mut challenge).unwrap());
+        let combined = timed(|| slots.combine(secret, answer).unwrap());
         slots.release(combined).unwrap();
         slots.begin_epoch(&mut [8; 32]).unwrap();
         let mut carried = [0; LOCK_RECORD_LEN];
-        slots
-            .carry(b"context", &mut Counting, &locked, &mut carried)
-            .unwrap();
-        assert_eq!(seen(), Some(true));
-        let transfer = slots.import32(Purpose::Transfer, &mut [4; 32]).unwrap();
-        let data = slots.import32(Purpose::ExternalData, &mut [2; 32]).unwrap();
-        let _ = seen();
+        timed(|| {
+            slots
+                .carry(b"context", &mut Counting, &locked, &mut carried)
+                .unwrap();
+        });
+        let transfer = timed(|| slots.import32(Purpose::Transfer, &mut [4; 32]).unwrap());
+        let data = timed(|| slots.import32(Purpose::ExternalData, &mut [2; 32]).unwrap());
         let mut exported = [0; RECORD_LEN];
-        slots
-            .export(data, transfer, b"context", &mut Counting, &mut exported)
-            .unwrap();
-        assert_eq!(seen(), Some(true));
+        timed(|| {
+            slots
+                .export(data, transfer, b"context", &mut Counting, &mut exported)
+                .unwrap();
+        });
         let mut end = [0; END_RECORD_LEN];
-        slots
-            .end_export(transfer, b"context", &mut Counting, &mut end)
-            .unwrap();
-        assert_eq!(seen(), Some(true));
+        timed(|| {
+            slots
+                .end_export(transfer, b"context", &mut Counting, &mut end)
+                .unwrap();
+        });
         slots.release(data).unwrap();
-        slots.receive(transfer, b"context", &exported).unwrap();
-        assert_eq!(seen(), Some(true));
-        slots.end_receive(transfer, b"context", &end).unwrap();
-        assert_eq!(seen(), Some(true));
+        timed(|| slots.receive(transfer, b"context", &exported).unwrap());
+        timed(|| slots.end_receive(transfer, b"context", &end).unwrap());
         slots.release(transfer).unwrap();
-        slots.transfer_from_words(&mut kept).unwrap();
-        assert_eq!(seen(), Some(true));
+        timed(|| slots.transfer_from_words(&mut kept).unwrap());
     }
 
     /// The stack, in KiB, that a load and that a wrap or an unwrap need, and the depth of the wipes

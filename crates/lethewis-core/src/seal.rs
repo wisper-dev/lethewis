@@ -162,6 +162,8 @@ fn encrypt(
     aad: &[u8],
     buffer: &mut [u8],
 ) -> Result<[u8; TAG_LEN], SealFailed> {
+    #[cfg(test)]
+    crate::timing::note();
     Aes256GcmSiv::new(key.into())
         .encrypt_inout_detached(&Nonce::from(*nonce), aad, InOutBuf::from(buffer))
         .map(Into::into)
@@ -176,6 +178,8 @@ fn decrypt(
     buffer: &mut [u8],
     tag: &[u8; TAG_LEN],
 ) -> Result<(), Rejected> {
+    #[cfg(test)]
+    crate::timing::note();
     Aes256GcmSiv::new(key.into())
         .decrypt_inout_detached(
             &Nonce::from(*nonce),

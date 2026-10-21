@@ -516,6 +516,7 @@ compile error.
 | a carry of an archive key or a move of a record of an archive that refuses every record | the unit tests that change every bit of the records |
 | the epoch of the record of an archive key written and read most significant byte first, a set of one that may hold more keys, a carry under the first stored key, or an archive key loaded as a key from a secret | the test of random records of archive keys |
 | an opening that compares half the check of the shared secret | no proof: the test of random records of an archive |
+| a call without data-independent timing, or a derivation, a cipher or an X-Wing operation not marked as inside the switch | no proof: the tests that every call holds the mode, which see the switch on every machine |
 | a self-test of X-Wing that does not remember its answer, or remembers a wrong one | no proof: the unit test that asks for the known answer twice |
 | a creation of an archive key that does not check its new key pair | `a_creation_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds` |
 | a check of a key pair that compares nothing | no proof: the unit test of key pairs that agree and that do not |

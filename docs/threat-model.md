@@ -340,8 +340,11 @@ loading a key and wrapping, unwrapping, exporting and receiving a set where Linu
 Apple system reports the feature; elsewhere, and where the system or a virtual machine hides it, the
 mode stays off.
 
-The mode is on around creating, loading and carrying an archive key as well. ML-KEM-768 and X25519
-run on portable code whose timing this library does not check.
+The mode is on around every call on an archive key and on the records of the archive as well.
+ML-KEM-768 and X25519 run on portable code whose timing this library does not check.
+
+Tests check on every machine that each call starts its derivations, Argon2id, ciphers and
+operations of X-Wing inside the switch, and on aarch64 that the switch turns the mode on.
 
 On Apple M1 and M2 the mode does not stop the data prefetcher from reading memory by its contents;
 on M3 it does. On Cortex-M3 the portable multiplication varies with its operands, and WebAssembly

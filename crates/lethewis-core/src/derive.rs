@@ -391,7 +391,7 @@ pub(crate) fn derive_from_words(
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
     #[cfg(test)]
-    timing::note();
+    crate::timing::note();
     let derived = words_on_stack(entropy, purpose, out);
     wipe_stack();
     derived
@@ -426,7 +426,7 @@ pub(crate) fn derive(
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
     #[cfg(test)]
-    timing::note();
+    crate::timing::note();
     let derived = derive_on_stack(key, salt, purpose, branch, out);
     wipe_stack();
     derived
@@ -446,7 +446,7 @@ pub(crate) fn hedge(
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
     #[cfg(test)]
-    timing::note();
+    crate::timing::note();
     let hedged = hedge_on_stack(epoch, count, branch, drawn, out);
     wipe_stack();
     hedged
@@ -536,29 +536,6 @@ struct WipeOnDrop([u8; CAPACITY]);
 impl Drop for WipeOnDrop {
     fn drop(&mut self) {
         wipe(&mut self.0);
-    }
-}
-
-/// Whether every derivation on this thread since the last look ran with data-independent timing
-/// on where it is offered: every call that derives holds the mode.
-#[cfg(test)]
-pub(crate) mod timing {
-    extern crate std;
-
-    use core::cell::Cell;
-
-    std::thread_local! {
-        static SEEN: Cell<Option<bool>> = const { Cell::new(None) };
-    }
-
-    pub(crate) fn note() {
-        let now = lethewis_dit::active() == lethewis_dit::supported();
-        SEEN.set(Some(SEEN.get().unwrap_or(true) && now));
-    }
-
-    /// What the derivations since the last look saw, and forget it.
-    pub(crate) fn seen() -> Option<bool> {
-        SEEN.take()
     }
 }
 

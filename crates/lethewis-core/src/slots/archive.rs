@@ -57,7 +57,7 @@ impl<'a> Slots<'a> {
         entropy: &mut (impl Entropy + ?Sized),
         record: &mut [u8; ARCHIVE_KEY_RECORD_LEN],
     ) -> Result<(), Error> {
-        let created = lethewis_dit::with(|| {
+        let created = crate::timing::with(|| {
             self.create_archive_key_on_stack(store, profile, context, entropy, record, &KNOWN)
         });
         wipe_archive_stack();
@@ -154,7 +154,7 @@ impl<'a> Slots<'a> {
         context: &[u8],
         record: &[u8; ARCHIVE_KEY_RECORD_LEN],
     ) -> Result<Handle<'a>, Error> {
-        let loaded = lethewis_dit::with(|| {
+        let loaded = crate::timing::with(|| {
             self.load_archive_key_on_stack(
                 store,
                 profile,
@@ -255,7 +255,7 @@ impl<'a> Slots<'a> {
         from: &[u8; ARCHIVE_KEY_RECORD_LEN],
         to: &mut [u8; ARCHIVE_KEY_RECORD_LEN],
     ) -> Result<(), Error> {
-        let carried = lethewis_dit::with(|| {
+        let carried = crate::timing::with(|| {
             self.carry_archive_key_on_stack(
                 profile,
                 next_profile,
@@ -585,6 +585,7 @@ mod tests {
     use crate::record::PLAINTEXT_LEN;
     use crate::slots::tests::{EPOCH, epoch_key, flipped_epoch_key, pattern};
     use crate::slots::write_record;
+    use crate::timing::timed;
     use crate::xwing::{self, wrong_known};
     use crate::{
         ARCHIVE_RECORD_LEN, Entropy, EntropyError, Epoch, Erasure, Error, Handle, KeyLength,
@@ -769,38 +770,40 @@ mod tests {
         }
     }
 
-    /// Every call on an archive key derives with data-independent timing on, where it is offered.
+    /// Every call on an archive key derives and runs the cipher and X-Wing inside the switch of
+    /// data-independent timing, and with the mode on where it is offered.
     #[test]
     fn every_call_on_an_archive_key_holds_data_independent_timing() {
-        use crate::derive::timing::seen;
         let mut memory = [const { Slot::empty() }; 6];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let [_, stored, _, archive, _] = keys(&mut slots);
-        let _ = seen();
         let mut record = [0; ARCHIVE_KEY_RECORD_LEN];
-        slots
-            .create_archive_key(archive, stored, b"archive", &mut Counting, &mut record)
-            .unwrap();
-        assert_eq!(seen(), Some(true));
-        let key = slots
-            .load_archive_key(archive, stored, b"archive", &record)
-            .unwrap();
-        assert_eq!(seen(), Some(true));
+        timed(|| {
+            slots
+                .create_archive_key(archive, stored, b"archive", &mut Counting, &mut record)
+                .unwrap();
+        });
+        let key = timed(|| {
+            slots
+                .load_archive_key(archive, stored, b"archive", &record)
+                .unwrap()
+        });
         slots.release(key).unwrap();
         slots.begin_epoch(&mut [8; 32]).unwrap();
         let mut carried = [0; ARCHIVE_KEY_RECORD_LEN];
-        slots
-            .carry_archive_key(
-                stored,
-                stored,
-                b"archive",
-                &mut Counting,
-                &record,
-                &mut carried,
-            )
-            .unwrap();
-        assert_eq!(seen(), Some(true));
+        timed(|| {
+            slots
+                .carry_archive_key(
+                    stored,
+                    stored,
+                    b"archive",
+                    &mut Counting,
+                    &record,
+                    &mut carried,
+                )
+                .unwrap();
+        });
     }
 
     /// An inner layer that opens under the stored key of the archive but holds no seed of an archive

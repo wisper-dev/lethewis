@@ -234,6 +234,8 @@ fn stretch(
     memory: &mut [MemoryBlock],
     out: &mut [u8],
 ) -> Result<(), EntropyError> {
+    #[cfg(test)]
+    crate::timing::note();
     let params = Params::new(memory_kib, passes, 1, Some(KEY_LEN)).map_err(|_| EntropyError)?;
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
         .hash_password_into_with_memory(password, salt, out, memory)
@@ -473,6 +475,22 @@ mod tests {
             passes: 2,
             salt: [salt; SALT_LEN],
         }
+    }
+
+    /// A derivation from a password runs Argon2id and derives inside the switch of data-independent
+    /// timing, with the mode on where it is offered.
+    #[test]
+    fn a_derivation_from_a_password_holds_data_independent_timing() {
+        let mut memory = [const { Slot::empty() }; 1];
+        let mut epoch = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut [9; 32]);
+        let mut password = *b"correct horse battery staple";
+        let mut working = blocks(256);
+        crate::timing::timed(|| {
+            slots
+                .derive_from_password(&mut password, &small(1), &mut working)
+                .unwrap()
+        });
     }
 
     #[test]

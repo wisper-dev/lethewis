@@ -68,7 +68,7 @@ impl<'a> Slots<'a> {
         context: &[u8],
         record: &[u8; ARCHIVE_KEY_RECORD_LEN],
     ) -> Result<ArchivePublic<'a>, Error> {
-        let read = lethewis_dit::with(|| {
+        let read = crate::timing::with(|| {
             self.archive_public_key_on_stack(profile, context, record, seal::open)
         });
         wipe_archive_stack();
@@ -141,7 +141,7 @@ impl<'a> Slots<'a> {
         record: &mut [u8; ARCHIVE_RECORD_LEN],
         data_key: &mut [u8; 32],
     ) -> Result<(), Error> {
-        let archived = lethewis_dit::with(|| {
+        let archived = crate::timing::with(|| {
             self.archive_on_stack(
                 seal,
                 public,
@@ -247,7 +247,7 @@ impl<'a> Slots<'a> {
         record: &[u8; ARCHIVE_RECORD_LEN],
         data_key: &mut [u8; 32],
     ) -> Result<(), Error> {
-        let opened = lethewis_dit::with(|| {
+        let opened = crate::timing::with(|| {
             self.open_archive_on_stack(
                 (archive, seal),
                 context,
@@ -341,7 +341,7 @@ impl<'a> Slots<'a> {
         record: &[u8; ARCHIVE_RECORD_LEN],
         out: &mut [u8; ARCHIVE_RECORD_LEN],
     ) -> Result<(), Error> {
-        let resealed = lethewis_dit::with(|| {
+        let resealed = crate::timing::with(|| {
             self.reseal_archive_on_stack(
                 (from, to),
                 context,
@@ -508,6 +508,7 @@ mod tests {
     use crate::key::tests::{Counting, Failing, Random, from_environment};
     use crate::record::AssociatedData;
     use crate::slots::tests::{EPOCH, epoch_key};
+    use crate::timing::timed;
     use crate::xwing::{self, wrong_known};
     use crate::{
         ARCHIVE_KEY_RECORD_LEN, Epoch, Error, Handle, KeyLength, Purpose, Slot, Slots, seal,
@@ -622,52 +623,53 @@ mod tests {
         assert_eq!(opened, again.1);
     }
 
-    /// Every call on a record of an archive derives with data-independent timing on, where it is
-    /// offered.
+    /// Every call on a record of an archive derives and runs the cipher and X-Wing inside the switch
+    /// of data-independent timing, and with the mode on where it is offered.
     #[test]
     fn every_call_on_a_record_of_an_archive_holds_data_independent_timing() {
-        use crate::derive::timing::seen;
         let mut memory = [const { Slot::empty() }; 8];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let ([stored, store, chat, other_chat], _, key_record) = archive(&mut slots);
-        let _ = seen();
-        let public = slots
-            .archive_public_key(stored, b"archive", &key_record)
-            .unwrap();
-        assert_eq!(seen(), Some(true));
+        let public = timed(|| {
+            slots
+                .archive_public_key(stored, b"archive", &key_record)
+                .unwrap()
+        });
         let (mut record, mut data_key) = ([0; ARCHIVE_RECORD_LEN], [0; 32]);
-        slots
-            .archive(
-                chat,
-                &public,
-                b"chat",
-                &mut Counting,
-                &mut record,
-                &mut data_key,
-            )
-            .unwrap();
-        assert_eq!(seen(), Some(true));
+        timed(|| {
+            slots
+                .archive(
+                    chat,
+                    &public,
+                    b"chat",
+                    &mut Counting,
+                    &mut record,
+                    &mut data_key,
+                )
+                .unwrap();
+        });
         let key = slots
             .load_archive_key(store, stored, b"archive", &key_record)
             .unwrap();
-        let _ = seen();
-        slots
-            .open_archive(key, chat, b"chat", &record, &mut data_key)
-            .unwrap();
-        assert_eq!(seen(), Some(true));
+        timed(|| {
+            slots
+                .open_archive(key, chat, b"chat", &record, &mut data_key)
+                .unwrap();
+        });
         let mut moved = [0; ARCHIVE_RECORD_LEN];
-        slots
-            .reseal_archive(
-                chat,
-                other_chat,
-                b"chat",
-                &mut Counting,
-                &record,
-                &mut moved,
-            )
-            .unwrap();
-        assert_eq!(seen(), Some(true));
+        timed(|| {
+            slots
+                .reseal_archive(
+                    chat,
+                    other_chat,
+                    b"chat",
+                    &mut Counting,
+                    &record,
+                    &mut moved,
+                )
+                .unwrap();
+        });
     }
 
     /// A public key serves only the slots and the epoch it was read in, and shows nothing of

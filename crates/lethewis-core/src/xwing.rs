@@ -49,6 +49,8 @@ pub(crate) struct InvalidPublicKey;
 /// Writes the public key of `seed`.
 #[cfg(not(kani))]
 pub(crate) fn public_key(seed: &[u8; SEED_LEN], public: &mut [u8; PUBLIC_LEN]) {
+    #[cfg(test)]
+    crate::timing::note();
     let mut expanded = [0; EXPANDED_LEN];
     expand(seed, &mut expanded);
     if let Some((ml_kem_seed, x25519_secret)) = split::<_, 64, 32>(&expanded) {
@@ -72,6 +74,8 @@ pub(crate) fn encapsulate(
     ciphertext: &mut [u8; CIPHERTEXT_LEN],
     shared: &mut [u8; SHARED_LEN],
 ) -> Result<(), InvalidPublicKey> {
+    #[cfg(test)]
+    crate::timing::note();
     let (Some((ml_kem_public, x25519_public)), Some((message, ephemeral))) = (
         split::<_, ML_KEM_PUBLIC_LEN, 32>(public),
         split::<_, 32, 32>(randomness),
@@ -107,6 +111,8 @@ pub(crate) fn decapsulate(
     ciphertext: &[u8; CIPHERTEXT_LEN],
     shared: &mut [u8; SHARED_LEN],
 ) {
+    #[cfg(test)]
+    crate::timing::note();
     let mut expanded = [0; EXPANDED_LEN];
     expand(seed, &mut expanded);
     if let (Some((ml_kem_seed, x25519_secret)), Some((ml_kem_ciphertext, x25519_ciphertext))) = (

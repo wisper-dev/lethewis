@@ -238,6 +238,8 @@ Nothing is published while the version is below 0.1.0.
 - `Slots::archive_public_key` reads the public key of an archive key, as `ArchivePublic`, from
   its record under the profile's stored key, for those slots and that epoch only. Proofs with Kani
   0.68.0 for the four calls, and tests against records an independent implementation computes.
+- Tests check on every machine, not only on aarch64, that each call starts its derivations,
+  Argon2id, ciphers and operations of X-Wing inside the switch of data-independent timing.
 - Tests refuse every changed bit of the records of archive keys and of an archive, and read random
   ones sealed with the real derivations and cipher; ten thousand of each from a new seed on every
   pull request.
