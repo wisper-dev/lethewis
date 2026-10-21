@@ -34,6 +34,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
   'cfg(sha2_backend, values("soft"))',
   'cfg(aes_backend, values("soft"))',
   'cfg(polyval_backend, values("soft"))',
+  'cfg(keccak_backend, values("soft"))',
 ] }
 unused_qualifications = "deny"
 
