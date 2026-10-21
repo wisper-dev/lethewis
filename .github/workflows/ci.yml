@@ -417,6 +417,18 @@ jobs:
             words::tests::many_random_words_are_read_as_the_list_says | tee random-words.txt
           grep -q '^test result: ok. 1 passed' random-words.txt
 
+      - name: Ten thousand random records of the archive
+        # X-Wing runs in every round, so the rounds are fewer.
+        env:
+          LETHEWIS_RANDOM_ROUNDS: "10000"
+          LETHEWIS_RANDOM_SEED: ${{ github.run_id }}
+        run: |
+          cargo test -p lethewis-core --lib --locked --release -- --ignored --exact \
+            slots::archive::tests::many_random_records_of_archive_keys_load_as_their_layers_say \
+            slots::archived::tests::many_random_records_of_an_archive_open_as_their_parts_say \
+            | tee random-archive.txt
+          grep -q '^test result: ok. 2 passed' random-archive.txt
+
       - name: Tests, software SHA-256, AES and POLYVAL
         # The runners have the instructions these use; the portable code is a path of its own, and
         # without them the hash and the cipher use a different amount of stack.

@@ -562,13 +562,18 @@ pub(super) fn open_archive_layer(
 mod tests {
     extern crate std;
 
+    use std::format;
+
+    use super::super::Occupancy;
     use super::{
         ARCHIVE_BODY_LEN, ARCHIVE_KEY_RECORD_LEN, PUBLIC_LEN, join_body, open_archive_layer,
         seal_archive_layer, seed_of, split_body,
     };
-    use crate::derive::derive_archive_key;
-    use crate::key::{Key, tests::Counting};
+    use crate::derive::{KeyId, derive_archive_key, derive_archive_layer_key, derive_key_id};
+    use crate::key::Key;
+    use crate::key::tests::{Counting, Random, from_environment};
     use crate::keyset::{self, Header, Stages};
+    use crate::record::AssociatedData;
     use crate::record::PLAINTEXT_LEN;
     use crate::slots::tests::{EPOCH, epoch_key, flipped_epoch_key, pattern};
     use crate::slots::write_record;
@@ -621,9 +626,7 @@ mod tests {
                 &slots.epoch.key,
                 slots.epoch.number,
             ),
-            crate::record::AssociatedData::new(b"archive")
-                .unwrap()
-                .bytes(),
+            AssociatedData::new(b"archive").unwrap().bytes(),
             record,
             &mut body,
             &mut seal::open,
@@ -656,7 +659,7 @@ mod tests {
         assert!(
             slots.memory[5..]
                 .iter()
-                .all(|slot| slot.occupancy == super::super::Occupancy::Free)
+                .all(|slot| slot.occupancy == Occupancy::Free)
         );
         for (store, profile, context, refused) in [
             (archive, stored, &b"archive 2"[..], Error::StaleRecord),
@@ -744,9 +747,7 @@ mod tests {
             seal_archive_layer(
                 (slots.memory[stored.index].wrapping_key().0, &*key, *number),
                 (&mut Counting, drawn),
-                crate::record::AssociatedData::new(b"archive")
-                    .unwrap()
-                    .bytes(),
+                AssociatedData::new(b"archive").unwrap().bytes(),
                 &body,
                 &mut changed,
             )
@@ -756,7 +757,7 @@ mod tests {
                 Err(Error::PublicKeyMismatch),
                 "change {change}"
             );
-            assert_eq!(slots.memory[5].occupancy, super::super::Occupancy::Free);
+            assert_eq!(slots.memory[5].occupancy, Occupancy::Free);
         }
     }
 
@@ -813,7 +814,7 @@ mod tests {
         other.copy32(&[6; 32]);
         let mut two = Stages::one();
         two.add().unwrap();
-        let associated = crate::record::AssociatedData::new(b"archive").unwrap();
+        let associated = AssociatedData::new(b"archive").unwrap();
         for (purpose, epoch, stages) in [
             (Purpose::Archive, 1, Stages::one()),
             (Purpose::Archive, 0, two),
@@ -857,7 +858,7 @@ mod tests {
                 Err(Error::RecordRejected),
                 "{purpose:?} in epoch {epoch}"
             );
-            assert_eq!(slots.memory[5].occupancy, super::super::Occupancy::Free);
+            assert_eq!(slots.memory[5].occupancy, Occupancy::Free);
         }
     }
 
@@ -971,7 +972,443 @@ mod tests {
             ),
             Err(Error::CipherFailed)
         );
-        assert_eq!(slots.memory[5].occupancy, super::super::Occupancy::Free);
+        assert_eq!(slots.memory[5].occupancy, Occupancy::Free);
+    }
+
+    /// Every changed bit of the record of an archive key is refused by the reading of its public key
+    /// and by the carry, which open it as the load does, and the carry writes nothing; without
+    /// optimisation, where the cipher is slow, one bit of every byte.
+    #[test]
+    #[expect(clippy::integer_division, reason = "a test picks bits of a record")]
+    fn every_changed_bit_of_the_record_of_an_archive_key_is_refused() {
+        let mut memory = [const { Slot::empty() }; 6];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let [_, stored, _, archive, _] = keys(&mut slots);
+        let mut record = [0; ARCHIVE_KEY_RECORD_LEN];
+        slots
+            .create_archive_key(archive, stored, b"archive", &mut Counting, &mut record)
+            .unwrap();
+        slots.begin_epoch(&mut [8; 32]).unwrap();
+        let mut carried = [7; ARCHIVE_KEY_RECORD_LEN];
+        let bits = (0..ARCHIVE_KEY_RECORD_LEN * 8)
+            .filter(|bit| !cfg!(lethewis_unoptimised) || bit % 8 == bit / 8 % 8);
+        for bit in bits {
+            let mut changed = record;
+            changed[bit / 8] ^= 1 << (bit % 8);
+            assert_eq!(
+                slots
+                    .archive_public_key(stored, b"archive", &changed)
+                    .map(|_| ()),
+                Err(Error::StaleRecord),
+                "bit {bit}"
+            );
+            assert_eq!(
+                slots.carry_archive_key(
+                    stored,
+                    stored,
+                    b"archive",
+                    &mut Counting,
+                    &changed,
+                    &mut carried
+                ),
+                Err(Error::StaleRecord),
+                "bit {bit}"
+            );
+            assert_eq!(carried, [7; ARCHIVE_KEY_RECORD_LEN], "bit {bit}");
+        }
+        assert!(
+            slots
+                .archive_public_key(stored, b"archive", &record)
+                .is_ok()
+        );
+        assert_eq!(
+            slots.carry_archive_key(
+                stored,
+                stored,
+                b"archive",
+                &mut Counting,
+                &record,
+                &mut carried
+            ),
+            Ok(())
+        );
+    }
+
+    /// What a slot holds: its occupancy, generation, purpose, level, stages, keys and identifiers.
+    type Holding = (
+        Occupancy,
+        u64,
+        Purpose,
+        bool,
+        Stages,
+        [[u8; 64]; 3],
+        [[u8; 16]; 3],
+    );
+
+    fn holdings(slots: &Slots<'_>) -> std::vec::Vec<Holding> {
+        slots
+            .memory
+            .iter()
+            .map(|slot| {
+                (
+                    slot.occupancy,
+                    slot.generation,
+                    slot.purpose,
+                    slot.unlocks,
+                    slot.stages,
+                    core::array::from_fn(|at| *slot.keys[at].bytes()),
+                    core::array::from_fn(|at| slot.ids[at].bytes()),
+                )
+            })
+            .collect()
+    }
+
+    /// What a round of random records of archive keys gets wrong.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Fault {
+        Nothing,
+        /// A context of no bytes or of more than 255.
+        Context,
+        /// A context other than the record's.
+        OtherContext,
+        /// A changed bit of the record.
+        Record,
+        /// The outer layer under another key than the profile's.
+        Profile,
+        /// The outer layer naming another epoch.
+        Epoch,
+        /// A changed bit of the inner layer.
+        Inner,
+        /// The inner layer under another key than the store's.
+        Store,
+        /// A set naming another parent.
+        Parent,
+        /// A byte of a field the set is read by.
+        Field,
+        /// A set of two keys.
+        SecondKey,
+        /// A plaintext of random bytes.
+        Plaintext,
+        /// An identifier not the seed's.
+        Id,
+        /// A changed bit of the public key.
+        Public,
+        /// A seed these slots hold already.
+        Held,
+    }
+
+    /// Each fault in turn; one round in four gets a second, at random.
+    const FAULTS: [Fault; 19] = [
+        Fault::Nothing,
+        Fault::Nothing,
+        Fault::Nothing,
+        Fault::Context,
+        Fault::OtherContext,
+        Fault::Record,
+        Fault::Profile,
+        Fault::Epoch,
+        Fault::Inner,
+        Fault::Store,
+        Fault::Parent,
+        Fault::Field,
+        Fault::Field,
+        Fault::Field,
+        Fault::SecondKey,
+        Fault::Plaintext,
+        Fault::Id,
+        Fault::Public,
+        Fault::Held,
+    ];
+
+    /// The fields a set of one seed is read by, in its layout: the version, the purpose, the
+    /// primary position, both ends of the epoch and of the revision, the stage and the length of
+    /// the first position, both ends of its padding, the stage and the length of the second, and
+    /// the last byte.
+    const FIELDS: [usize; 14] = [0, 1, 2, 19, 26, 27, 34, 35, 36, 69, 100, 101, 102, 232];
+
+    /// Whether `plaintext` holds the set of one seed of an archive key, read from the layout: version
+    /// 1, purpose 4, the primary at the first position, epoch and revision zero, the first position
+    /// enabled with 32 bytes and zeros past them, and the other two zero throughout.
+    fn holds_one_seed(plaintext: &[u8; PLAINTEXT_LEN]) -> bool {
+        plaintext[..3] == [1, 4, 0]
+            && plaintext[19..35].iter().all(|&byte| byte == 0)
+            && plaintext[35..37] == [1, 32]
+            && plaintext[69..].iter().all(|&byte| byte == 0)
+    }
+
+    /// `plaintext` sealed under `key` with `nonce`, laid out without the library's code for it.
+    fn sealed_by_hand<const N: usize, const R: usize>(
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        aad: &[u8],
+        plaintext: &[u8; N],
+    ) -> [u8; R] {
+        let mut sealed = *plaintext;
+        let tag = seal::seal(key, nonce, aad, &mut sealed).unwrap();
+        let mut record = [0; R];
+        let (nonce_out, rest) = record.split_at_mut(12);
+        let (sealed_out, tag_out) = rest.split_at_mut(N);
+        nonce_out.copy_from_slice(nonce);
+        sealed_out.copy_from_slice(&sealed);
+        tag_out.copy_from_slice(&tag);
+        record
+    }
+
+    /// What `record` holds under `key`, read without the library's code for it.
+    fn opened_by_hand<const N: usize, const R: usize>(
+        key: &[u8; 32],
+        aad: &[u8],
+        record: &[u8; R],
+    ) -> Result<[u8; N], seal::Rejected> {
+        let (nonce, rest) = record.split_at(12);
+        let (sealed, tag) = rest.split_at(N);
+        let mut sealed = <[u8; N]>::try_from(sealed).unwrap();
+        let (nonce, tag) = (nonce.try_into().unwrap(), tag.try_into().unwrap());
+        seal::open(key, nonce, aad, &mut sealed, tag).map(|()| sealed)
+    }
+
+    /// Records of archive keys sealed through the real derivations and cipher and laid out by hand,
+    /// with every fault of [`FAULTS`] in turn and at times a second: a context, either layer or its
+    /// key, the epoch, the set, the identifier or the public key wrong, or the seed held already.
+    /// The load, the reading of the public key and the carry, to the same stored key or another,
+    /// never panic, refuse exactly what they should, with the error they should, and change or
+    /// write nothing then; the load fills the first free slot with the seed, the reading gives the
+    /// identifier and the public key the record holds, and the carry the same under the next epoch.
+    #[expect(clippy::too_many_lines, reason = "one round builds and reads a record")]
+    fn load_random_archive_keys(rounds: u64, seed: u64) {
+        let mut random = Random(seed);
+        let (mut faults, mut fields) = (FAULTS.iter().cycle(), FIELDS.iter().cycle());
+        for round in 0..rounds {
+            let first = *faults.next().unwrap();
+            let second = if random.below(4) == 0 {
+                FAULTS[random.below(FAULTS.len())]
+            } else {
+                Fault::Nothing
+            };
+            let has = |fault| first == fault || second == fault;
+            let mut memory = [const { Slot::empty() }; 6];
+            let mut epoch_memory = Epoch::empty();
+            let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+            let length = [KeyLength::Bytes32, KeyLength::Bytes64][random.below(2)];
+            let stored = slots
+                .generate(Purpose::Wrap, length, &mut Counting)
+                .unwrap();
+            let next_stored = slots
+                .generate(Purpose::Wrap, KeyLength::Bytes32, &mut Counting)
+                .unwrap();
+            let store = slots
+                .generate(Purpose::ArchiveWrap, KeyLength::Bytes32, &mut Counting)
+                .unwrap();
+            let next_profile = [stored, next_stored][random.below(2)];
+            let held = has(Fault::Held).then(|| {
+                let mut record = [0; ARCHIVE_KEY_RECORD_LEN];
+                slots
+                    .create_archive_key(store, stored, b"archive", &mut Counting, &mut record)
+                    .unwrap();
+                let key = slots
+                    .load_archive_key(store, stored, b"archive", &record)
+                    .unwrap();
+                <[u8; 32]>::try_from(&slots.memory[key.index].keys[0].bytes()[..32]).unwrap()
+            });
+            let mut outsider = Key::empty();
+            outsider.copy32(&random.bytes());
+
+            let (archive_key, archive_id) = slots.memory[store.index].wrapping_key();
+            let mut plaintext = [0; PLAINTEXT_LEN];
+            plaintext[..3].copy_from_slice(&[1, 4, 0]);
+            plaintext[3..19].copy_from_slice(&if has(Fault::Parent) {
+                random.bytes()
+            } else {
+                archive_id.bytes()
+            });
+            plaintext[35..37].copy_from_slice(&[1, 32]);
+            plaintext[37..69].copy_from_slice(&held.unwrap_or(random.bytes()));
+            if has(Fault::Field) {
+                plaintext[*fields.next().unwrap()] = random.bytes::<1>()[0];
+            }
+            if has(Fault::SecondKey) {
+                plaintext[101..103].copy_from_slice(&[[1, 2][random.below(2)], 32]);
+                plaintext[103..135].copy_from_slice(&random.bytes::<32>());
+            }
+            if has(Fault::Plaintext) {
+                plaintext = random.bytes();
+            }
+            let context: std::vec::Vec<u8> = if has(Fault::Context) {
+                (0..[0, 256, 300][random.below(3)]).map(|_| 7).collect()
+            } else {
+                (0..=random.below(255))
+                    .map(|_| random.bytes::<1>()[0])
+                    .collect()
+            };
+            let sealed_for = if has(Fault::Context) {
+                &b"archive"[..]
+            } else {
+                &context[..]
+            };
+            let associated = AssociatedData::new(sealed_for).unwrap();
+            let mut inner_key = [0; 32];
+            derive_archive_key(
+                if has(Fault::Store) {
+                    &outsider
+                } else {
+                    archive_key
+                },
+                &mut inner_key,
+            )
+            .unwrap();
+            let mut inner: [u8; RECORD_LEN] =
+                sealed_by_hand(&inner_key, &random.bytes(), associated.bytes(), &plaintext);
+            if has(Fault::Inner) {
+                inner[random.below(RECORD_LEN)] ^= 1 << random.below(8);
+            }
+
+            let given = <[u8; 32]>::try_from(&plaintext[37..69]).unwrap();
+            let mut given_key = Key::empty();
+            given_key.copy32(&given);
+            let mut given_id = KeyId::empty();
+            derive_key_id(&given_key, &mut given_id).unwrap();
+            let mut public = [0; PUBLIC_LEN];
+            xwing::public_key(&given, &mut public);
+            let id = if has(Fault::Id) {
+                random.bytes()
+            } else {
+                given_id.bytes()
+            };
+            if has(Fault::Public) {
+                public[random.below(PUBLIC_LEN)] ^= 1 << random.below(8);
+            }
+            let mut layer = [0; super::ARCHIVE_LAYER_LEN];
+            let number = if has(Fault::Epoch) {
+                EPOCH ^ (1_u64 << random.below(64))
+            } else {
+                EPOCH
+            };
+            layer[..8].copy_from_slice(&number.to_le_bytes());
+            layer[8..24].copy_from_slice(&id);
+            layer[24..1240].copy_from_slice(&public);
+            layer[1240..].copy_from_slice(&inner);
+            let mut layer_key = [0; 32];
+            derive_archive_layer_key(
+                if has(Fault::Profile) {
+                    &outsider
+                } else {
+                    slots.memory[stored.index].wrapping_key().0
+                },
+                &slots.epoch.key,
+                &mut layer_key,
+            )
+            .unwrap();
+            let mut record: [u8; ARCHIVE_KEY_RECORD_LEN] =
+                sealed_by_hand(&layer_key, &random.bytes(), associated.bytes(), &layer);
+            if has(Fault::Record) {
+                record[random.below(ARCHIVE_KEY_RECORD_LEN)] ^= 1 << random.below(8);
+            }
+            let mut asked = context.clone();
+            if has(Fault::OtherContext) && !has(Fault::Context) {
+                let at = random.below(asked.len());
+                asked[at] ^= 1 << random.below(8);
+            }
+
+            let read = if has(Fault::Context) {
+                Err(Error::InvalidContext)
+            } else if has(Fault::OtherContext)
+                || has(Fault::Record)
+                || has(Fault::Profile)
+                || has(Fault::Epoch)
+            {
+                Err(Error::StaleRecord)
+            } else {
+                Ok(())
+            };
+            let loaded = read.and(
+                if has(Fault::Inner)
+                    || has(Fault::Store)
+                    || plaintext[3..19] != archive_id.bytes()
+                    || !holds_one_seed(&plaintext)
+                {
+                    Err(Error::RecordRejected)
+                } else if has(Fault::Id) || has(Fault::Public) {
+                    Err(Error::PublicKeyMismatch)
+                } else if held.is_some() {
+                    Err(Error::DuplicateKey)
+                } else {
+                    Ok(())
+                },
+            );
+            slots.begin_epoch(&mut [8; 32]).unwrap();
+            let at = format!("round {round} of seed {seed}");
+            let before = holdings(&slots);
+            let first_free = before
+                .iter()
+                .position(|holding| holding.0 == Occupancy::Free)
+                .unwrap();
+            let result = slots.load_archive_key(store, stored, &asked, &record);
+            assert_eq!(result.map(|_| ()), loaded, "{at}");
+            let mut after = before.clone();
+            if result.is_ok() {
+                let mut keys = [[0; 64]; 3];
+                keys[0][..32].copy_from_slice(&given);
+                let mut ids = [[0; 16]; 3];
+                ids[0] = given_id.bytes();
+                after[first_free] = (
+                    Occupancy::Loaded,
+                    before[first_free].1,
+                    Purpose::Archive,
+                    false,
+                    Stages::one(),
+                    keys,
+                    ids,
+                );
+            }
+            assert_eq!(holdings(&slots), after, "{at}");
+            let public_read = slots
+                .archive_public_key(stored, &asked, &record)
+                .map(|found| (found.id, found.public));
+            assert_eq!(public_read, read.map(|()| (id, public)), "{at}");
+            let mut carried = [7; ARCHIVE_KEY_RECORD_LEN];
+            let carry = slots.carry_archive_key(
+                stored,
+                next_profile,
+                &asked,
+                &mut Counting,
+                &record,
+                &mut carried,
+            );
+            assert_eq!(carry, read, "{at}");
+            if carry.is_ok() {
+                let mut next_key = [0; 32];
+                derive_archive_layer_key(
+                    slots.memory[next_profile.index].wrapping_key().0,
+                    &slots.epoch.next,
+                    &mut next_key,
+                )
+                .unwrap();
+                let moved: Result<[u8; super::ARCHIVE_LAYER_LEN], _> =
+                    opened_by_hand(&next_key, associated.bytes(), &carried);
+                let mut expected = layer;
+                expected[..8].copy_from_slice(&(EPOCH + 1).to_le_bytes());
+                assert_eq!(moved, Ok(expected), "{at}");
+            } else {
+                assert_eq!(carried, [7; ARCHIVE_KEY_RECORD_LEN], "{at}");
+            }
+        }
+    }
+
+    #[test]
+    fn random_records_of_archive_keys_load_as_their_layers_say() {
+        load_random_archive_keys(100, 1);
+    }
+
+    /// The same over as many rounds and from the seed `LETHEWIS_RANDOM_ROUNDS` and
+    /// `LETHEWIS_RANDOM_SEED` give.
+    #[test]
+    #[ignore = "long; the rounds and the seed come from the environment"]
+    fn many_random_records_of_archive_keys_load_as_their_layers_say() {
+        load_random_archive_keys(
+            from_environment("LETHEWIS_RANDOM_ROUNDS", 10_000),
+            from_environment("LETHEWIS_RANDOM_SEED", 2),
+        );
     }
 
     /// The record of an archive key and the same record carried into the next epoch, computed by an

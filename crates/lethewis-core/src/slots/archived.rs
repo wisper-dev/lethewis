@@ -499,9 +499,14 @@ fn split_archived(
 mod tests {
     extern crate std;
 
-    use super::{ARCHIVE_RECORD_LEN, ArchivePublic, CIPHERTEXT_LEN, ID_LEN, PUBLIC_LEN};
+    use super::{
+        ARCHIVE_RECORD_LEN, ARCHIVED_LEN, ArchivePublic, CIPHERTEXT_LEN, ID_LEN, KeyId, PUBLIC_LEN,
+    };
+    use crate::derive::{derive_archive_check, derive_archive_data, derive_archive_seal_key};
     use crate::epoch::{Erasure, Root, RootFailed};
-    use crate::key::tests::{Counting, Failing};
+    use crate::key::Key;
+    use crate::key::tests::{Counting, Failing, Random, from_environment};
+    use crate::record::AssociatedData;
     use crate::slots::tests::{EPOCH, epoch_key};
     use crate::xwing::{self, wrong_known};
     use crate::{
@@ -791,8 +796,8 @@ mod tests {
                 &mut data_key,
             )
             .unwrap();
-        let associated = crate::record::AssociatedData::new(b"chat").unwrap();
-        let mut sealed = [0; super::ARCHIVED_LEN];
+        let associated = AssociatedData::new(b"chat").unwrap();
+        let mut sealed = [0; ARCHIVED_LEN];
         super::open_archived(
             slots.memory[chat.index].wrapping_key().0,
             associated.bytes(),
@@ -1039,6 +1044,302 @@ mod tests {
             Err(Error::CipherFailed)
         );
         assert_eq!(opened, [5; 32]);
+    }
+
+    /// Every changed bit of a record of an archive is refused by the move, which opens it as the
+    /// opening does and writes nothing, without optimisation, where the cipher is slow, one bit of
+    /// every byte; and a changed byte in each part of it by the opening.
+    #[test]
+    #[expect(clippy::integer_division, reason = "a test picks bits of a record")]
+    fn every_changed_bit_of_a_record_of_an_archive_is_refused() {
+        let mut memory = [const { Slot::empty() }; 8];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let ([stored, store, chat, other_chat], public, key_record) = archive(&mut slots);
+        let (mut record, mut data_key) = ([0; ARCHIVE_RECORD_LEN], [0; 32]);
+        slots
+            .archive(
+                chat,
+                &public,
+                b"chat",
+                &mut Counting,
+                &mut record,
+                &mut data_key,
+            )
+            .unwrap();
+        let mut moved = [9; ARCHIVE_RECORD_LEN];
+        let bits = (0..ARCHIVE_RECORD_LEN * 8)
+            .filter(|bit| !cfg!(lethewis_unoptimised) || bit % 8 == bit / 8 % 8);
+        for bit in bits {
+            let mut changed = record;
+            changed[bit / 8] ^= 1 << (bit % 8);
+            assert_eq!(
+                slots.reseal_archive(
+                    chat,
+                    other_chat,
+                    b"chat",
+                    &mut Counting,
+                    &changed,
+                    &mut moved
+                ),
+                Err(Error::RecordRejected),
+                "bit {bit}"
+            );
+            assert_eq!(moved, [9; ARCHIVE_RECORD_LEN], "bit {bit}");
+        }
+        assert_eq!(
+            slots.reseal_archive(
+                chat,
+                other_chat,
+                b"chat",
+                &mut Counting,
+                &record,
+                &mut moved
+            ),
+            Ok(())
+        );
+        let key = slots
+            .load_archive_key(store, stored, b"archive", &key_record)
+            .unwrap();
+        let mut opened = [7; 32];
+        // The nonce, the identifier, the ciphertext, the check and the tag, at each end.
+        for at in [0, 11, 12, 27, 28, 1147, 1148, 1163, 1164, 1179] {
+            let mut changed = record;
+            changed[at] ^= 0x80;
+            assert_eq!(
+                slots.open_archive(key, chat, b"chat", &changed, &mut opened),
+                Err(Error::RecordRejected),
+                "byte {at}"
+            );
+            assert_eq!(opened, [7; 32], "byte {at}");
+        }
+        slots
+            .open_archive(key, chat, b"chat", &record, &mut opened)
+            .unwrap();
+        assert_eq!(opened, data_key);
+    }
+
+    /// `id`, `ciphertext` and `check` sealed under the key of the chat `chat` for its archive,
+    /// bound to `context`, with `nonce`, laid out without the library's code for it.
+    fn seal_parts(
+        chat: &Key,
+        context: &[u8],
+        nonce: &[u8; 12],
+        (id, ciphertext, check): (&[u8; ID_LEN], &[u8; CIPHERTEXT_LEN], &[u8; ID_LEN]),
+    ) -> [u8; ARCHIVE_RECORD_LEN] {
+        let mut cipher_key = [0; 32];
+        derive_archive_seal_key(chat, &mut cipher_key).unwrap();
+        let mut sealed = [0; ARCHIVED_LEN];
+        sealed[..16].copy_from_slice(id);
+        sealed[16..1136].copy_from_slice(ciphertext);
+        sealed[1136..].copy_from_slice(check);
+        let associated = AssociatedData::new(context).unwrap();
+        let tag = seal::seal(&cipher_key, nonce, associated.bytes(), &mut sealed).unwrap();
+        let mut record = [0; ARCHIVE_RECORD_LEN];
+        record[..12].copy_from_slice(nonce);
+        record[12..1164].copy_from_slice(&sealed);
+        record[1164..].copy_from_slice(&tag);
+        record
+    }
+
+    /// What a record of an archive under the key of the chat `chat` for its archive holds, bound to
+    /// `context`, read without the library's code for it.
+    fn opened_parts(
+        chat: &Key,
+        context: &[u8],
+        record: &[u8; ARCHIVE_RECORD_LEN],
+    ) -> Result<[u8; ARCHIVED_LEN], seal::Rejected> {
+        let mut cipher_key = [0; 32];
+        derive_archive_seal_key(chat, &mut cipher_key).unwrap();
+        let associated = AssociatedData::new(context).unwrap();
+        let mut sealed = <[u8; ARCHIVED_LEN]>::try_from(&record[12..1164]).unwrap();
+        let tag = <[u8; 16]>::try_from(&record[1164..]).unwrap();
+        let nonce = <[u8; 12]>::try_from(&record[..12]).unwrap();
+        seal::open(&cipher_key, &nonce, associated.bytes(), &mut sealed, &tag).map(|()| sealed)
+    }
+
+    /// What a round of random records of an archive gets wrong.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Fault {
+        Nothing,
+        /// A context of no bytes or of more than 255.
+        Context,
+        /// A context other than the record's.
+        OtherContext,
+        /// A changed bit of the record.
+        Record,
+        /// The record under the key of another chat.
+        OtherChat,
+        /// The record under a key no slot holds.
+        Outsider,
+        /// The identifier of another archive key.
+        Id,
+        /// A changed bit of the ciphertext.
+        Ciphertext,
+        /// A ciphertext of random bytes.
+        RandomCiphertext,
+        /// A changed bit of the check, in each byte in turn.
+        Check,
+    }
+
+    /// Each fault in turn; one round in four gets a second, at random.
+    const FAULTS: [Fault; 13] = [
+        Fault::Nothing,
+        Fault::Nothing,
+        Fault::Nothing,
+        Fault::Context,
+        Fault::OtherContext,
+        Fault::Record,
+        Fault::OtherChat,
+        Fault::Outsider,
+        Fault::Id,
+        Fault::Ciphertext,
+        Fault::RandomCiphertext,
+        Fault::Check,
+        Fault::Check,
+    ];
+
+    /// Records of an archive sealed through the real derivation and cipher and laid out by hand,
+    /// from real encapsulations to the archive key, with every fault of [`FAULTS`] in turn and at
+    /// times a second: a context, the key of the chat, the identifier, the ciphertext or the check
+    /// wrong. The opening and the move never panic, refuse exactly what they should, with the error
+    /// they should, and write nothing then; the opening gives the key of the batch the
+    /// encapsulation gave, and the move the same parts under the other key.
+    #[expect(clippy::too_many_lines, reason = "one round builds and reads a record")]
+    fn open_random_archive_records(rounds: u64, seed: u64) {
+        let mut random = Random(seed);
+        let mut memory = [const { Slot::empty() }; 8];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let ([stored, store, chat, other_chat], public, key_record) = archive(&mut slots);
+        let key = slots
+            .load_archive_key(store, stored, b"archive", &key_record)
+            .unwrap();
+        let (mut faults, mut checked) = (FAULTS.iter().cycle(), (0..ID_LEN).cycle());
+        for round in 0..rounds {
+            let first = *faults.next().unwrap();
+            let second = if random.below(4) == 0 {
+                FAULTS[random.below(FAULTS.len())]
+            } else {
+                Fault::Nothing
+            };
+            let has = |fault| first == fault || second == fault;
+            let mut outsider = Key::empty();
+            outsider.copy32(&random.bytes());
+            let context: std::vec::Vec<u8> = if has(Fault::Context) {
+                (0..[0, 256, 300][random.below(3)]).map(|_| 7).collect()
+            } else {
+                (0..=random.below(255))
+                    .map(|_| random.bytes::<1>()[0])
+                    .collect()
+            };
+            let sealed_for = if has(Fault::Context) {
+                &b"chat"[..]
+            } else {
+                &context[..]
+            };
+            let (mut ciphertext, mut shared) = ([0; CIPHERTEXT_LEN], [0; 32]);
+            xwing::encapsulate(
+                &public.public,
+                &random.bytes(),
+                &mut ciphertext,
+                &mut shared,
+            )
+            .unwrap();
+            let mut secret = Key::empty();
+            secret.copy32(&shared);
+            let (mut batch, mut check) = ([0; 32], KeyId::empty());
+            derive_archive_data(&secret, &ciphertext, &mut batch).unwrap();
+            derive_archive_check(&secret, &ciphertext, &mut check).unwrap();
+            let mut check = check.bytes();
+            let id = if has(Fault::Id) {
+                random.bytes()
+            } else {
+                public.id
+            };
+            if has(Fault::Ciphertext) {
+                ciphertext[random.below(CIPHERTEXT_LEN)] ^= 1 << random.below(8);
+            }
+            if has(Fault::RandomCiphertext) {
+                ciphertext = random.bytes();
+            }
+            if has(Fault::Check) {
+                check[checked.next().unwrap()] ^= 1 << random.below(8);
+            }
+            let sealed_by = if has(Fault::Outsider) {
+                &outsider
+            } else if has(Fault::OtherChat) {
+                slots.memory[other_chat.index].wrapping_key().0
+            } else {
+                slots.memory[chat.index].wrapping_key().0
+            };
+            let parts = (&id, &ciphertext, &check);
+            let mut record = seal_parts(sealed_by, sealed_for, &random.bytes(), parts);
+            if has(Fault::Record) {
+                record[random.below(ARCHIVE_RECORD_LEN)] ^= 1 << random.below(8);
+            }
+            let mut asked = context.clone();
+            if has(Fault::OtherContext) && !has(Fault::Context) {
+                let at = random.below(asked.len());
+                asked[at] ^= 1 << random.below(8);
+            }
+
+            let at = std::format!("round {round} of seed {seed}");
+            let opens = if has(Fault::Context) {
+                Err(Error::InvalidContext)
+            } else if has(Fault::OtherContext)
+                || has(Fault::Record)
+                || has(Fault::OtherChat)
+                || has(Fault::Outsider)
+            {
+                Err(Error::RecordRejected)
+            } else {
+                Ok(())
+            };
+            let expected = opens.and(if has(Fault::Id) {
+                Err(Error::WrongArchiveKey)
+            } else if has(Fault::Ciphertext) || has(Fault::RandomCiphertext) || has(Fault::Check) {
+                Err(Error::PublicKeyMismatch)
+            } else {
+                Ok(batch)
+            });
+            let mut opened = [7; 32];
+            let result = slots.open_archive(key, chat, &asked, &record, &mut opened);
+            assert_eq!(result.map(|()| opened), expected, "{at}");
+            if result.is_err() {
+                assert_eq!(opened, [7; 32], "{at}");
+            }
+            let mut moved = [9; ARCHIVE_RECORD_LEN];
+            let result =
+                slots.reseal_archive(chat, other_chat, &asked, &mut Counting, &record, &mut moved);
+            assert_eq!(result, opens, "{at}");
+            if result.is_ok() {
+                let mut parts = [0; ARCHIVED_LEN];
+                parts[..16].copy_from_slice(&id);
+                parts[16..1136].copy_from_slice(&ciphertext);
+                parts[1136..].copy_from_slice(&check);
+                let other = slots.memory[other_chat.index].wrapping_key().0;
+                assert_eq!(opened_parts(other, sealed_for, &moved), Ok(parts), "{at}");
+            } else {
+                assert_eq!(moved, [9; ARCHIVE_RECORD_LEN], "{at}");
+            }
+        }
+    }
+
+    #[test]
+    fn random_records_of_an_archive_open_as_their_parts_say() {
+        open_random_archive_records(100, 1);
+    }
+
+    /// The same over as many rounds and from the seed `LETHEWIS_RANDOM_ROUNDS` and
+    /// `LETHEWIS_RANDOM_SEED` give.
+    #[test]
+    #[ignore = "long; the rounds and the seed come from the environment"]
+    fn many_random_records_of_an_archive_open_as_their_parts_say() {
+        open_random_archive_records(
+            from_environment("LETHEWIS_RANDOM_ROUNDS", 10_000),
+            from_environment("LETHEWIS_RANDOM_SEED", 2),
+        );
     }
 }
 
