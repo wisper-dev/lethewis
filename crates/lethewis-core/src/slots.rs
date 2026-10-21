@@ -6910,6 +6910,12 @@ mod proofs {
         (0..2).all(|index| index == changed || snapshot(&slots.memory[index]) == before[index])
     }
 
+    /// The same, from the snapshots taken after a call: slots read once cost the solver about half
+    /// of what a read at each check costs.
+    fn unchanged_but(after: &[Snapshot; 2], before: &[Snapshot; 2], changed: usize) -> bool {
+        (0..2).all(|index| index == changed || after[index] == before[index])
+    }
+
     /// Whether the slot holds no key, no identifier at any position and no state of a transfer.
     fn wiped(slot: &Slot) -> bool {
         let now = snapshot(slot);
@@ -9000,15 +9006,16 @@ mod proofs {
             .chain
             .copy_from_slice(&record[NONCE_LEN + PLAINTEXT_LEN..RECORD_LEN]);
         chained.direction = Direction::Out;
+        let after = snapshots(&slots);
         kani::assert(
             if sealing {
-                unchanged_except(&slots, &before, set.index)
-                    && snapshot(slot_at(&slots, set.index)) == marked(child, child.changed, true)
+                unchanged_but(&after, &before, set.index)
+                    && snapshot_at(&after, set.index) == marked(child, child.changed, true)
             } else if result.is_ok() && !in_epoch {
-                unchanged_except(&slots, &before, parent.index)
-                    && snapshot(slot_at(&slots, parent.index)) == chained
+                unchanged_but(&after, &before, parent.index)
+                    && snapshot_at(&after, parent.index) == chained
             } else {
-                unchanged_except(&slots, &before, 2)
+                unchanged_but(&after, &before, 2)
             },
             "a wrap changes no key or stage, a wrap or a lock marks the set wrapped for the next \
              epoch only when it succeeds during a change, and an export marks nothing and gives \
