@@ -678,7 +678,7 @@ jobs:
           jq -sr '"\(map(.total_mutants) | add) mutants: \(map(.caught) | add) caught, \(map(.unviable) | add) unviable"' "${results[@]}"
 
   proof-parts:
-    name: Proofs, part ${{ matrix.part }} of 3
+    name: Proofs, part ${{ matrix.part }} of ${{ strategy.job-total }}
     needs: [lockfile, text]
     if: >-
       ${{ !cancelled() && github.event_name == 'pull_request' && needs.lockfile.result == 'success'
@@ -689,7 +689,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3]
+        part: [1, 2, 3, 4]
     permissions:
       contents: read
     steps:
@@ -709,11 +709,12 @@ jobs:
         run: scripts/prove.sh agree
 
       - name: Every proof of this part runs
-        # One per processor of the runner: none needs more than 3 GB of its 16.
+        # One per processor of the runner.
         env:
           LETHEWIS_PROOF_JOBS: 4
           PART: ${{ matrix.part }}
-        run: scripts/prove.sh part "$PART" 3
+          PARTS: ${{ strategy.job-total }}
+        run: scripts/prove.sh part "$PART" "$PARTS"
 
       - name: Keep the results
         # Also after a failed proof, whose results explain it.
