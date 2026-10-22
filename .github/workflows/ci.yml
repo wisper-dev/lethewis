@@ -702,7 +702,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4, 5, 6]
+        part: [1, 2, 3, 4, 5, 6, 7]
     permissions:
       contents: read
     steps:
@@ -722,9 +722,10 @@ jobs:
         run: scripts/prove.sh agree
 
       - name: Every proof of this part runs
-        # One per processor of the runner.
+        # One per processor of the runner, and room beside the peaks for the runner itself.
         env:
           LETHEWIS_PROOF_JOBS: 4
+          LETHEWIS_PROOF_MEMORY: 13000
           PART: ${{ matrix.part }}
           PARTS: ${{ strategy.job-total }}
         run: scripts/prove.sh part "$PART" "$PARTS"

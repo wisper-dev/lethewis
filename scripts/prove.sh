@@ -6,11 +6,13 @@
 #
 #   prove.sh             runs every proof, two at a time or LETHEWIS_PROOF_JOBS, then judges them
 #   prove.sh list        writes the declared proofs and prints their names as a JSON array
-#   prove.sh run PROOF   runs one proof; its results go to target/proofs/runs/
-#   prove.sh part K N    runs the K-th of N parts of the proofs, for N machines at once; the parts
-#                        are balanced by the seconds in scripts/proof-times, longest first
-#   prove.sh times       updates in scripts/proof-times the seconds of the proofs whose results
-#                        are in target/proofs/runs/
+#   prove.sh run PROOF   runs one proof; its results and peak memory go to target/proofs/runs/
+#   prove.sh part K N    runs the K-th of N parts of the proofs, for N machines at once, balanced
+#                        by the seconds in scripts/proof-times, LETHEWIS_PROOF_JOBS at a time; a
+#                        proof starts beside others only if their peaks there and its own come
+#                        within LETHEWIS_PROOF_MEMORY megabytes; `prove.sh judge` judges the parts
+#   prove.sh times       updates in scripts/proof-times the seconds and peaks of the proofs whose
+#                        results are in target/proofs/runs/
 #   prove.sh judge       judges the results in target/proofs/runs/ against the declared proofs
 #   prove.sh agree       compares, on a few proofs, Kani's own results with how a run reads them
 #   prove.sh sources     prints a digest of Kani and of every file but the documents; a run
@@ -72,16 +74,26 @@ run_file() {
   printf '%s/%s.json' "$runs" "${1//::/.}"
 }
 
+# Runs a command, and writes into FILE the peak memory, in megabytes, of the largest process it
+# started.
+peak() {
+  python3 -c 'import math, resource, subprocess, sys
+status = subprocess.call(sys.argv[2:])
+with open(sys.argv[1], "w") as out:
+    out.write(f"{math.ceil(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024)}\n")
+sys.exit(status)' "$@"
+}
+
 # Runs PROOF of the crates of MANIFEST and reads its results into FILE.
 read_run() {
   local manifest=$1 proof=$2 file=$3 started
-  rm -f "$file" "$file.part"
+  rm -f "$file" "$file.part" "${file%.json}.peak"
   started=${EPOCHREALTIME//[^0-9]/}
   # In a crate without the standard library Kani reports an assert! or unwrap that is never reached
   # as a success; line coverage shows it.
-  cargo kani --manifest-path "$manifest" --harness "$proof" --exact --output-format old \
-    --harness-timeout 10m --coverage -Z source-coverage -Z unstable-options >"${file%.json}.txt" 2>&1 ||
-    true
+  peak "${file%.json}.peak" cargo kani --manifest-path "$manifest" --harness "$proof" --exact \
+    --output-format old --harness-timeout 10m --coverage -Z source-coverage -Z unstable-options \
+    >"${file%.json}.txt" 2>&1 || true
   if ! scripts/cbmc-results.py read "$proof" "${file%.json}.txt" \
     $(((${EPOCHREALTIME//[^0-9]/} - started) / 1000)) >"$file.part"; then
     echo "prove: the results of $proof could not be read" >&2
@@ -183,9 +195,14 @@ prove_all() {
 
 # The K-th of N parts of the declared proofs.
 prove_part() {
-  local part=$1 parts=$2
+  local part=$1 parts=$2 jobs=${LETHEWIS_PROOF_JOBS:-2}
+  local memory=${LETHEWIS_PROOF_MEMORY:-$((1 << 40))}
   if ! [[ $part =~ ^[1-9][0-9]*$ && $parts =~ ^[1-9][0-9]*$ ]] || ((part > parts)); then
     echo "usage: prove.sh part K N, with 1 <= K <= N" >&2
+    exit 2
+  fi
+  if ! [[ $jobs =~ ^[1-9][0-9]*$ && $memory =~ ^[1-9][0-9]*$ ]]; then
+    echo "prove: LETHEWIS_PROOF_JOBS and LETHEWIS_PROOF_MEMORY are positive numbers" >&2
     exit 2
   fi
   rm -rf "$runs"
@@ -194,49 +211,114 @@ prove_part() {
   [ -f "$times" ] || { echo "prove: no $times" >&2; exit 1; }
   problems=$(jq -r --rawfile times "$times" '
     ($times | split("\n") | map(select(length > 0))) as $lines
-    | ($lines | map(select(test("^[0-9]+ [^ ]+$")) | split(" ")[1])) as $timed
+    | ($lines | map(select(test("^[0-9]+ [0-9]+ [^ ]+$")) | split(" ")[2])) as $timed
     | [.["standard-harnesses"][]?[]] as $declared
-    | ($lines[] | select(test("^[0-9]+ [^ ]+$") | not) | "  not <seconds> <proof>: \(.)"),
+    | ($lines[] | select(test("^[0-9]+ [0-9]+ [^ ]+$") | not)
+        | "  not <seconds> <megabytes> <proof>: \(.)"),
       ($timed | group_by(.)[] | select(length > 1) | "  twice: \(.[0])"),
-      (($declared - $timed)[] | "  no seconds for: \(.)"),
+      (($declared - $timed)[] | "  no line for: \(.)"),
       (($timed - $declared)[] | "  no such proof: \(.)")' "$out/declared.json")
   if [ -n "$problems" ]; then
-    printf 'prove: %s, a line "<seconds> <proof>" for each declared proof:\n%s\n' \
+    printf 'prove: %s, a line "<seconds> <megabytes> <proof>" for each declared proof:\n%s\n' \
       "$times" "$problems" >&2
     exit 1
   fi
   # Each proof, longest first, goes to the part with the fewest seconds so far.
-  jq -r --rawfile times "$times" --argjson part "$part" --argjson parts "$parts" '
+  local -a ordered
+  mapfile -t ordered < <(jq -r --rawfile times "$times" --argjson part "$part" \
+    --argjson parts "$parts" '
     $times | split("\n") | map(select(length > 0) | split(" ")
-      | {name: .[1], seconds: (.[0] | tonumber)}) | sort_by([-.seconds, .name])
+      | {name: .[2], seconds: (.[0] | tonumber), megabytes: .[1]}) | sort_by([-.seconds, .name])
     | reduce .[] as $proof ({seconds: [range($parts) | 0], parts: [range($parts) | []]};
       (.seconds | to_entries | min_by(.value) | .key) as $least
-      | .seconds[$least] += $proof.seconds | .parts[$least] += [$proof.name])
-    | .parts[$part - 1][]' -n |
-    xargs -r -d '\n' -n 1 -P "${LETHEWIS_PROOF_JOBS:-2}" --process-slot-var=PROVE_SLOT \
-      scripts/prove.sh run
+      | .seconds[$least] += $proof.seconds
+      | .parts[$least] += ["\($proof.megabytes) \($proof.name)"])
+    | .parts[$part - 1][]' -n)
+  run_within "$jobs" "$memory" "${ordered[@]}"
 }
 
-# The seconds of the proofs that ran replace their own; a proof that did not run keeps its line.
+# Runs the proofs of the lines "<megabytes> <proof>" in their order, at most JOBS at once; beside
+# running proofs one starts only if its peak fits with theirs within MEMORY megabytes, and one that
+# does not fit lets the next one start. Fails if a proof failed; a signal stops them all.
+run_within() {
+  local jobs=$1 memory=$2 failed=0 used=0 index size pid running slot started
+  shift 2
+  local -a pending=("$@") free=()
+  local -A size_of=() slot_of=()
+  trap 'trap - INT TERM; kill 0' INT TERM
+  for ((slot = 0; slot < jobs; slot++)); do
+    free+=("$slot")
+  done
+  while ((${#pending[@]} + ${#size_of[@]} > 0)); do
+    started=0
+    for index in "${!pending[@]}"; do
+      ((${#free[@]} > 0)) || break
+      size=${pending[index]%% *}
+      if ((${#size_of[@]} == 0 || used + size <= memory)); then
+        PROVE_SLOT=${free[0]} scripts/prove.sh run "${pending[index]#* }" &
+        size_of[$!]=$size
+        slot_of[$!]=${free[0]}
+        free=("${free[@]:1}")
+        used=$((used + size))
+        unset 'pending[index]'
+        started=1
+        break
+      fi
+    done
+    if ((started == 0)); then
+      # wait -n of bash 5.2 at times returns 127 and names no proof when two end at once.
+      pid=
+      for running in "${!size_of[@]}"; do
+        if ! kill -0 "$running" 2>/dev/null; then
+          pid=$running
+          break
+        fi
+      done
+      if [ -z "$pid" ]; then
+        sleep 1
+        continue
+      fi
+      wait "$pid" || failed=1
+      used=$((used - size_of[$pid]))
+      free+=("${slot_of[$pid]}")
+      unset 'size_of[$pid]' 'slot_of[$pid]'
+    fi
+  done
+  trap - INT TERM
+  return "$failed"
+}
+
+# What the proofs that ran took replaces their own; a proof that did not run keeps its line.
 write_times() {
-  local kept="" written
+  local kept="" peaks="" result written
   if ! compgen -G "$runs/*.json" >/dev/null; then
     echo "prove: no results in $runs to take the seconds from" >&2
     exit 1
   fi
   [ ! -f "$times" ] || kept=$(<"$times")
+  for result in "$runs"/*.json; do
+    if [ -f "${result%.json}.peak" ]; then
+      peaks+="$(<"${result%.json}.peak") ${result##*/}"$'\n'
+    fi
+  done
   declare_proofs
-  written=$(jq -rn --arg kept "$kept" --slurpfile declared "$out/declared.json" '
-    ($kept | split("\n") | map(select(test("^[0-9]+ [^ ]+$")) | split(" ")
-      | {key: .[1], value: (.[0] | tonumber)}) | from_entries) as $before
+  written=$(jq -rn --arg kept "$kept" --arg peaks "$peaks" \
+    --slurpfile declared "$out/declared.json" '
+    def name: rtrimstr(".json") | gsub("\\."; "::");
+    ($kept | split("\n") | map(select(test("^[0-9]+ [0-9]+ [^ ]+$")) | split(" ")
+      | {key: .[2], value: {seconds: .[0], megabytes: .[1]}}) | from_entries) as $before
+    | ($peaks | split("\n") | map(select(length > 0) | split(" ")
+      | {key: (.[1] | name), value: .[0]}) | from_entries) as $peak
     | ([inputs | {
-        key: (input_filename | split("/") | last | rtrimstr(".json") | gsub("\\."; "::")),
-        value: (.verification_results.results[0].duration_ms / 1000 | round)
+        key: (input_filename | split("/") | last | name),
+        value: (.verification_results.results[0].duration_ms / 1000 | round | tostring)
       }] | from_entries) as $ran
     | [$declared[0]["standard-harnesses"][]?[]] | sort[]
-    | (($ran[.] // $before[.]) as $seconds | select($seconds != null) | "\($seconds) \(.)")' \
-    "$runs"/*.json)
-  printf '%s\n' "$written" >"$times"
+    | ($ran[.] // $before[.].seconds) as $seconds | ($peak[.] // $before[.].megabytes) as $megabytes
+    | if $seconds == null or $megabytes == null then "- \(.)" else "\($seconds) \($megabytes) \(.)"
+      end' "$runs"/*.json)
+  grep -v '^- ' <<<"$written" >"$times" || true
+  grep '^- ' <<<"$written" | sed 's/^- /prove: no seconds or no peak, so no line, for /' >&2 || true
 }
 
 judge() {
