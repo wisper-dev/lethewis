@@ -7,7 +7,10 @@
 #   prove.sh             runs every proof, two at a time or LETHEWIS_PROOF_JOBS, then judges them
 #   prove.sh list        writes the declared proofs and prints their names as a JSON array
 #   prove.sh run PROOF   runs one proof; its results go to target/proofs/runs/
-#   prove.sh part K N    runs the K-th of N parts of the proofs, for N machines at once
+#   prove.sh part K N    runs the K-th of N parts of the proofs, for N machines at once; the parts
+#                        are balanced by the seconds in scripts/proof-times, longest first
+#   prove.sh times       updates in scripts/proof-times the seconds of the proofs whose results
+#                        are in target/proofs/runs/
 #   prove.sh judge       judges the results in target/proofs/runs/ against the declared proofs
 #   prove.sh agree       compares, on a few proofs, Kani's own results with how a run reads them
 #   prove.sh sources     prints a digest of Kani and of every file but the documents; a run
@@ -34,6 +37,7 @@ source scripts/kani-pin.sh
 out=target/proofs
 runs=$out/runs
 results=$out/results.json
+times=scripts/proof-times
 
 placed() {
   local misplaced
@@ -89,11 +93,12 @@ read_run() {
 sources() {
   {
     cargo kani --version
-    git ls-files --cached --others --exclude-standard -- ':!*.md' | while IFS= read -r name; do
-      if [ -f "$name" ]; then
-        printf '%s %s\n' "$(git hash-object -- "$name")" "$name"
-      fi
-    done
+    git ls-files --cached --others --exclude-standard -- ':!*.md' ':!scripts/proof-times' |
+      while IFS= read -r name; do
+        if [ -f "$name" ]; then
+          printf '%s %s\n' "$(git hash-object -- "$name")" "$name"
+        fi
+      done
   } | git hash-object --stdin
 }
 
@@ -176,7 +181,7 @@ prove_all() {
   judge
 }
 
-# Every N-th declared proof, from the K-th on, in the order of their names.
+# The K-th of N parts of the declared proofs.
 prove_part() {
   local part=$1 parts=$2
   if ! [[ $part =~ ^[1-9][0-9]*$ && $parts =~ ^[1-9][0-9]*$ ]] || ((part > parts)); then
@@ -185,11 +190,53 @@ prove_part() {
   fi
   rm -rf "$runs"
   declare_proofs
-  jq -r --argjson part "$part" --argjson parts "$parts" '
-    [.["standard-harnesses"][]?[]] | sort | to_entries[]
-    | select(.key % $parts == $part - 1) | .value' "$out/declared.json" |
+  local problems
+  [ -f "$times" ] || { echo "prove: no $times" >&2; exit 1; }
+  problems=$(jq -r --rawfile times "$times" '
+    ($times | split("\n") | map(select(length > 0))) as $lines
+    | ($lines | map(select(test("^[0-9]+ [^ ]+$")) | split(" ")[1])) as $timed
+    | [.["standard-harnesses"][]?[]] as $declared
+    | ($lines[] | select(test("^[0-9]+ [^ ]+$") | not) | "  not <seconds> <proof>: \(.)"),
+      ($timed | group_by(.)[] | select(length > 1) | "  twice: \(.[0])"),
+      (($declared - $timed)[] | "  no seconds for: \(.)"),
+      (($timed - $declared)[] | "  no such proof: \(.)")' "$out/declared.json")
+  if [ -n "$problems" ]; then
+    printf 'prove: %s, a line "<seconds> <proof>" for each declared proof:\n%s\n' \
+      "$times" "$problems" >&2
+    exit 1
+  fi
+  # Each proof, longest first, goes to the part with the fewest seconds so far.
+  jq -r --rawfile times "$times" --argjson part "$part" --argjson parts "$parts" '
+    $times | split("\n") | map(select(length > 0) | split(" ")
+      | {name: .[1], seconds: (.[0] | tonumber)}) | sort_by([-.seconds, .name])
+    | reduce .[] as $proof ({seconds: [range($parts) | 0], parts: [range($parts) | []]};
+      (.seconds | to_entries | min_by(.value) | .key) as $least
+      | .seconds[$least] += $proof.seconds | .parts[$least] += [$proof.name])
+    | .parts[$part - 1][]' -n |
     xargs -r -d '\n' -n 1 -P "${LETHEWIS_PROOF_JOBS:-2}" --process-slot-var=PROVE_SLOT \
       scripts/prove.sh run
+}
+
+# The seconds of the proofs that ran replace their own; a proof that did not run keeps its line.
+write_times() {
+  local kept="" written
+  if ! compgen -G "$runs/*.json" >/dev/null; then
+    echo "prove: no results in $runs to take the seconds from" >&2
+    exit 1
+  fi
+  [ ! -f "$times" ] || kept=$(<"$times")
+  declare_proofs
+  written=$(jq -rn --arg kept "$kept" --slurpfile declared "$out/declared.json" '
+    ($kept | split("\n") | map(select(test("^[0-9]+ [^ ]+$")) | split(" ")
+      | {key: .[1], value: (.[0] | tonumber)}) | from_entries) as $before
+    | ([inputs | {
+        key: (input_filename | split("/") | last | rtrimstr(".json") | gsub("\\."; "::")),
+        value: (.verification_results.results[0].duration_ms / 1000 | round)
+      }] | from_entries) as $ran
+    | [$declared[0]["standard-harnesses"][]?[]] | sort[]
+    | (($ran[.] // $before[.]) as $seconds | select($seconds != null) | "\($seconds) \(.)")' \
+    "$runs"/*.json)
+  printf '%s\n' "$written" >"$times"
 }
 
 judge() {
@@ -366,10 +413,11 @@ case "${1:-}" in
     prove_part "$2" "$3"
     ;;
   judge) judge ;;
+  times) write_times ;;
   agree) agree ;;
   sources) sources ;;
   *)
-    echo "usage: prove.sh [list | run PROOF | part K N | judge | agree | sources]" >&2
+    echo "usage: prove.sh [list | run PROOF | part K N | judge | agree | sources | times]" >&2
     exit 2
     ;;
 esac
