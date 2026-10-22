@@ -9529,8 +9529,8 @@ mod proofs {
             Kind::Lock => expected_lock_key(&wrapping.keys.0, length),
             Kind::Export | Kind::ArchiveKey => expected_export_key(&head),
         };
-        let mut written = [0; 32];
-        written.copy_from_slice(&record[NONCE_LEN..NONCE_LEN + 32]);
+        let mut ciphertext = [0; 32];
+        ciphertext.copy_from_slice(&record[NONCE_LEN..NONCE_LEN + 32]);
         let (mut tag_of_a_record, mut tag_of_a_lock) = ([0; TAG_LEN], [0; TAG_LEN]);
         tag_of_a_record.copy_from_slice(&record[RECORD_LEN - TAG_LEN..RECORD_LEN]);
         tag_of_a_lock.copy_from_slice(&record[LOCK_RECORD_LEN - TAG_LEN..]);
@@ -9567,7 +9567,7 @@ mod proofs {
                             && layer.given[20..32] == inner.written[..12]
                             && layer.given_end == inner.tag))
                     && record[..NONCE_LEN] == outer.nonce
-                    && written == outer.written
+                    && ciphertext == outer.written
                     && tag == outer.tag),
             "a wrap seals the set, naming its purpose and its parent, under the key derived for its \
              kind and bound to its context, an export also to the chain of its key, and writes the \
