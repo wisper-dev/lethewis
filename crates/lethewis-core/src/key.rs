@@ -122,6 +122,14 @@ impl Key {
         dest.copy_from_slice(&self.bytes);
     }
 
+    /// The key, if it has 32 bytes.
+    pub(crate) fn as32(&self) -> Option<&[u8; 32]> {
+        match self.length {
+            KeyLength::Bytes32 => self.bytes.first_chunk(),
+            KeyLength::Bytes64 => None,
+        }
+    }
+
     /// The key itself: as many bytes as its length.
     pub(crate) fn material(&self) -> Option<&[u8]> {
         self.bytes

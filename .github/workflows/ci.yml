@@ -417,11 +417,23 @@ jobs:
             words::tests::many_random_words_are_read_as_the_list_says | tee random-words.txt
           grep -q '^test result: ok. 1 passed' random-words.txt
 
+      - name: Ten thousand random records of the archive
+        # X-Wing runs in every round, so the rounds are fewer.
+        env:
+          LETHEWIS_RANDOM_ROUNDS: "10000"
+          LETHEWIS_RANDOM_SEED: ${{ github.run_id }}
+        run: |
+          cargo test -p lethewis-core --lib --locked --release -- --ignored --exact \
+            slots::archive::tests::many_random_records_of_archive_keys_load_as_their_layers_say \
+            slots::archived::tests::many_random_records_of_an_archive_open_as_their_parts_say \
+            | tee random-archive.txt
+          grep -q '^test result: ok. 2 passed' random-archive.txt
+
       - name: Tests, software SHA-256, AES and POLYVAL
         # The runners have the instructions these use; the portable code is a path of its own, and
         # without them the hash and the cipher use a different amount of stack.
         env:
-          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
           LETHEWIS_BACK_ENDS: portable
         run: |
           cargo test --workspace --all-features --locked
@@ -431,7 +443,7 @@ jobs:
         # The stack the hash and the cipher use, and so the depth the wipes have to reach, changes
         # with the level.
         env:
-          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
         run: |
           for level in 1 2 s z; do
             export CARGO_PROFILE_RELEASE_OPT_LEVEL=$level
@@ -461,7 +473,7 @@ jobs:
         run: |
           features=$(grep -m1 '^Features' /proc/cpuinfo)
           echo "$features"
-          for feature in aes pmull sha2; do
+          for feature in aes pmull sha2 sha3; do
             grep -qw "$feature" <<<"$features" || { echo "::error::no $feature on this runner"; exit 1; }
           done
           # What the system reports about data-independent timing, which the tests compare with what
@@ -476,7 +488,7 @@ jobs:
 
       - name: Tests, software SHA-256, AES and POLYVAL
         env:
-          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
           LETHEWIS_BACK_ENDS: portable
         run: |
           cargo test --workspace --all-features --locked
@@ -484,7 +496,7 @@ jobs:
 
       - name: Core tests at the other levels of optimisation
         env:
-          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
         run: |
           for level in 1 2 s z; do
             export CARGO_PROFILE_RELEASE_OPT_LEVEL=$level
@@ -527,8 +539,9 @@ jobs:
       - name: The runner has the instructions of the hardware paths
         run: |
           sysctl hw.optional.arm.FEAT_AES hw.optional.arm.FEAT_PMULL hw.optional.arm.FEAT_SHA256 \
+            hw.optional.arm.FEAT_SHA3 \
             hw.optional.arm.FEAT_DIT || true
-          for feature in FEAT_AES FEAT_PMULL FEAT_SHA256; do
+          for feature in FEAT_AES FEAT_PMULL FEAT_SHA256 FEAT_SHA3; do
             [ "$(sysctl -n "hw.optional.arm.$feature")" = 1 ] ||
               { echo "::error::no $feature on this runner"; exit 1; }
           done
@@ -543,7 +556,7 @@ jobs:
 
       - name: Tests, software SHA-256, AES and POLYVAL
         env:
-          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft"'
+          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
           LETHEWIS_BACK_ENDS: portable
         run: |
           cargo test --workspace --all-features --locked
@@ -577,7 +590,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4]
+        part: [1, 2, 3, 4, 5]
     permissions:
       contents: read
     env:
@@ -689,7 +702,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4, 5, 6]
+        part: [1, 2, 3, 4, 5, 6, 7]
     permissions:
       contents: read
     steps:
@@ -709,9 +722,10 @@ jobs:
         run: scripts/prove.sh agree
 
       - name: Every proof of this part runs
-        # One per processor of the runner.
+        # One per processor of the runner, and room beside the peaks for the runner itself.
         env:
           LETHEWIS_PROOF_JOBS: 4
+          LETHEWIS_PROOF_MEMORY: 13000
           PART: ${{ matrix.part }}
           PARTS: ${{ strategy.job-total }}
         run: scripts/prove.sh part "$PART" "$PARTS"

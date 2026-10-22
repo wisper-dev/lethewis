@@ -271,6 +271,17 @@ which holds the output; the compress temporaries (block.rs:81, 84, lib.rs:506); 
 by moves (lib.rs:326-327); H0 on the MemoryTooLittle return (lib.rs:362).
 """
 
+[[audits.autocfg]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "1.5.1"
+notes = """
+Not read in full. No build script; the crate runs inside build scripts. Read src/ in full except
+tests.rs: it reads OUT_DIR, TARGET, HOST, RUSTC and the wrapper and rustflags variables, runs rustc
+--version --verbose and compiles caller-supplied probes from stdin with --emit=llvm-ir into OUT_DIR,
+deleting the output; nothing is linked or run. No unsafe code, no network access.
+"""
+
 [[audits.base64ct]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "safe-to-deploy"
@@ -568,6 +579,11 @@ the constant true, so nothing is called. x86.rs:49-51 does not check the maximum
 first. sysctlbyname panics instead of returning false when the name does not exist; it is
 reached only for dit and sha3.
 
+Path used by keccak: on aarch64, every Keccak::new() checks sha3, whatever keccak_backend says.
+On Linux and Android that is getauxval(AT_HWCAP); on aarch64-apple-darwin sha3 is a static target
+feature and nothing is called; on other Apple targets, such as iOS, sysctlbyname is called and
+panics if the system does not know the name.
+
 Path used by aes and polyval: on x86_64, CPUID leaf 1 for aes and pclmulqdq, leaf 7 for vaes and
 avx512f together with the ZMM state in XCR0, and the YMM state for avx; on aarch64 Linux and
 Android, getauxval(AT_HWCAP); on aarch64 Apple targets, the constant true. The aes check on
@@ -667,8 +683,53 @@ barrier. CtGt and CtLt take the borrow of overflowing_sub and bypass cmov. Slice
 conversions into bool and Option branch on the Choice, as documented. ct_neg on signed types
 panics in debug builds at MIN (ct_neg.rs:29, 35).
 
-Use here: digest calls <[u8]>::ct_eq to verify a MAC; hkdf and hmac do not call it. The crate
-holds no secrets of its own and wipes nothing. CtOption and Choice derive Debug.
+Use here: digest calls <[u8]>::ct_eq to verify a MAC; hkdf and hmac do not call it. ml-kem
+compares the 1088 bytes of a ciphertext with its encryption again with ct_eq and picks the
+shared key with ct_select. The crate holds no secrets of its own and wipes nothing. CtOption and Choice derive Debug.
+"""
+
+[[audits.curve25519-dalek]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "5.0.0"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, build.rs, README.md and the docs files included as
+documentation, and every file under src/. build.rs reads the target arch, pointer width, target
+features and two cfg overrides, runs the compiler through rustc_version for its version, emits the
+curve25519_dalek_bits and curve25519_dalek_backend cfgs and panics on failure; it writes no files and
+uses no network. On x86_64 it selects the simd backend, which pulls in curve25519-dalek-derive and
+cpufeatures.
+
+Unsafe code: SIMD intrinsics in backend/vector, run only after cpufeatures confirms the CPU feature;
+two const transmutes of integer arrays into __m256i and one repr(transparent) reference cast in
+constants.rs (precomputed-tables only, off here); all sound. backend.rs expands cpufeatures::new!.
+With --cfg docsrs the vector functions become public safe functions.
+
+Secret data: clamping, the Montgomery ladder with constant-time swaps, field arithmetic and inversion
+are straight-line with fixed indices; conditional select and swap use subtle. Variable-time code
+(NAF, double-base, Straus, Pippenger, decompression) is documented and not used by X25519. With
+debug assertions on, montgomery.rs:197, scalar.rs:1020 and window.rs:55-56 compare secret values;
+release builds are unaffected. Constant time assumes a constant-time multiplier.
+
+Not cleared: field, scalar and point types are Copy and implement no Drop; the clamped scalar, the
+ladder state, field temporaries and copies stay on the stack, and only one bool of the ladder is
+wiped. Callers must wipe the stack after use.
+"""
+
+[[audits.curve25519-dalek-derive]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.1.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, src/lib.rs, README.md (included as the crate
+documentation). A procedural macro with two attributes, unsafe_target_feature and
+unsafe_target_feature_specialize, used only by the x86_64 vector backend of curve25519-dalek. At
+build time it parses and rewrites tokens with syn, quote and proc-macro2: no access to files,
+environment, processes or network, and no unsafe code in the macro. For a safe function it emits a
+safe inline(always) wrapper calling an inner target_feature function with the original body, so
+soundness rests on every caller checking the CPU at run time, which curve25519-dalek does; inside
+that body an unsafe operation would compile without an unsafe block, and the bodies here use only
+SIMD intrinsics.
 """
 
 [[audits.digest]]
@@ -704,6 +765,18 @@ MAC comparison: CtOutput::eq (mac.rs:228), verify_slice and verify_truncated_* (
 use ctutils CtEq on byte slices; the only branches are on the public tag length and on the final
 result. verify_slice and verify_truncated_* leave the computed tag in a temporary that is not
 cleared. HKDF calls none of them.
+"""
+
+[[audits.fiat-crypto]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "0.3.0"
+notes = """
+Not read in full: about 100 000 lines of field arithmetic generated by the Fiat Cryptography
+compiler. Read Cargo.toml, Cargo.toml.orig and src/lib.rs, and searched every file of src/: no
+unsafe code, no extern block, no inline assembly, no macro, no include_str!, include_bytes!, env! or
+#[path], no use of std beyond the no_std switch; no build script and no dependencies. curve25519-dalek
+builds it only with cfg curve25519_dalek_backend = "fiat", which is not set here.
 """
 
 [[audits.hkdf]]
@@ -776,12 +849,13 @@ include_str!), src/lib.rs, src/flatten.rs, src/from_fn.rs, src/iter.rs, src/trai
 src/sizes.rs, src/serde.rs (behind the serde feature, off here). The archive matches the
 repository at the commit in .cargo_vcs_info.json apart from the files cargo generates.
 
-No build script (build = false), no procedural macros. The optional dependencies and the
-features alloc and extra-sizes are off here. No access to the system, files or network.
+No build script (build = false), no procedural macros. The optional dependencies but ctutils and
+zeroize, and the feature alloc, are off here; ml-kem turns on extra-sizes and ctutils, and
+module-lattice zeroize. No access to the system, files or network.
 
 Soundness rests on ArraySize (traits.rs:22), an unsafe trait: ArrayType<T> is [T; USIZE]. Its
-only impls come from the impl_array_sizes macro (sizes.rs:26); each default line maps N to
-typenum's UN with the same N. typenum seals Unsigned, so no other crate can add sizes. split,
+only impls come from the impl_array_sizes macro (sizes.rs:26); each line, extra-sizes included,
+maps N to typenum's UN with the same N. typenum seals Unsigned, so no other crate can add sizes. split,
 concat, Flatten and Unflatten also rely on typenum's Add, Sub, Mul, Div and Rem being exact.
 
 Unsafe code, each use sound as read:
@@ -813,8 +887,9 @@ Unsafe code, each use sound as read:
   guard is forgotten on success (from_fn.rs:56).
 
 Secrets: no branch and no memory access in this crate depends on element values. PartialEq and
-Ord delegate to the slice and are not constant time; Hash and Debug pass the elements on. Array
-has no Drop and, with zeroize off, no Zeroize; Array<u8, U> is Copy (lib.rs:689). By-value paths
+Ord delegate to the slice and are not constant time; Hash and Debug pass the elements on. The
+ctutils and zeroize impls work element by element, with no unsafe code. Array has no Drop, and
+Zeroize clears it only when called; Array<u8, U> is Copy (lib.rs:689). By-value paths
 leave copies that are never wiped: from_fn and try_from_fn, hence Default, Clone, FromIterator,
 map and TryFrom<&[T]> for Array, build in a MaybeUninit buffer and copy it out; concat does the
 same; split, Flatten and Unflatten copy out of the original. Reference paths make no copy. Here
@@ -891,6 +966,35 @@ Unsafe code, each use sound as read unless stated otherwise:
 - reserved.rs:176, 195, 246: behind block-padding, off here.
 """
 
+[[audits.keccak]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.2.2"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (included as the crate documentation),
+src/lib.rs, src/backends.rs, src/backends/soft.rs, src/backends/simd.rs,
+src/backends/aarch64_sha3.rs, src/consts.rs, src/types.rs. Unsafe code only on aarch64: a call to a
+target_feature(sha3) function after a cpufeatures check at run time, and a NEON permutation of
+register-only intrinsics with constant lane indices; sound if detection is right. Other targets run
+the safe portable permutation. No build script, no procedural macros, no access to files, network
+or environment; on aarch64 Keccak::new() asks cpufeatures every time. No branch or memory index
+depends on the state. Not cleared: round temporaries, a 400-byte copy of the state and vector
+temporaries on aarch64; the crate has no zeroize support and leaves clearing to its callers.
+"""
+
+[[audits.kem]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.3.0"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (included as the crate documentation) and
+src/lib.rs. Unsafe code is forbidden at crate level. No build script, no macros, no access to the
+system, files, network or environment; feature getrandom is off. Traits and three blanket impls:
+FromSeed calls KeyInit::new, decapsulate_slice copies a ciphertext into a fixed array after a length
+check on public data, TryDecapsulate is infallible for Decapsulate types. It holds no secrets and has
+no branch or memory access of its own that depends on one.
+"""
+
 [[audits.libc]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "safe-to-deploy"
@@ -937,6 +1041,67 @@ run time the SHA-256 path calls getauxval(AT_HWCAP) on first use on aarch64 Linu
 and no libc function on Apple targets. No libc code here handles secrets.
 
 Review again by 2027-04-01 or at the next version, whichever comes first.
+"""
+
+[[audits.ml-kem]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.3.3"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (included as the crate documentation) and every
+file in src/. No unsafe code, no build script, no procedural macros; one macro_rules invocation of
+the field macro from module-lattice. No access to the system, files, network or environment;
+randomness only through caller traits. Here default features are off, so key parts stay inline
+rather than in Box (feature alloc); hazmat changes documentation only, and zeroize is on.
+
+ML-KEM-768 as used here: DecapsulationKey::from_seed, EncapsulationKey::new and
+encapsulate_deterministic. EncapsulationKey::new always performs the modulus check of FIPS 203
+section 7.2 by decoding, reducing, re-encoding and comparing; no public constructor skips it.
+Decapsulation always computes both the real and the rejection key, compares all 1088 bytes of the
+re-encrypted ciphertext in constant time through ctutils, and selects in constant time.
+
+Secret data: CBD sampling counts bits and reduces with a masked subtraction, without tables (new in
+this version); NTT, base multiplication and Barrett reduction index only by loop counters;
+compression multiplies and shifts by constants, without division. Rejection sampling branches only
+on the public seed. The compiled code was not checked for branches the optimiser may add.
+
+Not cleared: zeroize clears s_hat, d and z of a DecapsulationKey on drop and nothing else; stack
+temporaries (seed halves, sigma, s, e, the message, K, r, the rejection key, noise polynomials,
+hash states), returned keys and moved-from copies remain. Debug is derived on DecapsulationKey and
+prints its secret parts; its PartialEq compares z in variable time. Neither is used here.
+"""
+
+[[audits.module-lattice]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.2.3"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (included as the crate documentation) and every
+file in src/. No unsafe code, no build script, no procedural macros; macro_rules for field
+arithmetic and masked truncation. No access to the system, files, network or environment. With
+alloc off, MaybeBox is an inline wrapper. Feature zeroize adds Zeroize impls for field elements,
+polynomials and vectors; none clears itself on drop.
+
+Secret data: reduction is a masked conditional subtraction, Barrett reduction multiplies, shifts and
+subtracts by constants; no division or table lookup on values. Encoding and decoding shift by public
+amounts; 12-bit decoding reduces modulo q with the masked subtraction. Arithmetic on secrets uses
+core integer operators; num-traits supplies trait bounds and One::one on constants only.
+
+Not cleared: Elem and Polynomial are Copy, so moves leave copies; Debug and a variable-time
+PartialEq are derived on all types.
+"""
+
+[[audits.num-traits]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.2.19"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, build.rs and every file in src/. One unsafe use: the
+float-to-integer conversions call to_int_unchecked only after range checks that reject NaN,
+infinities and out-of-range values; sound, and not reached here. build.rs runs autocfg, which
+compiles one probe expression with rustc into OUT_DIR and sets cfg has_total_cmp. No access to
+files, network or environment at run time. Integer trait methods forward to core. No secret value
+reaches num-traits code here: module-lattice uses its traits as bounds and One::one on constants.
 """
 
 [[audits.polyval]]
@@ -1018,6 +1183,63 @@ AVX2 on x86 and the crypto target feature on other aarch64 platforms; the code c
 PCLMULQDQ, and the aes target feature.
 """
 
+[[audits.proc-macro2]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "1.0.107"
+notes = """
+Not read in full. Read build.rs in full: it reads RUSTC, OUT_DIR, TARGET and the wrapper and
+rustflags variables, runs rustc --version and compiles probe files from src/probe with
+--emit=metadata into a subdirectory of OUT_DIR, then deletes it; it prints only cfg, check-cfg and
+rerun-if directives. Read every unsafe block: one ptr::read out of ManuallyDrop, sound. No access to
+files, network, environment or processes in the library. On a nightly compiler the probe enables
+feature(proc_macro_span).
+"""
+
+[[audits.quote]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "1.0.47"
+notes = """
+Not read in full. Read build.rs in full: it runs rustc --version and emits one cfg for compilers
+older than 1.78. No unsafe code; searched src/ for access to files, network, environment and
+processes and found none. Macro bodies not reviewed line by line.
+"""
+
+[[audits.rand_core]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.10.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (included as the crate documentation),
+src/lib.rs, src/block.rs, src/seedable_rng.rs, src/unwrap_err.rs, src/utils.rs, src/word.rs. No
+features, dependencies, unsafe code, build script or macros. No access to the system, files, network
+or environment, no statics, no randomness of its own: code runs only when called, and nothing here
+calls it with secrets. Not cleared: seeds moved by value, the BlockRng buffer, clones. A one-word
+u32 block makes next_u64_from_u32 panic.
+"""
+
+[[audits.rustc_version]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "0.4.1"
+notes = """
+Not read in full. No build script. Read lib.rs in full: version_meta runs RUSTC, or rustc from PATH,
+optionally through RUSTC_WRAPPER, with -vV and parses its output. No unsafe code, no access to files
+or network, no other environment variables.
+"""
+
+[[audits.semver]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "1.0.28"
+notes = """
+Not read in full. No build script in the published archive. Read identifier.rs and parse.rs in full:
+the small-string Identifier (inline bytes, tagged heap pointer, length prefix) and the set_len in
+VersionReq parsing are sound, and the ASCII precondition of new_unchecked holds by the parser. No
+access to files, network, environment or processes. Feature serde, off here, not reviewed.
+"""
+
 [[audits.sha2]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -1091,6 +1313,74 @@ sha2_512_backend = "x86-avx2" (sha512.rs:24) fails to compile on a wrong compres
 sha2_* flag is set here.
 """
 
+[[audits.sha3]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.12.0"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (included as the crate documentation),
+src/lib.rs, src/utils.rs, src/oids.rs. Unsafe code is forbidden. No build script; one macro_rules
+generates the hashers. No access to the system, files, network or environment. Rates and padding
+match FIPS 202; the padding position depends only on the input length. With zeroize, Drop clears
+the Keccak state and the cursor. Not cleared: clones, the copy left when finalize consumes the
+hasher, conversion temporaries and the state serialize() returns. Keccak-f is invertible, so a left
+copy of the state of a one-block input gives the input.
+"""
+
+[[audits.shake]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.1.0"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (included as the crate documentation),
+src/lib.rs. Unsafe code is forbidden. No build script, no macros, no access to the system, files,
+network or environment. Rates 136 and 168 and the domain padding match FIPS 202; the padding
+position depends only on the input length. With zeroize, Drop clears state and cursor of Shake and
+of ShakeReader, which lacks the ZeroizeOnDrop marker. Not cleared: clones, the state moved into the
+reader, by-value returns of the reader, temporaries in keccak and sponge-cursor. The state of a
+reader is as secret as the seed until it is dropped.
+"""
+
+[[audits.sponge-cursor]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.1.0"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (included as the crate documentation),
+src/lib.rs, src/u64_le_utils.rs. Unsafe code: two unreachable_unchecked hints guarded by the private
+invariant that the position stays below the rate, kept by every constructor and setter, and three
+little-endian casts of [u64; N] to bytes guarded by const asserts on the sizes; sound. No build
+script, no macros, no access to the system, files, network or environment. Control flow and bounds
+depend only on lengths and the cursor. Zeroize clears only the cursor, which is not secret; the
+big-endian staging buffers and conversion temporaries keep input or state bytes.
+"""
+
+[[audits.subtle]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "2.6.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md, src/lib.rs. No dependencies; curve25519-dalek
+takes it without default features. Unsafe code: a volatile read of a local as an optimisation
+barrier, sound; and an i8 to Ordering cast in Ordering::conditional_select, unsound from safe code
+in release builds for a Choice built from a value other than 0 or 1, which ct_eq results never are.
+No build script, no procedural macros, no access to the system, files, network or environment.
+Constant time is best effort on every target: debug builds branch in debug_assert, slice ct_eq
+returns early on unequal lengths, conversions to bool and Option branch by design. No memory index
+depends on a secret. Nothing is cleared; Debug on CtOption, Choice and BlackBox prints the value.
+"""
+
+[[audits.syn]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "2.0.119"
+notes = """
+Not read in full. No build script. Read buffer.rs in full and every other unsafe block: the cursor
+pointer walk, the Cursor lifetime transmutes in parse.rs and discouraged.rs, the repr(transparent)
+casts in token.rs and the Send and Sync impls in thread.rs; sound. No access to files, network,
+environment or processes in src/, found by search rather than by reading every parser module.
+"""
+
 [[audits.typenum]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "safe-to-deploy"
@@ -1117,6 +1407,18 @@ system, files or network. All arithmetic is resolved at compile time.
 hybrid-array's unsafe code relies on UN::USIZE == N and on exact Add, Sub, Mul, Div and Rem on
 UInt (uint.rs:413, 547, 1090, 1789, 1817). As read, they are exact, and Sub has no impl when the
 result would be negative, so underflow fails to compile.
+"""
+
+[[audits.unicode-ident]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "1.0.26"
+notes = """
+Not read in full. No build script, no dependencies, no_std. Two get_unchecked reads into the LEAF
+table; recomputed from the shipped tables that the largest reachable index is 7967 for a table of
+7968 entries, so the reads stay in bounds; the margin is zero, so every new version needs the same
+check. No access to files, network, environment or processes. Table contents not checked against
+the Unicode data.
 """
 
 [[audits.universal-hash]]
@@ -1146,6 +1448,22 @@ implementing type wipes itself on drop, and returns the output, then calls reset
 (lib.rs:136) compares the finalized output with ctutils CtEq, branching only on the result, and
 leaves the computed value in a temporary. Array<u8, U16> has no Drop. polyval, the implementor
 used here, wipes itself on drop.
+"""
+
+[[audits.x25519-dalek]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "3.0.0"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, src/lib.rs, src/x25519.rs, README.md (included as the
+crate documentation). No unsafe code, no build script, no procedural macros of its own. Here default
+features are off and only zeroize is on: no access to the system, files, network or environment.
+The library calls only the function x25519, which runs MontgomeryPoint::mul_clamped, the Montgomery
+ladder on the serial field arithmetic of curve25519-dalek, for the public key from the base point as
+well as for the shared secret; the Edwards path of PublicKey::from and the vector backend are not
+reached. No branch or memory access in this crate depends on secret data. Not cleared: x25519 takes
+the secret by value and returns the result by value, and those copies stay on the stack. Low-order
+points are accepted.
 """
 
 [[audits.zeroize]]

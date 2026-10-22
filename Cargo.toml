@@ -29,13 +29,14 @@ unsafe_code = "forbid"
 unreachable_pub = "deny"
 # Kani sets cfg(kani) when it compiles the proofs; the build script of the core sets
 # cfg(lethewis_unoptimised) when it is built without optimisation, and a build may set it itself.
-# The other three select the portable code of the hash and the cipher in the dependencies.
+# The other four select the portable code of the hashes and the cipher in the dependencies.
 unexpected_cfgs = { level = "deny", check-cfg = [
   "cfg(kani)",
   "cfg(lethewis_unoptimised)",
   'cfg(sha2_backend, values("soft"))',
   'cfg(aes_backend, values("soft"))',
   'cfg(polyval_backend, values("soft"))',
+  'cfg(keccak_backend, values("soft"))',
 ] }
 unused_qualifications = "deny"
 # missing_docs and unused_crate_dependencies are declared in the crates themselves, not here: from
@@ -87,8 +88,9 @@ panic = "abort"
 overflow-checks = true
 
 [profile.mutants]
-# Every mutant is a build of its own. The derivation from a password, the slowest test by far, runs
-# optimised; the other dependencies are built as for the tests, whose stack depths depend on them.
+# Every mutant is a build of its own. The derivation from a password and the lattice, hash and curve
+# code of X-Wing, the slowest tests by far, run optimised; the other dependencies are built as for the
+# tests, whose stack depths depend on them.
 inherits = "test"
 debug = "none"
 
@@ -96,4 +98,16 @@ debug = "none"
 opt-level = 3
 
 [profile.mutants.package.blake2]
+opt-level = 3
+
+[profile.mutants.package.ml-kem]
+opt-level = 3
+
+[profile.mutants.package.module-lattice]
+opt-level = 3
+
+[profile.mutants.package.keccak]
+opt-level = 3
+
+[profile.mutants.package.curve25519-dalek]
 opt-level = 3

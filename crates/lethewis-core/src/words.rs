@@ -164,10 +164,10 @@ impl<'a> Slots<'a> {
         words: &mut Words,
     ) -> Result<Handle<'a>, Error> {
         let mut bytes = [0; WORDS_ENTROPY_LEN];
-        let generated = lethewis_dit::with(|| self.draw(entropy, Branch::HedgeWords, &mut bytes))
+        let generated = crate::timing::with(|| self.draw(entropy, Branch::HedgeWords, &mut bytes))
             .and_then(|()| self.derive_into(&bytes, Purpose::Wrap));
         if generated.is_ok() {
-            lethewis_dit::with(|| encode(list, &bytes, words));
+            crate::timing::with(|| encode(list, &bytes, words));
         }
         generated
     }
@@ -198,7 +198,7 @@ impl<'a> Slots<'a> {
         words: &Words,
     ) -> Result<Handle<'a>, Error> {
         let mut bytes = [0; WORDS_ENTROPY_LEN];
-        lethewis_dit::with(|| decode(list, words, &mut bytes))
+        crate::timing::with(|| decode(list, words, &mut bytes))
             .and_then(|()| self.derive_into(&bytes, purpose))
     }
 
@@ -236,7 +236,7 @@ impl Entropy for FromWords<'_> {
 /// Writes the twelve words of `bytes`, from `list`, into `words`.
 fn encode<const N: usize>(list: &[u64; N], bytes: &[u8; WORDS_ENTROPY_LEN], words: &mut Words) {
     #[cfg(test)]
-    crate::derive::timing::note();
+    crate::timing::note();
     for (word, &number) in words.iter_mut().zip(&numbers(bytes)) {
         *word = select_in(list, number).to_le_bytes();
     }
@@ -250,7 +250,7 @@ fn decode<const N: usize>(
     bytes: &mut [u8; WORDS_ENTROPY_LEN],
 ) -> Result<(), Error> {
     #[cfg(test)]
-    crate::derive::timing::note();
+    crate::timing::note();
     let mut numbers = [0; WORD_COUNT];
     let mut listed = u8::MAX;
     for (word, number) in words.iter().zip(&mut numbers) {

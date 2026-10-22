@@ -210,5 +210,46 @@ Nothing is published while the version is below 0.1.0.
   KiB; they need 25 KiB of stack, or 72 KiB.
 - Tests end to end: the keys of chats move to a second device under a shared secret, and a backup
   under the words restores them on a new phone; an export cut short leaves nothing to keep.
+- Dependencies: `ml-kem` 0.3.3, `x25519-dalek` 3.0.0, `sha3` 0.12.0 and `shake` 0.1.0 or later
+  compatible versions, without default features and with their `zeroize` features and the `hazmat`
+  feature of `ml-kem`, for X-Wing, the hybrid of ML-KEM-768 and X25519.
+- Three purposes of the archive: `Purpose::Archive`, the seed of an archive key;
+  `Purpose::ArchiveWrap`, a stored key of the archive, kept only in lock records, that wraps only
+  seeds; and `Purpose::ArchiveSeal`, a key of a chat for its archive, under a stored key for
+  wrapping. None is imported or derived from a password or words; no seed is generated.
+- Archive keys of X-Wing. `Slots::create_archive_key` writes the record of a new one,
+  `ARCHIVE_KEY_RECORD_LEN` bytes, 1529: its seed under a stored key of the archive, and that layer
+  with its identifier and public key under the profile's stored key and the key of the epoch.
+- `Slots::load_archive_key` loads an archive key and refuses a public key its seed does not give,
+  with `Error::PublicKeyMismatch`. `Slots::carry_archive_key` carries its record into the next epoch
+  without the stored key of the archive.
+- X-Wing gives the known answer of its draft once in a process, before its first use, and the key
+  pair of a new archive key has to agree with itself. The stack is wiped after each call on an
+  archive key: 96 KiB, or 224 KiB; they need 100 KiB of stack, or 232 KiB.
+- Proofs with Kani 0.68.0 for the creation, the load and the carry of an archive key, and tests
+  against records computed by an independent implementation, the public key of X-Wing included.
+- Records of an archive, `ARCHIVE_RECORD_LEN` bytes, 1180: `Slots::archive` encapsulates to an
+  archive key, gives the key of the batch and writes the ciphertext and a check of the shared
+  secret under the key of a chat for its archive. `Slots::reseal_archive` moves the record to
+  another key of the chat.
+- `Slots::open_archive` gives the key of a batch back with the archive key. It fails with
+  `Error::WrongArchiveKey` for a record of another archive key and with `Error::PublicKeyMismatch`
+  for a batch archived to another public key.
+- `Slots::archive_public_key` reads the public key of an archive key, as `ArchivePublic`, from
+  its record under the profile's stored key, for those slots and that epoch only. Proofs with Kani
+  0.68.0 for the four calls, and tests against records an independent implementation computes.
+- Tests check on every machine, not only on aarch64, that each call starts its derivations,
+  Argon2id, ciphers and operations of X-Wing inside the switch of data-independent timing.
+- The proofs of wraps, locks, exports, the carries of lock records, the ends of exports and archive
+  keys follow each seal and opening: the key, the associated data, and the nonce, first bytes and
+  tag a record holds. A failed seal gives `Error::CipherFailed`, as nothing else does but the checks
+  of X-Wing.
+- Outside the proofs and the tests, the calls seal and open with AES-256-GCM-SIV only and ask
+  X-Wing for the known answer of its draft only: a build has nothing else they could be given.
+- The tests that read back the stack after the calls on archive keys and on records of an archive
+  look for what X-Wing, the cipher and the derivations handle, and find it there without the wipe.
+- Tests refuse every changed bit of the records of archive keys and of an archive, and read random
+  ones sealed with the real derivations and cipher; ten thousand of each from a new seed on every
+  pull request.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

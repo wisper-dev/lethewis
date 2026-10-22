@@ -10,6 +10,7 @@ use crate::entropy::{Entropy, EntropyError};
 use crate::key::{CAPACITY, Key, wipe};
 use crate::record::{ID_LEN, Purpose, length_to_byte};
 use crate::seal::KEY_LEN as CIPHER_KEY_LEN;
+use crate::xwing::{CIPHERTEXT_LEN, RANDOMNESS_LEN};
 
 /// The salt of the derivation of an identifier, and of a key from words.
 pub(crate) const SALT: &[u8] = b"lethewis derivation salt v1";
@@ -32,6 +33,14 @@ const EPOCH_LAYER: &[u8; 11] = b"epoch layer";
 const COMBINED: &[u8; 12] = b"combined key";
 const CHALLENGE: &[u8; 9] = b"challenge";
 const EXPORT_KEY: &[u8; 10] = b"export key";
+const ARCHIVE_KEY: &[u8; 11] = b"archive key";
+const ARCHIVE_LAYER: &[u8; 13] = b"archive layer";
+const ARCHIVE_SEED: &[u8; 12] = b"archive seed";
+const ARCHIVE_SEAL: &[u8; 12] = b"archive seal";
+const HEDGE_ENCAPS: &[u8; 12] = b"hedge encaps";
+const ARCHIVE_ENCAPS: &[u8; 14] = b"archive encaps";
+const ARCHIVE_DATA: &[u8; 12] = b"archive data";
+const ARCHIVE_CHECK: &[u8; 13] = b"archive check";
 /// The count of a draw, after the bytes the source gave, in the material a hedge extracts.
 const COUNT_LEN: usize = 8;
 /// How many bytes twelve words stand for.
@@ -76,6 +85,25 @@ pub(crate) enum Branch {
     /// The key that encrypts the records of an export, and the record that ends one, under a key
     /// for transfers.
     ExportKey,
+    /// The key that encrypts the seed of an archive key under a stored key of the archive, whatever
+    /// the epoch.
+    ArchiveKey,
+    /// The key that encrypts the outer layer of the record of an archive key, under a stored key for
+    /// wrapping, in an epoch.
+    ArchiveLayer,
+    /// The seed of an archive key, from hedged bytes and a stored key of the archive.
+    ArchiveSeed,
+    /// The key that encrypts the records of an archive under a key of a chat for its archive,
+    /// whatever the epoch.
+    ArchiveSeal,
+    /// The randomness of an encapsulation of X-Wing, hedged.
+    HedgeEncaps,
+    /// The randomness of an encapsulation, from hedged bytes and a key of a chat for its archive.
+    ArchiveEncaps,
+    /// The key of a batch, from a shared secret of X-Wing.
+    ArchiveData,
+    /// The check of a shared secret of X-Wing that a record of an archive holds.
+    ArchiveCheck,
 }
 
 /// The purpose each branch is derived for.
@@ -86,12 +114,17 @@ pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
         | Branch::FromWords
         | Branch::LockKey
         | Branch::EpochLayer
-        | Branch::Combined => Some(Purpose::Wrap),
+        | Branch::Combined
+        | Branch::ArchiveLayer => Some(Purpose::Wrap),
         Branch::ExportKey => Some(Purpose::Transfer),
+        Branch::ArchiveKey => Some(Purpose::ArchiveWrap),
+        Branch::ArchiveSeed | Branch::ArchiveData | Branch::ArchiveCheck => Some(Purpose::Archive),
+        Branch::ArchiveSeal | Branch::ArchiveEncaps => Some(Purpose::ArchiveSeal),
         Branch::KeyId
         | Branch::HedgeKey
         | Branch::HedgeWords
         | Branch::HedgeNonce
+        | Branch::HedgeEncaps
         | Branch::Challenge => None,
     }
 }
@@ -245,6 +278,110 @@ pub(crate) fn derive_layer_key(
     derive(epoch, SALT, Some(Purpose::Wrap), Branch::EpochLayer, out)
 }
 
+/// Derives the key that encrypts the seeds the stored key of the archive `key` wraps, in any epoch.
+pub(crate) fn derive_archive_key(
+    key: &Key,
+    out: &mut [u8; CIPHER_KEY_LEN],
+) -> Result<(), DerivationFailed> {
+    derive(
+        key,
+        SALT,
+        Some(Purpose::ArchiveWrap),
+        Branch::ArchiveKey,
+        out,
+    )
+}
+
+/// Derives the key that encrypts the outer layer of the records of archive keys under the stored
+/// key for wrapping `key` in the epoch whose key is `epoch`.
+pub(crate) fn derive_archive_layer_key(
+    key: &Key,
+    epoch: &Key,
+    out: &mut [u8; CIPHER_KEY_LEN],
+) -> Result<(), DerivationFailed> {
+    let salt = epoch.material().ok_or(DerivationFailed)?;
+    derive(key, salt, Some(Purpose::Wrap), Branch::ArchiveLayer, out)
+}
+
+/// Derives the seed of an archive key from `hedged`, bytes of the platform's source hedged with the
+/// key of the epoch, as the salt and the stored key of the archive `key`.
+pub(crate) fn derive_archive_seed(
+    key: &Key,
+    hedged: &[u8; 32],
+    out: &mut [u8; 32],
+) -> Result<(), DerivationFailed> {
+    derive(
+        key,
+        hedged,
+        Some(Purpose::Archive),
+        Branch::ArchiveSeed,
+        out,
+    )
+}
+
+/// Derives the key that encrypts the records of an archive under the key of a chat for its archive
+/// `key`, in any epoch.
+pub(crate) fn derive_archive_seal_key(
+    key: &Key,
+    out: &mut [u8; CIPHER_KEY_LEN],
+) -> Result<(), DerivationFailed> {
+    derive(
+        key,
+        SALT,
+        Some(Purpose::ArchiveSeal),
+        Branch::ArchiveSeal,
+        out,
+    )
+}
+
+/// Derives the randomness of an encapsulation from `hedged`, bytes of the platform's source hedged
+/// with the key of the epoch, as the salt and the key of a chat for its archive `key`.
+pub(crate) fn derive_archive_randomness(
+    key: &Key,
+    hedged: &[u8; RANDOMNESS_LEN],
+    out: &mut [u8; RANDOMNESS_LEN],
+) -> Result<(), DerivationFailed> {
+    derive(
+        key,
+        hedged,
+        Some(Purpose::ArchiveSeal),
+        Branch::ArchiveEncaps,
+        out,
+    )
+}
+
+/// Derives the key of a batch from the shared secret of X-Wing `shared`, with the ciphertext it
+/// came with as the salt.
+pub(crate) fn derive_archive_data(
+    shared: &Key,
+    ciphertext: &[u8; CIPHERTEXT_LEN],
+    out: &mut [u8; 32],
+) -> Result<(), DerivationFailed> {
+    derive(
+        shared,
+        ciphertext,
+        Some(Purpose::Archive),
+        Branch::ArchiveData,
+        out,
+    )
+}
+
+/// Derives into `check` the check of the shared secret of X-Wing `shared` that a record of an
+/// archive holds, with the ciphertext it came with as the salt.
+pub(crate) fn derive_archive_check(
+    shared: &Key,
+    ciphertext: &[u8; CIPHERTEXT_LEN],
+    check: &mut KeyId,
+) -> Result<(), DerivationFailed> {
+    derive(
+        shared,
+        ciphertext,
+        Some(Purpose::Archive),
+        Branch::ArchiveCheck,
+        &mut check.0,
+    )
+}
+
 /// Fills `out` with the key for `purpose` that the bytes twelve words stand for, `entropy`, derive:
 /// HKDF-Extract with the salt of identifiers, then HKDF-Expand with a label of its own, which names
 /// the purpose. Then the stack the derivation used is wiped, whether it succeeded or not.
@@ -254,7 +391,7 @@ pub(crate) fn derive_from_words(
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
     #[cfg(test)]
-    timing::note();
+    crate::timing::note();
     let derived = words_on_stack(entropy, purpose, out);
     wipe_stack();
     derived
@@ -289,7 +426,7 @@ pub(crate) fn derive(
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
     #[cfg(test)]
-    timing::note();
+    crate::timing::note();
     let derived = derive_on_stack(key, salt, purpose, branch, out);
     wipe_stack();
     derived
@@ -309,7 +446,7 @@ pub(crate) fn hedge(
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
     #[cfg(test)]
-    timing::note();
+    crate::timing::note();
     let hedged = hedge_on_stack(epoch, count, branch, drawn, out);
     wipe_stack();
     hedged
@@ -399,29 +536,6 @@ struct WipeOnDrop([u8; CAPACITY]);
 impl Drop for WipeOnDrop {
     fn drop(&mut self) {
         wipe(&mut self.0);
-    }
-}
-
-/// Whether every derivation on this thread since the last look ran with data-independent timing
-/// on where it is offered: every call that derives holds the mode.
-#[cfg(test)]
-pub(crate) mod timing {
-    extern crate std;
-
-    use core::cell::Cell;
-
-    std::thread_local! {
-        static SEEN: Cell<Option<bool>> = const { Cell::new(None) };
-    }
-
-    pub(crate) fn note() {
-        let now = lethewis_dit::active() == lethewis_dit::supported();
-        SEEN.set(Some(SEEN.get().unwrap_or(true) && now));
-    }
-
-    /// What the derivations since the last look saw, and forget it.
-    pub(crate) fn seen() -> Option<bool> {
-        SEEN.take()
     }
 }
 
@@ -696,16 +810,22 @@ pub(crate) mod stack {
     ) -> Vec<Vec<u8>> {
         // A hedge takes the bytes drawn and an 8-byte count, and gives as many bytes as were drawn.
         let out_len = match branch {
-            Branch::KeyId | Branch::HedgeWords => 16,
+            Branch::KeyId | Branch::HedgeWords | Branch::ArchiveCheck => 16,
             Branch::HedgeNonce => 12,
-            Branch::HedgeKey => key.len() - 8,
+            Branch::HedgeKey | Branch::HedgeEncaps => key.len() - 8,
+            Branch::ArchiveEncaps => 64,
             Branch::WrapKey
             | Branch::FromWords
             | Branch::LockKey
             | Branch::EpochLayer
             | Branch::Combined
             | Branch::Challenge
-            | Branch::ExportKey => 32,
+            | Branch::ExportKey
+            | Branch::ArchiveKey
+            | Branch::ArchiveLayer
+            | Branch::ArchiveSeed
+            | Branch::ArchiveSeal
+            | Branch::ArchiveData => 32,
         };
         let length = u8::try_from(key.len()).unwrap();
         let (label, used) = label(purpose, length, branch, out_len).unwrap();
@@ -1157,11 +1277,19 @@ pub(crate) mod model {
         } else if let Ok(out) = <&mut [u8; 64]>::try_from(&mut *out) {
             // Taken apart rather than indexed: a bounds check on a path a proof never takes would be
             // a check it never reaches.
-            let [first, second, third, fourth] =
-                material.first_chunk::<64>().map_or([0; 4], |key| {
+            // A 32-byte key fills the first two lanes, so that it reaches a 64-byte output too.
+            let [first, second, third, fourth] = material.first_chunk::<64>().map_or_else(
+                || {
+                    material.first_chunk::<32>().map_or([0; 4], |key| {
+                        let (lanes, _) = key.as_chunks::<16>();
+                        core::array::from_fn(|at| lanes.get(at).map_or(0, head))
+                    })
+                },
+                |key| {
                     let (lanes, _) = key.as_chunks::<16>();
                     core::array::from_fn(|at| lanes.get(at).map_or(0, head))
-                });
+                },
+            );
             let folded = [
                 first ^ low ^ salt_low,
                 second ^ high ^ salt_high,
@@ -1262,6 +1390,14 @@ fn label(
         Branch::Combined => joined(head, COMBINED),
         Branch::Challenge => joined(head, CHALLENGE),
         Branch::ExportKey => joined(head, EXPORT_KEY),
+        Branch::ArchiveKey => joined(head, ARCHIVE_KEY),
+        Branch::ArchiveLayer => joined(head, ARCHIVE_LAYER),
+        Branch::ArchiveSeed => joined(head, ARCHIVE_SEED),
+        Branch::ArchiveSeal => joined(head, ARCHIVE_SEAL),
+        Branch::HedgeEncaps => joined(head, HEDGE_ENCAPS),
+        Branch::ArchiveEncaps => joined(head, ARCHIVE_ENCAPS),
+        Branch::ArchiveData => joined(head, ARCHIVE_DATA),
+        Branch::ArchiveCheck => joined(head, ARCHIVE_CHECK),
     }
 }
 
@@ -1293,9 +1429,11 @@ mod tests {
     use sha2::Sha256;
 
     use super::{
-        Branch, CHALLENGE, COMBINED, DerivationFailed, EPOCH_LAYER, EXPORT_KEY, FROM_WORDS,
-        HEDGE_KEY, HEDGE_NONCE, HEDGE_WORDS, Hedged, KEY_ID, KeyId, LOCK_KEY, SALT, WRAP_KEY,
-        derive, derive_from_words, derive_key_id, hedge, label, purpose_of,
+        ARCHIVE_CHECK, ARCHIVE_DATA, ARCHIVE_ENCAPS, ARCHIVE_KEY, ARCHIVE_LAYER, ARCHIVE_SEAL,
+        ARCHIVE_SEED, Branch, CHALLENGE, COMBINED, DerivationFailed, EPOCH_LAYER, EXPORT_KEY,
+        FROM_WORDS, HEDGE_ENCAPS, HEDGE_KEY, HEDGE_NONCE, HEDGE_WORDS, Hedged, KEY_ID, KeyId,
+        LOCK_KEY, SALT, WRAP_KEY, derive, derive_from_words, derive_key_id, hedge, label,
+        purpose_of,
     };
     use crate::entropy::{Entropy, EntropyError};
     use crate::key::{Key, KeyLength};
@@ -1678,6 +1816,14 @@ mod tests {
             Branch::Combined,
             Branch::Challenge,
             Branch::ExportKey,
+            Branch::ArchiveKey,
+            Branch::ArchiveLayer,
+            Branch::ArchiveSeed,
+            Branch::ArchiveSeal,
+            Branch::HedgeEncaps,
+            Branch::ArchiveEncaps,
+            Branch::ArchiveData,
+            Branch::ArchiveCheck,
         ] {
             let (_, used) = label(purpose_of(branch), 64, branch, 32).unwrap();
             let name = match branch {
@@ -1692,6 +1838,14 @@ mod tests {
                 Branch::Combined => COMBINED.len(),
                 Branch::Challenge => CHALLENGE.len(),
                 Branch::ExportKey => EXPORT_KEY.len(),
+                Branch::ArchiveKey => ARCHIVE_KEY.len(),
+                Branch::ArchiveLayer => ARCHIVE_LAYER.len(),
+                Branch::ArchiveSeed => ARCHIVE_SEED.len(),
+                Branch::ArchiveSeal => ARCHIVE_SEAL.len(),
+                Branch::HedgeEncaps => HEDGE_ENCAPS.len(),
+                Branch::ArchiveEncaps => ARCHIVE_ENCAPS.len(),
+                Branch::ArchiveData => ARCHIVE_DATA.len(),
+                Branch::ArchiveCheck => ARCHIVE_CHECK.len(),
             };
             assert_eq!(used, 14 + name);
         }
@@ -1742,6 +1896,28 @@ pub(crate) mod proofs {
             fold(SALT, &key[..length.bytes()], &label[..used], &mut id);
         });
         id
+    }
+
+    /// The key the model of HKDF gives the outer layer of the record of an archive key from the
+    /// first `length` bytes of the stored key for wrapping `key` in the epoch whose key is `epoch`,
+    /// worked out in the same way.
+    pub(crate) fn expected_archive_layer_key(
+        key: &[u8; 64],
+        length: KeyLength,
+        epoch: &[u8; 32],
+    ) -> [u8; CIPHER_KEY_LEN] {
+        let mut out = [0; CIPHER_KEY_LEN];
+        let length_byte = length_to_byte(length);
+        let _ = label(
+            Some(Purpose::Wrap),
+            length_byte,
+            Branch::ArchiveLayer,
+            CIPHER_KEY_LEN,
+        )
+        .map(|(label, used)| {
+            fold(epoch, &key[..length.bytes()], &label[..used], &mut out);
+        });
+        out
     }
 
     /// The key the model of HKDF gives a record's cipher from the first `length` bytes of the
@@ -1824,6 +2000,71 @@ pub(crate) mod proofs {
         out
     }
 
+    /// The key the model of HKDF gives the inner layer of the record of an archive key from the
+    /// stored key of the archive `key`, worked out in the same way.
+    pub(crate) fn expected_archive_key(key: &[u8; 32]) -> [u8; CIPHER_KEY_LEN] {
+        let mut out = [0; CIPHER_KEY_LEN];
+        let _ = label(
+            Some(Purpose::ArchiveWrap),
+            32,
+            Branch::ArchiveKey,
+            CIPHER_KEY_LEN,
+        )
+        .map(|(label, used)| {
+            fold(SALT, key, &label[..used], &mut out);
+        });
+        out
+    }
+
+    /// The key the model of HKDF gives the records of an archive under the key of a chat for its
+    /// archive `key`, worked out in the same way.
+    pub(crate) fn expected_archive_seal_key(key: &[u8; 32]) -> [u8; CIPHER_KEY_LEN] {
+        let mut out = [0; CIPHER_KEY_LEN];
+        let _ = label(
+            Some(Purpose::ArchiveSeal),
+            32,
+            Branch::ArchiveSeal,
+            CIPHER_KEY_LEN,
+        )
+        .map(|(label, used)| {
+            fold(SALT, key, &label[..used], &mut out);
+        });
+        out
+    }
+
+    /// The randomness of an encapsulation the model of HKDF gives from `hedged` and the key of a
+    /// chat for its archive `key`, worked out in the same way.
+    pub(crate) fn expected_archive_randomness(key: &[u8; 32], hedged: &[u8; 64]) -> [u8; 64] {
+        let mut out = [0; 64];
+        let _ = label(Some(Purpose::ArchiveSeal), 32, Branch::ArchiveEncaps, 64).map(
+            |(label, used)| {
+                fold(hedged, key, &label[..used], &mut out);
+            },
+        );
+        out
+    }
+
+    /// The check of a shared secret the model of HKDF gives from `shared` and a ciphertext that
+    /// begins with `ciphertext`, as far as the model reads it, worked out in the same way.
+    pub(crate) fn expected_archive_check(shared: &[u8; 32], ciphertext: &[u8; 32]) -> [u8; ID_LEN] {
+        let mut out = [0; ID_LEN];
+        let _ =
+            label(Some(Purpose::Archive), 32, Branch::ArchiveCheck, ID_LEN).map(|(label, used)| {
+                fold(ciphertext, shared, &label[..used], &mut out);
+            });
+        out
+    }
+
+    /// The key of a batch the model of HKDF gives from the shared secret `shared` and a ciphertext
+    /// that begins with `ciphertext`, as far as the model reads it, worked out in the same way.
+    pub(crate) fn expected_archive_data(shared: &[u8; 32], ciphertext: &[u8; 32]) -> [u8; 32] {
+        let mut out = [0; 32];
+        let _ = label(Some(Purpose::Archive), 32, Branch::ArchiveData, 32).map(|(label, used)| {
+            fold(ciphertext, shared, &label[..used], &mut out);
+        });
+        out
+    }
+
     /// The key the model of HKDF gives the records of an export, and the record that ends one,
     /// from the key for transfers `key`, worked out in the same way.
     pub(crate) fn expected_export_key(key: &[u8; 32]) -> [u8; CIPHER_KEY_LEN] {
@@ -1866,7 +2107,15 @@ pub(crate) mod proofs {
             7 => Branch::EpochLayer,
             8 => Branch::Combined,
             9 => Branch::Challenge,
-            _ => Branch::ExportKey,
+            10 => Branch::ExportKey,
+            11 => Branch::ArchiveKey,
+            12 => Branch::ArchiveLayer,
+            13 => Branch::ArchiveSeed,
+            14 => Branch::ArchiveSeal,
+            15 => Branch::HedgeEncaps,
+            16 => Branch::ArchiveEncaps,
+            17 => Branch::ArchiveData,
+            _ => Branch::ArchiveCheck,
         }
     }
 
@@ -1895,7 +2144,10 @@ pub(crate) mod proofs {
             0 => None,
             1 => Some(Purpose::Wrap),
             2 => Some(Purpose::ExternalData),
-            _ => Some(Purpose::Transfer),
+            3 => Some(Purpose::Transfer),
+            4 => Some(Purpose::Archive),
+            5 => Some(Purpose::ArchiveWrap),
+            _ => Some(Purpose::ArchiveSeal),
         }
     }
 
