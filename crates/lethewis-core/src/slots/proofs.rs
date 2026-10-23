@@ -7308,11 +7308,15 @@ fn into_new(free_at: Option<usize>) {
             );
             kani::cover!(error == Some(Error::StaleHandle), "a stale key is refused");
         }
-        Some(_) => kani::cover!(result.is_ok(), "a new set takes the second slot"),
-        None => kani::cover!(
-            error == Some(Error::NoFreeSlot),
-            "a new set needs a free slot"
-        ),
+        Some(_) => {
+            kani::cover!(result.is_ok(), "a new set takes the second slot");
+        }
+        None => {
+            kani::cover!(
+                error == Some(Error::NoFreeSlot),
+                "a new set needs a free slot"
+            );
+        }
     }
 }
 
