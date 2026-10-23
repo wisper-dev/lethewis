@@ -180,7 +180,7 @@ impl<'a> Slots<'a> {
     /// slots. Whether that record is kept, and the records of the keys above it, the library
     /// cannot see.
     ///
-    /// Needs 10 KiB of stack, or 69 KiB when this crate is built without optimisation or with
+    /// Needs 11 KiB of stack, or 69 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the hedge, the derivation and the whole call are each followed
     /// by a wipe of 8 KiB, or 64 KiB, below them, whether it succeeded or not. A build that
     /// optimises this crate but not the hash code it calls has to set that flag.
@@ -362,7 +362,7 @@ impl<'a> Slots<'a> {
     /// and the block is read under the key whose check it holds. The chunks follow with
     /// [`Slots::open_chunk`] and [`Slots::open_last`]; only the last tells that the block is whole.
     ///
-    /// Needs 10 KiB of stack, or 69 KiB when this crate is built without optimisation or with
+    /// Needs 11 KiB of stack, or 69 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: each derivation, and the whole call, are each followed by a
     /// wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate but not the hash
     /// code it calls has to set that flag.
@@ -1375,7 +1375,7 @@ mod stack {
 
     /// The stack a beginning needs, in KiB, in an optimised build and in one without optimisation:
     /// a little more than a load, for the block it returns.
-    const BEGIN_NEEDS: [usize; 2] = [10, 69];
+    const BEGIN_NEEDS: [usize; 2] = [11, 69];
 
     /// The documentation of the public call `name` in this file, its lines joined.
     fn documentation(name: &str) -> String {
