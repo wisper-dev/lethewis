@@ -722,9 +722,10 @@ jobs:
         run: scripts/prove.sh agree
 
       - name: Every proof of this part runs
-        # One per processor of the runner, and room beside the peaks for the runner itself.
+        # Two at once: four at once on this runner took each proof up to twice as long. Room beside
+        # the peaks for the runner itself.
         env:
-          LETHEWIS_PROOF_JOBS: 4
+          LETHEWIS_PROOF_JOBS: 2
           LETHEWIS_PROOF_MEMORY: 13000
           PART: ${{ matrix.part }}
           PARTS: ${{ strategy.job-total }}
