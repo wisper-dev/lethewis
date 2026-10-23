@@ -7141,24 +7141,10 @@ fn a_received_block_is_written_under_a_set_of_its_transfer() {
     kani::cover!(error == Some(Error::DerivationFailed), "a derivation fails");
 }
 
-/// A new set given to a receipt, with the free slot at `free_at`, or none: from any state of two
-/// slots otherwise and of the epoch, any receipt, any context of up to two bytes and any header,
-/// whatever the platform's source does.
-fn into_new(free_at: Option<usize>) {
-    // Past the first slot it holds the key for transfers, a set of one: where the new set goes
-    // past other sets, and the want of a free slot, are the load's, which the proofs of loads
-    // cover.
-    let mut memory = match free_at {
-        Some(0) => [any_slot_in(Occupancy::Free), any_slot()],
-        Some(_) => [any_slot_in(Occupancy::Loaded), any_slot_in(Occupancy::Free)],
-        None => [
-            any_slot_in(Occupancy::Loaded),
-            any_slot_in(Occupancy::Retired),
-        ],
-    };
-    if free_at != Some(0) {
-        kani::assume(memory[0].purpose == Purpose::Transfer);
-    }
+/// A new set given to a receipt in `memory`, whose first free slot is `free_at`: from any epoch,
+/// any receipt, any context of up to two bytes and any header, whatever the platform's source
+/// does. Whether the receipt succeeded, its error, and whether its failure released a set it made.
+fn into_new(mut memory: [Slot; 2], free_at: usize) -> (bool, Option<Error>, bool) {
     let id = memory.as_ptr().addr();
     let changing = kani::any();
     let mut epoch = any_epoch(changing);
@@ -7189,9 +7175,11 @@ fn into_new(free_at: Option<usize>) {
         epoch_snapshot(&slots) == (number, key, next, changing, draws),
         "a new set changes no epoch but the count of the draws the source answers",
     );
-    let free = first_free(&before);
-    kani::assert(free == free_at, "the free slot is where it was made");
-    let changed = free.unwrap_or(2);
+    kani::assert(
+        first_free(&before) == Some(free_at),
+        "the free slot is where it was made",
+    );
+    let changed = free_at;
     kani::assert(
         unchanged_but(&after, &before, changed),
         "a new set changes no slot but the first free one",
@@ -7209,9 +7197,10 @@ fn into_new(free_at: Option<usize>) {
                     Error::StaleHandle
                 })
                 && entropy.source.calls == 0
-                && after == before,
+                && after == before
+                && header == original,
             "a bad context, then a stale key or a chain that has moved, are refused before any \
-             draw",
+             draw and write nothing",
         );
     } else if let Ok((receiving, handle)) = &result {
         let new = snapshot_at(&after, changed);
@@ -7219,8 +7208,7 @@ fn into_new(free_at: Option<usize>) {
         drawn.copy_from_slice(&entropy.first[..SALT_LEN]);
         let salt = expected_hedge(&epoch_key, count, Branch::HedgeSalt, &drawn);
         kani::assert(
-            free.is_some()
-                && new.occupancy == Occupancy::Loaded
+            new.occupancy == Occupancy::Loaded
                 && new.purpose == Purpose::Data
                 && new.stages.stage(0) == Some(Status::Enabled)
                 && new.stages.stage(1).is_none()
@@ -7272,60 +7260,37 @@ fn into_new(free_at: Option<usize>) {
         kani::assert(
             header == original
                 && (left == snapshot_at(&before, changed)
-                    || (wiped(&slots.memory[changed.min(1)])
+                    || (wiped(&slots.memory[changed])
                         && (left.occupancy == Occupancy::Retired
                             || (left.occupancy == Occupancy::Free
                                 && left.generation
                                     == snapshot_at(&before, changed).generation.wrapping_add(1))))),
-            "a failed receipt writes nothing, and leaves the free slot as it was or releases the set \
-             it made there",
+            "a failed receipt writes nothing, and leaves the free slot as it was or releases the \
+             set it made there",
         );
         kani::assert(
             if entropy.source.failed {
                 error == Some(Error::EntropyFailed)
-            } else if free.is_none() && !any_failed() {
-                error == Some(Error::NoFreeSlot)
             } else {
                 error == Some(Error::DerivationFailed) && any_failed()
                     || error == Some(Error::DuplicateKey)
             },
-            "a new set fails only as the source, a free slot, a derivation or a key held already \
-             fails it",
+            "a new set fails only as the source, a derivation or a key held already fails it",
         );
     }
-    match free_at {
-        Some(0) => {
-            kani::cover!(result.is_ok(), "a block is received into a new set");
-            kani::cover!(
-                error == Some(Error::DerivationFailed)
-                    && entropy.source.calls == 2
-                    && after != before,
-                "a failed check releases the new set"
-            );
-            kani::cover!(
-                error == Some(Error::DuplicateKey),
-                "a new key held already makes no set"
-            );
-            kani::cover!(error == Some(Error::StaleHandle), "a stale key is refused");
-        }
-        Some(_) => {
-            kani::cover!(result.is_ok(), "a new set takes the second slot");
-        }
-        None => {
-            kani::cover!(
-                error == Some(Error::NoFreeSlot),
-                "a new set needs a free slot"
-            );
-        }
-    }
+    (
+        result.is_ok(),
+        error,
+        result.is_err() && entropy.source.calls == 2 && after != before,
+    )
 }
 
 /// With the first of two slots free and the second in any state, from any epoch, receipt, context
 /// of up to two bytes and header, whatever the platform's source does: giving a receipt a new set
-/// changes no slot but the first free one, and the epoch only by the count of the draws the source answers. It refuses
-/// an empty context and a key for transfers not held or whose chain has moved since the receipt
-/// began before it draws. It then draws the salt; a failed source, a want of a free slot and a
-/// failed load change no slot, and a failed check after the load releases the new set. On success
+/// changes no slot but the first free one, and the epoch only by the count of the draws the source
+/// answers. It refuses an empty context and a key for transfers not held or whose chain has moved
+/// since the receipt began before it draws. It then draws the salt; a failed source and a failed
+/// load change no slot, and a failed check after the load releases the new set. On success
 /// the first free slot holds a set for data of one enabled key of 32 bytes, generated as any is,
 /// marked as having come in the receipt's transfer; the header holds the salt hedged from the
 /// first draw and the check of the new key and that salt; and the block is received into the new
@@ -7333,7 +7298,17 @@ fn into_new(free_at: Option<usize>) {
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_received_block_takes_a_new_set_in_the_first_slot() {
-    into_new(Some(0));
+    let (received, error, released) = into_new([any_slot_in(Occupancy::Free), any_slot()], 0);
+    kani::cover!(received, "a block is received into a new set");
+    kani::cover!(
+        error == Some(Error::DerivationFailed) && released,
+        "a failed check releases the new set"
+    );
+    kani::cover!(
+        error == Some(Error::DuplicateKey),
+        "a new key held already makes no set"
+    );
+    kani::cover!(error == Some(Error::StaleHandle), "a stale key is refused");
 }
 
 /// From the same states with a key for transfers in the first slot and the second free: the new set
@@ -7341,14 +7316,83 @@ fn a_received_block_takes_a_new_set_in_the_first_slot() {
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_received_block_takes_a_new_set_in_the_second_slot() {
-    into_new(Some(1));
+    // Past the first slot, which holds a key for transfers, a set of one: where the new set goes
+    // past other sets is the load's, which the proofs of loads cover.
+    let memory = [any_slot_in(Occupancy::Loaded), any_slot_in(Occupancy::Free)];
+    kani::assume(memory[0].purpose == Purpose::Transfer);
+    let (received, ..) = into_new(memory, 1);
+    kani::cover!(received, "a new set takes the second slot");
 }
 
-/// From the same states with a key for transfers in the first slot and the second retired: a new set
-/// is refused as `NoFreeSlot` after the draw of the salt, unless a refusal or a failure comes first,
-/// and changes no slot.
+/// From the same states with a key for transfers in the first slot and the second retired: a new
+/// set is refused as `NoFreeSlot` after the one draw of the salt, unless a refusal or a failure
+/// comes first, and changes no slot and writes nothing.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_received_block_needs_a_free_slot_for_a_new_set() {
-    into_new(None);
+    let mut memory = [
+        any_slot_in(Occupancy::Loaded),
+        any_slot_in(Occupancy::Retired),
+    ];
+    kani::assume(memory[0].purpose == Purpose::Transfer);
+    let id = memory.as_ptr().addr();
+    let changing = kani::any();
+    let mut epoch = any_epoch(changing);
+    let mut slots = Slots {
+        memory: &mut memory,
+        epoch: &mut epoch,
+    };
+    let count = slots.epoch.drawn;
+    let (number, key, next, _, _) = epoch_snapshot(&slots);
+    let before = snapshots(&slots);
+    let (export_bytes, context_bytes): ([u8; 2], [u8; 2]) = (kani::any(), kani::any());
+    let export = any_block_context(&export_bytes);
+    let context = any_context(&context_bytes);
+    let receipt = any_receiving(id, export, b"x").receipt;
+    let transfer = receipt.transfer;
+    let carrier = snapshot_at(&before, transfer.index);
+    kani::assume(!names_loaded(&before, &transfer) || carrier.purpose == Purpose::Transfer);
+    let chain = receipt.chain;
+    let original: [u8; BLOCK_HEADER_LEN] = kani::any();
+    let mut header = original;
+    let mut entropy = FirstKept::new();
+
+    let error = slots
+        .receive_into_in(receipt, None, context, &mut entropy, &mut header)
+        .err();
+    let draws = count.wrapping_add(u64::from(entropy.source.answered));
+    kani::assert(
+        epoch_snapshot(&slots) == (number, key, next, changing, draws),
+        "a new set changes no epoch but the count of the draws the source answers",
+    );
+    kani::assert(
+        first_free(&before).is_none() && snapshots(&slots) == before && header == original,
+        "without a free slot a receipt changes no slot and writes nothing",
+    );
+    let refused = context.is_empty()
+        || !names_loaded(&before, &transfer)
+        || u128::from_ne_bytes(carrier.chain) != u128::from_ne_bytes(chain);
+    kani::assert(
+        if refused {
+            error
+                == Some(if context.is_empty() {
+                    Error::InvalidContext
+                } else {
+                    Error::StaleHandle
+                })
+                && entropy.source.calls == 0
+        } else if entropy.source.failed {
+            error == Some(Error::EntropyFailed)
+        } else if any_failed() {
+            error == Some(Error::DerivationFailed)
+        } else {
+            error == Some(Error::NoFreeSlot) && entropy.source.calls == 1
+        },
+        "a bad context, then a stale key or a chain that has moved, are refused before any draw; \
+         then the source or a derivation fails, or the want of a free slot refuses",
+    );
+    kani::cover!(
+        error == Some(Error::NoFreeSlot),
+        "a new set needs a free slot"
+    );
 }
