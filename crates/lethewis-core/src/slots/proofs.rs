@@ -2969,6 +2969,20 @@ impl<const N: usize> AnySeal<N> {
         self.calls = self.calls.saturating_add(1);
         if failed { Err(SealFailed) } else { Ok(tag) }
     }
+
+    /// [`AnySeal::seal`], as the stand-in for the cipher it is in the proofs: one closure for
+    /// every proof, so that one that seals reaches it for one that never does.
+    fn sealing(
+        &mut self,
+    ) -> impl FnMut(
+        &[u8; CIPHER_KEY_LEN],
+        &[u8; NONCE_LEN],
+        &[u8],
+        &mut [u8; N],
+    ) -> Result<[u8; TAG_LEN], SealFailed>
+    + '_ {
+        |key, nonce, aad, buffer| self.seal(key, nonce, aad, buffer)
+    }
 }
 
 /// Any source, which keeps what it gave the first time.
@@ -3489,7 +3503,7 @@ fn a_reseal_refuses_what_it_cannot_move() {
         &mut entropy,
         (&record, &mut out),
         opening(|key, nonce, aad, buffer, tag| cipher.open_bound(key, nonce, aad, buffer, tag)),
-        sealing(|key, nonce, aad, buffer| sealer.seal(key, nonce, aad, buffer)),
+        sealer.sealing(),
     );
     kani::assert(
         unchanged_except(&slots, &before, 2)
@@ -3590,7 +3604,7 @@ fn a_reseal_seals_what_the_record_held() {
         &mut entropy,
         (&record, &mut out),
         opening(|key, nonce, aad, buffer, tag| cipher.open_bound(key, nonce, aad, buffer, tag)),
-        sealing(|key, nonce, aad, buffer| sealer.seal(key, nonce, aad, buffer)),
+        sealer.sealing(),
     );
     let draws = count.wrapping_add(u64::from(entropy.answered));
     kani::assert(
