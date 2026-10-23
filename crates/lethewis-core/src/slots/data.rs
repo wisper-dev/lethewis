@@ -588,6 +588,7 @@ mod tests {
     use crate::key::tests::{Random, from_environment};
     use crate::keyset::Position;
     use crate::record::{Purpose, RECORD_LEN};
+    use crate::seal::{Rejected, SealFailed};
     use crate::slots::tests::{EPOCH, epoch_key, pattern};
     use crate::slots::{Erasure, Handle, Slot, Slots};
     use crate::timing::timed;
@@ -791,6 +792,69 @@ mod tests {
             }
             assert_eq!(open_block(&slots, set, &context, &block).unwrap(), data);
         }
+    }
+
+    /// A set unwrapped from a record of this epoch is held by that record, so it begins a block.
+    #[test]
+    fn a_set_unwrapped_from_a_record_of_this_epoch_begins_a_block() {
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let data = slots
+            .generate(
+                Purpose::Data,
+                KeyLength::Bytes32,
+                &mut Fixed(&pattern::<32>(59, 201)),
+            )
+            .unwrap();
+        let parent = slots.import32(Purpose::Wrap, &mut pattern(97, 13)).unwrap();
+        let parent = slots.store(parent);
+        let mut record = [0; RECORD_LEN];
+        slots
+            .wrap(data, parent, b"chat 7", &mut Fixed(&NONCE), &mut record)
+            .unwrap();
+        slots.release(data).unwrap();
+        let set = slots.unwrap(parent, b"chat 7", &record).unwrap();
+        let mut header = [0; BLOCK_HEADER_LEN];
+        assert!(
+            slots
+                .begin_seal(set, b"chat 7", &mut Fixed(&NONCE), &mut header)
+                .is_ok()
+        );
+    }
+
+    /// A chunk the cipher fails to seal is refused as `CipherFailed`, and one it refuses to open as
+    /// `RecordRejected`; neither writes a tag or moves its block on.
+    #[test]
+    fn a_failing_cipher_fails_the_chunk() {
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let (set, _) = recorded_set(&mut slots);
+        let mut header = [0; BLOCK_HEADER_LEN];
+        let mut sealing = slots
+            .begin_seal(set, b"chat 7", &mut Fixed(&NONCE), &mut header)
+            .unwrap();
+        let failing = |_: &[u8; 32], _: &[u8; 12], _: &[u8], _: &mut [u8]| Err(SealFailed);
+        let mut tag = [9; CHUNK_TAG_LEN];
+        assert_eq!(
+            slots.seal_chunk_on_stack(&mut sealing, &mut [1; 5], true, &mut tag, failing),
+            Err(Error::CipherFailed)
+        );
+        assert_eq!((tag, sealing.next), ([9; CHUNK_TAG_LEN], 0));
+        let block = seal_block(&mut slots, set, b"chat 7", &mut Fixed(&NONCE), &[1; 5]).unwrap();
+        let header: [u8; BLOCK_HEADER_LEN] = block[..BLOCK_HEADER_LEN].try_into().unwrap();
+        let length = u64::try_from(block.len()).unwrap();
+        let mut opening = slots.begin_open(set, b"chat 7", &header, length).unwrap();
+        let refusing =
+            |_: &[u8; 32], _: &[u8; 12], _: &[u8], _: &mut [u8], _: &[u8; 16]| Err(Rejected);
+        let tag: [u8; CHUNK_TAG_LEN] = block[BLOCK_HEADER_LEN + 5..].try_into().unwrap();
+        let mut chunk = block[BLOCK_HEADER_LEN..BLOCK_HEADER_LEN + 5].to_vec();
+        assert_eq!(
+            slots.open_chunk_on_stack(&mut opening, &mut chunk, true, &tag, refusing),
+            Err(Error::RecordRejected)
+        );
+        assert_eq!(opening.next, 0);
     }
 
     #[test]

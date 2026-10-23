@@ -103,7 +103,7 @@ pub(crate) fn first_match(matches: [bool; 3]) -> (usize, bool) {
     let second_only = second & (first ^ 1);
     let third_only = third & (first ^ 1) & (second ^ 1);
     (
-        usize::from(second_only | (third_only << 1)),
+        usize::from(second_only).wrapping_add(usize::from(third_only) << 1),
         (first | second | third) == 1,
     )
 }

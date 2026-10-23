@@ -492,6 +492,7 @@ compile error.
 | a plain record that holds a stored key of the archive, or refuses a chat's key for its archive | `a_wrap_changes_no_slot_and_writes_only_when_it_succeeds`, `admitting_into_the_first_slot`, unit tests |
 | a lock record that holds a chat's key for its archive, or refuses a stored key of the archive | `a_lock_changes_no_slot_and_writes_only_when_it_succeeds`, `admitting_into_the_first_slot`, unit tests |
 | a parser that refuses the purposes of the archive | `parsing_a_set_accepts_exactly_what_building_can_write` |
+| a parser that refuses a key for data | `parsing_a_set_accepts_exactly_what_building_can_write` |
 | an export record that holds a chat's key for its archive | `an_export_changes_no_set_and_writes_only_when_it_succeeds`, `admitting_into_the_first_slot`, unit tests |
 | a generation that refuses a stored key of the archive or a chat's key for its archive, or a long import of a key of the archive | `a_load_into_the_first_slot`, unit tests |
 | a load of an archive key that does not check its parents | `a_load_of_an_archive_key_refuses_its_parents_before_it_decrypts`, `a_load_of_an_archive_key_checks_its_public_key` |

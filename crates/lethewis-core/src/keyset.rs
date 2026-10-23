@@ -843,7 +843,7 @@ pub(crate) mod proofs {
     }
 
     /// Whether the position starting at `at` is one `build` can write for the purpose `purpose`:
-    /// keys of 32 or 64 bytes for 1, of 32 for 2 to 6.
+    /// keys of 32 or 64 bytes for 1, of 32 for 2 to 7.
     fn writable_position(bytes: &[u8; PLAINTEXT_LEN], at: usize, purpose: u8) -> bool {
         let stage = bytes[at];
         let length = bytes[at + 1];
@@ -861,7 +861,7 @@ pub(crate) mod proofs {
         let primary = bytes[2];
         let purpose = bytes[1];
         bytes[0] == 1
-            && (1..=6).contains(&purpose)
+            && (1..=7).contains(&purpose)
             && writable_position(bytes, POSITIONS[0], purpose)
             && writable_position(bytes, POSITIONS[1], purpose)
             && writable_position(bytes, POSITIONS[2], purpose)

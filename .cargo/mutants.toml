@@ -19,11 +19,11 @@ profile = "mutants"
 # lethewis-dit acts only on aarch64 where the system reports data-independent timing: the mutants of
 # its detection on Linux run on aarch64 Linux, the others of its aarch64 code and of its guard on
 # macOS, and those of its inert code here.
+exclude_globs = ["crates/lethewis-core/src/**/proofs.rs"]
 exclude_re = [
   '^crates/lethewis-dit/src/(lib|aarch64)\.rs:',
   '^crates/lethewis-core/src/key\.rs:[0-9]+:[0-9]+: replace <impl Drop for Key>::drop with \(\)$',
   '^crates/lethewis-core/src/derive\.rs:[0-9]+:[0-9]+: replace <impl Drop for KeyId>::drop with \(\)$',
   '^crates/lethewis-core/src/[a-z_/]+\.rs:[0-9]+:[0-9]+: .* (proofs|model)::',
-  '^crates/lethewis-core/src/([a-z_]+/)*(proofs|model)\.rs:',
   '^crates/lethewis-core/src/words\.rs:[0-9]+:[0-9]+: replace \| with \^ in numbers$',
 ]
