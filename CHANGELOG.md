@@ -60,7 +60,7 @@ Nothing is published while the version is below 0.1.0.
   it, `SameKey` for a set wrapped under itself, `InvalidContext` and `CipherFailed`.
 - `DuplicateKey`: a key is held in one place only, and a load of a key the slots already hold, or of
   a set that holds one key twice, is refused.
-- Dependency: `ctutils` 0.4.2 or a later compatible version, without default features, to compare
+- Dependency: `ctutils` 0.4.5 or a later compatible version, without default features, to compare
   a record's parent identifier, and words with the list, in constant time.
 - The stack a wrap or an unwrap used is wiped after it, also when it fails: 24 KiB, or 64 KiB when
   this crate is built without optimisation or with `--cfg lethewis_unoptimised`, which a build that
