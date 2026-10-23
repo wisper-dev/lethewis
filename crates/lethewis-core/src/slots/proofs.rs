@@ -1866,10 +1866,11 @@ fn admitting_past_a_retired_slot() {
     past_a(Occupancy::Retired, admit_from);
 }
 
-/// Stands in for the cipher of `N` bytes: writes any bytes, accepts or rejects at will, and
-/// remembers how often it was called, and the key and nonce it was given, what it wrote and
-/// whether it accepted.
+/// Stands in for the cipher of `N` bytes: writes any bytes, accepts or rejects at will or as it is
+/// told, and remembers how often it was called, and the key and nonce it was given, what it wrote
+/// and whether it accepted.
 struct AnyCipher<const N: usize> {
+    answer: Option<bool>,
     calls: usize,
     aad: Bound,
     key: [u8; CIPHER_KEY_LEN],
@@ -1883,6 +1884,7 @@ struct AnyCipher<const N: usize> {
 impl<const N: usize> AnyCipher<N> {
     fn new() -> Self {
         Self {
+            answer: None,
             calls: 0,
             aad: Bound::none(),
             key: [0; CIPHER_KEY_LEN],
@@ -1891,6 +1893,14 @@ impl<const N: usize> AnyCipher<N> {
             tag: [0; TAG_LEN],
             written: [0; N],
             accepted: false,
+        }
+    }
+
+    /// One that accepts every record when `answer` is true and rejects every one otherwise.
+    fn answering(answer: bool) -> Self {
+        Self {
+            answer: Some(answer),
+            ..Self::new()
         }
     }
 
@@ -1915,7 +1925,7 @@ impl<const N: usize> AnyCipher<N> {
         tag: &[u8; TAG_LEN],
     ) -> Result<(), Rejected> {
         let written: [u8; N] = kani::any();
-        let accepted: bool = kani::any();
+        let accepted = self.answer.unwrap_or_else(kani::any);
         (self.given, self.tag) = (*buffer, *tag);
         *buffer = written;
         (self.key, self.nonce, self.written, self.accepted) = (*key, *nonce, written, accepted);
@@ -3445,18 +3455,108 @@ fn an_opened_archive_gives_its_key_only_under_its_archive_key() {
 }
 
 /// From any state of two slots and of the epoch, for handles of these slots naming any slots
-/// and generations, any record of an archive, any context of up to two bytes and any output,
-/// whatever the platform's source and the cipher do: moving a record changes no slot and no
-/// epoch but its count of draws. It refuses an empty context, then for each handle in turn a
-/// stale one and a set not of a chat for its archive, before it decrypts. It opens the record
-/// once, under the key of the first chat, with the record's nonce, ciphertext and tag and the
-/// associated data of the context, and refuses it as `RecordRejected`, asking the source
-/// nothing, unless the cipher accepts it. On success it has drawn once and seals what the
-/// record held, under the key of the second chat, with the nonce the source gave, hedged with
-/// the key of this epoch, and the same associated data; otherwise it writes nothing.
+/// and generations, any record of an archive, any context of up to two bytes and any output, with
+/// a cipher that rejects every record: moving a record changes no slot and no epoch and writes
+/// nothing. It refuses an empty context, then for each handle in turn a stale one and a set not of
+/// a chat for its archive, before it decrypts. It opens the record at most once, under the key of
+/// the first chat, with the record's nonce, ciphertext and tag and the associated data of the
+/// context, and refuses it as `RecordRejected`, asking the source nothing.
 #[kani::proof]
 #[kani::unwind(1181)]
-fn a_reseal_changes_nothing_but_its_output() {
+fn a_reseal_refuses_what_it_cannot_move() {
+    let mut memory = [any_slot(), any_slot()];
+    let id = memory.as_ptr().addr();
+    let mut epoch = any_epoch(kani::any());
+    let mut slots = Slots {
+        memory: &mut memory,
+        epoch: &mut epoch,
+    };
+    let epoch_before = epoch_snapshot(&slots);
+    let before = snapshots(&slots);
+    let (from, to) = (forged(id), forged(id));
+    let context_bytes: [u8; 2] = kani::any();
+    let context = any_context(&context_bytes);
+    let record: [u8; ARCHIVE_RECORD_LEN] = kani::any();
+    let original: [u8; ARCHIVE_RECORD_LEN] = kani::any();
+    let mut out = original;
+    let mut entropy = AnyEntropy::new();
+    let mut cipher = AnyCipher::<ARCHIVED_LEN>::answering(false);
+    let mut sealer = AnySeal::<ARCHIVED_LEN>::new();
+
+    let result = slots.reseal_archive_on_stack(
+        (from, to),
+        context,
+        &mut entropy,
+        (&record, &mut out),
+        opening(|key, nonce, aad, buffer, tag| cipher.open_bound(key, nonce, aad, buffer, tag)),
+        sealing(|key, nonce, aad, buffer| sealer.seal(key, nonce, aad, buffer)),
+    );
+    kani::assert(
+        unchanged_except(&slots, &before, 2)
+            && epoch_snapshot(&slots) == epoch_before
+            && same(&out, &original),
+        "a refused move changes no slot and no epoch and writes nothing",
+    );
+    let refusal = |handle: &Handle<'_>| {
+        if !names_loaded(&before, handle) {
+            Some(Error::StaleHandle)
+        } else if snapshot_at(&before, handle.index).purpose != Purpose::ArchiveSeal {
+            Some(Error::WrongPurpose)
+        } else {
+            None
+        }
+    };
+    let refused = refusal(&from).or_else(|| refusal(&to));
+    kani::assert(
+        entropy.calls == 0
+            && sealer.calls == 0
+            && if context.is_empty() {
+                result == Err(Error::InvalidContext) && cipher.calls == 0
+            } else if let Some(error) = refused {
+                result == Err(error) && cipher.calls == 0
+            } else if cipher.calls == 0 {
+                result == Err(Error::DerivationFailed)
+            } else {
+                result == Err(Error::RecordRejected)
+            },
+        "moving a record refuses a bad context, stale handles and sets not of a chat for its \
+         archive before it decrypts, then a record the first key does not open, asking the source \
+         nothing",
+    );
+    kani::assert(
+        cipher.calls <= 1
+            && (cipher.calls == 0
+                || (cipher.key
+                    == expected_archive_seal_key(&key_head(&snapshot_at(&before, from.index)))
+                    && cipher.nonce[..] == record[..NONCE_LEN]
+                    && same_bytes(&cipher.given, &record[NONCE_LEN..NONCE_LEN + ARCHIVED_LEN])
+                    && cipher.tag[..] == record[NONCE_LEN + ARCHIVED_LEN..]
+                    && cipher.aad == Bound::to(context))),
+        "the record is opened once, under the key of the first chat, with its nonce, \
+         ciphertext and tag and the associated data of the context",
+    );
+    kani::cover!(
+        result == Err(Error::RecordRejected),
+        "a record the first key does not open is refused"
+    );
+    kani::cover!(
+        result == Err(Error::WrongPurpose),
+        "a set not of a chat for its archive is refused"
+    );
+}
+
+/// From any state of two slots and of the epoch, for handles that name sets of chats for their
+/// archive held there now, any record of an archive, any context of one or two bytes and any
+/// output, whatever the platform's source does and with a cipher that accepts every record:
+/// moving a record changes no slot and no epoch but its count of draws. It opens the record once,
+/// under the key of the first chat, with the record's nonce, ciphertext and tag and the associated
+/// data of the context, unless the derivation of that key fails. On success it has drawn once and
+/// seals what the record held, under the key of the second chat, with the nonce the source gave,
+/// hedged with the key of this epoch, and the same associated data; otherwise it fails as the
+/// source, a derivation or the seal failed, and writes nothing.
+#[kani::proof]
+#[kani::unwind(1181)]
+fn a_reseal_seals_what_the_record_held() {
     let mut memory = [any_slot(), any_slot()];
     let id = memory.as_ptr().addr();
     let changing = kani::any();
@@ -3469,13 +3569,19 @@ fn a_reseal_changes_nothing_but_its_output() {
     let (number, key, next, _, _) = epoch_snapshot(&slots);
     let before = snapshots(&slots);
     let (from, to) = (forged(id), forged(id));
+    let of_a_chat = |handle: &Handle<'_>| {
+        names_loaded(&before, handle)
+            && snapshot_at(&before, handle.index).purpose == Purpose::ArchiveSeal
+    };
+    kani::assume(of_a_chat(&from) && of_a_chat(&to));
     let context_bytes: [u8; 2] = kani::any();
     let context = any_context(&context_bytes);
+    kani::assume(!context.is_empty());
     let record: [u8; ARCHIVE_RECORD_LEN] = kani::any();
     let original: [u8; ARCHIVE_RECORD_LEN] = kani::any();
     let mut out = original;
     let mut entropy = AnyEntropy::new();
-    let mut cipher = AnyCipher::<ARCHIVED_LEN>::new();
+    let mut cipher = AnyCipher::<ARCHIVED_LEN>::answering(true);
     let mut sealer = AnySeal::<ARCHIVED_LEN>::new();
 
     let result = slots.reseal_archive_on_stack(
@@ -3493,25 +3599,9 @@ fn a_reseal_changes_nothing_but_its_output() {
         "moving a record changes no slot and no epoch, and counts once each draw the source \
          answers",
     );
-    let refusal = |handle: &Handle<'_>| {
-        if !names_loaded(&before, handle) {
-            Some(Error::StaleHandle)
-        } else if snapshot_at(&before, handle.index).purpose != Purpose::ArchiveSeal {
-            Some(Error::WrongPurpose)
-        } else {
-            None
-        }
-    };
-    let refused = refusal(&from).or_else(|| refusal(&to));
     kani::assert(
-        if context.is_empty() {
-            result == Err(Error::InvalidContext) && cipher.calls == 0
-        } else if let Some(error) = refused {
-            result == Err(error) && cipher.calls == 0
-        } else if cipher.calls == 0 {
+        if cipher.calls == 0 {
             result == Err(Error::DerivationFailed)
-        } else if !cipher.accepted {
-            result == Err(Error::RecordRejected) && entropy.calls == 0
         } else if entropy.failed {
             result == Err(Error::EntropyFailed)
         } else if any_failed() {
@@ -3521,9 +3611,8 @@ fn a_reseal_changes_nothing_but_its_output() {
         } else {
             result.is_ok()
         },
-        "moving a record refuses a bad context, stale handles and sets not of a chat for its \
-         archive before it decrypts, then a record the first key does not open, a failed \
-         source, a failed derivation and a failed seal",
+        "moving a record that opens fails only for a failed source, a failed derivation or a \
+         failed seal",
     );
     kani::assert(
         cipher.calls <= 1
@@ -3562,10 +3651,6 @@ fn a_reseal_changes_nothing_but_its_output() {
     kani::cover!(
         result.is_ok() && from.index != to.index,
         "a record is moved to another key"
-    );
-    kani::cover!(
-        result == Err(Error::RecordRejected),
-        "a record the first key does not open is refused"
     );
     kani::cover!(result == Err(Error::CipherFailed), "the seal fails");
     kani::cover!(result == Err(Error::EntropyFailed), "the source fails");

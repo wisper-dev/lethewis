@@ -794,6 +794,24 @@ mod tests {
     }
 
     #[test]
+    fn debug_shows_no_state_of_a_block() {
+        let mut memory = [const { Slot::empty() }; 2];
+        let mut epoch_memory = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+        let (set, _) = recorded_set(&mut slots);
+        let block = seal_block(&mut slots, set, b"chat 7", &mut Fixed(&NONCE), &[7]).unwrap();
+        let mut header = [0; BLOCK_HEADER_LEN];
+        let sealing = slots
+            .begin_seal(set, b"chat 7", &mut Fixed(&NONCE), &mut header)
+            .unwrap();
+        let header: [u8; BLOCK_HEADER_LEN] = block[..BLOCK_HEADER_LEN].try_into().unwrap();
+        let length = u64::try_from(block.len()).unwrap();
+        let opening = slots.begin_open(set, b"chat 7", &header, length).unwrap();
+        assert_eq!(std::format!("{sealing:?}"), "Sealing { .. }");
+        assert_eq!(std::format!("{opening:?}"), "Opening { .. }");
+    }
+
+    #[test]
     fn a_block_opens_back_to_its_data_at_every_boundary_of_a_chunk() {
         let mut memory = [const { Slot::empty() }; 2];
         let mut epoch_memory = Epoch::empty();
@@ -1514,9 +1532,10 @@ mod stack {
     }
 
     /// Sealing and opening a chunk without the wipe after them leave on the stack some of what they
-    /// handle, so that the test below can tell the wipe from its absence. The block is sealed again
-    /// from the same state, so it handles the same values. A beginning keeps nothing secret in its
-    /// own frame: the hedge and the derivations it runs wipe after themselves.
+    /// handle, so that the test below can tell the wipe from its absence; an opening in the portable
+    /// code built without optimisation leaves nothing even so. The block is sealed again from the
+    /// same state, so it handles the same values. A beginning keeps nothing secret in its own frame:
+    /// the hedge and the derivations it runs wipe after themselves.
     #[test]
     fn the_calls_on_a_chunk_without_the_wipe_leave_residue() {
         let (mut memory, mut other) = ([const { Slot::empty() }; 2], [const { Slot::empty() }; 2]);
@@ -1526,6 +1545,9 @@ mod stack {
         // The salt is in the header, public: a beginning to read copies it.
         others.push(block[..BLOCK_HEADER_LEN].to_vec());
         let pieces = key_dependent(&secrets, &others);
+        // The portable cipher wipes its keys itself, and its hash of the plaintext runs last, over
+        // the keystream.
+        let opening_leaves = !(cfg!(aes_backend = "soft") && cfg!(lethewis_unoptimised));
         let (header, mut first, first_tag, mut last, last_tag) = parts(&block);
         let mut opening = slots
             .begin_open(set, b"note", &header, length(&block))
@@ -1536,14 +1558,22 @@ mod stack {
                 .unwrap();
             black_box(&first);
         });
-        assert!(residue(range, &pieces) > 0, "an opening of a chunk");
+        assert_eq!(
+            residue(range, &pieces) > 0,
+            opening_leaves,
+            "an opening of a chunk"
+        );
         let range = below_pad(false, || {
             slots
                 .open_chunk_on_stack(&mut opening, &mut last, true, &last_tag, seal::Aes)
                 .unwrap();
             black_box(&last);
         });
-        assert!(residue(range, &pieces) > 0, "an opening of the last chunk");
+        assert_eq!(
+            residue(range, &pieces) > 0,
+            opening_leaves,
+            "an opening of the last chunk"
+        );
         let (mut again, mut again_epoch) = ([const { Slot::empty() }; 2], Epoch::empty());
         let (mut slots, set) = before_sealing(&mut again, &mut again_epoch, 0);
         let mut header = [0; BLOCK_HEADER_LEN];

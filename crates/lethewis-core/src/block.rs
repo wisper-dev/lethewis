@@ -41,7 +41,7 @@ pub(crate) const fn chunks_in<const C: usize>(len: u64) -> (u64, u64) {
     let chunk = C as u64;
     match (len.checked_div(chunk), len.checked_rem(chunk)) {
         (Some(full), Some(0)) if full != 0 => (full, chunk),
-        (Some(full), Some(rest)) if rest != 0 => (full.saturating_add(1), rest),
+        (Some(full), Some(rest)) => (full.saturating_add(1), rest),
         _ => (1, 0),
     }
 }
@@ -91,22 +91,8 @@ pub(crate) fn same_check(a: &[u8; CHECK_LEN], b: &[u8; CHECK_LEN]) -> bool {
         use ctutils::CtEq;
         a.ct_eq(b).to_bool()
     }
-    // The comparison ends in inline assembly, which Kani cannot model; as numbers, comparing the
-    // arrays whole reads bytes from before the latest write in Kani 0.68.0.
     #[cfg(kani)]
-    {
-        let halves = |bytes: &[u8; CHECK_LEN]| {
-            bytes
-                .split_first_chunk::<16>()
-                .map_or((0, 0), |(low, high)| {
-                    let high = high
-                        .first_chunk::<16>()
-                        .map_or(0, |high| u128::from_ne_bytes(*high));
-                    (u128::from_ne_bytes(*low), high)
-                })
-        };
-        halves(a) == halves(b)
-    }
+    model::same_check(a, b)
 }
 
 /// Which of three positions is the first to hold a match, and whether any does, worked out with no
@@ -139,6 +125,7 @@ pub(crate) fn chunk_nonce(index: u64, last: bool) -> [u8; NONCE_LEN] {
 mod tests {
     use super::{
         BLOCK_HEADER_LEN, CHUNK_LEN, block_len, block_len_in, chunk_nonce, chunks_in, data_len_in,
+        first_match,
     };
 
     #[test]
@@ -175,6 +162,22 @@ mod tests {
     }
 
     #[test]
+    fn the_first_match_is_the_first_position_that_holds_one() {
+        for (matches, found) in [
+            ([false, false, false], (0, false)),
+            ([true, false, false], (0, true)),
+            ([false, true, false], (1, true)),
+            ([false, false, true], (2, true)),
+            ([true, true, false], (0, true)),
+            ([true, false, true], (0, true)),
+            ([false, true, true], (1, true)),
+            ([true, true, true], (0, true)),
+        ] {
+            assert_eq!(first_match(matches), found, "{matches:?}");
+        }
+    }
+
+    #[test]
     fn a_nonce_is_the_number_and_the_mark_of_the_last_chunk() {
         assert_eq!(chunk_nonce(0, false), [0; 12]);
         assert_eq!(chunk_nonce(0, true), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
@@ -182,6 +185,28 @@ mod tests {
             chunk_nonce(0x0102_0304_0506_0708, true),
             [8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 0, 1]
         );
+    }
+}
+
+#[cfg(kani)]
+mod model {
+    use super::CHECK_LEN;
+
+    /// [`super::same_check`] as Kani sees it: the comparison ends in inline assembly, which Kani
+    /// cannot model; as numbers, comparing the arrays whole reads bytes from before the latest
+    /// write in Kani 0.68.0.
+    pub(super) fn same_check(a: &[u8; CHECK_LEN], b: &[u8; CHECK_LEN]) -> bool {
+        let halves = |bytes: &[u8; CHECK_LEN]| {
+            bytes
+                .split_first_chunk::<16>()
+                .map_or((0, 0), |(low, high)| {
+                    let high = high
+                        .first_chunk::<16>()
+                        .map_or(0, |high| u128::from_ne_bytes(*high));
+                    (u128::from_ne_bytes(*low), high)
+                })
+        };
+        halves(a) == halves(b)
     }
 }
 
