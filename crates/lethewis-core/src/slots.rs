@@ -5575,11 +5575,11 @@ mod tests {
         parent
     }
 
-    /// The plaintext of a random set for wrapping, external data, transfers or a chat's archive, at a
-    /// random revision naming `named`, at times with a key held in `held` or one key twice, left as
-    /// built, wholly random or with one byte changed. A set not for wrapping mostly holds 32-byte
-    /// keys, as it has to, and one not for external data is half the time a set of one that has
-    /// never changed, as it has to be.
+    /// The plaintext of a random set for wrapping, external data, transfers, a chat's archive or data,
+    /// at a random revision naming `named`, at times with a key held in `held` or one key twice, left
+    /// as built, wholly random or with one byte changed. A set not for wrapping mostly holds 32-byte
+    /// keys, as it has to, and one whose keys do not change by their stages is half the time a set of
+    /// one that has never changed, as it has to be.
     fn random_plaintext(
         random: &mut Random,
         named: [u8; 16],
@@ -5590,8 +5590,9 @@ mod tests {
             Purpose::ExternalData,
             Purpose::Transfer,
             Purpose::ArchiveSeal,
-        ][random.below(4)];
-        let one = purpose != Purpose::ExternalData && random.below(2) == 0;
+            Purpose::Data,
+        ][random.below(5)];
+        let one = !purpose.staged() && random.below(2) == 0;
         let (stages, primary) = if one {
             ([Some(Status::Enabled), None, None], 0)
         } else {
@@ -5637,7 +5638,7 @@ mod tests {
         let primary = usize::from(plaintext[2]);
         let purpose = plaintext[1];
         if plaintext[0] != 1
-            || ![2, 3, 6].contains(&purpose)
+            || ![2, 3, 6, 7].contains(&purpose)
             || plaintext[19..27] != EPOCH.to_le_bytes()
             || primary >= MEMBERS
             || plaintext[35 + 66 * primary] != 1
@@ -5659,7 +5660,7 @@ mod tests {
             && plaintext[35] == 1
             && keys[1..].iter().all(Option::is_none)
             && plaintext[27..35] == [0; 8];
-        (purpose == 2 || one).then_some(keys)
+        (purpose == 2 || purpose == 7 || one).then_some(keys)
     }
 
     /// The slot that holds the set of an accepted `plaintext`, as the layout states it.
