@@ -1122,6 +1122,92 @@ mod tests {
         to.end_receive(into, b"move", &end).unwrap();
     }
 
+    /// The last chunk is carried out and received only in its place and at its length; the
+    /// refusals give no tag and leave the export as it was.
+    #[test]
+    fn carried_chunks_go_in_the_order_and_lengths_of_their_block() {
+        let (mut memory, mut epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
+        let (mut other_memory, mut other_epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
+        let (mut from, set, out, mut to, into) = devices(
+            (&mut memory, &mut epoch),
+            (&mut other_memory, &mut other_epoch),
+        );
+        let entropy = &mut Fixed(&pattern::<16>(3, 7));
+        let data = pattern_of(CHUNK_LEN + 3);
+        let block = seal_block(&mut from, set, b"chat 7", entropy, &data).unwrap();
+        let header: [u8; BLOCK_HEADER_LEN] = block[..BLOCK_HEADER_LEN].try_into().unwrap();
+        let length = u64::try_from(block.len()).unwrap();
+        let pieces = chunks_of(&block, 2, 3);
+        let mut carried = [0; BLOCK_HEADER_LEN];
+        let mut tag = [9; CHUNK_TAG_LEN];
+        let opening = from.begin_open(set, b"chat 7", &header, length).unwrap();
+        let exporting = from
+            .begin_export_block(opening, out, b"move", entropy, &mut carried)
+            .unwrap();
+        assert_eq!(
+            from.export_last(exporting, &mut pieces[1].0.clone(), &pieces[1].1, &mut tag),
+            Err(Error::WrongChunk)
+        );
+        assert_eq!(tag, [9; CHUNK_TAG_LEN]);
+        let opening = from.begin_open(set, b"chat 7", &header, length).unwrap();
+        let mut exporting = from
+            .begin_export_block(opening, out, b"move", entropy, &mut carried)
+            .unwrap();
+        let mut first: [u8; CHUNK_LEN] = pieces[0].0[..].try_into().unwrap();
+        from.export_chunk(&mut exporting, &mut first, &pieces[0].1, &mut tag)
+            .unwrap();
+        tag = [9; CHUNK_TAG_LEN];
+        assert_eq!(
+            from.export_last(exporting, &mut [0; 4], &pieces[1].1, &mut tag),
+            Err(Error::WrongChunk)
+        );
+        assert_eq!(tag, [9; CHUNK_TAG_LEN]);
+        let block =
+            export_block(&mut from, (set, b"chat 7"), &block, (out, b"move"), entropy).unwrap();
+        let mut end = [0; END_RECORD_LEN];
+        from.end_export(out, b"move", entropy, &mut end).unwrap();
+        let header: [u8; BLOCK_HEADER_LEN] = block[..BLOCK_HEADER_LEN].try_into().unwrap();
+        let length = u64::try_from(block.len()).unwrap();
+        let pieces = chunks_of(&block, 2, 3);
+        let mut local = [0; BLOCK_HEADER_LEN];
+        let receipt = to
+            .begin_receive_block(into, b"move", &header, length)
+            .unwrap();
+        let (receiving, new) = to
+            .receive_into(receipt, None, b"chat 9", entropy, &mut local)
+            .unwrap();
+        assert_eq!(
+            to.receive_last(receiving, &mut pieces[1].0.clone(), &pieces[1].1, &mut tag),
+            Err(Error::WrongChunk)
+        );
+        assert_eq!(tag, [9; CHUNK_TAG_LEN]);
+        let receipt = to
+            .begin_receive_block(into, b"move", &header, length)
+            .unwrap();
+        let (mut receiving, _) = to
+            .receive_into(receipt, Some(new), b"chat 9", entropy, &mut local)
+            .unwrap();
+        let mut first: [u8; CHUNK_LEN] = pieces[0].0[..].try_into().unwrap();
+        to.receive_chunk(&mut receiving, &mut first, &pieces[0].1, &mut tag)
+            .unwrap();
+        tag = [9; CHUNK_TAG_LEN];
+        assert_eq!(
+            to.receive_last(receiving, &mut [0; 4], &pieces[1].1, &mut tag),
+            Err(Error::WrongChunk)
+        );
+        assert_eq!(tag, [9; CHUNK_TAG_LEN]);
+        let (received, _) = receive_block(
+            &mut to,
+            (into, b"move"),
+            &block,
+            (Some(new), b"chat 9"),
+            entropy,
+        )
+        .unwrap();
+        to.end_receive(into, b"move", &end).unwrap();
+        assert_eq!(open_block(&to, new, b"chat 9", &received).unwrap(), data);
+    }
+
     /// A block carried between records of the export takes its place among them, a record between
     /// two of its chunks breaks it, and a set that did not come in the transfer takes no block.
     #[test]
