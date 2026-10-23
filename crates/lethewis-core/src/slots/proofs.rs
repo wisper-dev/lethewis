@@ -5,21 +5,22 @@ use core::marker::PhantomData;
 
 use super::{
     ArchivePublic, AssociatedData, CIPHER_KEY_LEN, Direction, END_RECORD_LEN, Entropy,
-    EntropyError, Epoch, Erasure, Error, Handle, Key, KeyId, KeyLength, Kind, LAYER_LEN,
+    EntropyError, Epoch, Erasure, Error, Exporting, Handle, Key, KeyId, KeyLength, Kind, LAYER_LEN,
     LOCK_RECORD_LEN, MEMBERS, NONCE_LEN, Occupancy, Opening, Out, PLAINTEXT_LEN, Position, Purpose,
-    RECORD_LEN, Rejected, Root, RootFailed, SealFailed, Sealing, Slot, Slots, Stages, Status,
-    TAG_LEN, opening,
+    RECORD_LEN, Receipt, Receiving, Rejected, Root, RootFailed, SealFailed, Sealing, Slot, Slots,
+    Stages, Status, TAG_LEN, opening,
 };
-use crate::block::{BLOCK_HEADER_LEN, SALT_LEN};
+use crate::block::{BLOCK_HEADER_LEN, CARRY_LABEL, SALT_LEN, chunks_in, data_len_in};
 use crate::derive::{
     Branch,
-    model::{any_failed, failed, id_bytes, id_from_bytes},
+    model::{any_failed, failed, id_bytes, id_from_bytes, runs},
     proofs::{
         expected_archive_check, expected_archive_data, expected_archive_key,
         expected_archive_layer_key, expected_archive_randomness, expected_archive_seal_key,
-        expected_challenge, expected_combined, expected_data_check, expected_data_chunk,
-        expected_export_key, expected_hedge, expected_key_id, expected_layer_key,
-        expected_lock_key, expected_words_key, expected_wrap_key,
+        expected_carry_check, expected_carry_chunk, expected_challenge, expected_combined,
+        expected_data_check, expected_data_chunk, expected_export_key, expected_hedge,
+        expected_key_id, expected_layer_key, expected_lock_key, expected_words_key,
+        expected_wrap_key,
     },
 };
 use crate::keyset::proofs::{allowed, any_purpose, any_whole_stages};
@@ -193,18 +194,17 @@ fn padded(bytes: Bytes, length: KeyLength) -> Bytes {
 
 /// A slot in any state, for any purpose, with any generation and any stages whose primary is
 /// enabled; when loaded, holding a key of a length its purpose takes and any identifier at each
-/// position the stages fill, a set of one unless it is for external data or for data, from a
-/// secret or stored if it is for wrapping, changed and wrapped for the next epoch or not, and
-/// held by a record of this epoch or not. A loaded
-/// set for external data came in a transfer or not, under a key of either slot with any
-/// generation; a loaded key for transfers has any chain and direction. A free or retired slot
-/// keeps the purpose of the set it last held, and holds no state of a transfer. Every load,
-/// addition and unwrap keeps a key's length one its purpose takes, every load and unwrap makes
-/// a set neither for external data nor for data a set of one, and no change or addition takes
-/// one. A receipt
-/// marks only the set for external data it loads, with the slot of its key; only an export, a
-/// receipt and their ends give a key for transfers a chain and a direction; every release
-/// clears the state of a transfer. Their proofs show it.
+/// position the stages fill, a set of one unless it is for external data or for data, from a secret
+/// or stored if it is for wrapping, changed and wrapped for the next epoch or not, and held by a
+/// record of this epoch or not. A loaded set for external data or for data came in a transfer or
+/// not, under a key of either slot with any generation; a loaded key for transfers has any chain
+/// and direction. A free or retired slot keeps the purpose of the set it last held, and holds no
+/// state of a transfer. Every load, addition and unwrap keeps a key's length one its purpose takes,
+/// every load and unwrap makes a set neither for external data nor for data a set of one, and no
+/// change or addition takes one. A receipt marks only the set for external data it loads, and a
+/// receipt of a block only the set for data it makes, with the slot of its key; only an export, a
+/// receipt and their ends give a key for transfers a chain and a direction; every release clears
+/// the state of a transfer. Their proofs show it.
 fn any_slot() -> Slot {
     any_slot_in(any_occupancy())
 }
@@ -236,11 +236,12 @@ fn any_slot_in(occupancy: Occupancy) -> Slot {
         slot.changed = kani::any();
         slot.sealed = kani::any();
         slot.recorded = kani::any();
-        slot.pending = if purpose == Purpose::ExternalData && kani::any() {
-            Some((if kani::any() { 0 } else { 1 }, kani::any()))
-        } else {
-            None
-        };
+        slot.pending =
+            if (purpose == Purpose::ExternalData || purpose == Purpose::Data) && kani::any() {
+                Some((if kani::any() { 0 } else { 1 }, kani::any()))
+            } else {
+                None
+            };
         (slot.chain, slot.direction) = if purpose == Purpose::Transfer {
             let direction = if kani::any() {
                 Direction::Idle
@@ -5518,6 +5519,35 @@ impl AnyChunk {
         self.tag = *tag;
         if self.failed { Err(Rejected) } else { Ok(()) }
     }
+
+    /// [`AnyChunk::open`], as the stand-in for the cipher it is in the proofs: one closure for
+    /// every proof, so that one that opens reaches it for one that never does.
+    fn opening(
+        &mut self,
+    ) -> impl FnMut(
+        &[u8; CIPHER_KEY_LEN],
+        &[u8; NONCE_LEN],
+        &[u8],
+        &mut [u8],
+        &[u8; TAG_LEN],
+    ) -> Result<(), Rejected>
+    + '_ {
+        |key, nonce, aad, buffer, tag| self.open(key, nonce, aad, buffer, tag)
+    }
+
+    /// [`AnyChunk::seal`], as the stand-in for the cipher it is in the proofs, one closure for
+    /// every proof.
+    fn sealing(
+        &mut self,
+    ) -> impl FnMut(
+        &[u8; CIPHER_KEY_LEN],
+        &[u8; NONCE_LEN],
+        &[u8],
+        &mut [u8],
+    ) -> Result<[u8; TAG_LEN], SealFailed>
+    + '_ {
+        |key, nonce, aad, buffer| self.seal(key, nonce, aad, buffer)
+    }
 }
 
 /// `seal`, as the stand-in for the cipher of a chunk it is in the proofs.
@@ -5554,15 +5584,15 @@ fn any_block_context(bytes: &[u8; 2]) -> &[u8] {
     &bytes[..length]
 }
 
-/// From any state of two slots and of the epoch, for a handle of these slots naming any slot
-/// and generation, any context of up to two bytes and any header, whatever the platform's
-/// source does: beginning a block changes no slot, and the epoch only by the count of the draws
-/// the source answers. It refuses an empty context, a stale handle, a set not for data and one
-/// no record of this epoch holds as it is, in that order, before it draws; then a failed
-/// source and a failed derivation. A block begun writes into its header the salt, the hedge of
-/// the one draw under the key of this epoch, and the check derived from the primary key of the
-/// set and that salt; it names the set, the primary's position, the set's revision, the salt
-/// and the associated data of the context, from the first chunk. A refused one writes nothing.
+/// From any state of two slots and of the epoch, for a handle of these slots naming any slot and
+/// generation, any context of up to two bytes and any header, whatever the platform's source does:
+/// beginning a block changes no slot, and the epoch only by the count of the draws the source
+/// answers. It refuses an empty context, a stale handle, a set not for data, one of an unfinished
+/// transfer and one no record of this epoch holds as it is, in that order, before it draws; then a
+/// failed source and a failed derivation. A block begun writes into its header the salt, the hedge
+/// of the one draw under the key of this epoch, and the check derived from the primary key of the
+/// set and that salt; it names the set, the primary's position, the set's revision, the salt and
+/// the associated data of the context, from the first chunk. A refused one writes nothing.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_block_begins_under_the_primary_of_a_recorded_set() {
@@ -5602,6 +5632,8 @@ fn a_block_begins_under_the_primary_of_a_recorded_set() {
             error == Some(Error::StaleHandle) && asked == 0
         } else if named.purpose != Purpose::Data {
             error == Some(Error::WrongPurpose) && asked == 0
+        } else if named.pending.is_some() {
+            error == Some(Error::Unfinished) && asked == 0
         } else if !named.recorded {
             error == Some(Error::Unsaved) && asked == 0
         } else if entropy.source.failed {
@@ -5643,6 +5675,10 @@ fn a_block_begins_under_the_primary_of_a_recorded_set() {
     kani::cover!(
         result.is_ok() && changing && named.stages.primary() == 2,
         "a block begins under a primary at the last position during a change of epoch"
+    );
+    kani::cover!(
+        error == Some(Error::Unfinished),
+        "a set of an unfinished transfer begins no block"
     );
     kani::cover!(
         error == Some(Error::Unsaved),
@@ -5826,17 +5862,17 @@ fn a_chunk_is_sealed_under_the_key_its_block_began_with() {
     kani::cover!(result == Err(Error::CipherFailed), "the cipher fails");
 }
 
-/// From any state of two slots and of the epoch, for a handle of these slots naming any slot
-/// and generation, any context of up to two bytes, any header and any length of a block,
-/// beginning to read a block changes no slot and no epoch. It refuses an empty context, a stale
-/// handle, a set not for data and a length no block has, in that order, before it derives; it
-/// then derives the check of the key at every position the set fills, one derivation each,
-/// with the salt of the header, and refuses a failed one. It reads the block under the first
+/// From any state of two slots and of the epoch, for a handle of these slots naming any slot and
+/// generation, any context of up to two bytes, any header and any length of a block, beginning to
+/// read a block changes no slot and no epoch. It refuses an empty context, a stale handle, a set
+/// not for data, one of an unfinished transfer and a length no block has, in that order, before it
+/// derives; it then derives the check of the key at every position the set fills, one derivation
+/// each, with the salt of the header, and refuses a failed one. It reads the block under the first
 /// position whose check is the header's, as `KeyDisabled` if that key is disabled, and as
-/// `RecordRejected` if none is: an empty position matches nothing, though the header hold the
-/// check of an empty key. The block it reads names the set, the position, the revision, the
-/// salt and the associated data of the context, from the first chunk, and holds as many
-/// chunks as the length gives.
+/// `RecordRejected` if none is: an empty position matches nothing, though the header hold the check
+/// of an empty key. The block it reads names the set, the position, the revision, the salt and the
+/// associated data of the context, from the first chunk, and holds as many chunks as the length
+/// gives.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_block_opens_only_under_the_key_its_header_names() {
@@ -5854,10 +5890,10 @@ fn a_block_opens_only_under_the_key_its_header_names() {
     let context = any_context(&context_bytes);
     let header: [u8; BLOCK_HEADER_LEN] = kani::any();
     let block: u64 = kani::any();
-    let runs = crate::derive::model::runs();
+    let runs_before = runs();
 
     let result = slots.begin_open_in::<16>(set, context, &header, block);
-    let derived = crate::derive::model::runs().wrapping_sub(runs);
+    let derived = runs().wrapping_sub(runs_before);
     kani::assert(
         unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
         "beginning to read a block changes no slot and no epoch",
@@ -5876,7 +5912,7 @@ fn a_block_opens_only_under_the_key_its_header_names() {
             && header[SALT_LEN..] == expected_data_check(&key_head_at(&named, position), &salt)
     });
     let found = (0..MEMBERS).find(|&position| at(&matches, position));
-    let len = crate::block::data_len_in::<16>(block);
+    let len = data_len_in::<16>(block);
     let error = result.as_ref().err().copied();
     kani::assert(
         if context.is_empty() {
@@ -5885,6 +5921,8 @@ fn a_block_opens_only_under_the_key_its_header_names() {
             error == Some(Error::StaleHandle) && derived == 0
         } else if named.purpose != Purpose::Data {
             error == Some(Error::WrongPurpose) && derived == 0
+        } else if named.pending.is_some() {
+            error == Some(Error::Unfinished) && derived == 0
         } else if len.is_none() {
             error == Some(Error::RecordRejected) && derived == 0
         } else if any_failed() {
@@ -5906,7 +5944,7 @@ fn a_block_opens_only_under_the_key_its_header_names() {
          reads under the first whose check the header holds, refusing a disabled one, and none",
     );
     if let (Ok(opening), Some(len)) = (&result, len) {
-        let (chunks, last) = crate::block::chunks_in::<16>(len);
+        let (chunks, last) = chunks_in::<16>(len);
         kani::assert(
             opening.set == set
                 && opening.revision == named.stages.revision()
@@ -5930,6 +5968,10 @@ fn a_block_opens_only_under_the_key_its_header_names() {
     kani::cover!(
         error == Some(Error::KeyDisabled),
         "a block under a disabled key is refused"
+    );
+    kani::cover!(
+        error == Some(Error::Unfinished),
+        "a block under a set of an unfinished transfer is not read"
     );
     kani::cover!(
         error == Some(Error::RecordRejected)
@@ -6100,4 +6142,1209 @@ fn a_chunk_opens_only_as_the_next_of_its_block() {
         result == Err(Error::DerivationFailed),
         "the derivation fails"
     );
+}
+
+/// The associated data of a chunk of a block carried under a key for transfers, after `chain`,
+/// for the export's `context` of up to two bytes, written out from the layout: the label, the
+/// version, the length of the context, the chain, and the context.
+fn carry_bound(chain: &[u8; TAG_LEN], context: &[u8]) -> Bound {
+    Bound::chained(b"lethewis data carry", chain, context)
+}
+
+/// A block being carried out in any state: any block being read, for `context`, any handle of
+/// these slots as the key for transfers, any chain and salt, and the associated data of the
+/// export's `export` after that chain. Only a beginning makes one; this covers every state one
+/// can be in afterwards, its sets taken to be for data and for transfers.
+fn any_exporting(id: usize, context: &[u8], export: &[u8]) -> Exporting<'static> {
+    let chain: [u8; TAG_LEN] = kani::any();
+    Exporting {
+        source: any_opening(id, context),
+        transfer: forged(id),
+        chain,
+        salt: kani::any(),
+        associated: AssociatedData::of_data(export)
+            .unwrap()
+            .chained(CARRY_LABEL, &chain),
+    }
+}
+
+/// Chunks in their place, the last if `last` says so, from any state of two slots and of the
+/// epoch, any block being carried out and any chunk, whatever the ciphers do.
+fn carry_out(last: bool) {
+    let mut memory = [any_slot(), any_slot()];
+    let id = memory.as_ptr().addr();
+    let mut epoch = any_epoch(kani::any());
+    let mut slots = Slots {
+        memory: &mut memory,
+        epoch: &mut epoch,
+    };
+    let epoch_before = epoch_snapshot(&slots);
+    let before = snapshots(&slots);
+    let (context_bytes, export_bytes): ([u8; 2], [u8; 2]) = (kani::any(), kani::any());
+    let context = any_block_context(&context_bytes);
+    let export = any_block_context(&export_bytes);
+    let mut exporting = any_exporting(id, context, export);
+    let (set, transfer) = (exporting.source.set, exporting.transfer);
+    let (source, carrier) = (
+        snapshot_at(&before, set.index),
+        snapshot_at(&before, transfer.index),
+    );
+    kani::assume(!names_loaded(&before, &set) || source.purpose == Purpose::Data);
+    kani::assume(!names_loaded(&before, &transfer) || carrier.purpose == Purpose::Transfer);
+    let (at, revision, salt, next, chunks, last_len) = (
+        exporting.source.at,
+        exporting.source.revision,
+        exporting.source.salt,
+        exporting.source.next,
+        exporting.source.chunks,
+        exporting.source.last,
+    );
+    let (chain, carried_salt) = (exporting.chain, exporting.salt);
+    let length: usize = if last { kani::any() } else { 16 };
+    kani::assume(length <= 17);
+    let out_of_place = if last {
+        next.checked_add(1) != Some(chunks) || u64::try_from(length).ok() != Some(last_len)
+    } else {
+        next.checked_add(1).is_none_or(|after| after >= chunks)
+    };
+    let stale = !names_loaded(&before, &set)
+        || !names_loaded(&before, &transfer)
+        || source.stages.revision() != revision
+        || u128::from_ne_bytes(carrier.chain) != u128::from_ne_bytes(chain);
+    kani::assume(!out_of_place && !stale && carrier.direction != Direction::In);
+    let original: [u8; 17] = kani::any();
+    let mut buffer = original;
+    let tag: [u8; TAG_LEN] = kani::any();
+    let original_out: [u8; TAG_LEN] = kani::any();
+    let mut out = original_out;
+    let (mut opener, mut sealer) = (AnyChunk::new(), AnyChunk::new());
+    let (open_with, seal_with) = (opener.opening(), sealer.sealing());
+
+    let chunk = &mut buffer[..length];
+    let result = if last {
+        slots.export_last_in(
+            &mut exporting,
+            chunk,
+            (&tag, &mut out),
+            open_with,
+            seal_with,
+        )
+    } else {
+        slots.export_next_in(
+            &mut exporting,
+            chunk,
+            (&tag, &mut out),
+            open_with,
+            seal_with,
+        )
+    };
+    let after = snapshots(&slots);
+    let moved = Snapshot {
+        chain: sealer.tag,
+        direction: Direction::Out,
+        ..carrier
+    };
+    kani::assert(
+        epoch_snapshot(&slots) == epoch_before
+            && if result.is_ok() && last {
+                unchanged_but(&after, &before, transfer.index)
+                    && snapshot_at(&after, transfer.index) == moved
+            } else {
+                unchanged_but(&after, &before, 2)
+            },
+        "carrying a chunk out changes no slot and no epoch, but the last one moves the chain of \
+         the key for transfers to its tag and marks the key as writing an export",
+    );
+    if any_failed() {
+        kani::assert(
+            result == Err(Error::DerivationFailed) && opener.calls == 0,
+            "a failed derivation is refused before the ciphers run",
+        );
+    } else if opener.failed {
+        kani::assert(
+            result == Err(Error::RecordRejected) && sealer.calls == 0,
+            "a chunk that does not open is refused before it is sealed",
+        );
+    } else {
+        kani::assert(
+            if sealer.failed {
+                result == Err(Error::CipherFailed)
+            } else {
+                result.is_ok()
+            },
+            "a chunk that opens fails exactly when the seal does",
+        );
+    }
+    kani::assert(
+        opener.calls == 0
+            || (opener.calls == 1
+                && opener.key == expected_data_chunk(&key_head_at(&source, at.index()), &salt)
+                && opener.nonce == nonce_of(next, last)
+                && opener.aad == data_bound(context)
+                && opener.given == chunk_head(&original[..length])
+                && opener.tag == tag),
+        "the chunk is opened once, under the key of its position and salt, with its nonce, the \
+         associated data of the block and the tag given",
+    );
+    kani::assert(
+        sealer.calls == 0
+            || (sealer.calls == 1
+                && opener.calls == 1
+                && !opener.failed
+                && sealer.key == expected_carry_chunk(&key_head_at(&carrier, 0), &carried_salt)
+                && sealer.nonce == nonce_of(next, last)
+                && sealer.aad == carry_bound(&chain, export)
+                && sealer.given == opener.written),
+        "what opened is sealed once, under the key of the key for transfers and the carried \
+         salt, with the same nonce and the associated data of the export after the chain",
+    );
+    kani::assert(
+        exporting.source.set == set
+            && exporting.source.at == at
+            && exporting.source.revision == revision
+            && exporting.source.salt == salt
+            && exporting.source.chunks == chunks
+            && exporting.source.last == last_len
+            && Bound::of(exporting.source.associated.bytes()) == data_bound(context)
+            && exporting.transfer == transfer
+            && exporting.chain == chain
+            && exporting.salt == carried_salt
+            && Bound::of(exporting.associated.bytes()) == carry_bound(&chain, export),
+        "a chunk changes nothing of its block but the next number",
+    );
+    if result.is_ok() {
+        kani::assert(
+            out == sealer.tag
+                && chunk_head(&buffer[..length]) == sealer.written
+                && exporting.source.next == next.wrapping_add(1),
+            "a carried chunk holds what the seal wrote, its new tag is written, and the block \
+             moves on",
+        );
+    } else {
+        kani::assert(
+            out == original_out
+                && exporting.source.next == next
+                && (opener.calls != 0 || buffer == original),
+            "a refused or failed chunk writes no tag, keeps the block where it was, and is left \
+             as it was unless a cipher ran",
+        );
+    }
+    kani::cover!(result.is_ok(), "a chunk is carried out");
+    kani::cover!(
+        result == Err(Error::RecordRejected),
+        "a chunk that does not open is refused"
+    );
+    kani::cover!(result == Err(Error::CipherFailed), "the seal fails");
+    kani::cover!(
+        result == Err(Error::DerivationFailed),
+        "a failed derivation is refused"
+    );
+}
+
+/// From any state of two slots and of the epoch, any block being carried out and any chunk of up
+/// to 17 bytes, the last or one of a full 16, out of its place in the block, with a set not held,
+/// a set for data that has changed or a key for transfers whose chain has moved since the block
+/// began, or a key that receives an export: carrying it out is refused, in that order, before any
+/// derivation and before the ciphers run, and changes no slot, no epoch, no tag, no chunk and no
+/// block.
+#[kani::proof]
+#[kani::unwind(65)]
+fn a_chunk_carried_out_of_its_place_or_stream_is_refused() {
+    let mut memory = [any_slot(), any_slot()];
+    let id = memory.as_ptr().addr();
+    let mut epoch = any_epoch(kani::any());
+    let mut slots = Slots {
+        memory: &mut memory,
+        epoch: &mut epoch,
+    };
+    let epoch_before = epoch_snapshot(&slots);
+    let before = snapshots(&slots);
+    let (context_bytes, export_bytes): ([u8; 2], [u8; 2]) = (kani::any(), kani::any());
+    let context = any_block_context(&context_bytes);
+    let export = any_block_context(&export_bytes);
+    let mut exporting = any_exporting(id, context, export);
+    let (set, transfer) = (exporting.source.set, exporting.transfer);
+    let (source, carrier) = (
+        snapshot_at(&before, set.index),
+        snapshot_at(&before, transfer.index),
+    );
+    kani::assume(!names_loaded(&before, &set) || source.purpose == Purpose::Data);
+    kani::assume(!names_loaded(&before, &transfer) || carrier.purpose == Purpose::Transfer);
+    let (next, chunks, last_len) = (
+        exporting.source.next,
+        exporting.source.chunks,
+        exporting.source.last,
+    );
+    let last: bool = kani::any();
+    let length: usize = if last { kani::any() } else { 16 };
+    kani::assume(length <= 17);
+    let out_of_place = if last {
+        next.checked_add(1) != Some(chunks) || u64::try_from(length).ok() != Some(last_len)
+    } else {
+        next.checked_add(1).is_none_or(|after| after >= chunks)
+    };
+    let stale = !names_loaded(&before, &set)
+        || !names_loaded(&before, &transfer)
+        || source.stages.revision() != exporting.source.revision
+        || u128::from_ne_bytes(carrier.chain) != u128::from_ne_bytes(exporting.chain);
+    let turned = carrier.direction == Direction::In;
+    kani::assume(out_of_place || stale || turned);
+    let original: [u8; 17] = kani::any();
+    let mut buffer = original;
+    let tag: [u8; TAG_LEN] = kani::any();
+    let original_out: [u8; TAG_LEN] = kani::any();
+    let mut out = original_out;
+    let (open_with, seal_with) = (seal::model::refuse_chunk, seal::model::fail_chunk);
+
+    let chunk = &mut buffer[..length];
+    let result = if last {
+        slots.export_last_in(
+            &mut exporting,
+            chunk,
+            (&tag, &mut out),
+            open_with,
+            seal_with,
+        )
+    } else {
+        slots.export_next_in(
+            &mut exporting,
+            chunk,
+            (&tag, &mut out),
+            open_with,
+            seal_with,
+        )
+    };
+    kani::assert(
+        result
+            == Err(if out_of_place {
+                Error::WrongChunk
+            } else if stale {
+                Error::StaleHandle
+            } else {
+                Error::Unfinished
+            })
+            && !seal::model::asked()
+            && runs() == 0,
+        "a chunk out of its place, then a set not held or changed and a chain that has moved, then \
+         a key that receives an export, are refused before any derivation and before the ciphers \
+         run",
+    );
+    kani::assert(
+        unchanged_except(&slots, &before, 2)
+            && epoch_snapshot(&slots) == epoch_before
+            && out == original_out
+            && buffer == original
+            && exporting.source.next == next,
+        "a refused chunk changes no slot, no epoch, no tag, no chunk and no block",
+    );
+    kani::cover!(
+        result == Err(Error::StaleHandle)
+            && names_loaded(&before, &transfer)
+            && u128::from_ne_bytes(carrier.chain) != u128::from_ne_bytes(exporting.chain),
+        "a chunk after another element of the export is refused"
+    );
+    kani::cover!(
+        result == Err(Error::WrongChunk) && last,
+        "a last chunk out of its place is refused"
+    );
+}
+
+/// From the same states, a chunk in its place and not the last, under live sets: carrying it out
+/// changes no slot and no epoch. A failed derivation is refused before the ciphers run. The chunk
+/// opens once, under the key of its position and salt, with its nonce, the associated data of the
+/// block and the tag given, and is refused where it does not; what opened is sealed once, under
+/// the key derived from the key for transfers and the carried salt, with the same nonce and the
+/// associated data of the export after the chain. A success writes the new tag and moves the
+/// block on; a failure writes no tag and keeps the block where it was.
+#[kani::proof]
+#[kani::unwind(65)]
+fn a_chunk_is_carried_out_under_the_key_for_transfers() {
+    carry_out(false);
+}
+
+/// From the same states, the last chunk, in its place, under live sets: as any other chunk, and a
+/// success moves the chain of the key for transfers to the new tag and marks the key as writing
+/// an export, which nothing else changes.
+#[kani::proof]
+#[kani::unwind(65)]
+fn the_last_chunk_carried_out_moves_the_chain_of_the_export() {
+    carry_out(true);
+}
+
+/// A carried block being received in any state: any handle of these slots as the key for
+/// transfers, any chain, salt, count of chunks and length of the last, the associated data of the
+/// export's `export` after that chain; any handle as the set it is written under, any position,
+/// salt and next chunk, and the associated data of `context`. Only a beginning makes one; this
+/// covers every state one can be in afterwards, its sets taken to be for transfers and for data.
+fn any_receiving(id: usize, export: &[u8], context: &[u8]) -> Receiving<'static> {
+    let chain: [u8; TAG_LEN] = kani::any();
+    Receiving {
+        receipt: Receipt {
+            transfer: forged(id),
+            chain,
+            salt: kani::any(),
+            associated: AssociatedData::of_data(export)
+                .unwrap()
+                .chained(CARRY_LABEL, &chain),
+            chunks: kani::any(),
+            last: kani::any(),
+        },
+        set: forged(id),
+        at: any_position(),
+        salt: kani::any(),
+        associated: AssociatedData::of_data(context).unwrap(),
+        next: kani::any(),
+    }
+}
+
+/// Chunks received in their place, the last if `last` says so, from any state of two slots and of
+/// the epoch, any carried block being received and any chunk, whatever the ciphers do.
+fn receive_in(last: bool) {
+    let mut memory = [any_slot(), any_slot()];
+    let id = memory.as_ptr().addr();
+    let mut epoch = any_epoch(kani::any());
+    let mut slots = Slots {
+        memory: &mut memory,
+        epoch: &mut epoch,
+    };
+    let epoch_before = epoch_snapshot(&slots);
+    let before = snapshots(&slots);
+    let (export_bytes, context_bytes): ([u8; 2], [u8; 2]) = (kani::any(), kani::any());
+    let export = any_block_context(&export_bytes);
+    let context = any_block_context(&context_bytes);
+    let mut receiving = any_receiving(id, export, context);
+    let (transfer, set) = (receiving.receipt.transfer, receiving.set);
+    let (carrier, target) = (
+        snapshot_at(&before, transfer.index),
+        snapshot_at(&before, set.index),
+    );
+    kani::assume(!names_loaded(&before, &transfer) || carrier.purpose == Purpose::Transfer);
+    kani::assume(!names_loaded(&before, &set) || target.purpose == Purpose::Data);
+    let (chain, carried_salt, chunks, last_len) = (
+        receiving.receipt.chain,
+        receiving.receipt.salt,
+        receiving.receipt.chunks,
+        receiving.receipt.last,
+    );
+    let (at, salt, next) = (receiving.at, receiving.salt, receiving.next);
+    let length: usize = if last { kani::any() } else { 16 };
+    kani::assume(length <= 17);
+    let out_of_place = if last {
+        next.checked_add(1) != Some(chunks) || u64::try_from(length).ok() != Some(last_len)
+    } else {
+        next.checked_add(1).is_none_or(|after| after >= chunks)
+    };
+    let stale = !names_loaded(&before, &transfer)
+        || !names_loaded(&before, &set)
+        || u128::from_ne_bytes(carrier.chain) != u128::from_ne_bytes(chain)
+        || target.pending != Some((transfer.index, carrier.generation));
+    kani::assume(!out_of_place && !stale && carrier.direction != Direction::Out);
+    let original: [u8; 17] = kani::any();
+    let mut buffer = original;
+    let tag: [u8; TAG_LEN] = kani::any();
+    let original_out: [u8; TAG_LEN] = kani::any();
+    let mut out = original_out;
+    let (mut opener, mut sealer) = (AnyChunk::new(), AnyChunk::new());
+    let (open_with, seal_with) = (opener.opening(), sealer.sealing());
+
+    let chunk = &mut buffer[..length];
+    let result = if last {
+        slots.receive_last_in(
+            &mut receiving,
+            chunk,
+            (&tag, &mut out),
+            open_with,
+            seal_with,
+        )
+    } else {
+        slots.receive_next_in(
+            &mut receiving,
+            chunk,
+            (&tag, &mut out),
+            open_with,
+            seal_with,
+        )
+    };
+    let after = snapshots(&slots);
+    let moved = Snapshot {
+        chain: tag,
+        direction: Direction::In,
+        ..carrier
+    };
+    kani::assert(
+        epoch_snapshot(&slots) == epoch_before
+            && if result.is_ok() && last {
+                unchanged_but(&after, &before, transfer.index)
+                    && snapshot_at(&after, transfer.index) == moved
+            } else {
+                unchanged_but(&after, &before, 2)
+            },
+        "receiving a chunk changes no slot and no epoch, but the last one moves the chain of the \
+         key for transfers to the tag it came with and marks the key as receiving an export",
+    );
+    if any_failed() {
+        kani::assert(
+            result == Err(Error::DerivationFailed) && opener.calls == 0,
+            "a failed derivation is refused before the ciphers run",
+        );
+    } else if opener.failed {
+        kani::assert(
+            result == Err(Error::RecordRejected) && sealer.calls == 0,
+            "a chunk that does not open is refused before it is sealed",
+        );
+    } else {
+        kani::assert(
+            if sealer.failed {
+                result == Err(Error::CipherFailed)
+            } else {
+                result.is_ok()
+            },
+            "a chunk that opens fails exactly when the seal does",
+        );
+    }
+    kani::assert(
+        opener.calls == 0
+            || (opener.calls == 1
+                && opener.key == expected_carry_chunk(&key_head_at(&carrier, 0), &carried_salt)
+                && opener.nonce == nonce_of(next, last)
+                && opener.aad == carry_bound(&chain, export)
+                && opener.given == chunk_head(&original[..length])
+                && opener.tag == tag),
+        "the chunk is opened once, under the key of the key for transfers and the carried salt, \
+         with its nonce, the associated data of the export after the chain and the tag given",
+    );
+    kani::assert(
+        sealer.calls == 0
+            || (sealer.calls == 1
+                && opener.calls == 1
+                && !opener.failed
+                && sealer.key == expected_data_chunk(&key_head_at(&target, at.index()), &salt)
+                && sealer.nonce == nonce_of(next, last)
+                && sealer.aad == data_bound(context)
+                && sealer.given == opener.written),
+        "what opened is sealed once, under the key of its position in the set for data and the \
+         block's salt, with the same nonce and the associated data of the block",
+    );
+    kani::assert(
+        receiving.receipt.transfer == transfer
+            && receiving.receipt.chain == chain
+            && receiving.receipt.salt == carried_salt
+            && receiving.receipt.chunks == chunks
+            && receiving.receipt.last == last_len
+            && Bound::of(receiving.receipt.associated.bytes()) == carry_bound(&chain, export)
+            && receiving.set == set
+            && receiving.at == at
+            && receiving.salt == salt
+            && Bound::of(receiving.associated.bytes()) == data_bound(context),
+        "a chunk changes nothing of its block but the next number",
+    );
+    if result.is_ok() {
+        kani::assert(
+            out == sealer.tag
+                && chunk_head(&buffer[..length]) == sealer.written
+                && receiving.next == next.wrapping_add(1),
+            "a received chunk holds what the seal wrote, its new tag is written, and the block \
+             moves on",
+        );
+    } else {
+        kani::assert(
+            out == original_out
+                && receiving.next == next
+                && (opener.calls != 0 || buffer == original),
+            "a refused or failed chunk writes no tag, keeps the block where it was, and is left \
+             as it was unless a cipher ran",
+        );
+    }
+    kani::cover!(result.is_ok(), "a chunk is received");
+    kani::cover!(
+        result == Err(Error::RecordRejected),
+        "a chunk that does not open is refused"
+    );
+    kani::cover!(result == Err(Error::CipherFailed), "the seal fails");
+    kani::cover!(
+        result == Err(Error::DerivationFailed),
+        "a failed derivation is refused"
+    );
+}
+
+/// From any state of two slots and of the epoch, any carried block being received and any chunk
+/// of up to 17 bytes, the last or one of a full 16, out of its place in the block, with a set not
+/// held or no longer waiting for the end of this transfer, or a key for transfers whose chain has
+/// moved since the block began, or that writes an export: receiving it is refused, in that order,
+/// before any derivation and before the ciphers run, and changes no slot, no epoch, no tag, no
+/// chunk and no block.
+#[kani::proof]
+#[kani::unwind(65)]
+fn a_chunk_received_out_of_its_place_or_stream_is_refused() {
+    let mut memory = [any_slot(), any_slot()];
+    let id = memory.as_ptr().addr();
+    let mut epoch = any_epoch(kani::any());
+    let mut slots = Slots {
+        memory: &mut memory,
+        epoch: &mut epoch,
+    };
+    let epoch_before = epoch_snapshot(&slots);
+    let before = snapshots(&slots);
+    let (export_bytes, context_bytes): ([u8; 2], [u8; 2]) = (kani::any(), kani::any());
+    let export = any_block_context(&export_bytes);
+    let context = any_block_context(&context_bytes);
+    let mut receiving = any_receiving(id, export, context);
+    let (transfer, set) = (receiving.receipt.transfer, receiving.set);
+    let carrier = snapshot_at(&before, transfer.index);
+    kani::assume(!names_loaded(&before, &transfer) || carrier.purpose == Purpose::Transfer);
+    kani::assume(
+        !names_loaded(&before, &set) || snapshot_at(&before, set.index).purpose == Purpose::Data,
+    );
+    let (chunks, last_len, next) = (
+        receiving.receipt.chunks,
+        receiving.receipt.last,
+        receiving.next,
+    );
+    let last: bool = kani::any();
+    let length: usize = if last { kani::any() } else { 16 };
+    kani::assume(length <= 17);
+    let out_of_place = if last {
+        next.checked_add(1) != Some(chunks) || u64::try_from(length).ok() != Some(last_len)
+    } else {
+        next.checked_add(1).is_none_or(|after| after >= chunks)
+    };
+    let stale = !names_loaded(&before, &transfer)
+        || !names_loaded(&before, &set)
+        || u128::from_ne_bytes(carrier.chain) != u128::from_ne_bytes(receiving.receipt.chain)
+        || snapshot_at(&before, set.index).pending != Some((transfer.index, carrier.generation));
+    let turned = carrier.direction == Direction::Out;
+    kani::assume(out_of_place || stale || turned);
+    let original: [u8; 17] = kani::any();
+    let mut buffer = original;
+    let tag: [u8; TAG_LEN] = kani::any();
+    let original_out: [u8; TAG_LEN] = kani::any();
+    let mut out = original_out;
+    let (open_with, seal_with) = (seal::model::refuse_chunk, seal::model::fail_chunk);
+
+    let chunk = &mut buffer[..length];
+    let result = if last {
+        slots.receive_last_in(
+            &mut receiving,
+            chunk,
+            (&tag, &mut out),
+            open_with,
+            seal_with,
+        )
+    } else {
+        slots.receive_next_in(
+            &mut receiving,
+            chunk,
+            (&tag, &mut out),
+            open_with,
+            seal_with,
+        )
+    };
+    kani::assert(
+        result
+            == Err(if out_of_place {
+                Error::WrongChunk
+            } else if stale {
+                Error::StaleHandle
+            } else {
+                Error::Unfinished
+            })
+            && !seal::model::asked()
+            && runs() == 0,
+        "a chunk out of its place, then a set not held or no longer waiting for this transfer and \
+         a chain that has moved, then a key that writes an export, are refused before any \
+         derivation and before the ciphers run",
+    );
+    kani::assert(
+        unchanged_except(&slots, &before, 2)
+            && epoch_snapshot(&slots) == epoch_before
+            && out == original_out
+            && buffer == original
+            && receiving.next == next,
+        "a refused chunk changes no slot, no epoch, no tag, no chunk and no block",
+    );
+    kani::cover!(
+        result == Err(Error::StaleHandle)
+            && names_loaded(&before, &transfer)
+            && u128::from_ne_bytes(carrier.chain) != u128::from_ne_bytes(receiving.receipt.chain),
+        "a chunk after another element of the export is refused"
+    );
+    kani::cover!(
+        result == Err(Error::WrongChunk) && last,
+        "a last chunk out of its place is refused"
+    );
+}
+
+/// From the same states, a chunk in its place and not the last, under live sets: receiving it
+/// changes no slot and no epoch. A failed derivation is refused before the ciphers run. The chunk
+/// opens once, under the key derived from the key for transfers and the carried salt, with its
+/// nonce, the associated data of the export after the chain and the tag given, and is refused
+/// where it does not; what opened is sealed once, under the key of its position in the set for
+/// data and the block's salt, with the same nonce and the associated data of the block. A success
+/// writes the new tag and moves the block on; a failure writes no tag and keeps the block where it
+/// was.
+#[kani::proof]
+#[kani::unwind(65)]
+fn a_chunk_is_received_under_the_set_it_is_written_to() {
+    receive_in(false);
+}
+
+/// From the same states, the last chunk, in its place, under live sets: as any other chunk, and a
+/// success moves the chain of the key for transfers to the tag the chunk came with and marks the
+/// key as receiving an export, which nothing else changes.
+#[kani::proof]
+#[kani::unwind(65)]
+fn the_last_chunk_received_moves_the_chain_of_the_export() {
+    receive_in(true);
+}
+
+/// From any state of two slots and of the epoch, any block being read, a handle of these slots
+/// naming any slot and generation as the key for transfers, any context of up to two bytes and
+/// any header, whatever the platform's source does: beginning to carry a block out changes no
+/// slot, and the epoch only by the count of the draws the source answers. It refuses an empty
+/// context, a set for data not held or changed since the block began to be read, a key for
+/// transfers not held or of another purpose, one that receives an export, and a block a chunk
+/// has been read from, in that order, before it draws; then a failed source and a failed
+/// derivation. A block begun writes into its header the salt, the hedge of the one draw under the
+/// key of this epoch, and the check derived from the key for transfers and that salt; it holds the
+/// block being read, the key for transfers, its chain, the salt and the associated data of the
+/// export after that chain. A refused one writes nothing.
+#[kani::proof]
+#[kani::unwind(65)]
+fn a_block_is_carried_out_after_the_chain_of_its_export() {
+    let mut memory = [any_slot(), any_slot()];
+    let id = memory.as_ptr().addr();
+    let changing = kani::any();
+    let mut epoch = any_epoch(changing);
+    let mut slots = Slots {
+        memory: &mut memory,
+        epoch: &mut epoch,
+    };
+    let (epoch_key, count) = (first_half(&slots.epoch.key), slots.epoch.drawn);
+    let (number, key, next, _, _) = epoch_snapshot(&slots);
+    let before = snapshots(&slots);
+    let (block_bytes, export_bytes): ([u8; 2], [u8; 2]) = (kani::any(), kani::any());
+    let block_context = any_block_context(&block_bytes);
+    let export = any_context(&export_bytes);
+    let opening = any_opening(id, block_context);
+    let source = snapshot_at(&before, opening.set.index);
+    kani::assume(!names_loaded(&before, &opening.set) || source.purpose == Purpose::Data);
+    let (set, at, revision, block_salt, read, chunks, last) = (
+        opening.set,
+        opening.at,
+        opening.revision,
+        opening.salt,
+        opening.next,
+        opening.chunks,
+        opening.last,
+    );
+    let transfer = forged(id);
+    let carrier = snapshot_at(&before, transfer.index);
+    let original: [u8; BLOCK_HEADER_LEN] = kani::any();
+    let mut header = original;
+    let mut entropy = FirstKept::new();
+
+    let result = slots.begin_export_block_in(opening, transfer, export, &mut entropy, &mut header);
+    let draws = count.wrapping_add(u64::from(entropy.source.answered));
+    kani::assert(
+        unchanged_except(&slots, &before, 2)
+            && epoch_snapshot(&slots) == (number, key, next, changing, draws),
+        "beginning to carry a block out changes no slot and no epoch, and counts once each draw \
+         the source answers",
+    );
+    let asked = entropy.source.calls;
+    let error = result.as_ref().err().copied();
+    kani::assert(
+        if export.is_empty() {
+            error == Some(Error::InvalidContext) && asked == 0
+        } else if !names_loaded(&before, &set)
+            || source.stages.revision() != revision
+            || !names_loaded(&before, &transfer)
+        {
+            error == Some(Error::StaleHandle) && asked == 0
+        } else if carrier.purpose != Purpose::Transfer {
+            error == Some(Error::WrongPurpose) && asked == 0
+        } else if carrier.direction == Direction::In {
+            error == Some(Error::Unfinished) && asked == 0
+        } else if read != 0 {
+            error == Some(Error::WrongChunk) && asked == 0
+        } else if entropy.source.failed {
+            error == Some(Error::EntropyFailed) && asked == 1
+        } else if any_failed() {
+            error == Some(Error::DerivationFailed) && asked == 1
+        } else {
+            result.is_ok() && asked == 1
+        },
+        "carrying a block out refuses a bad context, a stale set or key, a key not for transfers \
+         or receiving and a block read from before it draws, then a failed source and a failed \
+         derivation, and draws at most once",
+    );
+    if let Ok(exporting) = &result {
+        let mut drawn = [0; SALT_LEN];
+        drawn.copy_from_slice(&entropy.first[..SALT_LEN]);
+        let salt = expected_hedge(&epoch_key, count, Branch::HedgeSalt, &drawn);
+        kani::assert(
+            header[..SALT_LEN] == salt
+                && header[SALT_LEN..] == expected_carry_check(&key_head_at(&carrier, 0), &salt),
+            "the header holds the salt hedged from the one draw and the check of the key for \
+             transfers and the salt",
+        );
+        let source = &exporting.source;
+        kani::assert(
+            source.set == set
+                && source.at == at
+                && source.revision == revision
+                && source.salt == block_salt
+                && source.next == 0
+                && source.chunks == chunks
+                && source.last == last
+                && Bound::of(source.associated.bytes()) == data_bound(block_context),
+            "the block is read on from its first chunk, as it was begun to be read",
+        );
+        kani::assert(
+            exporting.transfer == transfer
+                && u128::from_ne_bytes(exporting.chain) == u128::from_ne_bytes(carrier.chain)
+                && exporting.salt == salt
+                && Bound::of(exporting.associated.bytes()) == carry_bound(&carrier.chain, export),
+            "the carried block holds the key for transfers, its chain, the salt and the \
+             associated data of the export after that chain",
+        );
+    } else {
+        kani::assert(header == original, "a refused beginning writes nothing");
+    }
+    kani::cover!(result.is_ok(), "a block begins to be carried out");
+    kani::cover!(
+        result.is_ok() && carrier.direction == Direction::Out,
+        "a block is carried after another element of the export"
+    );
+    kani::cover!(
+        error == Some(Error::Unfinished),
+        "a key that receives an export carries no block out"
+    );
+    kani::cover!(
+        error == Some(Error::WrongChunk),
+        "a block a chunk was read from is not carried"
+    );
+    kani::cover!(
+        error == Some(Error::StaleHandle)
+            && names_loaded(&before, &set)
+            && source.stages.revision() != revision,
+        "a set changed since the block began to be read is refused"
+    );
+    kani::cover!(error == Some(Error::EntropyFailed), "the source fails");
+    kani::cover!(error == Some(Error::DerivationFailed), "a derivation fails");
+}
+
+/// From any state of two slots and of the epoch, for a handle of these slots naming any slot and
+/// generation, any context of up to two bytes, any header and any length of a block: beginning to
+/// receive a carried block changes no slot and no epoch. It refuses an empty context, a stale
+/// handle, a key not for transfers, one that writes an export and a length no block has, in that
+/// order, before it derives; it then derives the check of the key for transfers once, with the
+/// salt of the header, refuses a failed derivation, and refuses as `RecordRejected` a header that
+/// does not hold that check. A receipt holds the key, its chain, the salt, the associated data of
+/// the export after that chain, and as many chunks as the length gives.
+#[kani::proof]
+#[kani::unwind(65)]
+fn a_carried_block_is_received_only_under_the_key_its_header_names() {
+    let mut memory = [any_slot(), any_slot()];
+    let id = memory.as_ptr().addr();
+    let mut epoch = any_epoch(kani::any());
+    let slots = Slots {
+        memory: &mut memory,
+        epoch: &mut epoch,
+    };
+    let epoch_before = epoch_snapshot(&slots);
+    let before = snapshots(&slots);
+    let transfer = forged(id);
+    let context_bytes: [u8; 2] = kani::any();
+    let export = any_context(&context_bytes);
+    let header: [u8; BLOCK_HEADER_LEN] = kani::any();
+    let block: u64 = kani::any();
+    let runs_before = runs();
+
+    let result = slots.begin_receive_block_in::<16>(transfer, export, &header, block);
+    let derived = runs().wrapping_sub(runs_before);
+    kani::assert(
+        unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
+        "beginning to receive a block changes no slot and no epoch",
+    );
+    let carrier = snapshot_at(&before, transfer.index);
+    let len = data_len_in::<16>(block);
+    let mut salt = [0; SALT_LEN];
+    salt.copy_from_slice(&header[..SALT_LEN]);
+    let error = result.as_ref().err().copied();
+    kani::assert(
+        if export.is_empty() {
+            error == Some(Error::InvalidContext) && derived == 0
+        } else if !names_loaded(&before, &transfer) {
+            error == Some(Error::StaleHandle) && derived == 0
+        } else if carrier.purpose != Purpose::Transfer {
+            error == Some(Error::WrongPurpose) && derived == 0
+        } else if carrier.direction == Direction::Out {
+            error == Some(Error::Unfinished) && derived == 0
+        } else if len.is_none() {
+            error == Some(Error::RecordRejected) && derived == 0
+        } else if any_failed() {
+            error == Some(Error::DerivationFailed) && derived == 1
+        } else if header[SALT_LEN..] != expected_carry_check(&key_head_at(&carrier, 0), &salt) {
+            error == Some(Error::RecordRejected) && derived == 1
+        } else {
+            result.is_ok() && derived == 1
+        },
+        "a receipt refuses a bad context, a stale key, one not for transfers or writing and a \
+         length no block has before it derives, then derives the check once and refuses a failed \
+         derivation and a header without that check",
+    );
+    if let Ok(receipt) = &result {
+        let (chunks, last) = chunks_in::<16>(len.unwrap_or(0));
+        kani::assert(
+            receipt.transfer == transfer
+                && u128::from_ne_bytes(receipt.chain) == u128::from_ne_bytes(carrier.chain)
+                && receipt.salt == salt
+                && Bound::of(receipt.associated.bytes()) == carry_bound(&carrier.chain, export)
+                && receipt.chunks == chunks
+                && receipt.last == last,
+            "a receipt holds the key, its chain, the salt, the associated data of the export \
+             after that chain, and the chunks the length gives",
+        );
+    }
+    kani::cover!(result.is_ok(), "a carried block begins to be received");
+    kani::cover!(
+        error == Some(Error::RecordRejected) && len.is_some(),
+        "a header of another key is refused"
+    );
+    kani::cover!(
+        error == Some(Error::Unfinished),
+        "a key that writes an export receives no block"
+    );
+    kani::cover!(
+        error == Some(Error::DerivationFailed),
+        "the derivation fails"
+    );
+}
+
+/// From any state of two slots and of the epoch, any receipt, a handle of these slots naming any
+/// slot and generation as the set, any context of up to two bytes and any header, whatever the
+/// platform's source does: giving a receipt a set that came in its transfer changes no slot, and
+/// the epoch only by the count of the draws the source answers. It refuses an empty context, a key
+/// for transfers not held or whose chain has moved since the receipt began, a set not held or not
+/// for data and one that did not come in this transfer, in that order, before it draws; then a
+/// failed source and a failed derivation. A block begun writes into its header the salt, the hedge
+/// of the one draw under the key of this epoch, and the check derived from the primary key of the
+/// set and that salt; it receives into that set from the first chunk. A refused one writes
+/// nothing.
+#[kani::proof]
+#[kani::unwind(65)]
+fn a_received_block_is_written_under_a_set_of_its_transfer() {
+    let mut memory = [any_slot(), any_slot()];
+    let id = memory.as_ptr().addr();
+    let changing = kani::any();
+    let mut epoch = any_epoch(changing);
+    let mut slots = Slots {
+        memory: &mut memory,
+        epoch: &mut epoch,
+    };
+    let (epoch_key, count) = (first_half(&slots.epoch.key), slots.epoch.drawn);
+    let (number, key, next, _, _) = epoch_snapshot(&slots);
+    let before = snapshots(&slots);
+    let (export_bytes, context_bytes): ([u8; 2], [u8; 2]) = (kani::any(), kani::any());
+    let export = any_block_context(&export_bytes);
+    let context = any_context(&context_bytes);
+    let receipt = any_receiving(id, export, context.get(..1).unwrap_or(b"x")).receipt;
+    let transfer = receipt.transfer;
+    let carrier = snapshot_at(&before, transfer.index);
+    kani::assume(!names_loaded(&before, &transfer) || carrier.purpose == Purpose::Transfer);
+    let (chain, carried_salt, chunks, last) =
+        (receipt.chain, receipt.salt, receipt.chunks, receipt.last);
+    let set = forged(id);
+    let named = snapshot_at(&before, set.index);
+    let original: [u8; BLOCK_HEADER_LEN] = kani::any();
+    let mut header = original;
+    let mut entropy = FirstKept::new();
+
+    let result = slots.receive_into_in(receipt, Some(set), context, &mut entropy, &mut header);
+    let draws = count.wrapping_add(u64::from(entropy.source.answered));
+    kani::assert(
+        unchanged_except(&slots, &before, 2)
+            && epoch_snapshot(&slots) == (number, key, next, changing, draws),
+        "giving a receipt a set of its transfer changes no slot and no epoch, and counts once \
+         each draw the source answers",
+    );
+    let asked = entropy.source.calls;
+    let error = result.as_ref().err().copied();
+    kani::assert(
+        if context.is_empty() {
+            error == Some(Error::InvalidContext) && asked == 0
+        } else if !names_loaded(&before, &transfer)
+            || u128::from_ne_bytes(carrier.chain) != u128::from_ne_bytes(chain)
+            || !names_loaded(&before, &set)
+        {
+            error == Some(Error::StaleHandle) && asked == 0
+        } else if named.purpose != Purpose::Data {
+            error == Some(Error::WrongPurpose) && asked == 0
+        } else if named.pending != Some((transfer.index, carrier.generation)) {
+            error == Some(Error::NotReceived) && asked == 0
+        } else if entropy.source.failed {
+            error == Some(Error::EntropyFailed) && asked == 1
+        } else if any_failed() {
+            error == Some(Error::DerivationFailed) && asked == 1
+        } else {
+            result.is_ok() && asked == 1
+        },
+        "a receipt refuses a bad context, a stale key or set, a set not for data and one of \
+         another transfer before it draws, then a failed source and a failed derivation, and \
+         draws at most once",
+    );
+    if let Ok((receiving, handle)) = &result {
+        let mut drawn = [0; SALT_LEN];
+        drawn.copy_from_slice(&entropy.first[..SALT_LEN]);
+        let salt = expected_hedge(&epoch_key, count, Branch::HedgeSalt, &drawn);
+        let primary = named.stages.primary();
+        kani::assert(
+            header[..SALT_LEN] == salt
+                && header[SALT_LEN..] == expected_data_check(&key_head_at(&named, primary), &salt),
+            "the header holds the salt hedged from the one draw and the check of the primary \
+             key and the salt",
+        );
+        kani::assert(
+            *handle == set
+                && receiving.set == set
+                && receiving.at.index() == primary
+                && receiving.salt == salt
+                && Bound::of(receiving.associated.bytes()) == data_bound(context)
+                && receiving.next == 0
+                && receiving.receipt.transfer == transfer
+                && u128::from_ne_bytes(receiving.receipt.chain) == u128::from_ne_bytes(chain)
+                && receiving.receipt.salt == carried_salt
+                && receiving.receipt.chunks == chunks
+                && receiving.receipt.last == last,
+            "the block is received into the set, under its primary, from the first chunk, as the \
+             receipt began",
+        );
+    } else {
+        kani::assert(header == original, "a refused beginning writes nothing");
+    }
+    kani::cover!(
+        result.is_ok(),
+        "a block is received into a set of its transfer"
+    );
+    kani::cover!(
+        error == Some(Error::NotReceived),
+        "a set of another transfer takes no block"
+    );
+    kani::cover!(
+        error == Some(Error::StaleHandle)
+            && names_loaded(&before, &transfer)
+            && u128::from_ne_bytes(carrier.chain) != u128::from_ne_bytes(chain),
+        "a receipt after another element of the export is refused"
+    );
+    kani::cover!(error == Some(Error::EntropyFailed), "the source fails");
+    kani::cover!(error == Some(Error::DerivationFailed), "a derivation fails");
+}
+
+/// A new set given to a receipt, with the free slot at `free_at`, or none: from any state of two
+/// slots otherwise and of the epoch, any receipt, any context of up to two bytes and any header,
+/// whatever the platform's source does.
+fn into_new(free_at: Option<usize>) {
+    // Past the first slot it holds the key for transfers, a set of one: where the new set goes
+    // past other sets, and the want of a free slot, are the load's, which the proofs of loads
+    // cover.
+    let mut memory = match free_at {
+        Some(0) => [any_slot_in(Occupancy::Free), any_slot()],
+        Some(_) => [any_slot_in(Occupancy::Loaded), any_slot_in(Occupancy::Free)],
+        None => [
+            any_slot_in(Occupancy::Loaded),
+            any_slot_in(Occupancy::Retired),
+        ],
+    };
+    if free_at != Some(0) {
+        kani::assume(memory[0].purpose == Purpose::Transfer);
+    }
+    let id = memory.as_ptr().addr();
+    let changing = kani::any();
+    let mut epoch = any_epoch(changing);
+    let mut slots = Slots {
+        memory: &mut memory,
+        epoch: &mut epoch,
+    };
+    let (epoch_key, count) = (first_half(&slots.epoch.key), slots.epoch.drawn);
+    let (number, key, next, _, _) = epoch_snapshot(&slots);
+    let before = snapshots(&slots);
+    let (export_bytes, context_bytes): ([u8; 2], [u8; 2]) = (kani::any(), kani::any());
+    let export = any_block_context(&export_bytes);
+    let context = any_context(&context_bytes);
+    let receipt = any_receiving(id, export, b"x").receipt;
+    let transfer = receipt.transfer;
+    let carrier = snapshot_at(&before, transfer.index);
+    kani::assume(!names_loaded(&before, &transfer) || carrier.purpose == Purpose::Transfer);
+    let (chain, carried_salt, chunks, last) =
+        (receipt.chain, receipt.salt, receipt.chunks, receipt.last);
+    let original: [u8; BLOCK_HEADER_LEN] = kani::any();
+    let mut header = original;
+    let mut entropy = FirstKept::new();
+
+    let result = slots.receive_into_in(receipt, None, context, &mut entropy, &mut header);
+    let after = snapshots(&slots);
+    let draws = count.wrapping_add(u64::from(entropy.source.answered));
+    kani::assert(
+        epoch_snapshot(&slots) == (number, key, next, changing, draws),
+        "a new set changes no epoch but the count of the draws the source answers",
+    );
+    let free = first_free(&before);
+    kani::assert(free == free_at, "the free slot is where it was made");
+    let changed = free.unwrap_or(2);
+    kani::assert(
+        unchanged_but(&after, &before, changed),
+        "a new set changes no slot but the first free one",
+    );
+    let refused = context.is_empty()
+        || !names_loaded(&before, &transfer)
+        || u128::from_ne_bytes(carrier.chain) != u128::from_ne_bytes(chain);
+    let error = result.as_ref().err().copied();
+    if refused {
+        kani::assert(
+            error
+                == Some(if context.is_empty() {
+                    Error::InvalidContext
+                } else {
+                    Error::StaleHandle
+                })
+                && entropy.source.calls == 0
+                && after == before,
+            "a bad context, then a stale key or a chain that has moved, are refused before any \
+             draw",
+        );
+    } else if let Ok((receiving, handle)) = &result {
+        let new = snapshot_at(&after, changed);
+        let mut drawn = [0; SALT_LEN];
+        drawn.copy_from_slice(&entropy.first[..SALT_LEN]);
+        let salt = expected_hedge(&epoch_key, count, Branch::HedgeSalt, &drawn);
+        kani::assert(
+            free.is_some()
+                && new.occupancy == Occupancy::Loaded
+                && new.purpose == Purpose::Data
+                && new.stages.stage(0) == Some(Status::Enabled)
+                && new.stages.stage(1).is_none()
+                && new.stages.stage(2).is_none()
+                && new.stages.primary() == 0
+                && new.lengths[0] == KeyLength::Bytes32
+                && !new.unlocks
+                && new.pending == Some((transfer.index, carrier.generation))
+                && handle.index == changed
+                && handle.generation == snapshot_at(&before, changed).generation
+                && entropy.source.calls == 2,
+            "a new set of one enabled key of 32 bytes for data takes the first free slot, marked \
+             as having come in the transfer of the receipt, after two draws",
+        );
+        let mut key_drawn = [0; 32];
+        key_drawn.copy_from_slice(&entropy.source.written[..32]);
+        kani::assert(
+            key_head(&new)
+                == expected_hedge(
+                    &epoch_key,
+                    count.wrapping_add(1),
+                    Branch::HedgeKey,
+                    &key_drawn,
+                ),
+            "the new key is the hedge of the second draw under the key of this epoch",
+        );
+        kani::assert(
+            header[..SALT_LEN] == salt
+                && header[SALT_LEN..] == expected_data_check(&key_head(&new), &salt),
+            "the header holds the salt hedged from the first draw and the check of the new key \
+             and the salt",
+        );
+        kani::assert(
+            receiving.set == *handle
+                && receiving.at == Position::First
+                && receiving.salt == salt
+                && Bound::of(receiving.associated.bytes()) == data_bound(context)
+                && receiving.next == 0
+                && receiving.receipt.transfer == transfer
+                && u128::from_ne_bytes(receiving.receipt.chain) == u128::from_ne_bytes(chain)
+                && receiving.receipt.salt == carried_salt
+                && receiving.receipt.chunks == chunks
+                && receiving.receipt.last == last,
+            "the block is received into the new set, under its key, from the first chunk, as the \
+             receipt began",
+        );
+    } else {
+        let left = snapshot_at(&after, changed);
+        kani::assert(
+            header == original
+                && (left == snapshot_at(&before, changed)
+                    || (wiped(&slots.memory[changed.min(1)])
+                        && (left.occupancy == Occupancy::Retired
+                            || (left.occupancy == Occupancy::Free
+                                && left.generation
+                                    == snapshot_at(&before, changed).generation.wrapping_add(1))))),
+            "a failed receipt writes nothing, and leaves the free slot as it was or releases the set \
+             it made there",
+        );
+        kani::assert(
+            if entropy.source.failed {
+                error == Some(Error::EntropyFailed)
+            } else if free.is_none() && !any_failed() {
+                error == Some(Error::NoFreeSlot)
+            } else {
+                error == Some(Error::DerivationFailed) && any_failed()
+                    || error == Some(Error::DuplicateKey)
+            },
+            "a new set fails only as the source, a free slot, a derivation or a key held already \
+             fails it",
+        );
+    }
+    match free_at {
+        Some(0) => {
+            kani::cover!(result.is_ok(), "a block is received into a new set");
+            kani::cover!(
+                error == Some(Error::DerivationFailed)
+                    && entropy.source.calls == 2
+                    && after != before,
+                "a failed check releases the new set"
+            );
+            kani::cover!(
+                error == Some(Error::DuplicateKey),
+                "a new key held already makes no set"
+            );
+            kani::cover!(error == Some(Error::StaleHandle), "a stale key is refused");
+        }
+        Some(_) => kani::cover!(result.is_ok(), "a new set takes the second slot"),
+        None => kani::cover!(
+            error == Some(Error::NoFreeSlot),
+            "a new set needs a free slot"
+        ),
+    }
+}
+
+/// With the first of two slots free and the second in any state, from any epoch, receipt, context
+/// of up to two bytes and header, whatever the platform's source does: giving a receipt a new set
+/// changes no slot but the first free one, and the epoch only by the count of the draws the source answers. It refuses
+/// an empty context and a key for transfers not held or whose chain has moved since the receipt
+/// began before it draws. It then draws the salt; a failed source, a want of a free slot and a
+/// failed load change no slot, and a failed check after the load releases the new set. On success
+/// the first free slot holds a set for data of one enabled key of 32 bytes, generated as any is,
+/// marked as having come in the receipt's transfer; the header holds the salt hedged from the
+/// first draw and the check of the new key and that salt; and the block is received into the new
+/// set, under its key, from the first chunk, as the receipt began. A refused one writes nothing.
+#[kani::proof]
+#[kani::unwind(65)]
+fn a_received_block_takes_a_new_set_in_the_first_slot() {
+    into_new(Some(0));
+}
+
+/// From the same states with a key for transfers in the first slot and the second free: the new set
+/// takes the second slot, as above.
+#[kani::proof]
+#[kani::unwind(65)]
+fn a_received_block_takes_a_new_set_in_the_second_slot() {
+    into_new(Some(1));
+}
+
+/// From the same states with a key for transfers in the first slot and the second retired: a new set
+/// is refused as `NoFreeSlot` after the draw of the salt, unless a refusal or a failure comes first,
+/// and changes no slot.
+#[kani::proof]
+#[kani::unwind(65)]
+fn a_received_block_needs_a_free_slot_for_a_new_set() {
+    into_new(None);
 }

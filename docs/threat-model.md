@@ -98,6 +98,9 @@ A block of data is encrypted under a key for data, which lies only in records un
 stored key. Once that key is destroyed and the next epoch committed, a block left on flash is noise,
 as the key's records are.
 
+A copy carried out under a key for transfers is not noise: on the other device or in a backup, it
+opens with that key.
+
 **Not defended.** Whoever held the key of an epoch while a lock record lived, and knows the secret it
 was locked under, keeps the stored key it holds after that way in is revoked. Only a new stored key,
 with every way in locked again, stands against that.
@@ -155,7 +158,16 @@ before, and its end is bound to the last. Until that end is received, a set that
 is not revealed, wrapped, exported or changed: a cut, reordered or mixed export leaves nothing to
 keep.
 
-A key for transfers carries one export at a time, one way, and an export with no record has no end.
+A key for transfers carries one export at a time, one way, and an export with no record or block has
+no end.
+
+A block of data leaves the library only sealed again, chunk by chunk, under a key for transfers, as
+the next element of its export, bound to the tag before it; its last chunk moves the chain on, and
+the end covers it. A carried block dropped, moved or cut leaves the end unopened.
+
+A carried block is received only into a new set for data of the same transfer. Until the end is
+received, that set neither begins nor reads a block, and is neither wrapped nor changed: the blocks
+of a receipt that does not end are lost with the set.
 
 A new key is the hedge of the platform's random bytes under the key of the epoch, written straight
 into its slot; the bytes drawn are wiped, and if the source fails or panics, so is the slot. The
@@ -293,6 +305,14 @@ known to be part of a whole block.
 
 Whoever can call the library can export a set under a key for transfers it imported itself. That
 gives out every key of the set, the disabled ones too, which a reveal does not.
+
+Whoever holds a key for transfers reads every block carried under it and writes carried blocks that
+are received as genuine. An older backup under the same words, and a device's own export sent back
+to it, are received as fresh.
+
+A carried block is as long as its source, which links a backup to the blocks on a device. A block
+under a disabled key is not carried; a caller that goes on past that refusal leaves it out of the
+copy.
 
 The stack wipe is best effort. It does not reach registers, and it relies on the compiler keeping
 the derivation, the hedge, the reveal, the wrap and the unwrap out of their caller's frame. Its depth

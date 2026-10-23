@@ -733,9 +733,34 @@ pub(crate) mod model {
         Err(Rejected)
     }
 
-    /// Whether `refuse` was asked to decrypt.
+    /// Whether `refuse` was asked to decrypt, or `refuse_chunk` or `fail_chunk` to run.
     pub(crate) fn asked() -> bool {
         ASKED.load(Ordering::Relaxed)
+    }
+
+    /// Rejects every chunk and records that one was asked, so that a proof can show that the code
+    /// opens no chunk.
+    pub(crate) fn refuse_chunk(
+        _: &[u8; KEY_LEN],
+        _: &[u8; NONCE_LEN],
+        _: &[u8],
+        _: &mut [u8],
+        _: &[u8; TAG_LEN],
+    ) -> Result<(), Rejected> {
+        ASKED.store(true, Ordering::Relaxed);
+        Err(Rejected)
+    }
+
+    /// Fails every seal of a chunk and records that one was asked, so that a proof can show that
+    /// the code seals no chunk.
+    pub(crate) fn fail_chunk(
+        _: &[u8; KEY_LEN],
+        _: &[u8; NONCE_LEN],
+        _: &[u8],
+        _: &mut [u8],
+    ) -> Result<[u8; TAG_LEN], SealFailed> {
+        ASKED.store(true, Ordering::Relaxed);
+        Err(SealFailed)
     }
 }
 

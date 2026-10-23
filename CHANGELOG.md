@@ -268,5 +268,15 @@ Nothing is published while the version is below 0.1.0.
 - Proofs with Kani 0.68.0 of the layout of a block for every length, of its beginning, of each
   chunk sealed and opened, and of the cipher on a chunk. Tests against blocks an independent
   implementation computes, every changed bit, blocks cut, reordered and mixed, and random blocks.
+- Blocks carried to another device or into a backup: `Slots::begin_export_block`,
+  `Slots::export_chunk` and `Slots::export_last` seal each chunk of a block again under a key for
+  transfers, as the next element of its export. `Slots::begin_receive_block`, `Slots::receive_into`,
+  `Slots::receive_chunk` and `Slots::receive_last` seal it under a new set for data of that
+  transfer. No key for data leaves the library; `Exporting`, `Receipt` and `Receiving` hold no key.
+- A set of an unfinished transfer begins and reads no block, `Error::Unfinished`; a received block
+  goes into no set of another transfer, `Error::NotReceived`.
+- Proofs with Kani 0.68.0 of the beginnings, of each chunk carried out and received, and of their
+  refusals. Tests against carried blocks an independent implementation computes, every changed bit,
+  blocks out of order, dropped and mixed, data-independent timing and the stack.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

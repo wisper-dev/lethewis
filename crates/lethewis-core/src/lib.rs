@@ -71,7 +71,9 @@ pub use record::{
     ARCHIVE_KEY_RECORD_LEN, ARCHIVE_RECORD_LEN, END_RECORD_LEN, LOCK_RECORD_LEN, Purpose,
     RECORD_LEN,
 };
-pub use slots::{ArchivePublic, Handle, Opening, Sealing, Slot, Slots};
+pub use slots::{
+    ArchivePublic, Exporting, Handle, Opening, Receipt, Receiving, Sealing, Slot, Slots,
+};
 pub use words::{WORD_COUNT, WORD_LEN, Words};
 
 #[cfg(test)]

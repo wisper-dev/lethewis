@@ -9,8 +9,8 @@ use core::fmt;
 pub enum Error {
     /// Every slot holds a key set or is out of use.
     NoFreeSlot,
-    /// The handle does not refer to a key set held now, or a block began before its set last
-    /// changed.
+    /// The handle does not refer to a key set held now, a block began before its set last changed,
+    /// or another record or block went under the key for transfers since a carried block began.
     StaleHandle,
     /// The source of random bytes failed.
     EntropyFailed,
@@ -84,10 +84,10 @@ pub enum Error {
     /// The record of an archive was written to another archive key.
     WrongArchiveKey,
     /// A transfer has not ended: the set came in an export whose end has not been received, and is
-    /// neither revealed, wrapped, exported nor changed until then, or the key for transfers carries
-    /// an export the other way.
+    /// neither revealed, wrapped, exported nor changed, and begins and reads no block, until then;
+    /// or the key for transfers carries an export the other way.
     Unfinished,
-    /// The key for transfers has written or received no record of an export to end.
+    /// The key for transfers has written or received no record or block of an export to end.
     NoTransfer,
     /// The block is under a key of the set that is disabled: it opens once the key is enabled
     /// again.
@@ -96,6 +96,9 @@ pub enum Error {
     /// where the last is due, a last one of another length, longer than a chunk or empty after
     /// others, or one past as many chunks as a number of 64 bits counts.
     WrongChunk,
+    /// The set for data did not come in the transfer under way, so a received block is not written
+    /// under it.
+    NotReceived,
 }
 
 impl From<crate::keyset::Refused> for Error {
@@ -146,6 +149,7 @@ impl fmt::Display for Error {
             Self::NoTransfer => "no transfer",
             Self::KeyDisabled => "key disabled",
             Self::WrongChunk => "wrong chunk",
+            Self::NotReceived => "set not received",
         })
     }
 }
@@ -198,5 +202,6 @@ mod tests {
         assert_eq!(Error::NoTransfer.to_string(), "no transfer");
         assert_eq!(Error::KeyDisabled.to_string(), "key disabled");
         assert_eq!(Error::WrongChunk.to_string(), "wrong chunk");
+        assert_eq!(Error::NotReceived.to_string(), "set not received");
     }
 }
