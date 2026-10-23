@@ -10,7 +10,8 @@ recorded in [proofs.md](proofs.md). Lines marked "Not defended" are true now and
 ## What is protected
 
 Key material on a device: the keys, the relationships between them, and the accuracy of what the
-library reports about them. Not the data the keys encrypt.
+library reports about them; and the data the library encrypts itself, in blocks under keys for data.
+Not the data an engine outside the library encrypts with a key it hands out.
 
 ## Adversaries, in order of priority
 
@@ -92,6 +93,10 @@ carried opens no more once the old root is erased: so a way in is revoked. The r
 key is carried with the profile's stored keys, without the stored key of the archive.
 
 **Intended.** A platform layer whose root the hardware erases.
+
+A block of data is encrypted under a key for data, which lies only in records under the profile's
+stored key. Once that key is destroyed and the next epoch committed, a block left on flash is noise,
+as the key's records are.
 
 **Not defended.** Whoever held the key of an epoch while a lock record lived, and knows the secret it
 was locked under, keeps the stored key it holds after that way in is revoked. Only a new stored key,
@@ -234,6 +239,31 @@ platform keeps the old root.
 A record of the archive keeps a check of the shared secret: a batch archived to a public key other
 than its archive key's is refused when it is opened, and gives no key.
 
+A key for data leaves the library only wrapped under a stored key: it is not revealed, imported,
+exported or derived from a password or words, and only the platform's source creates it.
+
+A block begins only under the primary key of a set that a record of this epoch holds as it is now,
+so that its key outlives the slots; that the record is kept, and the records of the keys above it,
+is the caller's.
+
+A block's header holds a salt and a check that the key and the salt derive. Opening derives the
+check of every key of the set, with no early exit, and reads the block under the one it names; an
+empty position names none, and a disabled key is refused.
+
+Each chunk is sealed with AES-256-GCM-SIV under a key derived from the key and the salt, with the
+chunk's number and a mark of the last in its nonce, and bound to the context the caller names.
+
+Each sealed chunk is opened and sealed again to the same tag and ciphertext, as POLYVAL under a
+fixed key tells. A fault of the cipher in one of these passes fails the seal while the caller still
+holds its copy of the data; a fault alike in every pass is found only on the known input.
+
+A chunk moved, dropped or repeated is refused, and so is a block cut short. A chunk taken from
+another block is refused when the salts differ, which the hedge keeps so within one set of slots.
+
+The stack below each call on a block is wiped, 8 KiB after a beginning or 24 KiB after a chunk, or
+64 KiB without optimisation. Tests read it back for the key, the key of the epoch, the key of the
+chunks, what the hedge, the derivations and the cipher make of them, and the data.
+
 **Intended.** Drop keys from memory when the device locks.
 
 **Not defended.** Copies left by a value move, a buffer reallocation, a CPU register, swap, or a
@@ -253,6 +283,13 @@ randomness of the encapsulation, and from it and the public key the key of the b
 
 Profiles that share an epoch and a root are not kept apart: a change of epoch made from one carries
 none of the other's records, and those open no more once it is committed and the old root erased.
+
+A block shows its length to the byte and its fixed overhead: 48 bytes and 16 for each chunk. Padding
+it, and hiding how many blocks there are, are the caller's or the deniable storage's.
+
+A block that replaces an older one in the same context, and a block deleted, go unnoticed by the
+library: the caller's index of its blocks catches both. A chunk opened before the last is not yet
+known to be part of a whole block.
 
 Whoever can call the library can export a set under a key for transfers it imported itself. That
 gives out every key of the set, the disabled ones too, which a reveal does not.
@@ -323,11 +360,15 @@ what stands against an attack is the reading of every changed file before it is 
 ### 6. Timing and other side channels
 
 **Not measured.** The cipher compares its tag, and the library compares the identifier of the
-wrapping key a record names, through a comparison written for constant time: inline assembly on
-x86-64 and aarch64, best effort on other targets.
+wrapping key a record names and the check a block's header holds, through a comparison written for
+constant time: inline assembly on x86-64 and aarch64, best effort on other targets.
 
-A build step compiles that comparison for x86-64, aarch64, Cortex-M4 and WebAssembly and fails
-unless its machine code runs straight through: no branch, no call and no write of the program
+Which position of a set a block is under is worked out with no branch on which keys match. The key
+is then read from that position, so the timing may tell which position it is, and the count of
+derivations tells how many keys the set holds.
+
+A build step compiles those comparisons and that choice for x86-64, aarch64, Cortex-M4 and
+WebAssembly and fails unless the machine code of each runs straight through: no branch, no call and no write of the program
 counter but the final return. This shows how the pinned compiler laid the code out, before
 link-time optimisation, not how long each instruction takes.
 
@@ -340,7 +381,8 @@ loading a key and wrapping, unwrapping, exporting and receiving a set where Linu
 Apple system reports the feature; elsewhere, and where the system or a virtual machine hides it, the
 mode stays off.
 
-The mode is on around every call on an archive key and on the records of the archive as well.
+The mode is on around every call on an archive key, on the records of the archive and on blocks of
+data as well.
 ML-KEM-768 and X25519 run on portable code whose timing this library does not check.
 
 Tests check on every machine that each call starts its derivations, Argon2id, ciphers and

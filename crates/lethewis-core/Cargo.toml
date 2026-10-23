@@ -43,8 +43,9 @@ argon2 = { version = "0.6.0", default-features = false, features = ["zeroize"] }
 ctutils = { version = "0.4.2", default-features = false }
 # Data-independent timing on aarch64 around the derivation and the cipher.
 lethewis-dit = { path = "../lethewis-dit", version = "0.0.0" }
-# Direct only for `zeroize`: without it the key schedule and the POLYVAL state are not wiped on drop.
+# Direct only for `zeroize`: without it the key schedule is not wiped on drop.
 aes = { version = "0.9.3", default-features = false, features = ["zeroize"] }
+# The digest of a sealed chunk; `zeroize` wipes the POLYVAL state inside the cipher on drop.
 polyval = { version = "0.7.3", default-features = false, features = [
   "zeroize",
 ] }

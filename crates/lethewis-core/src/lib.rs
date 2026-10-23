@@ -36,10 +36,13 @@ macro_rules! assert_not_impl {
 // Under Kani the wipe is plain stores and the derivation and the cipher are models, so these go
 // unused there.
 #[cfg(kani)]
-use {aes_gcm_siv as _, argon2 as _, ctutils as _, hkdf as _, sha2 as _, zeroize as _};
+use {
+    aes_gcm_siv as _, argon2 as _, ctutils as _, hkdf as _, polyval as _, sha2 as _, zeroize as _,
+};
 // Depended on only for their zeroize feature.
-use {aes as _, blake2 as _, polyval as _};
+use {aes as _, blake2 as _};
 
+mod block;
 mod derive;
 mod entropy;
 mod epoch;
@@ -57,6 +60,7 @@ mod timing;
 mod words;
 mod xwing;
 
+pub use block::{BLOCK_HEADER_LEN, CHUNK_LEN, CHUNK_TAG_LEN, block_len};
 pub use entropy::{Entropy, EntropyError};
 pub use epoch::{Epoch, Erasure, Root, RootFailed};
 pub use error::Error;
@@ -67,7 +71,7 @@ pub use record::{
     ARCHIVE_KEY_RECORD_LEN, ARCHIVE_RECORD_LEN, END_RECORD_LEN, LOCK_RECORD_LEN, Purpose,
     RECORD_LEN,
 };
-pub use slots::{ArchivePublic, Handle, Slot, Slots};
+pub use slots::{ArchivePublic, Handle, Opening, Sealing, Slot, Slots};
 pub use words::{WORD_COUNT, WORD_LEN, Words};
 
 #[cfg(test)]

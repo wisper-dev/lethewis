@@ -17,7 +17,7 @@ Suggestions for functionality not listed here are accepted as issues.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/rustc-1.99.0-orange.svg)
-![Readiness](https://img.shields.io/badge/readiness-44%25-orange.svg)
+![Readiness](https://img.shields.io/badge/readiness-45%25-orange.svg)
 
 ## How the keys relate
 
@@ -64,13 +64,15 @@ password and the hardware secret at each unlock, and neither alone is enough.
   that holder reads already.
 - **The archive keeps batches secret but does not prove where they came from,** and their secrecy
   against whoever holds the main password rests on the random source when they are archived.
+- **A block of data shows its length, and which blocks exist is the caller's to keep.** An older
+  block put back in the same place, or a block deleted, goes unnoticed unless the caller's index of
+  its blocks catches it. Padding a block is the caller's too.
 - **A challenge to the chip is as sensitive as a hash of the password.** Whoever reads one on its
   way to the chip can test guesses at the password without the chip. Wiping it after use and
   passing it only to the chip is the caller's.
 - **Wiping a value from memory does not reach every copy.** Copies from a move, a reallocation, a
-  register, swap or a crash dump are beyond this library. Each load, addition,
-  derivation, reveal, wrap, unwrap, lock, unlock, carry, combination, challenge, export, receipt
-  and call on an archive wipes the stack it used, as measured on x86-64 and aarch64 Linux.
+  register, swap or a crash dump are beyond this library. Every call that derives from a key, runs
+  the cipher or X-Wing wipes the stack it used, as measured on x86-64 and aarch64 Linux.
 - **The stack a call needs is not measured on microcontrollers.** On a target such as Cortex-M a
   call needs at least the depth of the wipe after it, which its documentation states, and an
   overflow of an unguarded stack corrupts memory silently. A derivation from a password needs at
@@ -110,7 +112,7 @@ separate crate, so the proof perimeter is visible from the directory listing.
 
 | Crate | Contents |
 |---|---|
-| `lethewis-core` | derivation, hierarchy, lifecycle, destruction, two-tier access. Pure logic: no network, no clock; the system is asked, through `lethewis-dit`, only whether the processor offers data-independent timing |
+| `lethewis-core` | derivation, hierarchy, lifecycle, destruction, two-tier access, encryption of data in blocks. Pure logic: no network, no clock; the system is asked, through `lethewis-dit`, only whether the processor offers data-independent timing |
 | `lethewis-dit` | data-independent timing on aarch64 for a piece of work, where Linux, Android or an Apple system reports it; the one crate with unsafe code |
 
 Hardware binding, key shares and the time lock will each be a crate of its own, listed here when it

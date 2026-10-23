@@ -6,6 +6,7 @@ use hkdf::Hkdf;
 #[cfg(not(kani))]
 use sha2::Sha256;
 
+use crate::block::{CHECK_LEN, SALT_LEN};
 use crate::entropy::{Entropy, EntropyError};
 use crate::key::{CAPACITY, Key, wipe};
 use crate::record::{ID_LEN, Purpose, length_to_byte};
@@ -41,6 +42,9 @@ const HEDGE_ENCAPS: &[u8; 12] = b"hedge encaps";
 const ARCHIVE_ENCAPS: &[u8; 14] = b"archive encaps";
 const ARCHIVE_DATA: &[u8; 12] = b"archive data";
 const ARCHIVE_CHECK: &[u8; 13] = b"archive check";
+const DATA_CHECK: &[u8; 10] = b"data check";
+const DATA_CHUNK: &[u8; 10] = b"data chunk";
+const HEDGE_SALT: &[u8; 10] = b"hedge salt";
 /// The count of a draw, after the bytes the source gave, in the material a hedge extracts.
 const COUNT_LEN: usize = 8;
 /// How many bytes twelve words stand for.
@@ -104,6 +108,14 @@ pub(crate) enum Branch {
     ArchiveData,
     /// The check of a shared secret of X-Wing that a record of an archive holds.
     ArchiveCheck,
+    /// The check in the header of a block of data, which names the key of a set the block is
+    /// under, from that key and the block's salt.
+    DataCheck,
+    /// The key that encrypts the chunks of a block of data, from the key of a set and the block's
+    /// salt.
+    DataChunk,
+    /// The salt of a block of data, hedged.
+    HedgeSalt,
 }
 
 /// The purpose each branch is derived for.
@@ -120,11 +132,13 @@ pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
         Branch::ArchiveKey => Some(Purpose::ArchiveWrap),
         Branch::ArchiveSeed | Branch::ArchiveData | Branch::ArchiveCheck => Some(Purpose::Archive),
         Branch::ArchiveSeal | Branch::ArchiveEncaps => Some(Purpose::ArchiveSeal),
+        Branch::DataCheck | Branch::DataChunk => Some(Purpose::Data),
         Branch::KeyId
         | Branch::HedgeKey
         | Branch::HedgeWords
         | Branch::HedgeNonce
         | Branch::HedgeEncaps
+        | Branch::HedgeSalt
         | Branch::Challenge => None,
     }
 }
@@ -380,6 +394,26 @@ pub(crate) fn derive_archive_check(
         Branch::ArchiveCheck,
         &mut check.0,
     )
+}
+
+/// Derives into `out` the check in the header of a block of data under the key for data `key`,
+/// with the block's salt `salt` as the salt.
+pub(crate) fn derive_data_check(
+    key: &Key,
+    salt: &[u8; SALT_LEN],
+    out: &mut [u8; CHECK_LEN],
+) -> Result<(), DerivationFailed> {
+    derive(key, salt, Some(Purpose::Data), Branch::DataCheck, out)
+}
+
+/// Derives the key that encrypts the chunks of a block of data under the key for data `key`, with
+/// the block's salt `salt` as the salt.
+pub(crate) fn derive_data_chunk(
+    key: &Key,
+    salt: &[u8; SALT_LEN],
+    out: &mut [u8; CIPHER_KEY_LEN],
+) -> Result<(), DerivationFailed> {
+    derive(key, salt, Some(Purpose::Data), Branch::DataChunk, out)
 }
 
 /// Fills `out` with the key for `purpose` that the bytes twelve words stand for, `entropy`, derive:
@@ -812,7 +846,7 @@ pub(crate) mod stack {
         let out_len = match branch {
             Branch::KeyId | Branch::HedgeWords | Branch::ArchiveCheck => 16,
             Branch::HedgeNonce => 12,
-            Branch::HedgeKey | Branch::HedgeEncaps => key.len() - 8,
+            Branch::HedgeKey | Branch::HedgeEncaps | Branch::HedgeSalt => key.len() - 8,
             Branch::ArchiveEncaps => 64,
             Branch::WrapKey
             | Branch::FromWords
@@ -825,7 +859,9 @@ pub(crate) mod stack {
             | Branch::ArchiveLayer
             | Branch::ArchiveSeed
             | Branch::ArchiveSeal
-            | Branch::ArchiveData => 32,
+            | Branch::ArchiveData
+            | Branch::DataCheck
+            | Branch::DataChunk => 32,
         };
         let length = u8::try_from(key.len()).unwrap();
         let (label, used) = label(purpose, length, branch, out_len).unwrap();
@@ -1190,6 +1226,8 @@ pub(crate) mod model {
     static FAILED: AtomicBool = AtomicBool::new(false);
     /// How many derivations have failed, so a proof can tell whether any of several did.
     static FAILURES: AtomicU8 = AtomicU8::new(0);
+    /// How many derivations have run, so a proof can tell that a search stopped at none early.
+    static RUNS: AtomicU8 = AtomicU8::new(0);
 
     /// HKDF-SHA-256 is beyond Kani. The model fails at will, after writing into `out`, and records
     /// whether it failed; otherwise `out` takes the first bytes of the key, or zeros for a key
@@ -1203,6 +1241,10 @@ pub(crate) mod model {
         info: &[u8],
         out: &mut [u8],
     ) -> Result<(), DerivationFailed> {
+        RUNS.store(
+            RUNS.load(Ordering::Relaxed).saturating_add(1),
+            Ordering::Relaxed,
+        );
         let fail: bool = kani::any();
         FAILED.store(fail, Ordering::Relaxed);
         if fail {
@@ -1236,6 +1278,11 @@ pub(crate) mod model {
     /// Whether any derivation has failed.
     pub(crate) fn any_failed() -> bool {
         FAILURES.load(Ordering::Relaxed) != 0
+    }
+
+    /// How many derivations have run.
+    pub(crate) fn runs() -> u8 {
+        RUNS.load(Ordering::Relaxed)
     }
 
     // Never indexing: a path that never derives would leave a check unreached. Copies have lengths
@@ -1398,6 +1445,9 @@ fn label(
         Branch::ArchiveEncaps => joined(head, ARCHIVE_ENCAPS),
         Branch::ArchiveData => joined(head, ARCHIVE_DATA),
         Branch::ArchiveCheck => joined(head, ARCHIVE_CHECK),
+        Branch::DataCheck => joined(head, DATA_CHECK),
+        Branch::DataChunk => joined(head, DATA_CHUNK),
+        Branch::HedgeSalt => joined(head, HEDGE_SALT),
     }
 }
 
@@ -1430,10 +1480,10 @@ mod tests {
 
     use super::{
         ARCHIVE_CHECK, ARCHIVE_DATA, ARCHIVE_ENCAPS, ARCHIVE_KEY, ARCHIVE_LAYER, ARCHIVE_SEAL,
-        ARCHIVE_SEED, Branch, CHALLENGE, COMBINED, DerivationFailed, EPOCH_LAYER, EXPORT_KEY,
-        FROM_WORDS, HEDGE_ENCAPS, HEDGE_KEY, HEDGE_NONCE, HEDGE_WORDS, Hedged, KEY_ID, KeyId,
-        LOCK_KEY, SALT, WRAP_KEY, derive, derive_from_words, derive_key_id, hedge, label,
-        purpose_of,
+        ARCHIVE_SEED, Branch, CHALLENGE, COMBINED, DATA_CHECK, DATA_CHUNK, DerivationFailed,
+        EPOCH_LAYER, EXPORT_KEY, FROM_WORDS, HEDGE_ENCAPS, HEDGE_KEY, HEDGE_NONCE, HEDGE_SALT,
+        HEDGE_WORDS, Hedged, KEY_ID, KeyId, LOCK_KEY, SALT, WRAP_KEY, derive, derive_from_words,
+        derive_key_id, hedge, label, purpose_of,
     };
     use crate::entropy::{Entropy, EntropyError};
     use crate::key::{Key, KeyLength};
@@ -1824,6 +1874,9 @@ mod tests {
             Branch::ArchiveEncaps,
             Branch::ArchiveData,
             Branch::ArchiveCheck,
+            Branch::DataCheck,
+            Branch::DataChunk,
+            Branch::HedgeSalt,
         ] {
             let (_, used) = label(purpose_of(branch), 64, branch, 32).unwrap();
             let name = match branch {
@@ -1846,6 +1899,9 @@ mod tests {
                 Branch::ArchiveEncaps => ARCHIVE_ENCAPS.len(),
                 Branch::ArchiveData => ARCHIVE_DATA.len(),
                 Branch::ArchiveCheck => ARCHIVE_CHECK.len(),
+                Branch::DataCheck => DATA_CHECK.len(),
+                Branch::DataChunk => DATA_CHUNK.len(),
+                Branch::HedgeSalt => HEDGE_SALT.len(),
             };
             assert_eq!(used, 14 + name);
         }
@@ -1882,7 +1938,7 @@ mod tests {
 #[coverage(on)]
 pub(crate) mod proofs {
     use super::{
-        Branch, CIPHER_KEY_LEN, SALT, WORDS_ENTROPY_LEN, label,
+        Branch, CHECK_LEN, CIPHER_KEY_LEN, SALT, SALT_LEN, WORDS_ENTROPY_LEN, label,
         model::{fold, twice},
     };
     use crate::key::KeyLength;
@@ -2055,6 +2111,27 @@ pub(crate) mod proofs {
         out
     }
 
+    /// The check in the header of a block the model of HKDF gives from the key for data `key`, its
+    /// first 32 bytes, and the block's salt `salt`, worked out in the same way.
+    pub(crate) fn expected_data_check(key: &[u8; 32], salt: &[u8; SALT_LEN]) -> [u8; CHECK_LEN] {
+        let mut out = [0; CHECK_LEN];
+        let _ =
+            label(Some(Purpose::Data), 32, Branch::DataCheck, CHECK_LEN).map(|(label, used)| {
+                fold(salt, key, &label[..used], &mut out);
+            });
+        out
+    }
+
+    /// The key of the chunks of a block the model of HKDF gives from the key for data `key` and
+    /// the block's salt `salt`, worked out in the same way.
+    pub(crate) fn expected_data_chunk(key: &[u8; 32], salt: &[u8; SALT_LEN]) -> [u8; 32] {
+        let mut out = [0; 32];
+        let _ = label(Some(Purpose::Data), 32, Branch::DataChunk, 32).map(|(label, used)| {
+            fold(salt, key, &label[..used], &mut out);
+        });
+        out
+    }
+
     /// The key of a batch the model of HKDF gives from the shared secret `shared` and a ciphertext
     /// that begins with `ciphertext`, as far as the model reads it, worked out in the same way.
     pub(crate) fn expected_archive_data(shared: &[u8; 32], ciphertext: &[u8; 32]) -> [u8; 32] {
@@ -2115,7 +2192,10 @@ pub(crate) mod proofs {
             15 => Branch::HedgeEncaps,
             16 => Branch::ArchiveEncaps,
             17 => Branch::ArchiveData,
-            _ => Branch::ArchiveCheck,
+            18 => Branch::ArchiveCheck,
+            19 => Branch::DataCheck,
+            20 => Branch::DataChunk,
+            _ => Branch::HedgeSalt,
         }
     }
 
@@ -2147,7 +2227,8 @@ pub(crate) mod proofs {
             3 => Some(Purpose::Transfer),
             4 => Some(Purpose::Archive),
             5 => Some(Purpose::ArchiveWrap),
-            _ => Some(Purpose::ArchiveSeal),
+            6 => Some(Purpose::ArchiveSeal),
+            _ => Some(Purpose::Data),
         }
     }
 

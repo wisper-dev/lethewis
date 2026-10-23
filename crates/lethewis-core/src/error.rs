@@ -9,7 +9,8 @@ use core::fmt;
 pub enum Error {
     /// Every slot holds a key set or is out of use.
     NoFreeSlot,
-    /// The handle does not refer to a key set held now.
+    /// The handle does not refer to a key set held now, or a block began before its set last
+    /// changed.
     StaleHandle,
     /// The source of random bytes failed.
     EntropyFailed,
@@ -17,14 +18,17 @@ pub enum Error {
     DerivationFailed,
     /// The record does not open with the key of the parent set and this context, holds a plaintext
     /// this version of the library cannot read, or names a key other than the one that opens it;
-    /// or X-Wing refuses the public key of an archive key.
+    /// or X-Wing refuses the public key of an archive key; or no block has the length given, the
+    /// header of a block names no key of the set, or a chunk does not open as the next of its
+    /// block.
     RecordRejected,
     /// A key set cannot wrap itself.
     SameKey,
     /// The context is empty or longer than 255 bytes.
     InvalidContext,
     /// The cipher or X-Wing gave a known input a wrong answer, a new key pair of X-Wing did not agree
-    /// with itself, or the cipher refused the input, so nothing was written.
+    /// with itself, the cipher refused the input, or a sealed chunk did not open or seal again to
+    /// the same tag and ciphertext, so nothing was written.
     CipherFailed,
     /// A key of the set is held here already, or the set holds one key twice: a key is held in one
     /// place only.
@@ -37,7 +41,8 @@ pub enum Error {
     WrongStage,
     /// The set has changed as many times as its counter holds.
     SetExhausted,
-    /// The set has changed in this epoch, and only a new epoch saves the change.
+    /// The set has changed in this epoch, and only a new epoch saves the change; or a block is to
+    /// be written under a set no record of this epoch holds as it is now.
     Unsaved,
     /// A change to the next epoch has begun already.
     EpochChanging,
@@ -64,8 +69,8 @@ pub enum Error {
     WrongLength,
     /// The set is not of the level the call takes: a key from a secret wraps only stored keys, for
     /// wrapping or of the archive; a stored key for wrapping wraps only keys for external data, keys
-    /// for transfers and keys of chats for their archives; a key for transfers exports only keys
-    /// for external data.
+    /// for transfers, keys of chats for their archives and keys for data; a key for transfers
+    /// exports only keys for external data.
     WrongLevel,
     /// The lock record or the record of an archive key does not open in this epoch for this
     /// context: it was not written or carried into it, or it was changed; or the public key of an
@@ -84,6 +89,13 @@ pub enum Error {
     Unfinished,
     /// The key for transfers has written or received no record of an export to end.
     NoTransfer,
+    /// The block is under a key of the set that is disabled: it opens once the key is enabled
+    /// again.
+    KeyDisabled,
+    /// The chunk is not the one its block takes next: the last one where more are due, another
+    /// where the last is due, a last one of another length, longer than a chunk or empty after
+    /// others, or one past as many chunks as a number of 64 bits counts.
+    WrongChunk,
 }
 
 impl From<crate::keyset::Refused> for Error {
@@ -132,6 +144,8 @@ impl fmt::Display for Error {
             Self::WrongArchiveKey => "wrong archive key",
             Self::Unfinished => "unfinished transfer",
             Self::NoTransfer => "no transfer",
+            Self::KeyDisabled => "key disabled",
+            Self::WrongChunk => "wrong chunk",
         })
     }
 }
@@ -182,5 +196,7 @@ mod tests {
         assert_eq!(Error::WrongArchiveKey.to_string(), "wrong archive key");
         assert_eq!(Error::Unfinished.to_string(), "unfinished transfer");
         assert_eq!(Error::NoTransfer.to_string(), "no transfer");
+        assert_eq!(Error::KeyDisabled.to_string(), "key disabled");
+        assert_eq!(Error::WrongChunk.to_string(), "wrong chunk");
     }
 }

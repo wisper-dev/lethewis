@@ -112,6 +112,16 @@ impl Stages {
         self.primary
     }
 
+    /// The position of the primary key, named.
+    pub(crate) const fn primary_position(&self) -> Option<Position> {
+        Position::at(self.primary)
+    }
+
+    /// How many transitions the set has gone through.
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Stages as given, whole or not.
     #[cfg(test)]
     pub(crate) const fn from_parts(
@@ -546,15 +556,15 @@ mod tests {
         }
     }
 
-    /// The version is 1; the purpose is one of the six, and a set of any purpose but wrapping holds
-    /// only 32-byte keys, as [`gap`] does and [`full`] does not.
+    /// The version is 1; the purpose is one of the seven, and a set of any purpose but wrapping
+    /// holds only 32-byte keys, as [`gap`] does and [`full`] does not.
     #[test]
     fn the_version_is_one_and_the_purpose_takes_its_lengths() {
         for (position, bytes, accepted) in [
             (0, full(), &[1][..]),
             (0, gap(), &[1][..]),
             (1, full(), &[1][..]),
-            (1, gap(), &[1, 2, 3, 4, 5, 6][..]),
+            (1, gap(), &[1, 2, 3, 4, 5, 6, 7][..]),
         ] {
             for value in 0..=u8::MAX {
                 let mut changed = bytes;
@@ -833,7 +843,7 @@ pub(crate) mod proofs {
     }
 
     /// Whether the position starting at `at` is one `build` can write for the purpose `purpose`:
-    /// keys of 32 or 64 bytes for 1, of 32 for 2 to 6.
+    /// keys of 32 or 64 bytes for 1, of 32 for 2 to 7.
     fn writable_position(bytes: &[u8; PLAINTEXT_LEN], at: usize, purpose: u8) -> bool {
         let stage = bytes[at];
         let length = bytes[at + 1];
@@ -851,7 +861,7 @@ pub(crate) mod proofs {
         let primary = bytes[2];
         let purpose = bytes[1];
         bytes[0] == 1
-            && (1..=6).contains(&purpose)
+            && (1..=7).contains(&purpose)
             && writable_position(bytes, POSITIONS[0], purpose)
             && writable_position(bytes, POSITIONS[1], purpose)
             && writable_position(bytes, POSITIONS[2], purpose)
@@ -965,13 +975,14 @@ pub(crate) mod proofs {
 
     /// Any purpose.
     pub(crate) fn any_purpose() -> Purpose {
-        match kani::any::<u8>() % 6 {
+        match kani::any::<u8>() % 7 {
             0 => Purpose::Wrap,
             1 => Purpose::ExternalData,
             2 => Purpose::Transfer,
             3 => Purpose::Archive,
             4 => Purpose::ArchiveWrap,
-            _ => Purpose::ArchiveSeal,
+            5 => Purpose::ArchiveSeal,
+            _ => Purpose::Data,
         }
     }
 
@@ -1026,6 +1037,7 @@ pub(crate) mod proofs {
             Purpose::Archive => 4,
             Purpose::ArchiveWrap => 5,
             Purpose::ArchiveSeal => 6,
+            Purpose::Data => 7,
         };
         kani::assert(
             out[0] == 1 && out[1] == purpose && usize::from(out[2]) == stages.primary,
