@@ -5324,17 +5324,20 @@ fn a_long_addition_in_the_first_slot() {
     kani::assert(
         match refusal {
             Some(refusal) => result == Err(refusal) && unchanged_except(&slots, &before, 2),
-            None => matches!(
-                result,
-                Ok(_)
-                    | Err(Error::SetFull
-                        | Error::SetExhausted
-                        | Error::WrongStage
-                        | Error::PrimaryKey
-                        | Error::EntropyFailed
-                        | Error::DerivationFailed
-                        | Error::DuplicateKey)
-            ),
+            None => {
+                result.is_ok()
+                    || [
+                        Error::SetFull,
+                        Error::SetExhausted,
+                        Error::WrongStage,
+                        Error::PrimaryKey,
+                        Error::EntropyFailed,
+                        Error::DerivationFailed,
+                        Error::DuplicateKey,
+                    ]
+                    .iter()
+                    .any(|&error| result == Err(error))
+            }
         },
         "an addition is refused for the first reason, a length its purpose does not take among \
          them, and then changes nothing",
