@@ -34,7 +34,7 @@ pub const ARCHIVE_RECORD_LEN: usize = 1180;
 pub(crate) const ARCHIVED_LEN: usize = ID_LEN + CIPHERTEXT_LEN + ID_LEN;
 /// The longest context a record can be bound to, in bytes.
 pub(crate) const MAX_CONTEXT: usize = 255;
-const LABEL_LEN: usize = 19;
+pub(crate) const LABEL_LEN: usize = 19;
 const AAD_LABEL: &[u8; LABEL_LEN] = b"lethewis key record";
 pub(crate) const EXPORT_LABEL: &[u8; LABEL_LEN] = b"lethewis key export";
 pub(crate) const END_LABEL: &[u8; LABEL_LEN] = b"lethewis export end";
@@ -64,7 +64,8 @@ pub enum Purpose {
     /// A key of 32 or 64 bytes that wraps other keys. Its set holds this one key and never changes.
     /// A key from a secret, such as a password, wraps only stored keys, for wrapping or of the
     /// archive, which [`Slots::lock`](crate::Slots::lock) keeps under it; a stored key for wrapping
-    /// wraps only keys for external data, keys for transfers and keys of chats for their archives.
+    /// wraps only keys for external data, keys for transfers, keys of chats for their archives and
+    /// keys for data.
     /// Leaves the library only wrapped, or as the words
     /// [`Slots::generate_words`](crate::Slots::generate_words) writes once; a key from a secret
     /// gives out a [`Slots::challenge`](crate::Slots::challenge) derived from it.
@@ -89,6 +90,11 @@ pub enum Purpose {
     /// A key of 32 bytes for the outer layer of the records of an archive, one for each chat. It is
     /// stored under a stored key for wrapping, and leaves the library only wrapped.
     ArchiveSeal = 6,
+    /// A key of 32 bytes that encrypts the caller's data in the library, in blocks with
+    /// AES-256-GCM-SIV: whatever one key covers, such as one chat, is unreadable once it is
+    /// destroyed. Only the platform's source creates it, and it is stored under a stored key for
+    /// wrapping; it is never exported and leaves the library only wrapped.
+    Data = 7,
 }
 
 impl Purpose {
@@ -100,6 +106,7 @@ impl Purpose {
             4 => Some(Self::Archive),
             5 => Some(Self::ArchiveWrap),
             6 => Some(Self::ArchiveSeal),
+            7 => Some(Self::Data),
             _ => None,
         }
     }
@@ -112,7 +119,8 @@ impl Purpose {
             | Self::Transfer
             | Self::Archive
             | Self::ArchiveWrap
-            | Self::ArchiveSeal => matches!(length, KeyLength::Bytes32),
+            | Self::ArchiveSeal
+            | Self::Data => matches!(length, KeyLength::Bytes32),
         }
     }
 
@@ -126,8 +134,14 @@ impl Purpose {
     pub(crate) const fn generated(self) -> bool {
         matches!(
             self,
-            Self::Wrap | Self::ExternalData | Self::ArchiveWrap | Self::ArchiveSeal
+            Self::Wrap | Self::ExternalData | Self::ArchiveWrap | Self::ArchiveSeal | Self::Data
         )
+    }
+
+    /// Whether a set for this purpose holds up to three keys that change by their stages: a set
+    /// for any other purpose holds one key that never changes.
+    pub(crate) const fn staged(self) -> bool {
+        matches!(self, Self::ExternalData | Self::Data)
     }
 }
 
@@ -183,6 +197,20 @@ pub(crate) struct AssociatedData {
 
 impl AssociatedData {
     pub(crate) fn new(context: &[u8]) -> Result<Self, InvalidContext> {
+        Self::labelled(AAD_LABEL, VERSION, context)
+    }
+
+    /// The associated data of a chunk of a block of data: its own label and version, the length of
+    /// the context, and the context.
+    pub(crate) fn of_data(context: &[u8]) -> Result<Self, InvalidContext> {
+        Self::labelled(crate::block::DATA_LABEL, crate::block::VERSION, context)
+    }
+
+    fn labelled(
+        label_of: &[u8; LABEL_LEN],
+        version: u8,
+        context: &[u8],
+    ) -> Result<Self, InvalidContext> {
         let context_len = u8::try_from(context.len())
             .ok()
             .filter(|&len| len != 0)
@@ -191,11 +219,11 @@ impl AssociatedData {
         // time costs many times its bytes.
         let mut bytes = [0; AAD_CAPACITY];
         let (label, rest) = bytes
-            .split_first_chunk_mut::<{ AAD_LABEL.len() }>()
+            .split_first_chunk_mut::<LABEL_LEN>()
             .ok_or(InvalidContext)?;
-        *label = *AAD_LABEL;
+        *label = *label_of;
         let (head, rest) = rest.split_first_chunk_mut::<2>().ok_or(InvalidContext)?;
-        *head = [VERSION, context_len];
+        *head = [version, context_len];
         rest.get_mut(..context.len())
             .ok_or(InvalidContext)?
             .copy_from_slice(context);

@@ -6,8 +6,10 @@ use aes_gcm_siv::{
     Aes256GcmSiv, KeyInit, Nonce,
     aead::{AeadInOut, inout::InOutBuf},
 };
+#[cfg(not(kani))]
+use polyval::{Polyval, universal_hash::UniversalHash};
 
-use crate::key::wipe;
+use crate::key::{wipe, wipe_slice};
 use crate::record::PLAINTEXT_LEN;
 
 /// The size of the key a record is encrypted with, in bytes.
@@ -167,6 +169,119 @@ pub(crate) fn open<const N: usize>(
     opened
 }
 
+/// Encrypts `buffer`, a chunk of a block of data of any length, in place as [`seal`] does, and
+/// returns the tag. The cipher first encrypts a known input, and then the chunk is opened under its
+/// tag and sealed again, which gives the same bytes and tag unless the cipher erred in one of these
+/// passes. On any failure `buffer` is wiped.
+pub(crate) fn seal_data(
+    key: &[u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    buffer: &mut [u8],
+) -> Result<[u8; TAG_LEN], SealFailed> {
+    seal_data_checked(&KNOWN, encrypt_data, key, nonce, aad, buffer)
+}
+
+/// An encryption of a chunk in place, which gives its tag.
+trait Encrypt:
+    FnMut(&[u8; KEY_LEN], &[u8; NONCE_LEN], &[u8], &mut [u8]) -> Result<[u8; TAG_LEN], SealFailed>
+{
+}
+
+impl<F> Encrypt for F where
+    F: FnMut(
+        &[u8; KEY_LEN],
+        &[u8; NONCE_LEN],
+        &[u8],
+        &mut [u8],
+    ) -> Result<[u8; TAG_LEN], SealFailed>
+{
+}
+
+fn seal_data_checked(
+    known: &Known,
+    mut encrypt_chunk: impl Encrypt,
+    key: &[u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    buffer: &mut [u8],
+) -> Result<[u8; TAG_LEN], SealFailed> {
+    #[cfg(kani)]
+    let given = (model::head_of(buffer), model::end_of(buffer));
+    let sealed = if answers(known) {
+        encrypt_chunk(key, nonce, aad, buffer)
+            .and_then(|tag| sealed_again(&mut encrypt_chunk, key, nonce, aad, buffer, tag))
+    } else {
+        Err(SealFailed)
+    };
+    #[cfg(kani)]
+    if let Ok(tag) = &sealed {
+        model::keep_data_seal(
+            key,
+            nonce,
+            aad,
+            (&given.0, &given.1, &model::head_of(buffer)),
+            tag,
+        );
+    }
+    if sealed.is_err() {
+        #[cfg(kani)]
+        model::note_seal_failed();
+        wipe_slice(buffer);
+    }
+    sealed
+}
+
+/// Opens the chunk `buffer` sealed under `tag` and seals it again with `encrypt_chunk`: AES-256-GCM-SIV gives the same
+/// ciphertext and tag for the same input, so a chunk that does not open, another tag or another
+/// digest of the ciphertext is a fault of the cipher on this chunk.
+fn sealed_again(
+    encrypt_chunk: &mut impl Encrypt,
+    key: &[u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    buffer: &mut [u8],
+    tag: [u8; TAG_LEN],
+) -> Result<[u8; TAG_LEN], SealFailed> {
+    let sealed = digest(buffer);
+    decrypt_data(key, nonce, aad, buffer, &tag).map_err(|Rejected| SealFailed)?;
+    let again = encrypt_chunk(key, nonce, aad, buffer)?;
+    if again == tag && digest(buffer) == sealed {
+        Ok(tag)
+    } else {
+        Err(SealFailed)
+    }
+}
+
+/// The key of [`digest`].
+#[cfg(not(kani))]
+const DIGEST_KEY: [u8; 16] = *b"lethewis digest.";
+
+/// POLYVAL of `bytes` under a fixed key. A change of `bytes` that does not depend on the key
+/// leaves it as it was with a chance of at most one in 2^128 for each block of 16 bytes.
+#[cfg(not(kani))]
+fn digest(bytes: &[u8]) -> [u8; 16] {
+    let mut hash = Polyval::new(&DIGEST_KEY.into());
+    hash.update_padded(bytes);
+    hash.finalize().into()
+}
+
+/// Decrypts `buffer`, a chunk of a block of data, in place if `tag` matches it, the key, the nonce
+/// and the associated data, and otherwise wipes it.
+pub(crate) fn open_data(
+    key: &[u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    aad: &[u8],
+    buffer: &mut [u8],
+    tag: &[u8; TAG_LEN],
+) -> Result<(), Rejected> {
+    let opened = decrypt_data(key, nonce, aad, buffer, tag);
+    if opened.is_err() {
+        wipe_slice(buffer);
+    }
+    opened
+}
+
 // In place only: with a separate output, a ciphertext that fails the tag would leave its
 // decryption there.
 
@@ -205,8 +320,10 @@ fn decrypt(
         .map_err(|_| Rejected)
 }
 
+#[cfg(not(kani))]
+use self::{decrypt as decrypt_data, encrypt as encrypt_data};
 #[cfg(kani)]
-use model::{decrypt, encrypt};
+use model::{decrypt, decrypt_data, digest, encrypt, encrypt_data};
 
 /// What stands in for AES-256-GCM-SIV under Kani.
 #[cfg(kani)]
@@ -222,7 +339,9 @@ pub(crate) mod model {
     /// bytes reaches.
     pub(crate) const RECORD: usize = 0;
     pub(crate) const LAYER: usize = 1;
-    const KEPT: usize = 2;
+    /// The last seal of a chunk of a block of data, whatever its length.
+    pub(crate) const DATA: usize = 2;
+    const KEPT: usize = 3;
     pub(crate) const HEAD: usize = 32;
     pub(crate) const AAD_HEAD: usize = 39;
 
@@ -260,6 +379,22 @@ pub(crate) mod model {
         buffer.first_chunk::<HEAD>().copied().unwrap_or([0; HEAD])
     }
 
+    /// The first bytes of a chunk, zero past its end, read one by one: Kani 0.68.0 reads stale
+    /// bytes in a slice copy of unknown length.
+    pub(super) fn head_of(buffer: &[u8]) -> [u8; HEAD] {
+        core::array::from_fn(|place| buffer.get(place).copied().unwrap_or(0))
+    }
+
+    /// The last bytes of a chunk, as many as a tag, or zeros for a shorter one, read one by one.
+    pub(super) fn end_of(buffer: &[u8]) -> [u8; TAG_LEN] {
+        match buffer.len().checked_sub(TAG_LEN) {
+            Some(from) => core::array::from_fn(|place| {
+                buffer.get(from.saturating_add(place)).copied().unwrap_or(0)
+            }),
+            None => [0; TAG_LEN],
+        }
+    }
+
     /// The last bytes of `buffer`, as many as a tag, or zeros for a shorter one.
     pub(super) fn end<const N: usize>(buffer: &[u8; N]) -> [u8; TAG_LEN] {
         buffer
@@ -275,7 +410,7 @@ pub(crate) mod model {
         key: &[u8; KEY_LEN],
         nonce: &[u8; NONCE_LEN],
         aad: &[u8],
-        (given, given_end, written): (&[u8; HEAD], &[u8; TAG_LEN], &[u8; HEAD]),
+        kept: (&[u8; HEAD], &[u8; TAG_LEN], &[u8; HEAD]),
         tag: &[u8; TAG_LEN],
     ) {
         let at = if N == PLAINTEXT_LEN || N == 0 {
@@ -283,6 +418,28 @@ pub(crate) mod model {
         } else {
             LAYER
         };
+        keep_in(at, key, nonce, aad, kept, tag);
+    }
+
+    /// Keeps what a seal of a chunk that succeeded was given and gave, in its own place.
+    pub(super) fn keep_data_seal(
+        key: &[u8; KEY_LEN],
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        kept: (&[u8; HEAD], &[u8; TAG_LEN], &[u8; HEAD]),
+        tag: &[u8; TAG_LEN],
+    ) {
+        keep_in(DATA, key, nonce, aad, kept, tag);
+    }
+
+    fn keep_in(
+        at: usize,
+        key: &[u8; KEY_LEN],
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        (given, given_end, written): (&[u8; HEAD], &[u8; TAG_LEN], &[u8; HEAD]),
+        tag: &[u8; TAG_LEN],
+    ) {
         let aad_head: [u8; AAD_HEAD] =
             core::array::from_fn(|place| aad.get(place).copied().unwrap_or(0));
         if let (
@@ -387,6 +544,147 @@ pub(crate) mod model {
         }
     }
 
+    /// The tags the last two encryptions of a chunk gave, as numbers, and how many decryptions of
+    /// a chunk ran, so that a proof can tell a chunk checked by opening and sealing it again.
+    static CHUNK_TAGS: [[AtomicU64; 2]; 2] = [const { [const { AtomicU64::new(0) }; 2] }; 2];
+    static CHUNK_OPENINGS: AtomicUsize = AtomicUsize::new(0);
+
+    /// The same for a chunk of any length, written byte by byte, recording what it was given.
+    pub(super) fn encrypt_data(
+        key: &[u8; KEY_LEN],
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        buffer: &mut [u8],
+    ) -> Result<[u8; TAG_LEN], SealFailed> {
+        note_inputs(key, nonce, aad);
+        for byte in buffer.iter_mut() {
+            *byte = kani::any();
+        }
+        if kani::any() {
+            let tag: [u8; TAG_LEN] = kani::any();
+            let [earlier, last] = &CHUNK_TAGS;
+            keep(earlier, &kept::<TAG_LEN, 2>(last));
+            keep(last, &tag);
+            Ok(tag)
+        } else {
+            Err(SealFailed)
+        }
+    }
+
+    /// The tags the last two encryptions of a chunk gave, the earlier first.
+    pub(crate) fn chunk_tags() -> [[u8; TAG_LEN]; 2] {
+        let [earlier, last] = &CHUNK_TAGS;
+        [kept(earlier), kept(last)]
+    }
+
+    /// How many decryptions of a chunk ran.
+    pub(crate) fn chunk_openings() -> usize {
+        CHUNK_OPENINGS.load(Ordering::Relaxed)
+    }
+
+    /// What a call of the cipher on a chunk was given: the key, the nonce, the first bytes of the
+    /// associated data, zero past its end, as far as the proofs' reach, and its length.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Inputs {
+        key: [u8; KEY_LEN],
+        nonce: [u8; NONCE_LEN],
+        aad: [u8; 8],
+        aad_len: usize,
+    }
+
+    impl Inputs {
+        /// The inputs `key`, `nonce` and `aad`.
+        pub(crate) fn of(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], aad: &[u8]) -> Self {
+            Self {
+                key: *key,
+                nonce: *nonce,
+                aad: core::array::from_fn(|place| aad.get(place).copied().unwrap_or(0)),
+                aad_len: aad.len(),
+            }
+        }
+    }
+
+    /// The inputs of the first call of the cipher on a chunk, whether a later call was given
+    /// others, and the tag the last decryption of a chunk was given. Kept in places known when the
+    /// proof is built, which a count of the calls would not give.
+    static FIRST_KEY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static FIRST_NONCE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static FIRST_AAD: [AtomicU64; 1] = [const { AtomicU64::new(0) }; 1];
+    static FIRST_AAD_LEN: AtomicUsize = AtomicUsize::new(0);
+    static CALLED: AtomicBool = AtomicBool::new(false);
+    static OTHER_INPUTS: AtomicBool = AtomicBool::new(false);
+    static OPENED_TAG: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+    fn first_inputs() -> Inputs {
+        Inputs {
+            key: kept(&FIRST_KEY),
+            nonce: kept(&FIRST_NONCE),
+            aad: kept(&FIRST_AAD),
+            aad_len: FIRST_AAD_LEN.load(Ordering::Relaxed),
+        }
+    }
+
+    fn note_inputs(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], aad: &[u8]) {
+        let given = Inputs::of(key, nonce, aad);
+        if !CALLED.load(Ordering::Relaxed) {
+            keep(&FIRST_KEY, &given.key);
+            keep(&FIRST_NONCE, &given.nonce);
+            keep(&FIRST_AAD, &given.aad);
+            FIRST_AAD_LEN.store(given.aad_len, Ordering::Relaxed);
+            CALLED.store(true, Ordering::Relaxed);
+        } else if given != first_inputs() {
+            OTHER_INPUTS.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The inputs every call of the cipher on a chunk was given, if any ran and all were given the
+    /// same.
+    pub(crate) fn chunk_inputs() -> Option<Inputs> {
+        (CALLED.load(Ordering::Relaxed) && !OTHER_INPUTS.load(Ordering::Relaxed)).then(first_inputs)
+    }
+
+    /// The tag the last decryption of a chunk was given.
+    pub(crate) fn opened_tag() -> [u8; TAG_LEN] {
+        kept(&OPENED_TAG)
+    }
+
+    /// The first bytes of the chunk the last decryption of a chunk was given.
+    static OPENED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+    /// The first bytes of the chunk the last decryption of a chunk was given.
+    pub(crate) fn opened_chunk() -> [u8; TAG_LEN] {
+        kept(&OPENED)
+    }
+
+    /// The digest of a chunk is its first 16 bytes, zero past its end: exact for the chunks the
+    /// proofs take.
+    pub(super) fn digest(bytes: &[u8]) -> [u8; 16] {
+        core::array::from_fn(|place| bytes.get(place).copied().unwrap_or(0))
+    }
+
+    /// The same for a chunk of any length, written byte by byte, recording what it was given.
+    pub(super) fn decrypt_data(
+        key: &[u8; KEY_LEN],
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        buffer: &mut [u8],
+        tag: &[u8; TAG_LEN],
+    ) -> Result<(), Rejected> {
+        note_inputs(key, nonce, aad);
+        keep(&OPENED_TAG, tag);
+        CHUNK_OPENINGS.store(
+            CHUNK_OPENINGS.load(Ordering::Relaxed).saturating_add(1),
+            Ordering::Relaxed,
+        );
+        keep(&OPENED, &digest(buffer));
+        for byte in buffer.iter_mut() {
+            *byte = kani::any();
+        }
+        let rejected: bool = kani::any();
+        REJECTED.store(rejected, Ordering::Relaxed);
+        if rejected { Err(Rejected) } else { Ok(()) }
+    }
+
     /// Whether any seal has failed, the check on a known input or the encryption, so that a proof
     /// can tell a success from one the code makes up after a failure.
     static SEAL_FAILED: AtomicBool = AtomicBool::new(false);
@@ -453,8 +751,8 @@ mod tests {
     use std::vec::Vec;
 
     use super::{
-        KNOWN, Known, PLAINTEXT_LEN, Rejected, SealFailed, TAG_LEN, decrypt, encrypt, open, seal,
-        seal_checked,
+        KNOWN, Known, PLAINTEXT_LEN, Rejected, SealFailed, TAG_LEN, decrypt, digest, encrypt, open,
+        open_data, seal, seal_checked, seal_data_checked,
     };
 
     /// RFC 8452, appendices C.2 and C.3: key, nonce, associated data, plaintext, and the result,
@@ -927,6 +1225,96 @@ mod tests {
     }
 
     #[test]
+    fn the_digest_of_a_chunk_changes_with_any_bit_of_it() {
+        let mut chunk = std::vec![0; 65_536];
+        for (at, byte) in chunk.iter_mut().enumerate() {
+            *byte = u8::try_from(at % 251).unwrap();
+        }
+        let whole = digest(&chunk);
+        for at in (0..chunk.len()).step_by(4093).chain([1, 15, 16, 65_535]) {
+            for bit in 0..8 {
+                chunk[at] ^= 1 << bit;
+                assert_ne!(digest(&chunk), whole, "byte {at}, bit {bit}");
+                chunk[at] ^= 1 << bit;
+            }
+        }
+        // The same bit of two blocks.
+        chunk[3] ^= 0x80;
+        chunk[19] ^= 0x80;
+        assert_ne!(digest(&chunk), whole);
+    }
+
+    #[test]
+    fn a_wrong_answer_fails_the_seal_of_a_chunk_and_wipes_it() {
+        for field in 0..6 {
+            for at in [0, 41, PLAINTEXT_LEN - 1] {
+                let mut chunk = [7; 100];
+                assert_eq!(
+                    seal_data_checked(
+                        &changed(field, at),
+                        encrypt,
+                        &KNOWN.key,
+                        &KNOWN.nonce,
+                        b"note",
+                        &mut chunk
+                    ),
+                    Err(SealFailed),
+                    "field {field}, byte {at}"
+                );
+                assert_eq!(chunk, [0; 100]);
+            }
+        }
+        let mut chunk = [7; 100];
+        let tag = seal_data_checked(
+            &KNOWN,
+            encrypt,
+            &KNOWN.key,
+            &KNOWN.nonce,
+            b"note",
+            &mut chunk,
+        )
+        .unwrap();
+        open_data(&KNOWN.key, &KNOWN.nonce, b"note", &mut chunk, &tag).unwrap();
+        assert_eq!(chunk, [7; 100]);
+    }
+
+    /// A fault of the first encryption of a chunk or of the second, in one byte of the chunk or in
+    /// its tag, fails the seal and wipes the chunk.
+    #[test]
+    fn a_fault_of_the_cipher_fails_the_seal_of_a_chunk_and_wipes_it() {
+        for pass in 0..2 {
+            for at in [0, 50, 99, 100] {
+                let mut passes = 0;
+                let faulty = |key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], buffer: &mut [u8]| {
+                    let mut tag = encrypt(key, nonce, aad, buffer)?;
+                    if passes == pass {
+                        match buffer.get_mut(at) {
+                            Some(byte) => *byte ^= 1,
+                            None => tag[0] ^= 1,
+                        }
+                    }
+                    passes += 1;
+                    Ok(tag)
+                };
+                let mut chunk = [7; 100];
+                assert_eq!(
+                    seal_data_checked(
+                        &KNOWN,
+                        faulty,
+                        &KNOWN.key,
+                        &KNOWN.nonce,
+                        b"note",
+                        &mut chunk
+                    ),
+                    Err(SealFailed),
+                    "pass {pass}, byte {at}"
+                );
+                assert_eq!(chunk, [0; 100]);
+            }
+        }
+    }
+
+    #[test]
     fn a_record_that_does_not_open_is_wiped() {
         for field in 0..6 {
             for at in [0, 41, PLAINTEXT_LEN - 1] {
@@ -953,7 +1341,13 @@ mod tests {
 #[cfg(kani)]
 #[coverage(on)]
 mod proofs {
-    use super::{model::rejected, open, seal};
+    use super::{
+        model::{
+            Inputs, chunk_inputs, chunk_openings, chunk_tags, digest, opened_chunk, opened_tag,
+            rejected,
+        },
+        open, open_data, seal, seal_data,
+    };
     use crate::record::{LAYER_LEN, PLAINTEXT_LEN};
 
     /// Sealing any `N` bytes: it gives a tag, or fails and leaves the buffer zero. Returns whether it
@@ -1014,5 +1408,86 @@ mod proofs {
         };
         kani::cover!(opened, "a record opens");
         kani::cover!(!opened, "a record is refused");
+    }
+
+    /// For any key, nonce, associated data and chunk of `N` bytes, whatever the cipher does:
+    /// sealing the chunk either fails and leaves it zero, or gives the tag of its first encryption
+    /// once the chunk opened under it and sealed again to that tag and to the bytes that opened,
+    /// each pass under the same key, nonce and associated data.
+    /// The chunk is the start of a buffer of 16 bytes, so that an empty one is no object of size
+    /// zero, on which Kani 0.68.0 runs out of time.
+    fn seal_chunk_of<const N: usize>() {
+        let mut buffer: [u8; 16] = kani::any();
+        let chunk = &mut buffer[..N];
+        let key = kani::any();
+        let nonce = kani::any();
+        let aad: [u8; 4] = kani::any();
+        let sealed = seal_data(&key, &nonce, &aad, chunk);
+        kani::assert(
+            sealed.is_ok() || chunk.iter().all(|&byte| byte == 0),
+            "a failed seal of a chunk leaves it zero",
+        );
+        let [first, again] = chunk_tags();
+        kani::assert(
+            sealed.is_err()
+                || (chunk_openings() == 1
+                    && !rejected()
+                    && sealed == Ok(first)
+                    && first == again
+                    && chunk_inputs() == Some(Inputs::of(&key, &nonce, &aad))
+                    && opened_tag() == first
+                    && digest(chunk) == opened_chunk()),
+            "a chunk is sealed only once it opened under its tag and sealed again to the same tag \
+             and the same bytes, each pass under the same key, nonce and associated data",
+        );
+        kani::cover!(sealed.is_ok(), "a chunk is sealed");
+        kani::cover!(
+            sealed.is_err() && chunk_openings() == 1,
+            "a chunk sealed again fails"
+        );
+    }
+
+    /// As above for a chunk of 16 bytes, of one byte and of none, which stand for every length:
+    /// this code reads their bytes only through the digest, which is exact for them.
+    #[kani::proof]
+    #[kani::unwind(270)]
+    fn a_seal_of_a_full_chunk_is_checked() {
+        seal_chunk_of::<16>();
+    }
+
+    #[kani::proof]
+    #[kani::unwind(270)]
+    fn a_seal_of_a_chunk_of_one_byte_is_checked() {
+        seal_chunk_of::<1>();
+    }
+
+    #[kani::proof]
+    #[kani::unwind(270)]
+    fn a_seal_of_an_empty_chunk_is_checked() {
+        seal_chunk_of::<0>();
+    }
+
+    /// For any key, nonce, associated data, tag and chunk of any length up to 16 bytes, and
+    /// whatever the cipher does: opening the chunk fails exactly when the cipher rejects it, and
+    /// then leaves it zero.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn a_rejected_chunk_leaves_it_wiped() {
+        let length: usize = kani::any();
+        kani::assume(length <= 16);
+        let mut buffer: [u8; 16] = kani::any();
+        let aad: [u8; 4] = kani::any();
+        let chunk = &mut buffer[..length];
+        let opened = open_data(&kani::any(), &kani::any(), &aad, chunk, &kani::any());
+        kani::assert(
+            opened.is_err() == rejected(),
+            "a chunk is refused exactly when the cipher rejects it",
+        );
+        kani::assert(
+            opened.is_ok() || chunk.iter().all(|&byte| byte == 0),
+            "a refused chunk is left zero",
+        );
+        kani::cover!(opened.is_ok() && length == 16, "a full chunk opens");
+        kani::cover!(opened.is_err() && length == 5, "a chunk is refused");
     }
 }

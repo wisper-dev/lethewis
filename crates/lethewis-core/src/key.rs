@@ -194,6 +194,14 @@ pub(crate) fn wipe<const N: usize>(bytes: &mut [u8; N]) {
     }
 }
 
+/// Wipes `bytes`, of any length.
+pub(crate) fn wipe_slice(bytes: &mut [u8]) {
+    #[cfg(not(kani))]
+    zeroize::Zeroize::zeroize(bytes);
+    #[cfg(kani)]
+    bytes.fill(0);
+}
+
 #[cfg(kani)]
 pub(crate) mod model {
     use super::{Key, KeyLength};

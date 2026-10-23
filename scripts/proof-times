@@ -1,3 +1,7 @@
+2 365 block::proofs::a_nonce_holds_the_number_and_the_mark_of_its_chunk
+25 255 block::proofs::data_of_any_length_take_the_chunks_and_the_block_their_layout_says
+2 254 block::proofs::only_the_length_of_a_block_gives_a_length_of_data
+2 335 block::proofs::the_first_match_is_found
 23 486 derive::proofs::different_derivations_have_different_labels
 26 467 keyset::proofs::a_parsed_set_builds_back_to_the_same_bytes
 13 276 keyset::proofs::a_transition_keeps_the_set_whole
@@ -7,12 +11,20 @@
 15 370 password::proofs::parameters_are_read_exactly_as_written
 9 242 password::proofs::passwords_are_taken_by_their_length
 25 520 seal::proofs::a_failed_seal_leaves_the_buffer_wiped
+5 407 seal::proofs::a_rejected_chunk_leaves_it_wiped
 6 250 seal::proofs::a_rejected_record_leaves_the_buffer_wiped
+19 998 seal::proofs::a_seal_of_a_chunk_of_one_byte_is_checked
+22 1112 seal::proofs::a_seal_of_a_full_chunk_is_checked
+18 991 seal::proofs::a_seal_of_an_empty_chunk_is_checked
+98 1743 slots::proofs::a_block_begins_under_the_primary_of_a_recorded_set
+102 3242 slots::proofs::a_block_opens_only_under_the_key_its_header_names
 122 1975 slots::proofs::a_carry_changes_no_slot_and_writes_only_when_it_succeeds
 296 4126 slots::proofs::a_carry_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds
 131 1392 slots::proofs::a_change_of_stage_in_the_first_slot
 123 1383 slots::proofs::a_change_of_stage_in_the_second_slot
 430 3875 slots::proofs::a_change_of_stage_with_a_stale_handle_changes_nothing
+144 3846 slots::proofs::a_chunk_is_sealed_under_the_key_its_block_began_with
+125 3842 slots::proofs::a_chunk_opens_only_as_the_next_of_its_block
 154 3247 slots::proofs::a_combination_loads_its_key_and_releases_both
 28 441 slots::proofs::a_combination_refuses_in_order
 457 6184 slots::proofs::a_creation_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds
@@ -30,7 +42,7 @@
 131 2840 slots::proofs::a_load_past_a_loaded_slot
 126 2071 slots::proofs::a_load_past_a_retired_slot
 430 6584 slots::proofs::a_lock_changes_no_slot_and_writes_only_when_it_succeeds
-79 3342 slots::proofs::a_long_addition_in_the_first_slot
+40 3363 slots::proofs::a_long_addition_in_the_first_slot
 160 2830 slots::proofs::a_public_key_is_read_from_its_record
 151 2403 slots::proofs::a_receipt_into_the_first_slot
 202 3420 slots::proofs::a_receipt_past_a_loaded_slot

@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""The comparison of key identifiers, and each step of the lookup of a word in the list and of the
-choice of a word by its number, run straight through on every target below: no branch, no call and
-no write of the program counter.
+"""The comparison of key identifiers and of the checks of blocks, the choice of the key a block is
+under, and each step of the lookup of a word in the list and of the choice of a word by its number,
+run straight through on every target below: no branch, no call and no write of the program counter.
 
 The core is compiled to assembly as a library, optimised, before any link-time optimisation, for
-each target, and the bodies of `KeyId::is`, `find_step` and `select_step` are read out of it.
+each target, and the bodies of `KeyId::is`, `same_check`, `first_match`, `find_step` and
+`select_step` are read out of it.
 Every instruction in each body has to be one of a set known not to move control, and on every
 target but WebAssembly, whose functions end without one, the last has to be an unconditional
 return. An instruction outside that set fails the
@@ -26,6 +27,10 @@ from pathlib import Path
 SYMBOL = re.compile(r"^(_RNv\S*13lethewis_core6derive\S*5KeyId2is):\s*$")
 FUNCTIONS = {
     "the comparison of key identifiers": SYMBOL,
+    "the comparison of the checks of blocks": re.compile(
+        r"^(_RNv\S*13lethewis_core5block10same_check):\s*$"),
+    "the choice of the key a block is under": re.compile(
+        r"^(_RNv\S*13lethewis_core5block11first_match):\s*$"),
     "a step of the lookup of a word": re.compile(r"^(_RNv\S*13lethewis_core5words9find_step):\s*$"),
     "a step of the choice of a word": re.compile(
         r"^(_RNv\S*13lethewis_core5words11select_step):\s*$"),

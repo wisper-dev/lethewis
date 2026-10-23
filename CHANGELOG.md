@@ -251,5 +251,22 @@ Nothing is published while the version is below 0.1.0.
 - Tests refuse every changed bit of the records of archive keys and of an archive, and read random
   ones sealed with the real derivations and cipher; ten thousand of each from a new seed on every
   pull request.
+- `Purpose::Data`: a key of 32 bytes that encrypts the caller's data in the library and leaves it
+  only wrapped. Only the platform's source creates it; it is stored under a stored key for wrapping,
+  in a set whose keys change by their stages, and is never exported or revealed.
+- Blocks of data: a header of `BLOCK_HEADER_LEN` bytes, a salt and a check that names the key, then
+  chunks of up to `CHUNK_LEN` bytes, each followed by a tag of `CHUNK_TAG_LEN`; `block_len` gives
+  the length of a block.
+- `Slots::begin_seal`, `Slots::seal_chunk` and `Slots::seal_last` write a block under the primary
+  key of a set a record of this epoch holds. `Slots::begin_open`, `Slots::open_chunk` and
+  `Slots::open_last` read it under the key its header names. `Sealing` and `Opening` follow a block
+  between the calls and hold no key.
+- A sealed chunk is opened and sealed again to the same tag and ciphertext before its tag is given,
+  so that a fault of the cipher in one of these passes fails the seal.
+- `Error::KeyDisabled` for a block under a disabled key, and `Error::WrongChunk` for a chunk out of
+  the order or the length of its block.
+- Proofs with Kani 0.68.0 of the layout of a block for every length, of its beginning, of each
+  chunk sealed and opened, and of the cipher on a chunk. Tests against blocks an independent
+  implementation computes, every changed bit, blocks cut, reordered and mixed, and random blocks.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main
