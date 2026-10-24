@@ -144,11 +144,22 @@ a new archive key must agree with itself, or a fault while its public key is der
 record whose archived batches could never be opened. A pair that does not makes X-Wing give the
 known answer again.
 
-A batch of history is archived to the public key the record of the archive key holds. The key of
-the batch is derived from the shared secret of an encapsulation, with its ciphertext as the salt.
+A batch of history is archived to the public key the record of the archive key holds. The library
+seals the batch itself, in chunks of 64 KiB, under a key derived from the shared secret of an
+encapsulation, with its ciphertext as the salt; that key never leaves it.
 
 The record of the archive holds that ciphertext under the key of the chat for its archive, in no
-epoch. The key of the batch comes back only with the archive key and that key of the chat.
+epoch. The body of the batch opens only with the archive key and that key of the chat, and only
+whole: data are given once every chunk has opened, and wiped when one does not.
+
+The data of a batch are sealed in a buffer of the library and only their ciphertext goes into the
+body, which may be a mapped file.
+
+When a batch is opened, a chunk goes into the data only once it has opened, and the data are wiped
+if a later one does not, so they belong in memory of the process.
+
+The context names the place of a batch, as it does for a block: the record and body of another
+batch of the same context open in its place, which only the caller's index sees.
 
 A record of the archive moves to another key of the chat without the archive key. A key of a chat
 not carried into the next epoch, with the records still under it, takes their batches with it.
@@ -220,10 +231,11 @@ both layers of the record and the keys derived for them. They do so after an exp
 refused receipt and both ends too, for the key for transfers and the key derived from it.
 
 After each call on an archive key or a record of the archive the stack is wiped 96 KiB deep, or
-224 KiB without optimisation: at least twice what each uses.
+224 KiB without optimisation, and after archiving or opening a batch 160 KiB deep, or 224 KiB: at
+least twice what each uses.
 
 Tests read it back for the seed, what X-Wing expands it to, the stored keys, the keys of chats, the
-shared secret and the key of a batch. The inner values of ML-KEM-768 and X25519 are not looked for.
+shared secret, the key of a body and the data of a batch. The inner values of ML-KEM-768 and X25519 are not looked for.
 
 The wipe on release and on creating the slots, and the refusal of a released or foreign handle, are
 proven for two slots; the statements and their limits are in [proofs.md](proofs.md).
@@ -249,7 +261,7 @@ wrapped before still does, and opens until the next epoch is committed, then onl
 platform keeps the old root.
 
 A record of the archive keeps a check of the shared secret: a batch archived to a public key other
-than its archive key's is refused when it is opened, and gives no key.
+than its archive key's is refused when it is opened, and gives no data.
 
 A key for data leaves the library only wrapped under a stored key: it is not revealed, imported,
 exported or derived from a password or words, and only the platform's source creates it.
@@ -265,9 +277,9 @@ empty position names none, and a disabled key is refused.
 Each chunk is sealed with AES-256-GCM-SIV under a key derived from the key and the salt, with the
 chunk's number and a mark of the last in its nonce, and bound to the context the caller names.
 
-Each sealed chunk is opened and sealed again to the same tag and ciphertext, as POLYVAL under a
-fixed key tells. A fault of the cipher in one of these passes fails the seal while the caller still
-holds its copy of the data; a fault alike in every pass is found only on the known input.
+Each sealed chunk, of a block or of a batch, is opened and sealed again to the same tag and
+ciphertext, as POLYVAL under a fixed key tells. A fault in one of these passes fails the seal while
+the caller still holds the data; a fault alike in every pass is found only on the known input.
 
 A chunk moved, dropped or repeated is refused, and so is a block cut short. A chunk taken from
 another block is refused when the salts differ, which the hedge keeps so within one set of slots.
@@ -291,7 +303,12 @@ a chat for its archive and the public key can write records and batches that ope
 
 Against whoever holds the key of the epoch and the key of a chat, the secrecy of a batch rests on
 the platform's random source when it is archived. With a broken source, they can work out the
-randomness of the encapsulation, and from it and the public key the key of the batch.
+randomness of the encapsulation, and from it and the public key the key of the body.
+
+A device rolled back to a snapshot with a broken source draws the same bytes again: two batches
+then share a key of the body and its nonces, and equal chunks at the same place show as equal.
+
+A body shows the length of its data to the byte and 16 bytes for each chunk.
 
 Profiles that share an epoch and a root are not kept apart: a change of epoch made from one carries
 none of the other's records, and those open no more once it is committed and the old root erased.

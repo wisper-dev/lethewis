@@ -64,9 +64,9 @@ password and the hardware secret at each unlock, and neither alone is enough.
   that holder reads already.
 - **The archive keeps batches secret but does not prove where they came from,** and their secrecy
   against whoever holds the main password rests on the random source when they are archived.
-- **A block of data shows its length, and which blocks exist is the caller's to keep.** An older
-  block put back in the same place, or a block deleted, goes unnoticed unless the caller's index of
-  its blocks catches it. Padding a block is the caller's too.
+- **A block of data or a batch of the archive shows its length, and which exist is the caller's to
+  keep.** An older block or batch put back in the same place, or one deleted, goes unnoticed unless
+  the caller's index catches it. Padding is the caller's too.
 - **A challenge to the chip is as sensitive as a hash of the password.** Whoever reads one on its
   way to the chip can test guesses at the password without the chip. Wiping it after use and
   passing it only to the chip is the caller's.

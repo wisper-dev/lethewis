@@ -60,7 +60,7 @@ mod timing;
 mod words;
 mod xwing;
 
-pub use block::{BLOCK_HEADER_LEN, CHUNK_LEN, CHUNK_TAG_LEN, block_len};
+pub use block::{BLOCK_HEADER_LEN, CHUNK_LEN, CHUNK_TAG_LEN, batch_data_len, batch_len, block_len};
 pub use entropy::{Entropy, EntropyError};
 pub use epoch::{Epoch, Erasure, Root, RootFailed};
 pub use error::Error;

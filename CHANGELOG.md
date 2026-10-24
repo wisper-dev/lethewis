@@ -229,15 +229,24 @@ Nothing is published while the version is below 0.1.0.
 - Proofs with Kani 0.68.0 for the creation, the load and the carry of an archive key, and tests
   against records computed by an independent implementation, the public key of X-Wing included.
 - Records of an archive, `ARCHIVE_RECORD_LEN` bytes, 1180: `Slots::archive` encapsulates to an
-  archive key, gives the key of the batch and writes the ciphertext and a check of the shared
-  secret under the key of a chat for its archive. `Slots::reseal_archive` moves the record to
-  another key of the chat.
-- `Slots::open_archive` gives the key of a batch back with the archive key. It fails with
-  `Error::WrongArchiveKey` for a record of another archive key and with `Error::PublicKeyMismatch`
-  for a batch archived to another public key.
+  archive key and writes the ciphertext and a check of the shared secret under the key of a chat
+  for its archive. `Slots::reseal_archive` moves the record to another key of the chat.
+- `Slots::archive` seals the data of the batch into a body of `batch_len` bytes, in chunks of
+  64 KiB, under a key derived from the shared secret that never leaves the library; the data never
+  pass through the body. A body of another length fails with `Error::WrongLength`, and any failure
+  wipes the body. A moved record opens the same body.
+- `Slots::open_archive` opens the body into data of `batch_data_len` bytes with the archive key,
+  all of it or none: a failure wipes the data. It fails with `Error::WrongArchiveKey` for a record
+  of another archive key, with `Error::PublicKeyMismatch` for a batch archived to another public
+  key, with `Error::RecordRejected` for a body no batch has, and with `Error::WrongLength` for data
+  of another length than the body holds.
+- `batch_len` and `batch_data_len` give the length of a body and of the data it holds.
+- Archiving and opening a batch need 164 KiB of stack, or 232 KiB, and are followed by a wipe
+  160 KiB deep, or 224 KiB.
 - `Slots::archive_public_key` reads the public key of an archive key, as `ArchivePublic`, from
   its record under the profile's stored key, for those slots and that epoch only. Proofs with Kani
-  0.68.0 for the four calls, and tests against records an independent implementation computes.
+  0.68.0 for the four calls and for the seal and the opening of a body, and tests against records
+  and bodies an independent implementation computes.
 - Tests check on every machine, not only on aarch64, that each call starts its derivations,
   Argon2id, ciphers and operations of X-Wing inside the switch of data-independent timing.
 - The proofs of wraps, locks, exports, the carries of lock records, the ends of exports and archive
