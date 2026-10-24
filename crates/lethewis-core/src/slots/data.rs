@@ -189,8 +189,9 @@ impl<'a> Slots<'a> {
     ///
     /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Data`], [`Error::Unsaved`] if
-    /// no record of this epoch holds it as it is now, [`Error::EntropyFailed`] if `entropy` fails,
+    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Data`], [`Error::Unfinished`]
+    /// if it came in a transfer whose end has not been received, [`Error::Unsaved`] if no record of
+    /// this epoch holds it as it is now, [`Error::EntropyFailed`] if `entropy` fails,
     /// and [`Error::DerivationFailed`] if the salt cannot be hedged or the check cannot be derived.
     /// `header` is then left as it was.
     ///
@@ -223,6 +224,9 @@ impl<'a> Slots<'a> {
         let index = self.serving(set, Purpose::Data)?;
         let Self { memory, epoch } = self;
         let slot = memory.get(index).ok_or(Error::StaleHandle)?;
+        if slot.pending.is_some() {
+            return Err(Error::Unfinished);
+        }
         if !slot.recorded {
             return Err(Error::Unsaved);
         }
@@ -371,7 +375,8 @@ impl<'a> Slots<'a> {
     ///
     /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
     /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Data`],
+    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Data`], [`Error::Unfinished`]
+    /// if it came in a transfer whose end has not been received,
     /// [`Error::RecordRejected`] if no block is `block` bytes long, [`Error::DerivationFailed`] if a
     /// check cannot be derived, [`Error::RecordRejected`] if the header names no key of the set,
     /// and [`Error::KeyDisabled`] if it names a disabled one.
@@ -401,6 +406,9 @@ impl<'a> Slots<'a> {
         let associated = AssociatedData::of_data(context).map_err(|_| Error::InvalidContext)?;
         let index = self.serving(set, Purpose::Data)?;
         let slot = self.memory.get(index).ok_or(Error::StaleHandle)?;
+        if slot.pending.is_some() {
+            return Err(Error::Unfinished);
+        }
         let len = data_len_in::<C>(block).ok_or(Error::RecordRejected)?;
         let (chunks, last) = chunks_in::<C>(len);
         let (salt, kept) = split_header(header);
@@ -554,7 +562,7 @@ impl<'a> Slots<'a> {
 }
 
 /// The salt and the check of a block's header.
-fn split_header(header: &[u8; BLOCK_HEADER_LEN]) -> ([u8; SALT_LEN], [u8; CHECK_LEN]) {
+pub(super) fn split_header(header: &[u8; BLOCK_HEADER_LEN]) -> ([u8; SALT_LEN], [u8; CHECK_LEN]) {
     let mut salt = [0; SALT_LEN];
     let mut check = [0; CHECK_LEN];
     if let Some((first, rest)) = header.split_first_chunk::<SALT_LEN>()
@@ -573,7 +581,7 @@ fn split_header(header: &[u8; BLOCK_HEADER_LEN]) -> ([u8; SALT_LEN], [u8; CHECK_
     clippy::large_stack_arrays,
     reason = "a test lays chunks out, picks bits and holds a full chunk"
 )]
-mod tests {
+pub(super) mod tests {
     extern crate std;
 
     use std::vec::Vec;
@@ -594,7 +602,7 @@ mod tests {
     use crate::timing::timed;
 
     /// Writes the bytes it was made with, over and over.
-    struct Fixed<'b>(&'b [u8]);
+    pub(in crate::slots) struct Fixed<'b>(pub(in crate::slots) &'b [u8]);
 
     impl Entropy for Fixed<'_> {
         fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
@@ -605,13 +613,13 @@ mod tests {
         }
     }
 
-    const NONCE: [u8; 12] = [
+    pub(in crate::slots) const NONCE: [u8; 12] = [
         0x05, 0x16, 0x27, 0x38, 0x49, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0xaf, 0xc0,
     ];
 
     /// Writes `data` as one block under the set `set` refers to, for `context`: the header, then
     /// each chunk followed by its tag.
-    fn seal_block<'a>(
+    pub(in crate::slots) fn seal_block<'a>(
         slots: &mut Slots<'a>,
         set: Handle<'a>,
         context: &[u8],
@@ -647,7 +655,7 @@ mod tests {
     }
 
     /// Reads `block` under the set `set` refers to, for `context`.
-    fn open_block<'a>(
+    pub(in crate::slots) fn open_block<'a>(
         slots: &Slots<'a>,
         set: Handle<'a>,
         context: &[u8],
@@ -677,7 +685,7 @@ mod tests {
 
     /// A key for data from `pattern(59, 201)` as the first draw of `slots`, wrapped under a stored
     /// key as the second, so that a record of this epoch holds it.
-    fn recorded_set<'a>(slots: &mut Slots<'a>) -> (Handle<'a>, Handle<'a>) {
+    pub(in crate::slots) fn recorded_set<'a>(slots: &mut Slots<'a>) -> (Handle<'a>, Handle<'a>) {
         let data = slots
             .generate(
                 Purpose::Data,
@@ -701,7 +709,7 @@ mod tests {
             .collect()
     }
 
-    fn pattern_of(length: usize) -> Vec<u8> {
+    pub(in crate::slots) fn pattern_of(length: usize) -> Vec<u8> {
         (0..length)
             .map(|at| {
                 u8::try_from(at % 256)

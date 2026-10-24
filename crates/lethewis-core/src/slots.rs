@@ -23,9 +23,11 @@ use crate::{
 
 mod archive;
 mod archived;
+mod carry;
 mod data;
 
 pub use archived::ArchivePublic;
+pub use carry::{Exporting, Receipt, Receiving};
 pub use data::{Opening, Sealing};
 
 /// Memory for one key set, provided by the caller: up to three keys, the stage of each, and which
@@ -57,7 +59,8 @@ pub struct Slot {
     /// The slot and generation of the key for transfers the set came under, until the end of that
     /// transfer is received.
     pending: Option<(usize, u64)>,
-    /// For a key for transfers: the tag of the last record of the export it writes or receives, or
+    /// For a key for transfers: the tag of the last record or block of the export it writes or
+    /// receives, or
     /// zero before the first.
     chain: [u8; TAG_LEN],
     /// For a key for transfers: whether it writes an export or receives one, until its end.
@@ -894,9 +897,9 @@ impl<'a> Slots<'a> {
     /// the order of the calls, until [`Slots::end_export`] ends it. The key carries this one export
     /// until then: it receives none, and releasing it abandons the export. The record holds every
     /// key of the set, disabled ones too, its stage and which key is the primary, and opens only
-    /// with that key, the same `context`, from 1 to 255 bytes, and the records before it, in any
-    /// epoch: neither a change of epoch nor a destruction afterwards reaches it. The nonce comes
-    /// from `entropy`, hedged with the key of this epoch.
+    /// with that key, the same `context`, from 1 to 255 bytes, and the records and blocks before
+    /// it, in any epoch: neither a change of epoch nor a destruction afterwards reaches it. The
+    /// nonce comes from `entropy`, hedged with the key of this epoch.
     ///
     /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
@@ -931,8 +934,8 @@ impl<'a> Slots<'a> {
     }
 
     /// Ends the export under the key for transfers that `transfer` refers to and writes its end
-    /// into `end`: it opens only after every record of the export, in order, with the same
-    /// `context`. The next record exported under the key begins a new export. The nonce comes from
+    /// into `end`: it opens only after every record and block of the export, in order, with the
+    /// same `context`. The next record or block exported under the key begins a new export. The nonce comes from
     /// `entropy`, hedged with the key of this epoch.
     ///
     /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
@@ -945,8 +948,8 @@ impl<'a> Slots<'a> {
     /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
     /// [`Error::StaleHandle`] if `transfer` does not refer to a set held here now,
     /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Transfer`],
-    /// [`Error::NoTransfer`] if the key carries no export: it has written or received no record
-    /// since its load or its last end, [`Error::Unfinished`] if it receives one,
+    /// [`Error::NoTransfer`] if the key carries no export: it has written or received no record or
+    /// block since its load or its last end, [`Error::Unfinished`] if it receives one,
     /// [`Error::EntropyFailed`] if `entropy` fails,
     /// [`Error::DerivationFailed`] if the nonce cannot be hedged or the key that encrypts the end
     /// cannot be derived, and [`Error::CipherFailed`] if the cipher gives a known input a wrong
@@ -1146,7 +1149,7 @@ impl<'a> Slots<'a> {
 
     /// Receives `record`, the next record of an export under the key for transfers that `transfer`
     /// refers to, for the `context` it was exported for, into a free slot: it opens only after the
-    /// records received under that key before it, in the order they were exported. The set comes
+    /// records and blocks received under that key before it, in the order they were exported. The set comes
     /// out with the keys, stages and primary the record holds, and is neither revealed, wrapped,
     /// exported nor changed until [`Slots::end_receive`] receives the end of the export; it may be
     /// released. The key carries this one export until then: it exports none, a receipt goes on
@@ -1166,7 +1169,7 @@ impl<'a> Slots<'a> {
     /// [`Error::NoFreeSlot`] if no slot is free, [`Error::Unfinished`] if the key writes an export,
     /// [`Error::DerivationFailed`] if a value cannot be derived from a key,
     /// [`Error::RecordRejected`] if the record does not open with that key, this context and the
-    /// records received before it, names a key other than the one that opens it or an epoch, or
+    /// records and blocks received before it, names a key other than the one that opens it or an epoch, or
     /// holds a set not for external data or a plaintext this version of the library cannot read,
     /// and [`Error::DuplicateKey`] if these slots hold a key of the set already or the set holds
     /// one key twice. No slot changes then, and the export goes on as before the call.
@@ -1212,9 +1215,9 @@ impl<'a> Slots<'a> {
     }
 
     /// Receives `end`, the end of the export under the key for transfers that `transfer` refers to,
-    /// for the `context` it was exported for: it opens only after every record of the export, in
-    /// order. The sets received under that key are then revealed, wrapped, exported and changed as
-    /// any other, and the next record received under it begins a new export.
+    /// for the `context` it was exported for: it opens only after every record and block of the
+    /// export, in order. The sets received under that key are then revealed, wrapped, exported and
+    /// changed as any other, and the next record or block received under it begins a new export.
     ///
     /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
     /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
@@ -1226,11 +1229,11 @@ impl<'a> Slots<'a> {
     /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
     /// [`Error::StaleHandle`] if `transfer` does not refer to a set held here now,
     /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Transfer`],
-    /// [`Error::NoTransfer`] if the key carries no export: it has written or received no record
-    /// since its load or its last end, [`Error::Unfinished`] if it writes one,
+    /// [`Error::NoTransfer`] if the key carries no export: it has written or received no record or
+    /// block since its load or its last end, [`Error::Unfinished`] if it writes one,
     /// [`Error::DerivationFailed`] if the key that encrypts the end cannot be derived, and
     /// [`Error::RecordRejected`] if the end does not open with that key, this context and the
-    /// records received: a record is missing or another end was given. No slot changes then, and
+    /// records and blocks received: one is missing or another end was given. No slot changes then, and
     /// the export goes on as before the call.
     pub fn end_receive(
         &mut self,

@@ -45,6 +45,8 @@ const ARCHIVE_CHECK: &[u8; 13] = b"archive check";
 const DATA_CHECK: &[u8; 10] = b"data check";
 const DATA_CHUNK: &[u8; 10] = b"data chunk";
 const HEDGE_SALT: &[u8; 10] = b"hedge salt";
+const CARRY_CHECK: &[u8; 11] = b"carry check";
+const CARRY_CHUNK: &[u8; 11] = b"carry chunk";
 /// The count of a draw, after the bytes the source gave, in the material a hedge extracts.
 const COUNT_LEN: usize = 8;
 /// How many bytes twelve words stand for.
@@ -116,6 +118,12 @@ pub(crate) enum Branch {
     DataChunk,
     /// The salt of a block of data, hedged.
     HedgeSalt,
+    /// The check in the header of a block carried under a key for transfers, which names that key,
+    /// from it and the block's salt.
+    CarryCheck,
+    /// The key that encrypts the chunks of a block carried under a key for transfers, from that key
+    /// and the block's salt.
+    CarryChunk,
 }
 
 /// The purpose each branch is derived for.
@@ -128,7 +136,7 @@ pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
         | Branch::EpochLayer
         | Branch::Combined
         | Branch::ArchiveLayer => Some(Purpose::Wrap),
-        Branch::ExportKey => Some(Purpose::Transfer),
+        Branch::ExportKey | Branch::CarryCheck | Branch::CarryChunk => Some(Purpose::Transfer),
         Branch::ArchiveKey => Some(Purpose::ArchiveWrap),
         Branch::ArchiveSeed | Branch::ArchiveData | Branch::ArchiveCheck => Some(Purpose::Archive),
         Branch::ArchiveSeal | Branch::ArchiveEncaps => Some(Purpose::ArchiveSeal),
@@ -414,6 +422,26 @@ pub(crate) fn derive_data_chunk(
     out: &mut [u8; CIPHER_KEY_LEN],
 ) -> Result<(), DerivationFailed> {
     derive(key, salt, Some(Purpose::Data), Branch::DataChunk, out)
+}
+
+/// Derives into `out` the check in the header of a block carried under the key for transfers `key`,
+/// with the block's salt `salt` as the salt.
+pub(crate) fn derive_carry_check(
+    key: &Key,
+    salt: &[u8; SALT_LEN],
+    out: &mut [u8; CHECK_LEN],
+) -> Result<(), DerivationFailed> {
+    derive(key, salt, Some(Purpose::Transfer), Branch::CarryCheck, out)
+}
+
+/// Derives the key that encrypts the chunks of a block carried under the key for transfers `key`,
+/// with the block's salt `salt` as the salt.
+pub(crate) fn derive_carry_chunk(
+    key: &Key,
+    salt: &[u8; SALT_LEN],
+    out: &mut [u8; CIPHER_KEY_LEN],
+) -> Result<(), DerivationFailed> {
+    derive(key, salt, Some(Purpose::Transfer), Branch::CarryChunk, out)
 }
 
 /// Fills `out` with the key for `purpose` that the bytes twelve words stand for, `entropy`, derive:
@@ -861,7 +889,9 @@ pub(crate) mod stack {
             | Branch::ArchiveSeal
             | Branch::ArchiveData
             | Branch::DataCheck
-            | Branch::DataChunk => 32,
+            | Branch::DataChunk
+            | Branch::CarryCheck
+            | Branch::CarryChunk => 32,
         };
         let length = u8::try_from(key.len()).unwrap();
         let (label, used) = label(purpose, length, branch, out_len).unwrap();
@@ -1448,6 +1478,8 @@ fn label(
         Branch::DataCheck => joined(head, DATA_CHECK),
         Branch::DataChunk => joined(head, DATA_CHUNK),
         Branch::HedgeSalt => joined(head, HEDGE_SALT),
+        Branch::CarryCheck => joined(head, CARRY_CHECK),
+        Branch::CarryChunk => joined(head, CARRY_CHUNK),
     }
 }
 
@@ -1480,10 +1512,10 @@ mod tests {
 
     use super::{
         ARCHIVE_CHECK, ARCHIVE_DATA, ARCHIVE_ENCAPS, ARCHIVE_KEY, ARCHIVE_LAYER, ARCHIVE_SEAL,
-        ARCHIVE_SEED, Branch, CHALLENGE, COMBINED, DATA_CHECK, DATA_CHUNK, DerivationFailed,
-        EPOCH_LAYER, EXPORT_KEY, FROM_WORDS, HEDGE_ENCAPS, HEDGE_KEY, HEDGE_NONCE, HEDGE_SALT,
-        HEDGE_WORDS, Hedged, KEY_ID, KeyId, LOCK_KEY, SALT, WRAP_KEY, derive, derive_from_words,
-        derive_key_id, hedge, label, purpose_of,
+        ARCHIVE_SEED, Branch, CARRY_CHECK, CARRY_CHUNK, CHALLENGE, COMBINED, DATA_CHECK,
+        DATA_CHUNK, DerivationFailed, EPOCH_LAYER, EXPORT_KEY, FROM_WORDS, HEDGE_ENCAPS, HEDGE_KEY,
+        HEDGE_NONCE, HEDGE_SALT, HEDGE_WORDS, Hedged, KEY_ID, KeyId, LOCK_KEY, SALT, WRAP_KEY,
+        derive, derive_from_words, derive_key_id, hedge, label, purpose_of,
     };
     use crate::entropy::{Entropy, EntropyError};
     use crate::key::{Key, KeyLength};
@@ -1877,6 +1909,8 @@ mod tests {
             Branch::DataCheck,
             Branch::DataChunk,
             Branch::HedgeSalt,
+            Branch::CarryCheck,
+            Branch::CarryChunk,
         ] {
             let (_, used) = label(purpose_of(branch), 64, branch, 32).unwrap();
             let name = match branch {
@@ -1902,6 +1936,8 @@ mod tests {
                 Branch::DataCheck => DATA_CHECK.len(),
                 Branch::DataChunk => DATA_CHUNK.len(),
                 Branch::HedgeSalt => HEDGE_SALT.len(),
+                Branch::CarryCheck => CARRY_CHECK.len(),
+                Branch::CarryChunk => CARRY_CHUNK.len(),
             };
             assert_eq!(used, 14 + name);
         }
@@ -2132,6 +2168,28 @@ pub(crate) mod proofs {
         out
     }
 
+    /// The check in the header of a carried block the model of HKDF gives from the key for transfers
+    /// `key`, its first 32 bytes, and the block's salt `salt`, worked out in the same way.
+    pub(crate) fn expected_carry_check(key: &[u8; 32], salt: &[u8; SALT_LEN]) -> [u8; CHECK_LEN] {
+        let mut out = [0; CHECK_LEN];
+        let _ = label(Some(Purpose::Transfer), 32, Branch::CarryCheck, CHECK_LEN).map(
+            |(label, used)| {
+                fold(salt, key, &label[..used], &mut out);
+            },
+        );
+        out
+    }
+
+    /// The key of the chunks of a carried block the model of HKDF gives from the key for transfers
+    /// `key` and the block's salt `salt`, worked out in the same way.
+    pub(crate) fn expected_carry_chunk(key: &[u8; 32], salt: &[u8; SALT_LEN]) -> [u8; 32] {
+        let mut out = [0; 32];
+        let _ = label(Some(Purpose::Transfer), 32, Branch::CarryChunk, 32).map(|(label, used)| {
+            fold(salt, key, &label[..used], &mut out);
+        });
+        out
+    }
+
     /// The key of a batch the model of HKDF gives from the shared secret `shared` and a ciphertext
     /// that begins with `ciphertext`, as far as the model reads it, worked out in the same way.
     pub(crate) fn expected_archive_data(shared: &[u8; 32], ciphertext: &[u8; 32]) -> [u8; 32] {
@@ -2195,7 +2253,9 @@ pub(crate) mod proofs {
             18 => Branch::ArchiveCheck,
             19 => Branch::DataCheck,
             20 => Branch::DataChunk,
-            _ => Branch::HedgeSalt,
+            21 => Branch::HedgeSalt,
+            22 => Branch::CarryCheck,
+            _ => Branch::CarryChunk,
         }
     }
 

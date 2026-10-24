@@ -40,7 +40,7 @@ aes-gcm-siv = { version = "0.12.1", default-features = false, features = [
 argon2 = { version = "0.6.0", default-features = false, features = ["zeroize"] }
 # Compares a record's parent identifier with the unwrapping key's, and words with the list, in
 # constant time.
-ctutils = { version = "0.4.2", default-features = false }
+ctutils = { version = "0.4.5", default-features = false }
 # Data-independent timing on aarch64 around the derivation and the cipher.
 lethewis-dit = { path = "../lethewis-dit", version = "0.0.0" }
 # Direct only for `zeroize`: without it the key schedule is not wiped on drop.

@@ -60,7 +60,7 @@ Nothing is published while the version is below 0.1.0.
   it, `SameKey` for a set wrapped under itself, `InvalidContext` and `CipherFailed`.
 - `DuplicateKey`: a key is held in one place only, and a load of a key the slots already hold, or of
   a set that holds one key twice, is refused.
-- Dependency: `ctutils` 0.4.2 or a later compatible version, without default features, to compare
+- Dependency: `ctutils` 0.4.5 or a later compatible version, without default features, to compare
   a record's parent identifier, and words with the list, in constant time.
 - The stack a wrap or an unwrap used is wiped after it, also when it fails: 24 KiB, or 64 KiB when
   this crate is built without optimisation or with `--cfg lethewis_unoptimised`, which a build that
@@ -268,5 +268,15 @@ Nothing is published while the version is below 0.1.0.
 - Proofs with Kani 0.68.0 of the layout of a block for every length, of its beginning, of each
   chunk sealed and opened, and of the cipher on a chunk. Tests against blocks an independent
   implementation computes, every changed bit, blocks cut, reordered and mixed, and random blocks.
+- Blocks carried to another device or into a backup: `Slots::begin_export_block`,
+  `Slots::export_chunk` and `Slots::export_last` seal each chunk of a block again under a key for
+  transfers, as the next element of its export. `Slots::begin_receive_block`, `Slots::receive_into`,
+  `Slots::receive_chunk` and `Slots::receive_last` seal it under a new set for data of that
+  transfer. No key for data leaves the library; `Exporting`, `Receipt` and `Receiving` hold no key.
+- A set of an unfinished transfer begins and reads no block, `Error::Unfinished`; a received block
+  goes into no set of another transfer, `Error::NotReceived`.
+- Proofs with Kani 0.68.0 of the beginnings, of each chunk carried out and received, and of their
+  refusals. Tests against carried blocks an independent implementation computes, every changed bit,
+  blocks out of order, dropped and mixed, data-independent timing and the stack.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

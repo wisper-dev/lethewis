@@ -20,6 +20,8 @@ pub const CHUNK_LEN: usize = 65_536;
 pub const CHUNK_TAG_LEN: usize = TAG_LEN;
 /// The label of the associated data of a chunk.
 pub(crate) const DATA_LABEL: &[u8; LABEL_LEN] = b"lethewis data block";
+/// The label of the associated data of a chunk of a block carried under a key for transfers.
+pub(crate) const CARRY_LABEL: &[u8; LABEL_LEN] = b"lethewis data carry";
 /// The version of the format of a block, in the associated data of each chunk.
 pub(crate) const VERSION: u8 = 1;
 

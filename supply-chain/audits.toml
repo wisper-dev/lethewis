@@ -688,6 +688,33 @@ compares the 1088 bytes of a ciphertext with its encryption again with ct_eq and
 shared key with ct_select. The crate holds no secrets of its own and wipes nothing. CtOption and Choice derive Debug.
 """
 
+[[audits.ctutils]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+delta = "0.4.2 -> 0.4.5"
+notes = """
+Files read: the changes to Cargo.toml, Cargo.toml.orig, README.md, src/lib.rs, src/choice.rs,
+src/ct_option.rs, src/traits/ct_gt.rs and src/traits/ct_lt.rs, and src/primitives.rs, new, in
+full. The archive matches the repository at the commit in .cargo_vcs_info.json apart from the files
+cargo generates and checkct, which the manifest excludes.
+
+Still no build script, no procedural macros, no unsafe code (lib.rs:7) and no access to the system,
+files, network or environment. Dependencies: cmov 0.5.3 as before; subtle, optional and off here,
+now needs 2.6. rust-version is 1.87.
+
+to_bool and to_u8 become const fn, both through black_box; to_bool_vartime and to_u8_vartime are
+deprecated and call them. The to_*_mask functions take the byte through to_u8 rather than the raw
+field (choice.rs:444-489). On 32-bit targets from_u128_lt and from_u128_le compare the 64-bit halves
+(choice.rs:259-304), and CtLt and CtGt for u128 now go through from_u128_lt. On ARM without
+pointer-width atomics, Choice::and and the u32 and u64 comparisons pass the bit through black_box.
+The comparison macros move from choice.rs to primitives.rs with the same arithmetic; bitlt now
+expands through bitborrow to the same expression. primitives.rs adds public borrowing subtraction,
+zero counts and overflowing addition, with no branch on the operands; nothing here calls them.
+
+ct_eq.rs, ct_assign.rs and ct_select.rs are unchanged, so the MAC check in digest, the tag check in
+aes-gcm-siv and the comparison and selection in ml-kem run the same code as in 0.4.2.
+"""
+
 [[audits.curve25519-dalek]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
