@@ -35,19 +35,6 @@ use crate::words::{
 };
 use crate::xwing::{self, CIPHERTEXT_LEN, PUBLIC_LEN, model::answered as xwing_answered};
 
-/// `seal`, as the stand-in for the cipher it is in the proofs.
-fn sealing<F, const N: usize>(seal: F) -> F
-where
-    F: FnMut(
-        &[u8; CIPHER_KEY_LEN],
-        &[u8; NONCE_LEN],
-        &[u8],
-        &mut [u8; N],
-    ) -> Result<[u8; TAG_LEN], SealFailed>,
-{
-    seal
-}
-
 type Bytes = [u8; 64];
 type Id = [u8; ID_LEN];
 /// One of each position. Keys and identifiers are kept apart rather than in one array: an array
@@ -1918,6 +1905,21 @@ impl<const N: usize> AnyCipher<N> {
         self.open(key, nonce, buffer, tag)
     }
 
+    /// [`AnyCipher::open_bound`], as the stand-in for the cipher it is in the proofs: one closure
+    /// for every proof, so that one that opens reaches it for one that never does.
+    fn opening(
+        &mut self,
+    ) -> impl FnMut(
+        &[u8; CIPHER_KEY_LEN],
+        &[u8; NONCE_LEN],
+        &[u8],
+        &mut [u8; N],
+        &[u8; TAG_LEN],
+    ) -> Result<(), Rejected>
+    + '_ {
+        |key, nonce, aad, buffer, tag| self.open_bound(key, nonce, aad, buffer, tag)
+    }
+
     fn open(
         &mut self,
         key: &[u8; CIPHER_KEY_LEN],
@@ -3036,6 +3038,14 @@ impl AnyBody {
             Ok(())
         }
     }
+
+    /// [`AnyBody::run`], as the stand-in for the sealer or opener of a body it is in the proofs:
+    /// one closure for every proof, so that one that runs it reaches it for one that never does.
+    fn running(
+        &mut self,
+    ) -> impl FnMut(&[u8; CIPHER_KEY_LEN], &[u8], &[u8], &mut [u8]) -> Result<(), Error> + '_ {
+        |key, aad, input, output| self.run(key, aad, input, output)
+    }
 }
 
 /// A key as two numbers: in Kani 0.68.0 comparing arrays whole reads bytes from before the latest
@@ -3052,14 +3062,6 @@ fn seventeen_value(bytes: &[u8; 17]) -> (u128, u8) {
     let mut head = [0; 16];
     head.copy_from_slice(&bytes[..16]);
     (u128::from_le_bytes(head), bytes[16])
-}
-
-/// `run`, as the stand-in for the sealer or opener of a body it is in the proofs.
-fn body_with<F>(run: F) -> F
-where
-    F: FnMut(&[u8; CIPHER_KEY_LEN], &[u8], &[u8], &mut [u8]) -> Result<(), Error>,
-{
-    run
 }
 
 /// Where `bytes` lie and how long they are.
@@ -3262,10 +3264,7 @@ fn an_archive_writes_only_when_it_succeeds() {
         &mut entropy,
         (data, &mut record, &mut memory_of_body),
         &xwing::KNOWN,
-        (
-            sealing(|key, nonce, aad, buffer| sealer.seal(key, nonce, aad, buffer)),
-            body_with(|key, aad, input, output| body.run(key, aad, input, output)),
-        ),
+        (sealer.sealing(), body.running()),
     );
     let draws = count.wrapping_add(u64::from(entropy.source.answered));
     kani::assert(
@@ -3401,10 +3400,7 @@ fn an_archive_seals_its_identifier_ciphertext_and_check() {
         &mut entropy,
         (&[], &mut record, &mut memory_of_body),
         &xwing::KNOWN,
-        (
-            sealing(|key, nonce, aad, buffer| sealer.seal(key, nonce, aad, buffer)),
-            body_with(|key, aad, input, output| body.run(key, aad, input, output)),
-        ),
+        (sealer.sealing(), body.running()),
     );
     let chat = snapshot_at(&before, seal.index);
     if result.is_ok() {
@@ -3482,10 +3478,7 @@ fn an_opened_archive_opens_its_body_only_under_its_archive_key() {
         context,
         (&record, &sealed_body, &mut memory_of_data),
         &xwing::KNOWN,
-        (
-            opening(|key, nonce, aad, buffer, tag| cipher.open_bound(key, nonce, aad, buffer, tag)),
-            body_with(|key, aad, input, output| body.run(key, aad, input, output)),
-        ),
+        (cipher.opening(), body.running()),
     );
     kani::assert(
         unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
@@ -7946,10 +7939,7 @@ fn buffers_of_another_length_are_refused_before_anything_else() {
         &mut entropy,
         (&[], &mut record, &mut short),
         &xwing::KNOWN,
-        (
-            sealing(|key, nonce, aad, buffer| sealer.seal(key, nonce, aad, buffer)),
-            body_with(|key, aad, input, output| body.run(key, aad, input, output)),
-        ),
+        (sealer.sealing(), body.running()),
     );
     let chat = snapshot_at(&before, seal.index);
     kani::assert(
@@ -7995,20 +7985,14 @@ fn buffers_of_another_length_are_refused_before_anything_else() {
         context,
         (&original, &impossible, &mut data),
         &xwing::KNOWN,
-        (
-            opening(|key, nonce, aad, buffer, tag| cipher.open_bound(key, nonce, aad, buffer, tag)),
-            body_with(|key, aad, input, output| opener.run(key, aad, input, output)),
-        ),
+        (cipher.opening(), opener.running()),
     );
     let unopened = slots.open_archive_on_stack(
         (archive, seal),
         context,
         (&original, &whole, &mut short_data),
         &xwing::KNOWN,
-        (
-            opening(|key, nonce, aad, buffer, tag| cipher.open_bound(key, nonce, aad, buffer, tag)),
-            body_with(|key, aad, input, output| opener.run(key, aad, input, output)),
-        ),
+        (cipher.opening(), opener.running()),
     );
     let (first, second) = if context.is_empty() {
         (Error::InvalidContext, Error::InvalidContext)
