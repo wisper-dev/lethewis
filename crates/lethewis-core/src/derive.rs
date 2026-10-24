@@ -40,7 +40,7 @@ const ARCHIVE_SEED: &[u8; 12] = b"archive seed";
 const ARCHIVE_SEAL: &[u8; 12] = b"archive seal";
 const HEDGE_ENCAPS: &[u8; 12] = b"hedge encaps";
 const ARCHIVE_ENCAPS: &[u8; 14] = b"archive encaps";
-const ARCHIVE_DATA: &[u8; 12] = b"archive data";
+const ARCHIVE_BATCH: &[u8; 13] = b"archive batch";
 const ARCHIVE_CHECK: &[u8; 13] = b"archive check";
 const DATA_CHECK: &[u8; 10] = b"data check";
 const DATA_CHUNK: &[u8; 10] = b"data chunk";
@@ -106,8 +106,8 @@ pub(crate) enum Branch {
     HedgeEncaps,
     /// The randomness of an encapsulation, from hedged bytes and a key of a chat for its archive.
     ArchiveEncaps,
-    /// The key of a batch, from a shared secret of X-Wing.
-    ArchiveData,
+    /// The key of the body of a batch, from a shared secret of X-Wing.
+    ArchiveBatch,
     /// The check of a shared secret of X-Wing that a record of an archive holds.
     ArchiveCheck,
     /// The check in the header of a block of data, which names the key of a set the block is
@@ -138,7 +138,7 @@ pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
         | Branch::ArchiveLayer => Some(Purpose::Wrap),
         Branch::ExportKey | Branch::CarryCheck | Branch::CarryChunk => Some(Purpose::Transfer),
         Branch::ArchiveKey => Some(Purpose::ArchiveWrap),
-        Branch::ArchiveSeed | Branch::ArchiveData | Branch::ArchiveCheck => Some(Purpose::Archive),
+        Branch::ArchiveSeed | Branch::ArchiveBatch | Branch::ArchiveCheck => Some(Purpose::Archive),
         Branch::ArchiveSeal | Branch::ArchiveEncaps => Some(Purpose::ArchiveSeal),
         Branch::DataCheck | Branch::DataChunk => Some(Purpose::Data),
         Branch::KeyId
@@ -372,9 +372,9 @@ pub(crate) fn derive_archive_randomness(
     )
 }
 
-/// Derives the key of a batch from the shared secret of X-Wing `shared`, with the ciphertext it
-/// came with as the salt.
-pub(crate) fn derive_archive_data(
+/// Derives the key that seals the chunks of the body of a batch from the shared secret of X-Wing
+/// `shared`, with the ciphertext it came with as the salt.
+pub(crate) fn derive_archive_batch(
     shared: &Key,
     ciphertext: &[u8; CIPHERTEXT_LEN],
     out: &mut [u8; 32],
@@ -383,7 +383,7 @@ pub(crate) fn derive_archive_data(
         shared,
         ciphertext,
         Some(Purpose::Archive),
-        Branch::ArchiveData,
+        Branch::ArchiveBatch,
         out,
     )
 }
@@ -887,7 +887,7 @@ pub(crate) mod stack {
             | Branch::ArchiveLayer
             | Branch::ArchiveSeed
             | Branch::ArchiveSeal
-            | Branch::ArchiveData
+            | Branch::ArchiveBatch
             | Branch::DataCheck
             | Branch::DataChunk
             | Branch::CarryCheck
@@ -1473,7 +1473,7 @@ fn label(
         Branch::ArchiveSeal => joined(head, ARCHIVE_SEAL),
         Branch::HedgeEncaps => joined(head, HEDGE_ENCAPS),
         Branch::ArchiveEncaps => joined(head, ARCHIVE_ENCAPS),
-        Branch::ArchiveData => joined(head, ARCHIVE_DATA),
+        Branch::ArchiveBatch => joined(head, ARCHIVE_BATCH),
         Branch::ArchiveCheck => joined(head, ARCHIVE_CHECK),
         Branch::DataCheck => joined(head, DATA_CHECK),
         Branch::DataChunk => joined(head, DATA_CHUNK),
@@ -1511,7 +1511,7 @@ mod tests {
     use sha2::Sha256;
 
     use super::{
-        ARCHIVE_CHECK, ARCHIVE_DATA, ARCHIVE_ENCAPS, ARCHIVE_KEY, ARCHIVE_LAYER, ARCHIVE_SEAL,
+        ARCHIVE_BATCH, ARCHIVE_CHECK, ARCHIVE_ENCAPS, ARCHIVE_KEY, ARCHIVE_LAYER, ARCHIVE_SEAL,
         ARCHIVE_SEED, Branch, CARRY_CHECK, CARRY_CHUNK, CHALLENGE, COMBINED, DATA_CHECK,
         DATA_CHUNK, DerivationFailed, EPOCH_LAYER, EXPORT_KEY, FROM_WORDS, HEDGE_ENCAPS, HEDGE_KEY,
         HEDGE_NONCE, HEDGE_SALT, HEDGE_WORDS, Hedged, KEY_ID, KeyId, LOCK_KEY, SALT, WRAP_KEY,
@@ -1904,7 +1904,7 @@ mod tests {
             Branch::ArchiveSeal,
             Branch::HedgeEncaps,
             Branch::ArchiveEncaps,
-            Branch::ArchiveData,
+            Branch::ArchiveBatch,
             Branch::ArchiveCheck,
             Branch::DataCheck,
             Branch::DataChunk,
@@ -1931,7 +1931,7 @@ mod tests {
                 Branch::ArchiveSeal => ARCHIVE_SEAL.len(),
                 Branch::HedgeEncaps => HEDGE_ENCAPS.len(),
                 Branch::ArchiveEncaps => ARCHIVE_ENCAPS.len(),
-                Branch::ArchiveData => ARCHIVE_DATA.len(),
+                Branch::ArchiveBatch => ARCHIVE_BATCH.len(),
                 Branch::ArchiveCheck => ARCHIVE_CHECK.len(),
                 Branch::DataCheck => DATA_CHECK.len(),
                 Branch::DataChunk => DATA_CHUNK.len(),
@@ -2190,11 +2190,11 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The key of a batch the model of HKDF gives from the shared secret `shared` and a ciphertext
+    /// The key of a body the model of HKDF gives from the shared secret `shared` and a ciphertext
     /// that begins with `ciphertext`, as far as the model reads it, worked out in the same way.
-    pub(crate) fn expected_archive_data(shared: &[u8; 32], ciphertext: &[u8; 32]) -> [u8; 32] {
+    pub(crate) fn expected_archive_batch(shared: &[u8; 32], ciphertext: &[u8; 32]) -> [u8; 32] {
         let mut out = [0; 32];
-        let _ = label(Some(Purpose::Archive), 32, Branch::ArchiveData, 32).map(|(label, used)| {
+        let _ = label(Some(Purpose::Archive), 32, Branch::ArchiveBatch, 32).map(|(label, used)| {
             fold(ciphertext, shared, &label[..used], &mut out);
         });
         out
@@ -2249,7 +2249,7 @@ pub(crate) mod proofs {
             14 => Branch::ArchiveSeal,
             15 => Branch::HedgeEncaps,
             16 => Branch::ArchiveEncaps,
-            17 => Branch::ArchiveData,
+            17 => Branch::ArchiveBatch,
             18 => Branch::ArchiveCheck,
             19 => Branch::DataCheck,
             20 => Branch::DataChunk,

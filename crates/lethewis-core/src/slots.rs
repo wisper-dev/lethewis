@@ -23,6 +23,7 @@ use crate::{
 
 mod archive;
 mod archived;
+mod batch;
 mod carry;
 mod data;
 
@@ -247,9 +248,8 @@ impl fmt::Debug for Handle<'_> {
 /// Key sets held in slots provided by the caller.
 ///
 /// A key goes in, and only a handle to its set comes out: no call returns a key itself except
-/// [`Slots::reveal32`], and only a key for external data. [`Slots::archive`] and
-/// [`Slots::open_archive`] give the key of a batch, derived for the caller. A key is held in one
-/// place only, whatever its purpose: a load that would hold a key these slots already hold is
+/// [`Slots::reveal32`], and only a key for external data. A key is held in one place only,
+/// whatever its purpose: a load that would hold a key these slots already hold is
 /// refused. Each profile needs an epoch and a root of its own: a change of epoch carries only the
 /// records it is made with, and the other records of an epoch open no more once it is committed and
 /// the old root erased.

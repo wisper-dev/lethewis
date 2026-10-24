@@ -20,7 +20,7 @@ pub enum Error {
     /// this version of the library cannot read, or names a key other than the one that opens it;
     /// or X-Wing refuses the public key of an archive key; or no block has the length given, the
     /// header of a block names no key of the set, or a chunk does not open as the next of its
-    /// block.
+    /// block; or no body of a batch has the length given, or a chunk of it does not open.
     RecordRejected,
     /// A key set cannot wrap itself.
     SameKey,
@@ -65,7 +65,7 @@ pub enum Error {
     InvalidChecksum,
     /// The key set serves a purpose the call does not take.
     WrongPurpose,
-    /// The purpose takes no key of this length.
+    /// The purpose takes no key of this length, or a buffer is not as long as the call takes.
     WrongLength,
     /// The set is not of the level the call takes: a key from a secret wraps only stored keys, for
     /// wrapping or of the archive; a stored key for wrapping wraps only keys for external data, keys

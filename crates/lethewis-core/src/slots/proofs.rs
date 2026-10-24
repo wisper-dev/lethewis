@@ -15,7 +15,7 @@ use crate::derive::{
     Branch,
     model::{any_failed, failed, id_bytes, id_from_bytes, runs},
     proofs::{
-        expected_archive_check, expected_archive_data, expected_archive_key,
+        expected_archive_batch, expected_archive_check, expected_archive_key,
         expected_archive_layer_key, expected_archive_randomness, expected_archive_seal_key,
         expected_carry_check, expected_carry_chunk, expected_challenge, expected_combined,
         expected_data_check, expected_data_chunk, expected_export_key, expected_hedge,
@@ -34,19 +34,6 @@ use crate::words::{
     proofs::{any_list, expected_words},
 };
 use crate::xwing::{self, CIPHERTEXT_LEN, PUBLIC_LEN, model::answered as xwing_answered};
-
-/// `seal`, as the stand-in for the cipher it is in the proofs.
-fn sealing<F, const N: usize>(seal: F) -> F
-where
-    F: FnMut(
-        &[u8; CIPHER_KEY_LEN],
-        &[u8; NONCE_LEN],
-        &[u8],
-        &mut [u8; N],
-    ) -> Result<[u8; TAG_LEN], SealFailed>,
-{
-    seal
-}
 
 type Bytes = [u8; 64];
 type Id = [u8; ID_LEN];
@@ -1918,6 +1905,21 @@ impl<const N: usize> AnyCipher<N> {
         self.open(key, nonce, buffer, tag)
     }
 
+    /// [`AnyCipher::open_bound`], as the stand-in for the cipher it is in the proofs: one closure
+    /// for every proof, so that one that opens reaches it for one that never does.
+    fn opening(
+        &mut self,
+    ) -> impl FnMut(
+        &[u8; CIPHER_KEY_LEN],
+        &[u8; NONCE_LEN],
+        &[u8],
+        &mut [u8; N],
+        &[u8; TAG_LEN],
+    ) -> Result<(), Rejected>
+    + '_ {
+        |key, nonce, aad, buffer, tag| self.open_bound(key, nonce, aad, buffer, tag)
+    }
+
     fn open(
         &mut self,
         key: &[u8; CIPHER_KEY_LEN],
@@ -2986,6 +2988,87 @@ impl<const N: usize> AnySeal<N> {
     }
 }
 
+/// Any sealer or opener of the body of a batch: it writes any bytes into its output, succeeds or
+/// fails at will as `failure`, and keeps what it was given: the key, the associated data, and
+/// where its input and output lie and how long they are.
+struct AnyBody {
+    calls: usize,
+    key: [u8; CIPHER_KEY_LEN],
+    aad: Bound,
+    input: (usize, usize),
+    output: (usize, usize),
+    written: [u8; 17],
+    failure: Error,
+    failed: bool,
+}
+
+impl AnyBody {
+    fn new(failure: Error) -> Self {
+        Self {
+            calls: 0,
+            key: [0; CIPHER_KEY_LEN],
+            aad: Bound::none(),
+            input: (0, 0),
+            output: (0, 0),
+            written: [0; 17],
+            failure,
+            failed: false,
+        }
+    }
+
+    fn run(
+        &mut self,
+        key: &[u8; CIPHER_KEY_LEN],
+        aad: &[u8],
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), Error> {
+        (self.key, self.aad) = (*key, Bound::of(aad));
+        self.input = (input.as_ptr().addr(), input.len());
+        self.output = (output.as_ptr().addr(), output.len());
+        // One copy, not a loop: a loop over a buffer of a length known only at run time unwinds
+        // to the bound of the whole proof.
+        self.written = kani::any();
+        output.copy_from_slice(&self.written[..output.len()]);
+        self.failed = kani::any();
+        self.calls = self.calls.saturating_add(1);
+        if self.failed {
+            Err(self.failure)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// [`AnyBody::run`], as the stand-in for the sealer or opener of a body it is in the proofs:
+    /// one closure for every proof, so that one that runs it reaches it for one that never does.
+    fn running(
+        &mut self,
+    ) -> impl FnMut(&[u8; CIPHER_KEY_LEN], &[u8], &[u8], &mut [u8]) -> Result<(), Error> + '_ {
+        |key, aad, input, output| self.run(key, aad, input, output)
+    }
+}
+
+/// A key as two numbers: in Kani 0.68.0 comparing arrays whole reads bytes from before the latest
+/// write.
+fn key_value(key: &[u8; CIPHER_KEY_LEN]) -> (u128, u128) {
+    let mut halves = ([0; 16], [0; 16]);
+    halves.0.copy_from_slice(&key[..16]);
+    halves.1.copy_from_slice(&key[16..]);
+    (u128::from_le_bytes(halves.0), u128::from_le_bytes(halves.1))
+}
+
+/// The first 16 of 17 bytes as a number, and the last, for the same reason.
+fn seventeen_value(bytes: &[u8; 17]) -> (u128, u8) {
+    let mut head = [0; 16];
+    head.copy_from_slice(&bytes[..16]);
+    (u128::from_le_bytes(head), bytes[16])
+}
+
+/// Where `bytes` lie and how long they are.
+fn place(bytes: &[u8]) -> (usize, usize) {
+    (bytes.as_ptr().addr(), bytes.len())
+}
+
 /// Any source, which keeps what it gave the first time.
 struct FirstKept {
     source: AnyEntropy,
@@ -3129,15 +3212,17 @@ fn a_public_key_is_read_from_its_record() {
 
 /// From any state of two slots and of the epoch, with a change to the next under way or not,
 /// for a handle of these slots naming any slot and generation, any public key read for any slots
-/// and epoch, any context of up to two bytes and any outputs, whatever the platform's source,
-/// X-Wing and the cipher do: archiving changes no slot and no epoch but its count of draws. It
-/// refuses an empty context, a stale handle, a set not of a chat for its archive, a public key of
-/// other slots or another epoch and a wrong answer of X-Wing before it draws, then a failed
-/// source; `DerivationFailed` is a failed derivation, `RecordRejected` a public key X-Wing
-/// refuses and `CipherFailed` a failed seal, each and only that. It writes its outputs only when
-/// it succeeds: after two draws, the randomness given to X-Wing with the public key is the hedge
-/// of the first under the key of this epoch, derived under the key of the chat, and the key of
-/// the batch is derived from the shared secret, with the ciphertext as the salt.
+/// and epoch, any context of up to two bytes, data of one byte, their body of 17 and any record,
+/// whatever the platform's source, X-Wing, the cipher and the sealer of the body do: archiving
+/// changes no slot and no epoch but its count of draws. It refuses an empty context, a stale
+/// handle, a set not of a chat for its archive, a public key of other slots or another epoch and a
+/// wrong answer of X-Wing before it draws, then a failed source; `DerivationFailed` is a failed derivation, `RecordRejected` a public key
+/// X-Wing refuses and `CipherFailed` a failed seal of the record or of the body, each and only
+/// that. It writes the record only when it succeeds, and wipes the body when it fails: after two
+/// draws, the randomness given to X-Wing with the public key is the hedge of the first under the
+/// key of this epoch, derived under the key of the chat, and the body is sealed once, from the
+/// data into the body, under the key derived from the shared secret, with the ciphertext as the
+/// salt, and the associated data of a batch of the context.
 #[kani::proof]
 #[kani::unwind(1181)]
 fn an_archive_writes_only_when_it_succeeds() {
@@ -3163,19 +3248,23 @@ fn an_archive_writes_only_when_it_succeeds() {
     let context_bytes: [u8; 2] = kani::any();
     let context = any_context(&context_bytes);
     let original: [u8; ARCHIVE_RECORD_LEN] = kani::any();
-    let original_key: [u8; 32] = kani::any();
-    let (mut record, mut data_key) = (original, original_key);
+    let mut record = original;
+    let mut memory_of_body: [u8; 17] = kani::any();
+    let body_at = place(&memory_of_body);
+    let data_bytes: [u8; 1] = kani::any();
+    let data: &[u8] = &data_bytes;
     let mut entropy = FirstKept::new();
     let mut sealer = AnySeal::<ARCHIVED_LEN>::new();
+    let mut body = AnyBody::new(Error::CipherFailed);
 
     let result = slots.archive_on_stack(
         seal,
         &public,
         context,
         &mut entropy,
-        (&mut record, &mut data_key),
+        (data, &mut record, &mut memory_of_body),
         &xwing::KNOWN,
-        sealing(|key, nonce, aad, buffer| sealer.seal(key, nonce, aad, buffer)),
+        (sealer.sealing(), body.running()),
     );
     let draws = count.wrapping_add(u64::from(entropy.source.answered));
     kani::assert(
@@ -3203,33 +3292,46 @@ fn an_archive_writes_only_when_it_succeeds() {
         } else if xwing::model::refused() {
             result == Err(Error::RecordRejected) && sealer.calls == 0
         } else if sealer.failed {
+            result == Err(Error::CipherFailed) && body.calls == 0
+        } else if body.failed {
             result == Err(Error::CipherFailed)
         } else {
             result.is_ok()
         },
         "archiving refuses a bad context, a stale handle, a set not of a chat for its archive, \
          a public key of other slots or another epoch and a wrong answer of X-Wing before it \
-         draws, then a failed source, a failed derivation, a refused public key and a failed seal",
+         draws, then a failed source, a failed derivation, a refused public key, a failed seal of \
+         the record and one of the body",
     );
-    if result.is_ok() {
-        let hedged = expected_hedge(&epoch_key, count, Branch::HedgeEncaps, &entropy.first);
-        let mut drawn = [0; 12];
-        drawn.copy_from_slice(&entropy.source.written[..12]);
+    if body.calls != 0 {
         let (shared, ciphertext) = (xwing::model::shared(), xwing::model::ciphertext_head());
         kani::assert(
+            body.calls == 1
+                && key_value(&body.key) == key_value(&expected_archive_batch(&shared, &ciphertext))
+                && body.aad == batch_bound(context)
+                && body.input == place(data)
+                && body.output == body_at,
+            "the body is sealed once, from the data into the body, under the key derived from \
+             the shared secret and the ciphertext and with the associated data of a batch",
+        );
+    }
+    if result.is_ok() {
+        let hedged = expected_hedge(&epoch_key, count, Branch::HedgeEncaps, &entropy.first);
+        kani::assert(
             asked == 2
+                && body.calls == 1
                 && xwing::model::randomness()
                     == expected_archive_randomness(&key_head(&chat), &hedged)
                 && xwing::model::public_head()[..] == public.public[..32]
-                && data_key == expected_archive_data(&shared, &ciphertext),
+                && seventeen_value(&memory_of_body) == seventeen_value(&body.written),
             "an archive encapsulates to its public key with the randomness hedged with the key \
-             of this epoch and derived under the key of the chat, and gives the key of the \
-             batch derived from the shared secret and the ciphertext",
+             of this epoch and derived under the key of the chat, and its body is the one the \
+             sealer wrote",
         );
     } else {
         kani::assert(
-            same(&record, &original) && data_key == original_key,
-            "an archive that fails writes nothing",
+            same(&record, &original) && seventeen_value(&memory_of_body) == (0, 0),
+            "an archive that fails writes no record and wipes the body",
         );
     }
     kani::cover!(result.is_ok(), "a batch is archived");
@@ -3248,6 +3350,10 @@ fn an_archive_writes_only_when_it_succeeds() {
     kani::cover!(
         result == Err(Error::CipherFailed) && sealer.failed,
         "the seal fails"
+    );
+    kani::cover!(
+        result == Err(Error::CipherFailed) && body.failed,
+        "the seal of the body fails"
     );
     kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
     kani::cover!(result == Err(Error::DerivationFailed), "a derivation fails");
@@ -3281,20 +3387,20 @@ fn an_archive_seals_its_identifier_ciphertext_and_check() {
     };
     let context_bytes: [u8; 2] = kani::any();
     let context = any_context(&context_bytes);
-    let original: [u8; ARCHIVE_RECORD_LEN] = kani::any();
-    let original_key: [u8; 32] = kani::any();
-    let (mut record, mut data_key) = (original, original_key);
+    let mut record: [u8; ARCHIVE_RECORD_LEN] = kani::any();
+    let mut memory_of_body: [u8; 16] = kani::any();
     let mut entropy = FirstKept::new();
     let mut sealer = AnySeal::<ARCHIVED_LEN>::new();
+    let mut body = AnyBody::new(Error::CipherFailed);
 
     let result = slots.archive_on_stack(
         seal,
         &public,
         context,
         &mut entropy,
-        (&mut record, &mut data_key),
+        (&[], &mut record, &mut memory_of_body),
         &xwing::KNOWN,
-        sealing(|key, nonce, aad, buffer| sealer.seal(key, nonce, aad, buffer)),
+        (sealer.sealing(), body.running()),
     );
     let chat = snapshot_at(&before, seal.index);
     if result.is_ok() {
@@ -3335,18 +3441,19 @@ fn an_archive_seals_its_identifier_ciphertext_and_check() {
 }
 
 /// From any state of two slots and of the epoch, for handles of these slots naming any slots
-/// and generations, any record of an archive, any context of up to two bytes and any output,
-/// whatever X-Wing and the cipher do: opening a record of an archive changes no slot and no
-/// epoch. It refuses an empty context, then for each handle in turn a stale one and a set not
-/// of its purpose, then a wrong answer of X-Wing, before it decrypts. It opens the record once,
-/// under the key of the chat, with the record's nonce, ciphertext and tag and the associated
-/// data of the context, as `RecordRejected` unless the cipher accepts it, and as
-/// `WrongArchiveKey`, decapsulating nothing, unless it names the archive key. Then it gives the
-/// seed and the ciphertext to X-Wing, refuses as `PublicKeyMismatch` a check that is not the
-/// shared secret's, and writes the key of the batch only when it succeeds.
+/// and generations, any record of an archive, any context of up to two bytes, a body of 17 bytes
+/// and its data of one, whatever X-Wing, the cipher and the opener of the body do: opening a batch
+/// changes no slot and no epoch. It refuses an empty context, then for each handle in turn a stale
+/// one and a set not of its purpose, then a wrong answer of X-Wing, before it decrypts. It opens the record once, under the key of the chat, with the
+/// record's nonce, ciphertext and tag and the associated data of the context, as
+/// `RecordRejected` unless the cipher accepts it, and as `WrongArchiveKey`, decapsulating
+/// nothing, unless it names the archive key. Then it gives the seed and the ciphertext to X-Wing,
+/// refuses as `PublicKeyMismatch` a check that is not the shared secret's, and opens the body
+/// once, into the data, under the key derived from the shared secret, with the ciphertext as the
+/// salt, and the associated data of a batch of the context. Data not opened are wiped.
 #[kani::proof]
 #[kani::unwind(1181)]
-fn an_opened_archive_gives_its_key_only_under_its_archive_key() {
+fn an_opened_archive_opens_its_body_only_under_its_archive_key() {
     let mut memory = [any_slot(), any_slot()];
     let id = memory.as_ptr().addr();
     let mut epoch = any_epoch(kani::any());
@@ -3360,16 +3467,18 @@ fn an_opened_archive_gives_its_key_only_under_its_archive_key() {
     let context_bytes: [u8; 2] = kani::any();
     let context = any_context(&context_bytes);
     let record: [u8; ARCHIVE_RECORD_LEN] = kani::any();
-    let original_key: [u8; 32] = kani::any();
-    let mut data_key = original_key;
+    let sealed_body: [u8; 17] = kani::any();
+    let mut memory_of_data: [u8; 1] = kani::any();
+    let data_at = place(&memory_of_data);
     let mut cipher = AnyCipher::<ARCHIVED_LEN>::new();
+    let mut body = AnyBody::new(Error::RecordRejected);
 
     let result = slots.open_archive_on_stack(
         (archive, seal),
         context,
-        (&record, &mut data_key),
+        (&record, &sealed_body, &mut memory_of_data),
         &xwing::KNOWN,
-        opening(|key, nonce, aad, buffer, tag| cipher.open_bound(key, nonce, aad, buffer, tag)),
+        (cipher.opening(), body.running()),
     );
     kani::assert(
         unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
@@ -3412,14 +3521,16 @@ fn an_opened_archive_gives_its_key_only_under_its_archive_key() {
         } else if any_failed() {
             result == Err(Error::DerivationFailed)
         } else if !checked {
-            result == Err(Error::PublicKeyMismatch)
+            result == Err(Error::PublicKeyMismatch) && body.calls == 0
+        } else if body.failed {
+            result == Err(Error::RecordRejected)
         } else {
             result.is_ok()
         },
-        "opening refuses a bad context, stale handles, sets of other purposes and a wrong \
-         answer of X-Wing before it decrypts, then a record the key of the chat does not \
-         open, one of another archive key, a failed derivation and a check not of the shared \
-         secret",
+        "opening refuses a bad context, stale handles, sets of other purposes and a wrong answer \
+         of X-Wing before it decrypts, then a record the key of the chat does not open, one of \
+         another archive key, a failed derivation, a check not of the shared secret and a body \
+         that does not open",
     );
     kani::assert(
         cipher.calls <= 1
@@ -3432,21 +3543,37 @@ fn an_opened_archive_gives_its_key_only_under_its_archive_key() {
         "the record is opened once, under the key of the chat, with its nonce, ciphertext and \
          tag and the associated data of the context",
     );
+    if body.calls != 0 {
+        kani::assert(
+            body.calls == 1
+                && xwing::model::seed() == key_head(&archived)
+                && xwing::model::ciphertext_head() == ciphertext
+                && key_value(&body.key) == key_value(&expected_archive_batch(&shared, &ciphertext))
+                && body.aad == batch_bound(context)
+                && body.input == place(&sealed_body)
+                && body.output == data_at,
+            "the body is opened once, into the data, under the key derived from the shared \
+             secret the seed gives the ciphertext of the record, with that ciphertext as the \
+             salt, and with the associated data of a batch",
+        );
+    }
     if result.is_ok() {
         kani::assert(
-            xwing::model::seed() == key_head(&archived)
-                && xwing::model::ciphertext_head() == ciphertext
-                && data_key == expected_archive_data(&shared, &ciphertext),
-            "the key of the batch is derived from the shared secret the seed gives the \
-             ciphertext of the record, with that ciphertext as the salt",
+            body.calls == 1 && memory_of_data[0] == body.written[0],
+            "opened data are the ones the opener of the body wrote",
         );
     } else {
         kani::assert(
-            data_key == original_key,
-            "an opening that fails writes nothing",
+            memory_of_data == [0],
+            "an opening that fails wipes the data",
         );
     }
     kani::cover!(result.is_ok(), "a batch is opened");
+    kani::cover!(
+        result == Err(Error::RecordRejected) && body.failed,
+        "a body that does not open is refused"
+    );
+
     kani::cover!(
         result == Err(Error::WrongArchiveKey),
         "a record of another archive key is refused"
@@ -7394,5 +7521,509 @@ fn a_received_block_needs_a_free_slot_for_a_new_set() {
     kani::cover!(
         error == Some(Error::NoFreeSlot),
         "a new set needs a free slot"
+    );
+}
+
+/// The associated data of a chunk of the body of a batch bound to `context`, of up to two bytes,
+/// written out from the layout: the label, the version, the length of the context, and the
+/// context.
+fn batch_bound(context: &[u8]) -> Bound {
+    let mut bytes = [0; seal::model::AAD_HEAD];
+    bytes[..19].copy_from_slice(b"lethewis data batch");
+    bytes[19] = 1;
+    bytes[20] = u8::try_from(context.len()).unwrap_or(0);
+    bytes[21] = context.first().copied().unwrap_or(0);
+    bytes[22] = context.get(1).copied().unwrap_or(0);
+    Bound {
+        bytes,
+        length: context.len().wrapping_add(21),
+    }
+}
+
+/// What a cipher on a chunk of a body of chunks of 16 bytes was given and gave in one call: where
+/// the key and the associated data lay, the nonce, the chunk, its length and where it lay, what the
+/// cipher wrote and the tag. Places, not copies, and copies, not loops: a loop over bytes would
+/// unwind the loop over the chunks as far.
+#[derive(Clone, Copy)]
+struct ChunkCall {
+    key: usize,
+    aad: (usize, usize),
+    nonce: [u8; NONCE_LEN],
+    given: [u8; 16],
+    length: usize,
+    at: usize,
+    written: [u8; 16],
+    tag: [u8; TAG_LEN],
+    failed: bool,
+}
+
+/// Any cipher on up to three chunks of 16 bytes: it writes any bytes, and gives any tag or fails,
+/// or accepts or refuses, at will, and keeps what each call was given.
+struct ChunkCalls {
+    calls: usize,
+    made: [ChunkCall; 3],
+}
+
+impl ChunkCalls {
+    fn new() -> Self {
+        let call = ChunkCall {
+            key: 0,
+            aad: (0, 0),
+            nonce: [0; NONCE_LEN],
+            given: [0; 16],
+            length: 0,
+            at: 0,
+            written: [0; 16],
+            tag: [0; TAG_LEN],
+            failed: false,
+        };
+        Self {
+            calls: 0,
+            made: [call; 3],
+        }
+    }
+
+    fn take(
+        &mut self,
+        key: &[u8; CIPHER_KEY_LEN],
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        buffer: &mut [u8],
+        tag: [u8; TAG_LEN],
+    ) -> bool {
+        let (at, length) = (buffer.as_ptr().addr(), buffer.len());
+        let (mut given, written): ([u8; 16], [u8; 16]) = ([0; 16], kani::any());
+        given[..length].copy_from_slice(buffer);
+        buffer.copy_from_slice(&written[..length]);
+        let failed = kani::any();
+        self.made[self.calls] = ChunkCall {
+            key: key.as_ptr().addr(),
+            aad: place(aad),
+            nonce: *nonce,
+            given,
+            length,
+            at,
+            written,
+            tag,
+            failed,
+        };
+        self.calls = self.calls.saturating_add(1);
+        failed
+    }
+
+    fn seal(
+        &mut self,
+        key: &[u8; CIPHER_KEY_LEN],
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        buffer: &mut [u8],
+    ) -> Result<[u8; TAG_LEN], SealFailed> {
+        let tag = kani::any();
+        if self.take(key, nonce, aad, buffer, tag) {
+            Err(SealFailed)
+        } else {
+            Ok(tag)
+        }
+    }
+
+    fn open(
+        &mut self,
+        key: &[u8; CIPHER_KEY_LEN],
+        nonce: &[u8; NONCE_LEN],
+        aad: &[u8],
+        buffer: &mut [u8],
+        tag: &[u8; TAG_LEN],
+    ) -> Result<(), Rejected> {
+        if self.take(key, nonce, aad, buffer, *tag) {
+            Err(Rejected)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The first call that failed, if any did, read at constant indexes.
+    fn failure(&self) -> Option<usize> {
+        if self.calls > 0 && self.made[0].failed {
+            Some(0)
+        } else if self.calls > 1 && self.made[1].failed {
+            Some(1)
+        } else if self.calls > 2 && self.made[2].failed {
+            Some(2)
+        } else {
+            None
+        }
+    }
+}
+
+/// Sixteen bytes of `bytes` from `at`, those past `length` taken as zero, as a number: read in one
+/// copy, and compared as numbers, since in Kani 0.68.0 comparing arrays whole reads bytes from
+/// before the latest write.
+fn piece_at(bytes: &[u8], at: usize, length: usize) -> u128 {
+    let mut piece = [0; 16];
+    piece.copy_from_slice(&bytes[at..at + 16]);
+    let value = u128::from_le_bytes(piece);
+    if length >= 16 {
+        value
+    } else {
+        value & ((1 << (8 * length)) - 1)
+    }
+}
+
+/// A nonce as a number, for the same reason.
+fn nonce_value(nonce: &[u8; NONCE_LEN]) -> u128 {
+    let mut padded = [0; 16];
+    padded[..NONCE_LEN].copy_from_slice(nonce);
+    u128::from_le_bytes(padded)
+}
+
+/// Whether `bytes` and `original` hold the same from `at` on, sixteen bytes at a time.
+fn same_from<const N: usize>(bytes: &[u8; N], original: &[u8; N], at: usize) -> bool {
+    (0..N / 16).all(|piece| {
+        16 * piece < at || piece_at(bytes, 16 * piece, 16) == piece_at(original, 16 * piece, 16)
+    })
+}
+
+/// For any key, associated data of up to two bytes, data of up to 48 bytes, a body of up to 96
+/// and whatever the cipher does: sealing the body refuses as `WrongLength` a body not as long as
+/// the chunks of 16 bytes of the data with their tags, before the cipher and writing nothing.
+/// Otherwise it seals each chunk in turn, under the key, the nonce of its number and of whether
+/// it is the last and the associated data, in a buffer that is not the body, and stops at the
+/// first that fails, as `CipherFailed`. Each chunk sealed is in the body as the cipher wrote it,
+/// followed by its tag, and the body past them is as it was.
+#[kani::proof]
+#[kani::unwind(8)]
+fn a_body_is_sealed_chunk_by_chunk_outside_it() {
+    let key: [u8; CIPHER_KEY_LEN] = kani::any();
+    let aad_bytes: [u8; 2] = kani::any();
+    let aad = any_context(&aad_bytes);
+    // Sixteen bytes more than the data and the body take, so that a piece is read in one copy.
+    let data_bytes: [u8; 64] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= 48);
+    let data = &data_bytes[..len];
+    let original: [u8; 112] = kani::any();
+    let mut memory = original;
+    let length: usize = kani::any();
+    kani::assume(length <= 96);
+    let start = memory.as_ptr().addr();
+    let mut cipher = ChunkCalls::new();
+
+    let result = super::batch::seal_batch_in::<16>(
+        &key,
+        aad,
+        data,
+        &mut memory[..length],
+        chunk_sealing(|key, nonce, aad, buffer| cipher.seal(key, nonce, aad, buffer)),
+    );
+    let (chunks, last) = chunks_in::<16>(len as u64);
+    let (chunks, last) = (chunks as usize, last as usize);
+    let failed = cipher.failure();
+    kani::assert(
+        if length != len + 16 * chunks {
+            result == Err(Error::WrongLength) && cipher.calls == 0
+        } else if let Some(failed) = failed {
+            result == Err(Error::CipherFailed) && cipher.calls == failed + 1
+        } else {
+            result.is_ok() && cipher.calls == chunks
+        },
+        "a body of another length is refused before the cipher, and the seal stops at the first \
+         chunk that fails",
+    );
+    // A constant index in each round: a field of an element read at an index known only at run
+    // time fails falsely in Kani 0.68.0.
+    for index in 0..3 {
+        if index >= cipher.calls {
+            continue;
+        }
+        let call = cipher.made[index];
+        let take = if index + 1 == chunks { last } else { 16 };
+        kani::assert(
+            call.key == key.as_ptr().addr()
+                && call.aad == place(aad)
+                && nonce_value(&call.nonce)
+                    == nonce_value(&nonce_of(index as u64, index + 1 == chunks))
+                && call.length == take
+                && piece_at(&call.given, 0, take) == piece_at(&data_bytes, 16 * index, take)
+                && (call.at < start || call.at >= start + 112),
+            "each chunk is sealed in turn under the key, the nonce of its number and of whether \
+             it is the last and the associated data, outside the body",
+        );
+    }
+    let sealed = if result.is_ok() {
+        chunks
+    } else {
+        failed.unwrap_or(0)
+    };
+    for index in 0..3 {
+        if index >= sealed {
+            continue;
+        }
+        let call = cipher.made[index];
+        let take = if index + 1 == chunks { last } else { 16 };
+        kani::assert(
+            piece_at(&memory, 32 * index, take) == piece_at(&call.written, 0, take)
+                && piece_at(&memory, 32 * index + take, 16) == u128::from_le_bytes(call.tag),
+            "each chunk sealed is in the body as the cipher wrote it, followed by its tag",
+        );
+    }
+    if result.is_err() {
+        kani::assert(
+            same_from(&memory, &original, 32 * sealed),
+            "past the chunks sealed, the body is as it was",
+        );
+    }
+    kani::cover!(result.is_ok() && len == 0, "empty data are sealed");
+    kani::cover!(result.is_ok() && len == 16, "one full chunk is sealed");
+    kani::cover!(result.is_ok() && len == 33, "three chunks are sealed");
+    kani::cover!(result.is_ok() && len == 48, "three full chunks are sealed");
+    kani::cover!(
+        failed == Some(2),
+        "the seal of the last of three chunks fails"
+    );
+    kani::cover!(
+        failed == Some(1) && chunks == 3,
+        "the seal of the middle chunk fails"
+    );
+    kani::cover!(
+        result == Err(Error::WrongLength),
+        "a body of another length"
+    );
+}
+
+/// For any key, associated data of up to two bytes, a body of up to 96 bytes, data of up to 48
+/// and whatever the cipher does: opening the body refuses, before the cipher and writing nothing,
+/// a body of a length no body has, as `RecordRejected`, and data not as long as it holds, as
+/// `WrongLength`. Otherwise it opens each chunk in turn, under the key, the nonce of its number and
+/// of whether it is the last and the associated data, with the tag that follows it, in a buffer
+/// that is not the data, and stops at the first the cipher refuses, as `RecordRejected`. Each
+/// chunk that opened is in the data as the cipher wrote it, and the data past them are as they
+/// were.
+#[kani::proof]
+#[kani::unwind(8)]
+fn a_body_opens_chunk_by_chunk_outside_its_data() {
+    let key: [u8; CIPHER_KEY_LEN] = kani::any();
+    let aad_bytes: [u8; 2] = kani::any();
+    let aad = any_context(&aad_bytes);
+    // Sixteen bytes more than the body and the data take, as above.
+    let body_bytes: [u8; 112] = kani::any();
+    let length: usize = kani::any();
+    kani::assume(length <= 96);
+    let body = &body_bytes[..length];
+    let original: [u8; 64] = kani::any();
+    let mut memory = original;
+    let len: usize = kani::any();
+    kani::assume(len <= 48);
+    let start = memory.as_ptr().addr();
+    let mut cipher = ChunkCalls::new();
+
+    let result = super::batch::open_batch_in::<16>(
+        &key,
+        aad,
+        body,
+        &mut memory[..len],
+        chunk_opening(|key, nonce, aad, buffer, tag| cipher.open(key, nonce, aad, buffer, tag)),
+    );
+    let held = crate::block::body_data_len_in::<16>(length as u64);
+    let (chunks, last) = chunks_in::<16>(len as u64);
+    let (chunks, last) = (chunks as usize, last as usize);
+    let failed = cipher.failure();
+    kani::assert(
+        if held.is_none() {
+            result == Err(Error::RecordRejected) && cipher.calls == 0
+        } else if held != Some(len as u64) {
+            result == Err(Error::WrongLength) && cipher.calls == 0
+        } else if let Some(failed) = failed {
+            result == Err(Error::RecordRejected) && cipher.calls == failed + 1
+        } else {
+            result.is_ok() && cipher.calls == chunks
+        },
+        "a body of no length a body has and data of another length are refused before the \
+         cipher, and the opening stops at the first chunk refused",
+    );
+    // A constant index in each round: a field of an element read at an index known only at run
+    // time fails falsely in Kani 0.68.0.
+    for index in 0..3 {
+        if index >= cipher.calls {
+            continue;
+        }
+        let call = cipher.made[index];
+        let take = if index + 1 == chunks { last } else { 16 };
+        kani::assert(
+            call.key == key.as_ptr().addr()
+                && call.aad == place(aad)
+                && nonce_value(&call.nonce)
+                    == nonce_value(&nonce_of(index as u64, index + 1 == chunks))
+                && call.length == take
+                && piece_at(&call.given, 0, take) == piece_at(&body_bytes, 32 * index, take)
+                && u128::from_le_bytes(call.tag) == piece_at(&body_bytes, 32 * index + take, 16)
+                && (call.at < start || call.at >= start + 64),
+            "each chunk is opened in turn under the key, the nonce of its number and of whether \
+             it is the last and the associated data, with the tag that follows it, outside the \
+             data",
+        );
+    }
+    let opened = if result.is_ok() {
+        chunks
+    } else {
+        failed.unwrap_or(0)
+    };
+    for index in 0..3 {
+        if index >= opened {
+            continue;
+        }
+        let take = if index + 1 == chunks { last } else { 16 };
+        kani::assert(
+            piece_at(&memory, 16 * index, take) == piece_at(&cipher.made[index].written, 0, take),
+            "each chunk that opened is in the data as the cipher wrote it",
+        );
+    }
+    if result.is_err() {
+        kani::assert(
+            same_from(&memory, &original, 16 * opened),
+            "past the chunks that opened, the data are as they were",
+        );
+    }
+    kani::cover!(result.is_ok() && len == 0, "empty data are opened");
+    kani::cover!(result.is_ok() && len == 33, "three chunks are opened");
+    kani::cover!(result.is_ok() && len == 48, "three full chunks are opened");
+    kani::cover!(failed == Some(2), "the last of three chunks is refused");
+    kani::cover!(
+        failed == Some(1) && chunks == 3,
+        "the middle chunk is refused"
+    );
+    kani::cover!(
+        result == Err(Error::RecordRejected) && cipher.calls == 0,
+        "a body of a length no body has"
+    );
+    kani::cover!(result == Err(Error::WrongLength), "data of another length");
+}
+
+/// From any state of two slots and of the epoch, for handles of these slots naming any slots and
+/// generations, any public key read for any slots and epoch, any context of up to two bytes and
+/// any record: archiving empty data into a body of 15 bytes, and opening a body of 15 bytes into
+/// one byte or a body of 17 bytes into two, change no slot and no epoch. After the refusals of a context, the
+/// handles and, for archiving, the public key, in order, they are refused for the length, before
+/// X-Wing, any draw and any decryption, writing no record and wiping the body or the data.
+#[kani::proof]
+#[kani::unwind(1181)]
+fn buffers_of_another_length_are_refused_before_anything_else() {
+    let mut memory = [any_slot(), any_slot()];
+    let id = memory.as_ptr().addr();
+    let mut epoch = any_epoch(kani::any());
+    let mut slots = Slots {
+        memory: &mut memory,
+        epoch: &mut epoch,
+    };
+    let epoch_before = epoch_snapshot(&slots);
+    let before = snapshots(&slots);
+    let (archive, seal) = (forged(id), forged(id));
+    let public = ArchivePublic {
+        id: kani::any(),
+        public: kani::any(),
+        slots: kani::any(),
+        epoch: kani::any(),
+        memory: PhantomData,
+    };
+    let context_bytes: [u8; 2] = kani::any();
+    let context = any_context(&context_bytes);
+    let original: [u8; ARCHIVE_RECORD_LEN] = kani::any();
+    let mut record = original;
+    let mut short: [u8; 15] = kani::any();
+    let mut entropy = AnyEntropy::new();
+    let mut sealer = AnySeal::<ARCHIVED_LEN>::new();
+    let mut body = AnyBody::new(Error::CipherFailed);
+    let archived = slots.archive_on_stack(
+        seal,
+        &public,
+        context,
+        &mut entropy,
+        (&[], &mut record, &mut short),
+        &xwing::KNOWN,
+        (sealer.sealing(), body.running()),
+    );
+    let chat = snapshot_at(&before, seal.index);
+    kani::assert(
+        if context.is_empty() {
+            archived == Err(Error::InvalidContext)
+        } else if !names_loaded(&before, &seal) {
+            archived == Err(Error::StaleHandle)
+        } else if chat.purpose != Purpose::ArchiveSeal {
+            archived == Err(Error::WrongPurpose)
+        } else if public.slots != id || public.epoch != epoch_before.0 {
+            archived == Err(Error::StaleRecord)
+        } else {
+            archived == Err(Error::WrongLength)
+        },
+        "archiving refuses a body of another length after the context, the handle and the \
+         public key",
+    );
+    kani::assert(
+        entropy.calls == 0
+            && sealer.calls == 0
+            && body.calls == 0
+            && same(&record, &original)
+            && short == [0; 15],
+        "a refused archive draws nothing, seals nothing, writes no record and wipes the body",
+    );
+    let refusal = |handle: &Handle<'_>, purpose| {
+        if !names_loaded(&before, handle) {
+            Some(Error::StaleHandle)
+        } else if snapshot_at(&before, handle.index).purpose != purpose {
+            Some(Error::WrongPurpose)
+        } else {
+            None
+        }
+    };
+    let refused =
+        refusal(&archive, Purpose::Archive).or_else(|| refusal(&seal, Purpose::ArchiveSeal));
+    let mut cipher = AnyCipher::<ARCHIVED_LEN>::new();
+    let mut opener = AnyBody::new(Error::RecordRejected);
+    let (impossible, whole): ([u8; 15], [u8; 17]) = (kani::any(), kani::any());
+    let (mut data, mut short_data): ([u8; 1], [u8; 2]) = (kani::any(), kani::any());
+    let opened = slots.open_archive_on_stack(
+        (archive, seal),
+        context,
+        (&original, &impossible, &mut data),
+        &xwing::KNOWN,
+        (cipher.opening(), opener.running()),
+    );
+    let unopened = slots.open_archive_on_stack(
+        (archive, seal),
+        context,
+        (&original, &whole, &mut short_data),
+        &xwing::KNOWN,
+        (cipher.opening(), opener.running()),
+    );
+    let (first, second) = if context.is_empty() {
+        (Error::InvalidContext, Error::InvalidContext)
+    } else if let Some(error) = refused {
+        (error, error)
+    } else {
+        (Error::RecordRejected, Error::WrongLength)
+    };
+    kani::assert(
+        opened == Err(first) && unopened == Err(second),
+        "opening refuses a body no batch has and data of another length after the context and \
+         the handles",
+    );
+    kani::assert(
+        cipher.calls == 0
+            && opener.calls == 0
+            && data[0] == 0
+            && short_data[0] == 0
+            && short_data[1] == 0,
+        "a refused opening decrypts nothing and wipes the data",
+    );
+    kani::assert(
+        unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
+        "refusals change no slot and no epoch",
+    );
+    kani::cover!(
+        archived == Err(Error::WrongLength),
+        "a body of another length archives nothing"
+    );
+    kani::cover!(
+        opened == Err(Error::RecordRejected) && unopened == Err(Error::WrongLength),
+        "a body no batch has and data of another length open nothing"
     );
 }

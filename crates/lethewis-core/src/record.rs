@@ -206,6 +206,16 @@ impl AssociatedData {
         Self::labelled(crate::block::DATA_LABEL, crate::block::VERSION, context)
     }
 
+    /// The associated data of a chunk of the body of a batch of an archive: its own label and
+    /// version, the length of the context, and the context.
+    pub(crate) fn of_batch(context: &[u8]) -> Result<Self, InvalidContext> {
+        Self::labelled(
+            crate::block::BATCH_LABEL,
+            crate::block::BATCH_VERSION,
+            context,
+        )
+    }
+
     fn labelled(
         label_of: &[u8; LABEL_LEN],
         version: u8,

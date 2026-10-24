@@ -577,6 +577,8 @@ mod tests {
         ARCHIVE_BODY_LEN, ARCHIVE_KEY_RECORD_LEN, PUBLIC_LEN, join_body, open_archive_layer,
         seal_archive_layer, seed_of, split_body,
     };
+    use sha2::{Digest, Sha256};
+
     use crate::derive::{KeyId, derive_archive_key, derive_archive_layer_key, derive_key_id};
     use crate::key::Key;
     use crate::key::tests::{Counting, Random, from_environment};
@@ -589,7 +591,7 @@ mod tests {
     use crate::xwing::{self, wrong_known};
     use crate::{
         ARCHIVE_RECORD_LEN, Entropy, EntropyError, Epoch, Erasure, Error, Handle, KeyLength,
-        Position, Purpose, RECORD_LEN, Root, RootFailed, Slot, Slots, seal,
+        Position, Purpose, RECORD_LEN, Root, RootFailed, Slot, Slots, batch_len, seal,
     };
 
     struct Platform;
@@ -1587,7 +1589,7 @@ mod tests {
         "7a52a98a8dfdf6551ccf74e33394f795cff7ef166ce217a054cc9fe6994b8dbe",
         "87618af444dc3ff099d8556423f9b072d88e370a6342884d0f",
     );
-    const KNOWN_DATA_KEY: &str = "ba34462d533d6e56240e071de9f8bddbcad2f84ed47bb5302beabd72218ba99f";
+    const KNOWN_BODY: &str = "7de2f6af97689cf9ab32556741b06d73f3f5ad45e7d10dbe93302d7f0e7993ed";
     const KNOWN_ARCHIVED: &str = concat!(
         "1550e151dd86770fb739bab0756873bacddd76f929e8ab4fcd5a9fd4a6634b75",
         "87329bfe1ffdaffc7052e20c9aca10bd5a7d6d424320e8388798f8f1a3c966ef",
@@ -1667,6 +1669,47 @@ mod tests {
         "8d1db027ec36b65217c411a6f7cef4a8762609e3afc9545a7fd98494",
     );
 
+    const KNOWN_EMPTY: &str = concat!(
+        "b3fa92991346d40688ad54554e4f4a9e2476c59d23078f808351a388b3e54a54",
+        "44a60269e65ea0de4718e26ca4e89d84d7fa0ac60c350a30ac597023dd1fb0c5",
+        "519c7f326f5af102b6848383b29ec5ffa6131eaac4bdb72903c1a12ffe1ced8d",
+        "5625fc7293f07bde613f244d67129a2f4e146811d2204f68d205aa27ccdd8bc8",
+        "472918a2aaded1ec75271757c433267e32b74470da40a5b9aa2a016f46339d25",
+        "9760c6518b0dddb055a380d08e8fe62bfbd0d8c158f7ad2fc040a1fa8c34810c",
+        "24cb16701f367afc53379bb1dac10b9d7c5996e7778ebc398482cc520452757d",
+        "75eed0ac01e695504e87447553ff5aab080d46cd53329c09614e5615c7fd3613",
+        "ea98c692c02da352daefdba77a49f8f4508d08f4837b24f8fc4701f8fe76b9c7",
+        "35ff05c32cd6ab4e89c081b50e6cc3431be99b8ef2acff18b116d00a94f68bb0",
+        "d81582c02a5a9c4fa1bc6e575d9c7654bd29561be0d9bf15eaad160b7b85f8ac",
+        "f27957916572a6307ba5fa008c18aa7155b006281d2d01fc409bfa710781f2e4",
+        "18ea75b97fd29736edbd055d07e53f3716420f0119b044b833e1f66742fa46aa",
+        "2b41061d3fdcf0a164a232d5aa65ed121e67c709ec34e61ae6bc1a17c30ef1e1",
+        "70e5487da4a21686f01aa407f0a416fd747e540cdf0a7766180bd3015e47e8f0",
+        "20c1703663ccd496b35d9b06ad1e3a0e478fea4a0cd393feb2f9c3542abdb52c",
+        "6ba20ebd5c1f5259d3724640a8620ac6f1cb86df887c85578ec0ab1f2516e351",
+        "202b80c24b3a15aa3373393eb80b6aede6817c39b5707910abb2eefc53edf40e",
+        "610662e5cf74bcad949b43bf9ede42f733699cff45d690c0a7524ce9b28383bf",
+        "99ffebd954d7a46c23def266c85e5b66aa9028c9554bbe11b39504799cb458c0",
+        "2449840ee2fc0ee221059c8eb1e7cf3d8db7f518cee103f2b7b611ed2f5e4861",
+        "350155c14b97101105799b3e6283e642763034c47a5abf773d7eb4679716a86e",
+        "7a2686e1d988ff8bcf2dd1851696790f8ff67a0bb996addb095edce63b7c32c2",
+        "2860f30de7d007c265fc78ebb0a57a02ee320deed899693cf4043083838903de",
+        "650346871c6b77f0a25af071e57fc365e487c5936c3f0b7a5f38dafd417d187a",
+        "0fabf05fddb76523dc69e657c517b0905223bb9d4ff23b74e9f500df7b49d855",
+        "9c2f2e5a9bbba37ae4deeed122e6b0ad8164deb9665521a192dc59ea9687d525",
+        "968a4ade110d6d3275c320107e72fcdcf2c59b9c8d5947412890a0eb7f653258",
+        "63596a0cecc8c086ef68606b5a00e0d2012a84d0efbb32bf6bbaa5ccbbb07850",
+        "56e886433872d8994025faf70449a79ed4c9e38edbcf44d686877561321f3fc2",
+        "a44f05d43bcdfead6811210b4df7368fde767f25ade9a0c419692da6927a1931",
+        "c5a3956a86af435eba445a846e06c31a09abc3e1f8a6f45cedb9a740641d99df",
+        "02b0fc8b240025005e3e86808f27acad95e9c732d9b17544d3994cc36458cd49",
+        "be93153a61dabe32f1abafc64194380b40f42e8b4c9706b078cdfbb1c6da35bd",
+        "451ccd5d2eb51f9046b88e4ea82cb36d21ab83892a68a46f41b1e2bd4ecc1e1e",
+        "c008d2f59931633785f3e3c0236763bd0e237d042f5ab47893888447bb444338",
+        "012ddd49e7c42f31f7de45be31f59f12a40fdfed6b8634ba4b47dc56",
+    );
+    const KNOWN_EMPTY_BODY: &str = "043d95a211fe0e6b5a9838b7e94b324d";
+
     /// Gives `pattern(17, 5)` for a draw of any length.
     struct Pattern;
 
@@ -1683,6 +1726,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one test follows an archive key from its creation to an empty batch"
+    )]
     fn records_of_the_archive_match_ones_computed_independently() {
         let mut memory = [const { Slot::empty() }; 6];
         let mut epoch_memory = Epoch::empty();
@@ -1734,19 +1781,29 @@ mod tests {
         let public = slots
             .archive_public_key(profile, b"archive", &created)
             .unwrap();
-        let (mut archived, mut data_key) = ([0; ARCHIVE_RECORD_LEN], [0; 32]);
+        let data: std::vec::Vec<u8> = (0..131_073_u32)
+            .map(|at| {
+                u8::try_from(at % 256)
+                    .unwrap()
+                    .wrapping_mul(97)
+                    .wrapping_add(13)
+            })
+            .collect();
+        let length = usize::try_from(batch_len(131_073).unwrap()).unwrap();
+        let (mut archived, mut body) = ([0; ARCHIVE_RECORD_LEN], std::vec![0; length]);
         slots
             .archive(
                 chat,
                 &public,
                 b"chat",
                 &mut Pattern,
+                &data,
                 &mut archived,
-                &mut data_key,
+                &mut body,
             )
             .unwrap();
-        assert_eq!(data_key, archive_hex(KNOWN_DATA_KEY));
         assert_eq!(archived, archive_hex(KNOWN_ARCHIVED));
+        assert_eq!(Sha256::digest(&body)[..], archive_hex::<32>(KNOWN_BODY));
         let other = slots
             .generate(Purpose::ArchiveSeal, KeyLength::Bytes32, &mut Pattern)
             .unwrap();
@@ -1758,11 +1815,28 @@ mod tests {
         let key = slots
             .load_archive_key(store, profile, b"archive", &created)
             .unwrap();
-        let mut opened = [0; 32];
+        let mut opened = std::vec![0; data.len()];
         slots
-            .open_archive(key, other, b"chat", &moved, &mut opened)
+            .open_archive(key, other, b"chat", &moved, &body, &mut opened)
             .unwrap();
-        assert_eq!(opened, data_key);
+        assert_eq!(opened, data);
+        let (mut empty, mut empty_body) = ([0; ARCHIVE_RECORD_LEN], [0; 16]);
+        slots
+            .archive(
+                other,
+                &public,
+                b"chat",
+                &mut Pattern,
+                &[],
+                &mut empty,
+                &mut empty_body,
+            )
+            .unwrap();
+        assert_eq!(empty, archive_hex(KNOWN_EMPTY));
+        assert_eq!(empty_body, archive_hex(KNOWN_EMPTY_BODY));
+        slots
+            .open_archive(key, other, b"chat", &empty, &empty_body, &mut [])
+            .unwrap();
     }
 }
 

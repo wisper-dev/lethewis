@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The layout of a block of data: a header of a salt and a check, then the data in chunks, each
-//! followed by its tag.
+//! followed by its tag. The body of a batch of an archive is the same chunks without the header.
 
 use crate::record::LABEL_LEN;
 use crate::seal::{NONCE_LEN, TAG_LEN};
@@ -22,16 +22,26 @@ pub const CHUNK_TAG_LEN: usize = TAG_LEN;
 pub(crate) const DATA_LABEL: &[u8; LABEL_LEN] = b"lethewis data block";
 /// The label of the associated data of a chunk of a block carried under a key for transfers.
 pub(crate) const CARRY_LABEL: &[u8; LABEL_LEN] = b"lethewis data carry";
+/// The label of the associated data of a chunk of the body of a batch of an archive.
+pub(crate) const BATCH_LABEL: &[u8; LABEL_LEN] = b"lethewis data batch";
 /// The version of the format of a block, in the associated data of each chunk.
 pub(crate) const VERSION: u8 = 1;
+/// The version of the format of the body of a batch, in the associated data of each chunk.
+pub(crate) const BATCH_VERSION: u8 = 1;
+
+/// The length of the chunks of `C` bytes that data of `len` bytes take, each followed by its tag;
+/// `None` past what a number of 64 bits holds.
+pub(crate) const fn body_len_in<const C: usize>(len: u64) -> Option<u64> {
+    let Some(tags) = chunks_in::<C>(len).0.checked_mul(TAG_LEN as u64) else {
+        return None;
+    };
+    len.checked_add(tags)
+}
 
 /// The length of a block whose chunks hold `C` bytes each and whose data are `len` bytes long: the
 /// header, the data, and a tag for each chunk; `None` past what a number of 64 bits holds.
 pub(crate) const fn block_len_in<const C: usize>(len: u64) -> Option<u64> {
-    let Some(tags) = chunks_in::<C>(len).0.checked_mul(TAG_LEN as u64) else {
-        return None;
-    };
-    match len.checked_add(tags) {
+    match body_len_in::<C>(len) {
         Some(body) => body.checked_add(BLOCK_HEADER_LEN as u64),
         None => None,
     }
@@ -54,6 +64,12 @@ pub(crate) const fn data_len_in<const C: usize>(block: u64) -> Option<u64> {
     let Some(body) = block.checked_sub(BLOCK_HEADER_LEN as u64) else {
         return None;
     };
+    body_data_len_in::<C>(body)
+}
+
+/// The length of the data that chunks of `C` bytes with their tags hold in `body` bytes, if chunks
+/// the library writes take that many.
+pub(crate) const fn body_data_len_in<const C: usize>(body: u64) -> Option<u64> {
     let whole = (C as u64).saturating_add(TAG_LEN as u64);
     // A chunk and its tag take `whole` bytes; the last chunk takes at least its tag.
     let Some(past_tags) = body.checked_sub(TAG_LEN as u64) else {
@@ -62,7 +78,7 @@ pub(crate) const fn data_len_in<const C: usize>(block: u64) -> Option<u64> {
     let Some(count) = past_tags.checked_div(whole) else {
         return None;
     };
-    // At most the bytes of a block over 32, so one more fits.
+    // At most the bytes of the chunks over 32, so one more fits.
     let count = count.saturating_add(1);
     let Some(tags) = count.checked_mul(TAG_LEN as u64) else {
         return None;
@@ -70,8 +86,8 @@ pub(crate) const fn data_len_in<const C: usize>(block: u64) -> Option<u64> {
     let Some(len) = body.checked_sub(tags) else {
         return None;
     };
-    match block_len_in::<C>(len) {
-        Some(again) if again == block => Some(len),
+    match body_len_in::<C>(len) {
+        Some(again) if again == body => Some(len),
         _ => None,
     }
 }
@@ -82,6 +98,21 @@ pub(crate) const fn data_len_in<const C: usize>(block: u64) -> Option<u64> {
 #[must_use]
 pub const fn block_len(len: u64) -> Option<u64> {
     block_len_in::<CHUNK_LEN>(len)
+}
+
+/// The length of the body of a batch of an archive whose data are `len` bytes long, or `None` past
+/// what a number of 64 bits holds: the data, and [`CHUNK_TAG_LEN`] for each chunk of up to
+/// [`CHUNK_LEN`] bytes, one chunk at least.
+#[must_use]
+pub const fn batch_len(len: u64) -> Option<u64> {
+    body_len_in::<CHUNK_LEN>(len)
+}
+
+/// The length of the data the body of a batch of `body` bytes holds, or `None` if no body of a
+/// batch is that long.
+#[must_use]
+pub const fn batch_data_len(body: u64) -> Option<u64> {
+    body_data_len_in::<CHUNK_LEN>(body)
 }
 
 /// Whether two checks are equal, compared in constant time. Kept out of line, so that the check of
@@ -216,14 +247,16 @@ mod model {
 #[coverage(on)]
 mod proofs {
     use super::{
-        BLOCK_HEADER_LEN, CHUNK_LEN, block_len_in, chunk_nonce, chunks_in, data_len_in, first_match,
+        BLOCK_HEADER_LEN, CHUNK_LEN, block_len_in, body_data_len_in, body_len_in, chunk_nonce,
+        chunks_in, data_len_in, first_match,
     };
 
     /// For data of any length, in chunks of 64 KiB, and of 16 bytes as the proofs of the calls
     /// take: they take at least one chunk, each but the last full, and the last holds the rest,
-    /// from 1 byte to a whole chunk, or none for empty data; the block is the header, the data and
-    /// a tag for each chunk, unless that does not fit in 64 bits, and it gives back the length of
-    /// its data. Worked out in numbers of 128 bits, apart from the code.
+    /// from 1 byte to a whole chunk, or none for empty data; the body of a batch is the data and a
+    /// tag for each chunk, and the block the header and that body, unless it does not fit in 64
+    /// bits, and each gives back the length of its data. Worked out in numbers of 128 bits, apart
+    /// from the code.
     #[kani::proof]
     fn data_of_any_length_take_the_chunks_and_the_block_their_layout_says() {
         layout::<CHUNK_LEN>();
@@ -242,7 +275,24 @@ mod proofs {
             "every chunk but the last is full, and the last holds the rest, or nothing for empty \
              data",
         );
-        let whole = BLOCK_HEADER_LEN as u128 + u128::from(len) + 16 * u128::from(count);
+        let body = u128::from(len) + 16 * u128::from(count);
+        match body_len_in::<C>(len) {
+            Some(batch) => {
+                kani::assert(
+                    u128::from(batch) == body,
+                    "the body of a batch is its data and a tag for each chunk",
+                );
+                kani::assert(
+                    body_data_len_in::<C>(batch) == Some(len),
+                    "the body of a batch gives back the length of its data",
+                );
+            }
+            None => kani::assert(
+                body > u128::from(u64::MAX),
+                "only a body too long for 64 bits has no length",
+            ),
+        }
+        let whole = BLOCK_HEADER_LEN as u128 + body;
         match block_len_in::<C>(len) {
             Some(block) => {
                 kani::assert(
@@ -262,13 +312,18 @@ mod proofs {
         kani::cover!(count == 2 && last == 1, "two chunks, the last of one byte");
         kani::cover!(count == 1 && u128::from(last) == chunk, "one full chunk");
         kani::cover!(
-            block_len_in::<C>(len).is_none(),
-            "a length too long for a block"
+            block_len_in::<C>(len).is_none() && body_len_in::<C>(len).is_some(),
+            "a length too long for a block but not for the body of a batch"
+        );
+        kani::cover!(
+            body_len_in::<C>(len).is_none(),
+            "a length too long for the body of a batch"
         );
     }
 
-    /// For any length of a block, in chunks of 64 KiB and of 16 bytes, the length of data it gives
-    /// is one whose block has exactly that length: a length no block has gives none.
+    /// For any length of a block or of the body of a batch, in chunks of 64 KiB and of 16 bytes,
+    /// the length of data it gives is one whose block or body has exactly that length: a length no
+    /// block or body has gives none.
     #[kani::proof]
     fn only_the_length_of_a_block_gives_a_length_of_data() {
         lengths::<CHUNK_LEN>();
@@ -296,6 +351,19 @@ mod proofs {
             "a length shorter than any block"
         );
         kani::cover!(len.is_some() && block > 1 << 40, "a long block");
+        let body: u64 = kani::any();
+        let held = body_data_len_in::<C>(body);
+        if let Some(held) = held {
+            kani::assert(
+                body_len_in::<C>(held) == Some(body),
+                "the length of data the body of a batch gives makes a body of that length",
+            );
+        }
+        kani::cover!(held == Some(0), "the body of empty data");
+        kani::cover!(
+            held.is_none() && body > one - 48 && body < one - 31,
+            "a length between the body of one chunk and two that no body has"
+        );
     }
 
     /// The nonce of any chunk holds its number, least significant byte first, three zero bytes and
