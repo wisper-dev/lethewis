@@ -45,10 +45,15 @@ impl<'a> Slots<'a> {
     /// [`Error::WrongPurpose`] if the set `store` refers to does not serve
     /// [`Purpose::ArchiveWrap`] or the one `profile` refers to [`Purpose::Wrap`],
     /// [`Error::WrongLevel`] if `profile` refers to a key from a secret, [`Error::EpochExhausted`]
-    /// if a change to the last epoch is under way, [`Error::CipherFailed`] if X-Wing or the cipher
-    /// gives a known input a wrong answer, the new key pair does not agree with itself or the
-    /// cipher fails, [`Error::EntropyFailed`] if `entropy` fails, and [`Error::DerivationFailed`]
-    /// if a value cannot be derived from a key. `record` is then left as it was.
+    /// if a change to the last epoch is under way, [`Error::CipherFailed`] if X-Wing gives a known
+    /// input a wrong answer, [`Error::EntropyFailed`] if `entropy` fails,
+    /// [`Error::DerivationFailed`] if a value cannot be derived from a key, and
+    /// [`Error::CipherFailed`] if the new key pair does not agree with itself or the cipher gives a
+    /// known input a wrong answer or fails. `record` is then left as it was.
+    ///
+    /// # Panics
+    ///
+    /// Only if `entropy` panics. The panic passes through, and `record` is left as it was.
     pub fn create_archive_key(
         &mut self,
         store: Handle<'a>,
@@ -97,6 +102,10 @@ impl<'a> Slots<'a> {
         if !xwing::answers(known) {
             return Err(Error::CipherFailed);
         }
+        let mut nonces = [[0; NONCE_LEN]; 2];
+        let [inner, outer] = &mut nonces;
+        hedged_draw(entropy, epoch_key, drawn, Branch::HedgeNonce, inner)?;
+        hedged_draw(entropy, epoch_key, drawn, Branch::HedgeNonce, outer)?;
         let mut hedged = [0; SEED_LEN];
         hedged_draw(entropy, epoch_key, drawn, Branch::HedgeKey, &mut hedged)?;
         let (archive_key, archive_id) = archive.wrapping_key();
@@ -111,7 +120,7 @@ impl<'a> Slots<'a> {
                 (&seed, known),
                 (archive_key, archive_id),
                 (stored.wrapping_key().0, epoch_key, number),
-                (entropy, drawn),
+                &nonces,
                 associated.bytes(),
                 record,
             )
@@ -241,11 +250,15 @@ impl<'a> Slots<'a> {
     /// [`Error::WrongPurpose`] if either set does not serve [`Purpose::Wrap`],
     /// [`Error::WrongLevel`] if either is a key from a secret, [`Error::NoEpochChange`] if no
     /// change to the next epoch is under way, [`Error::EpochExhausted`] if it is the last,
-    /// [`Error::DerivationFailed`] if a key that encrypts a layer cannot be derived or the nonce
-    /// cannot be hedged, [`Error::StaleRecord`] if `from` does not open with the first stored key,
-    /// this context and the key of this epoch, [`Error::EntropyFailed`] if `entropy` fails, and
-    /// [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or fails. `to` is
-    /// then left as it was.
+    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if the nonce
+    /// cannot be hedged or a key that encrypts a layer cannot be derived, [`Error::StaleRecord`]
+    /// if `from` does not open with the first stored key, this context and the key of this epoch,
+    /// and [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or fails. `to`
+    /// is then left as it was.
+    ///
+    /// # Panics
+    ///
+    /// Only if `entropy` panics. The panic passes through, and `to` is left as it was.
     pub fn carry_archive_key(
         &mut self,
         profile: Handle<'a>,
@@ -302,6 +315,8 @@ impl<'a> Slots<'a> {
             return Err(Error::NoEpochChange);
         }
         let following = number.checked_add(1).ok_or(Error::EpochExhausted)?;
+        let mut nonce = [0; NONCE_LEN];
+        hedged_draw(entropy, next, drawn, Branch::HedgeNonce, &mut nonce)?;
         let mut body = [0; ARCHIVE_BODY_LEN];
         let carried = open_archive_layer(
             (stored.wrapping_key().0, &*key, *number),
@@ -313,7 +328,7 @@ impl<'a> Slots<'a> {
         .and_then(|()| {
             seal_archive_layer(
                 (next_stored.wrapping_key().0, &*next, following),
-                (entropy, drawn),
+                &nonce,
                 associated.bytes(),
                 &body,
                 to,
@@ -364,12 +379,12 @@ pub(super) fn wipe_archive_stack() {
 /// Writes the record of the archive key `seed`, once its key pair agrees with itself, which makes
 /// `known` asked for again if it does not: its inner layer under `archive`, the stored key of the
 /// archive and its identifier, its outer layer under `outer`, a stored key for wrapping, the key of
-/// an epoch and its number. The nonces come from `entropy`, hedged with that epoch's key.
+/// an epoch and its number, each under its nonce of `nonces`.
 fn write_archive_key(
     (seed, known): (&Key, &Known),
     (archive, archive_id): (&Key, &KeyId),
     outer: (&Key, &Key, u64),
-    (entropy, drawn): (&mut (impl Entropy + ?Sized), &mut u64),
+    [nonce, outer_nonce]: &[[u8; NONCE_LEN]; 2],
     aad: &[u8],
     record: &mut [u8; ARCHIVE_KEY_RECORD_LEN],
 ) -> Result<(), Error> {
@@ -384,8 +399,6 @@ fn write_archive_key(
     if !agrees {
         return Err(Error::CipherFailed);
     }
-    let mut nonce = [0; NONCE_LEN];
-    hedged_draw(entropy, epoch_key, drawn, Branch::HedgeNonce, &mut nonce)?;
     let mut cipher_key = [0; CIPHER_KEY_LEN];
     if derive_record_key(Kind::ArchiveKey, archive, epoch_key, &mut cipher_key).is_err() {
         wipe(&mut cipher_key);
@@ -399,16 +412,16 @@ fn write_archive_key(
     let empty = Key::empty();
     let mut sealed = [0; PLAINTEXT_LEN];
     keyset::build(&header, &Stages::one(), [seed, &empty, &empty], &mut sealed);
-    let tag = seal::seal(&cipher_key, &nonce, aad, &mut sealed);
+    let tag = seal::seal(&cipher_key, nonce, aad, &mut sealed);
     wipe(&mut cipher_key);
     let tag = tag.map_err(|_| Error::CipherFailed)?;
     let mut inner = [0; RECORD_LEN];
-    write_record(&mut inner, &nonce, &sealed, &tag);
+    write_record(&mut inner, nonce, &sealed, &tag);
     wipe(&mut sealed);
     let mut body = [0; ARCHIVE_BODY_LEN];
     join_body(&mut body, &id.bytes(), &public, &inner);
     wipe(&mut inner);
-    let sealed = seal_archive_layer(outer, (entropy, drawn), aad, &body, record);
+    let sealed = seal_archive_layer(outer, outer_nonce, aad, &body, record);
     wipe(&mut body);
     sealed
 }
@@ -487,17 +500,15 @@ fn join_body(
 }
 
 /// Seals `body` with the epoch's `number` under the key derived from the stored key for wrapping
-/// `stored` and the key of the epoch `epoch_key`, into `out`; the nonce comes from `entropy`, hedged
-/// with `epoch_key`. `out` is written only when this succeeds.
+/// `stored` and the key of the epoch `epoch_key`, under `nonce` into `out`. `out` is written only
+/// when this succeeds.
 fn seal_archive_layer(
     (stored, epoch_key, number): (&Key, &Key, u64),
-    (entropy, drawn): (&mut (impl Entropy + ?Sized), &mut u64),
+    nonce: &[u8; NONCE_LEN],
     aad: &[u8],
     body: &[u8; ARCHIVE_BODY_LEN],
     out: &mut [u8; ARCHIVE_KEY_RECORD_LEN],
 ) -> Result<(), Error> {
-    let mut nonce = [0; NONCE_LEN];
-    hedged_draw(entropy, epoch_key, drawn, Branch::HedgeNonce, &mut nonce)?;
     let mut layer_key = [0; CIPHER_KEY_LEN];
     if derive_archive_layer_key(stored, epoch_key, &mut layer_key).is_err() {
         wipe(&mut layer_key);
@@ -510,13 +521,13 @@ fn seal_archive_layer(
         *head = number.to_le_bytes();
         *rest = *body;
     }
-    let tag = seal::seal(&layer_key, &nonce, aad, &mut layer);
+    let tag = seal::seal(&layer_key, nonce, aad, &mut layer);
     wipe(&mut layer_key);
     let tag = tag.map_err(|_| Error::CipherFailed)?;
     if let Some((nonce_out, rest)) = out.split_first_chunk_mut::<NONCE_LEN>()
         && let Some((layer_out, tag_out)) = rest.split_first_chunk_mut::<ARCHIVE_LAYER_LEN>()
     {
-        *nonce_out = nonce;
+        *nonce_out = *nonce;
         *layer_out = layer;
         tag_out.copy_from_slice(&tag);
     }
@@ -752,12 +763,10 @@ mod tests {
             let mut body = [0; ARCHIVE_BODY_LEN];
             join_body(&mut body, &id, &public, &inner);
             let mut changed = [0; ARCHIVE_KEY_RECORD_LEN];
-            let Epoch {
-                key, drawn, number, ..
-            } = &mut *slots.epoch;
+            let Epoch { key, number, .. } = &*slots.epoch;
             seal_archive_layer(
-                (slots.memory[stored.index].wrapping_key().0, &*key, *number),
-                (&mut Counting, drawn),
+                (slots.memory[stored.index].wrapping_key().0, key, *number),
+                &[2; 12],
                 AssociatedData::new(b"archive").unwrap().bytes(),
                 &body,
                 &mut changed,
@@ -855,12 +864,10 @@ mod tests {
             let mut body = [0; ARCHIVE_BODY_LEN];
             join_body(&mut body, &id, &public, &inner);
             let mut changed = [0; ARCHIVE_KEY_RECORD_LEN];
-            let Epoch {
-                key, drawn, number, ..
-            } = &mut *slots.epoch;
+            let Epoch { key, number, .. } = &*slots.epoch;
             seal_archive_layer(
-                (slots.memory[stored.index].wrapping_key().0, &*key, *number),
-                (&mut Counting, drawn),
+                (slots.memory[stored.index].wrapping_key().0, key, *number),
+                &[2; 12],
                 associated.bytes(),
                 &body,
                 &mut changed,
@@ -1440,275 +1447,275 @@ mod tests {
     /// to the second archive key from the next two, another key of a chat from the twelfth, and the
     /// record moved to it with the thirteenth.
     const KNOWN_RECORD: &str = concat!(
-        "5afbf61400553277f85274b83481e92fd244717a764ba72c32cb4e9f94ecee18",
-        "8552df95b427d9e53df937982ca0676a9548ce2a72bdae4799e73418fa5a9a8b",
-        "79edd57901d47169ed3e60192c97e87b492075329fe6baee92672838498d28b8",
-        "417a40c0b13da9006a7340910cc51b0b8a54cc4939883adc736b4ec85718451e",
-        "77559db9ec58063bb023c768e52e0a26c4d4bee0c3d1a30f608e67f333437794",
-        "31b6ae7c4868d31a7f04518ec02a12e5d0f2e6c8377a46ac3ecf6380fc6f92f5",
-        "b7fdc216bee1f0e9efb75e053c3d3725162a881666f7da91463ab8d16126675c",
-        "117621b170f2dcabfba8c1b9a880e373895a8aad9a116b4e738f6007b30f4fcd",
-        "40539c16bd0433abff57189a0d226cb019797545a0c604de0f216515e68f8a54",
-        "94b2f8c814424c127232d7b836c017c600d7fa25ac8ac5b849d887965f339292",
-        "53210b0249180c1e2ea0a7ad1a6a599909b428d61cb04a689909521ca4d0693a",
-        "992570b0661f4e726cb722e1f977383c1dde0263a37a29efbbeae60e469ff601",
-        "fcbc857a874b1845495836365517634c01bd77846df7e6e0dcf337dbb8d31c2f",
-        "8251afe3e476c4b33e912f45468cc000d71b2f65941ce8d6af488dae97c41ed1",
-        "bc6d3dd93ba23a9c92ec7433127b95f06b133e473d3406a5242ab04fb6bb6b13",
-        "55c3764382c23ddb1ff55a3c022eb3fccdf136f827a2b23c98e3a7215da53c76",
-        "45d8a3c4a8994ae0073eb41f511144a2f4b49d7259c2cae7cafffc78dfb66cc8",
-        "6bf5c27e4aa119d2c1780bc2b5e88e2bb6bd68a77cce3c1f9d6f566e609c42ae",
-        "713e60c0d4487f39cfe183c37d0cf83b5ac591c507ca7e32da5fe87e76d00551",
-        "2f14b3a21c832b99192a1ecf277492d4292ceffbaafe1ca14958ac4b68b12e33",
-        "272889dc1f0933b2ad6cb5c0c4f7b0ea8257d20d5365a13fd8f678568712b1ab",
-        "6f05cc275612ae7d9578b29ba3e0addf0ba5b2daa0988e83e1ad92e69aab7619",
-        "739a2c5c0fb96ddce7bf3b6a696fe1f2ec241936d63f173168d51f89e52c943a",
-        "9d9bc21138d68c9529bdb899f637d3b86e0326eb59e1b86018b3bddabbaed686",
-        "575cbfeff743fd23c63d5e9c1c04e1926eba7015f8798ccc91e3ac7300c0176e",
-        "8ee3ad20062233fffbd8d9e5ba5ed7654348b154eceb3a9bc30eafa0efc07afd",
-        "4dd46d279518fe3f514086b4eaf6a3fe6389eb2b8502491b5660f0daf15d3773",
-        "fff5ce422b343253e8815e8e1159d3261f4519163d3d401cd7e8750e6c1870e2",
-        "d07a5ff02f81bad1245d5bf459746b1ac71cb031c92c3487ee5b8a70951bb395",
-        "d6e6092181484188b9d51e66faa3db2501b8c0056498c01991729a92fd7929da",
-        "428fe51227b761c97153da61a1abfdf080fc45eaed462a1ce4002195cd007671",
-        "29187e75838170f030015769c4e519a052104b56df4b8ca6a55f3a58e476cdc7",
-        "495161f3310c33bacc93cc00eeb0ffebf730877b6101194351e587779ef2cc1f",
-        "a818ef13aa406d37634b581c76d2d212ca2ed2d0be9d6ad61bea0d0c3cb7c477",
-        "60259401bebaf9a7c7d59dd2d9bd59ef3087a16f501d96d1a8ad4894f862b060",
-        "555b2f560e6752d568b31268103f52c8a6bd9abd758fbadac4c8789b69f47dfe",
-        "e1c28011b9959df673554f5ace97edffb2a144e5b25ab3e7926e42241a159d59",
-        "2e66d75c287bb4720fe2cfa89104bcc78351d5e92c5b3aa592cab6f36c657843",
-        "517f980a1ae4d73546a8f3af0e998bfbd41e03f737d606ab2e67e60166351dc4",
-        "479ef418eb5b537f2313c2d0f2eda31ee3ecf9f1aa2b9cc8c9daeb4545ce2ee4",
-        "3638ecb87002e50f74dcf7035356a78fa49373a1bbbc628f54e6a9774a108368",
-        "bcb4ee49a946131acf256589371a5e7b3611a500dcd60f3bbd2a304409e93f59",
-        "2c820f98188422fd67349e314d2d9b540af3b6d6d5c16958a3b3c5240bf92276",
-        "a9917d1525b772face7197058c8cf29f4d1c22abd56922f55ed97eb4798bf12c",
-        "dd11683128a5e0b8bf1c3fd99627e1d3df47f25e84f87023e44a47b40e918c44",
-        "759aceeeb8921fda2d084f484352e0532eee5bb9bb9bced97290948f038f83a2",
-        "3552f4b103dde659fa798bb97423f363fab945714f7f5743e75320bbab5ddc65",
-        "208ece78bdcbebbd9a39dac25d3e788cbea547ba078e9d6c78",
+        "27bae2fc323c379d396cc79bbdf51002a439a6a94cbdf763d122b78635d67108",
+        "10af90cacf926bd3f24cf02a42d2f09ee008316790fe361e9f7e4b1fd69fbc92",
+        "2133cb5851a809548f4a0ad9c4429a29406eb25b5f324da989773ebac29146dc",
+        "e35c5182e154387b2e76cc02fa16daff13e7fd639d0d8e126c1af46a36eff152",
+        "b61d0ef6e8587f05255b3bdde4f39318d7bb1b3fcd2ff5b52d51251f5990e5d4",
+        "c3546e9c8af6472d04c7937743588f9eb1063117e223b1ec37e9e613c575215d",
+        "830cfd9a094c324c4b05510eaf82a8a069418b747e7c059d345bbad5b45f52bf",
+        "7fa810b357508fcccdc80aedd343e7d9f66ee5d86e5a26fb98e9e454ef3b279f",
+        "420a919c8465bbe17e90ad7e783010497071ef1192c5080c38890a39cba6f916",
+        "dbb92569b3305a88cea189df597dff3f1b5caf82acbca3270188497cdd0547b6",
+        "96fcb3440c308f4bde32a60502c449bb7c27aaad8e3532195abe0c4767c96c64",
+        "1e0bf53398e568ec6732f234c5f370d1d8c5132c687513ee448cee25b05be5cf",
+        "506e4b6e7866715051303917c14e2c5a0fb62d9da120c187a0aaf71af862da73",
+        "9ccaaaf67a35bbf077bceebc1c8679df16c9defd751d2971c65b678a2539f353",
+        "abf0634f2a5e15b20f18a3b7bda51d2927172fa0caf86a5db555e86f2d3926e7",
+        "ebfb323f8838736309c08aeac4500ed38870931042ce4486f9c9e0d752613e30",
+        "a96c98700e1ea525786332c56890837ac0b029a4f1cec8fe04b918e114bd7a47",
+        "732b5dd03c636aa8d48d059fb634e236ed1d3a16890de951cd0a48a5cdbc5af9",
+        "a3c449a477a3913c507f3754c01a23e2c23c77e7e39c8d76806a1180b26c95e2",
+        "03d8ca79d83e80ba61b74ca578e1bc84ed7cc52e288960304dbb607135e9b113",
+        "2e2c7da4adcdbd5aa90e7a5317453d4c094472ee8bb3edde4cd58184d79672ca",
+        "7f12f61a602cbc413df3fa9c1079149a2f8668e2fd86efa29848470bad64dc5b",
+        "febff36caf7c579e07f1ead9e0c663ac0fc528802d67d0c701b4ad590fcbd2df",
+        "d09a5100630614cc207dcefc0e94bccce828fa092447e4f7f7a8b465aa9e2bf0",
+        "34b9fadfe07d1fbfda7fbad7e5a7f489ae751e4ca40a1875e4b720c42716563a",
+        "1aa9014344fb7e48b0dcfc5d57319bb293fc1d8c47b17513aebf245a41020b23",
+        "97e665880a65d597f2887408f2a57b27c8a89f513b71b9fffee3d4f5202383bd",
+        "d841be21e8b10fb948c0448e618c035a578411141c4031f92b7951939bfeea8c",
+        "c4844fb48553fcc2a2efd2bdc75684289bc7871fc110123862069d0c8ea19f44",
+        "cde81d19b41e5622d316f2dca7c87adef05e52683792567eba46cd3edcf73ebf",
+        "3e8afc2d970ccf16844c1258b3f244508a8bfb0b5149d7d40c998be2fd09fc75",
+        "71b39fc811308759bd830e3c92163686547e2f650143c34a71deb9d44be09b5b",
+        "a6baf9a7f8c5bc6f7b03c0129c116671a84eaa9a0b2ff5367639ba1ca8dc5ee0",
+        "e81fb2d6b7249b1a810be3f2fe1685d2cba2a774d5ee2656b619e1fe051f494a",
+        "6d75e1159cacd6728404268fef8f2a3b85daa38e13821e7e1c39a8890b27b9a1",
+        "9d659b88e56438c8fc811fc446c9bab399190293a89947b6b410240be19dd855",
+        "28241a1d623478c261b5c959670b7260cd68fe5ae031b96d2a9ab79bd56615c5",
+        "94bf1542985e6a4a0bca92f09a88e3e384d59d3f43bf254c0275cf371c9dc949",
+        "d0019dfcd1fcdca5eacf415104d10be384e0e6a670fb6a0d1122fbb76710f73a",
+        "e97475d7dcb52c2ed3e464a04ee9806b30f2cce3895980608fbd47ef5f5e49c1",
+        "49efdf0fb60ba59276f5c8d89437f993c9ca77b52d0dd04801e5e521c2d46116",
+        "278ade269263e1d183512e2a5a33f3a470d837d0256184260d20c2b7fa73aacb",
+        "c2574a1c3fe40bfe4c1770b088f19ad1a2abe352c92c757bced9c44a4ad523e6",
+        "07266a7237855a9fd83341abf1309edcc9a039f618e90e5716c7f96629dfca43",
+        "7d05e1272dbacefda49b99c561cc3913e9bf865ce6ed562e3876960109d66cfe",
+        "e366448d1f69b857f0eb0573721dcb3d7d8342f2d750341bbd20ab25600ffcb4",
+        "7d0dc4300c3dcd9561cf56428b39d623ede02cebcb1c1080947f2622e67bc3ae",
+        "dc7dc0783574dfc4dee53af04463c396ecb03a58a39636e027",
     );
     const KNOWN_CARRIED: &str = concat!(
-        "3b54f7a561fd4fc7cdd63a60dc5cff021092377a8ec410ac44277f15d216cde3",
-        "d847fe669286070fe16cdbe90af0fcadfbbb4cfea9d0f410c0a294e392df6d35",
-        "7d26f4c6a80f7d1db1773dfb3ddd5b12a5d15763b465d144de47eaecf5ec3916",
-        "b13474eee5d39d3ba83de62af53e0ccb363a49c19da65e1cd93380a1140cd771",
-        "d683db8e1cfc36c91e217f6529bf385c7935043a45734933cda2f145659b012d",
-        "ad59b177494015cee4d7201d0a49baf39a0ccf6367cc629aeb39dbdb07a4c909",
-        "8d7b4ba334dcb425a098c078a9b72db1b939a084c2b1bd8c0de3555b3099a3bf",
-        "1ecdd0a37355c22d880c19f466744ac6f7670d8fd4e637068a3edd4ffbc44f0b",
-        "b95f4cc35f8f2e3b9a942e19fd97f1c0f9ad54402358bb186e175f5791357a8f",
-        "24be009ec0d8faae9548094cb211e4cddc90b5500f8932450fe6a5e69134a6f5",
-        "00267fd65692bbdce78fa3627551e87c14a395e6a036b61f8979ab97a0f2496f",
-        "a046a9d971a032199f1cffac2edfbc197af2bc1721c77e1c29263274694b5484",
-        "27c4ebf5d34c83c2422c017affe8235d3c31320b84e533fb2759f743915e8a21",
-        "9a4497bd31785d0c97c67f53db7c36172d09826b087111964f002d0326d98f8a",
-        "8725eb4751349a450b4b19f40f53edb7c3a1040fb8236def52bd5586e465c559",
-        "93a82cae98ba0b03be8a764dba85ad4dfb3ff38e88fdedfa5ff000fbe99f2bd5",
-        "c79f3fd4d290ad7040fd3979cd964830d0e988d696b404a92027a16c3fd234fd",
-        "eda1acda7e574a4b1db5df0d0a0d3085e549bf3fb6ff193554a73e66f2e30173",
-        "bad87b46154f7bb2ac688167302838ea42d328dc46b15cb3ce1a83e2eaf6c642",
-        "84f824f57980af5ebff85fd249b86bcac3a67b8ec8b652e243e74bddac11240f",
-        "ad2f36228fc98bad1e89253af27045d3391e9e05d1b38290e47ebbf1608420f8",
-        "810fc63cf1388175b5f7ab928553182bc1eb7506041bd5a5e174020cc442de11",
-        "76e5d2e0196d613b95e63c09aea594ceba87fd8f737de3b46426164080545643",
-        "bfd17c5a4d2102bb4db22f5fd975100b05844f39c9f74bb9e8872a19495df437",
-        "b403c3f282bdc16dcfa64144179aec7f2f4623c0e5444b7058850c3b76d249d1",
-        "488dcb8cbc0c22f559cedb7f42fecba6d8fb26a5819dacb3bb224dac5181fe8f",
-        "68a24f2fb4bdc5a1168139fa1e2e13e9fdf280ac426f17e9a572d5ac5d0bcb26",
-        "810f7cd953f1ab7f489ccee4abac76bef660b9f471d2f7a5ce79fdfe85e944ec",
-        "85e8bf1b9edb9eb81d1d8df72bdfd982f686fb5ccd7ad2e7ca68ee6fce92c5a0",
-        "22f1f23dcf328d0ebebe469270c9d848d58142992a428e6d68acae5c3d5b3dda",
-        "c11eee5bd7bed674ee76d13013d8b2fb83aae1fabde01ede30893970ad72449e",
-        "3cc7cd52e5fa7c29c047033ce0cbc2f4904dc10f28f2177e4e74ada8f45273e2",
-        "2f3e9a216ed256374c3cc377da827a392833a6cb33f19abb415e7a2aca1487ad",
-        "50f8ec9634ad365bcafe9ab90e726b5b2a4ca9f0cbc087bca07da328cc25de26",
-        "b4f761f6cedd02ea2d264ab3a5fdc7cbd65839fb99a3b25555e82fea873528e4",
-        "f95f0572a42cfbb5a03872eda5a332ec909cd863d3af1108eb26e4d7ac5c4a05",
-        "8582540c9c0ae209e9ab12c7b0694c4b81aa4521464c44aed4e3fb94861ae194",
-        "7dac33da00b57b5d1e24538f44895f1ad5598390ff042ad6504005e01d124092",
-        "9c38dd9aa93a3085ee16dd716193e23bd1798a2caed997b7490d17cfb8795f71",
-        "bc52bcec5a1b360d364d070360b58139fe717dc99154775d4e9af5a4d4cdb0d0",
-        "c2d2ca652057116b8a47df0de5e028819b17e145c3454a5a83a1fa0d6b1e692b",
-        "854a2c738b331ee46232d7ec5f9f12e9374982b4f59ca10f1c1d4ee50f6ab29c",
-        "b98aaa30beb8bc3d07b8cacb1f3fdba64cb13490b202ce8c2d738c7dea83218f",
-        "9e218fd3db154ab0e385f7816e86350dfd3cb927ba27e6c936d39cba710e4e19",
-        "269d5a10c09a93492cba2ae6edaa4808967c8e7e850e9258adbd4ee3aba1ecea",
-        "94ec2cfce51b77a6e4ef826ab5914d608f2c060c7f8bf34d38d8378a7731e20a",
-        "9de32c0efec659d67ddea1a24622dba488b83a388d31e85e42d518184ad8d1ec",
-        "f58bcc95829563b7ea8fd69fda2edad87b49f62d90398f34e1",
+        "3b54f7a561fd4fc7cdd63a60e0aec4ef41620cedb92a8f551cfeee78052df50f",
+        "31e144a229fa7b698ea2a04255ef2f44e1b27898160893804cd2aab6e0c6ea16",
+        "d576bafe8c5f0b2db37c0cc7c294e9a45ebb89ea30c23f0f43f58b509d5b24d1",
+        "40ec9ba342c5d32cff049b47ff751d8edaadc6efa5faec4c1f024c80921c585c",
+        "7da17d925963187707de1d3784cb7353c2d7b709b98740cfc2ae2fef00773d7a",
+        "91ce2d3e428d266d4a14576489c543e0e1e3650b39777c43ed0445b8ecbeca5e",
+        "47de3adf634fba5e49e45e8e23baa93ee93e9fa8aa6ccc05c4f2dcaf21f01319",
+        "8f7fb30e1f6c5da438f61e84eab060357f700d56ff22412d049d3d1184e93711",
+        "cba310bece112e627562454884b3b34ab60df0649c1057dcede5ea0df0bdbe7a",
+        "df4ce66c862b1f539c8b862c069f2138d4f0daeff34d8f58c5e7e31f1809de54",
+        "fe17873d0c44162a210bddbc3153f45639894aa3d1a3378dd0c5b27bf5a138ea",
+        "686dcef120e7eb3bb0b95fa939bf087c1935e55cc798a20a4bb4f0ca06b89251",
+        "d20411a718b19ce2bac180037730d8db7ceb15c9286833bcfb3c31626ccf0072",
+        "d64cf2cf37ac1130caf1032299fd5eeb7da3ccbaf980625246d34a87368742d9",
+        "01221988beed3d610abb174812eceda1e60fe1c72aa7eb2d20791083faabbc48",
+        "38078583836f933676028a613cf1bfa4c79ace781d8b3887d029354139e8e501",
+        "a061201c1f246751bc7a6bef21a71adf6ca68046ffea23bbfd8c70fcebde75aa",
+        "1edc860cddfc819d06b24e02dde55aff447b218269209d8b32b78f5496e7625a",
+        "04f8943d4402e3329300cffb08f9b24735d4623ee620f7d7ee373fcc04246de4",
+        "c759f8d5bd537aef8e20fe2bb3b97ead7b2a08ac18047f5db79257ad4757f620",
+        "037460809b732c42badc5e3fad25384a46299145f8f84a0164c003fdf9b45c35",
+        "f342e8d450bf6d5f87467d8d3fa50f5df8c4f99a71adde19afcf2bf31ca0e7a3",
+        "44faa54a47bcd08fa3937a5d8f006c8e020357af0c31a14342fcf478e2481d59",
+        "6f0db9c5124ef9e2cfd51d6a928fb4874d7f769f844606a30695293630b5b4f8",
+        "95d0dab19d37f06c42ef3c02ae9587ac5c8db67e3f36f81a87c5a2c349fa5475",
+        "897682c216ccebf272ab6eae92d1a425d9ffbb28bfba5bd74a3b8b31a849aae2",
+        "8f766aa2bf4b990f176061912de6731da1990f5fe620e3bacb16946296171ad9",
+        "d791834b26b4d10b1533849a8d61c646b7856fbdf3a81392a01d5c694abc43e4",
+        "044e984881e465bd29723970eb1e49f419a1613ad4df7a9ad828e33938a3475a",
+        "50414fc5e038d14ef924f0fd63b67b8b22985bd0292331e88d18f7477ef09b9c",
+        "4f10e22aec225c33b8f6890d41d350ee2c390fc9ed8abddc969a1247f791c3a3",
+        "1148083eea00c4eb0ef4a0e2a3254636b334607ead56ab83d0aff54e6dee4283",
+        "938bbc8db36d360e24087b09f497b12652059975afe0a6a76be7ce37b35999d2",
+        "7bc616f46ecfa88a214555dee8d054248b3708ee90466be2703218d8d38d1e3d",
+        "b23f992e2635216fddc8a6493f12e34befb7c88c6ebd726034329bff197131b3",
+        "61a59904c691efc2b2806ea5079e29f22a9a82b8d8569e08f7d902c8bb9b9bd2",
+        "c6e2ab944562ee37a8a153d4cd050da4fbea5e79ea533e0b71de0adc0721777e",
+        "c05ed75b5ae216c2048f3d7e56f6cd6ab4b5206e609aa4d291414779037ba141",
+        "bed81bfe1b7413d90c6f3c1fab9ee13dcb7dd354f4dd0f0d813ebe4ab2676505",
+        "575b78832a4f635d322b3db3e563f11bbe48de01ef4033467c2ae08fb59dd158",
+        "1f42933a3d61a6df33ecc391e26aea811f3260f15923c4a18fa274971274c214",
+        "7ac6dd3cb941dab03ac232e864d8ff4840088efd9fb9659af7a08a50bf133f3f",
+        "ece873ae3f104e384134d8f6e25346e99eab2c13a585230ea7d7a8c848b63bfc",
+        "f25881dd5bf43248e222a8a535fe1e7f49645d5a78088310a96cc2919154e384",
+        "f73ad3bc0076d0ebe958da4564ea80cb52eaebf4f53664434d6f835d302b9c5d",
+        "1329ef57c769ff7ce13c47f552fbe4701e0c51dd2ed7573482fd3118ebf0ebb0",
+        "c5153826571a3156791184a0a0408040d201dc3dbac3955f502625c29c0672a0",
+        "5038571962a7cf524b9f71704672603a41e9b3f08ef6bee10e",
     );
     const KNOWN_CREATED: &str = concat!(
-        "932d0cbe6b107a6606e3fa558b076328ac72f1bcf5112bcd8219204167a1daa4",
-        "8a79076ffe9de7d7937b6a18fc78c3941c58c01301c8e5f5854dff12fce9380c",
-        "50a5580178fde97c81b2f85414d0274a79e9697a3eaab71f272233fe4f45a501",
-        "ca94bb74ee9bba97e2c34002c54607483ae29fb5ed84eba9a225289962dc87a9",
-        "403a120e8883972485ca18df84145d0de16803762aaf4016daaa0db025e381df",
-        "9dded4067385135060c693a6be90a18feacdc58e61cb45f346a38501f093b322",
-        "a980b76980e75681ec26bfb72ce4710e05dde83dbc0adafdaf5b38d5252269f8",
-        "7d7ebd08e2d2338d8818490da86fa88317f9bf167c84464b682c318e20eb202c",
-        "b2bc736950c0283b1fd1096f2f3a9eafbb7e91e9eb2305411776807c5a07fa0b",
-        "00f247bc7f8ddf1e8767d6591942c3de9d754386dcecfbb1c05b3ce35e12dbf5",
-        "56ac3063602055d65016b3b7dbfb2e3b2769f7fd2b9881718ada3e0752b0f278",
-        "eed73c795b26374d0e7e5bfc2b439262aa405f3aa925878b943c08fb337c726d",
-        "5b3e01151e73f57f6bf7b59e619758b81f74d3b6fed5575cdace23b19cf9d354",
-        "8c4a7c443597a008d876b26bb5084be71b09130482b16a99cd5729617433adee",
-        "9e66aabeaef818814520204f768e0ec4e4f0a9425a847815c50c031355462bf6",
-        "a6e74b62f4adebd5c1842267caac2e514e776544aaf6820774d92406709ae530",
-        "a3bc5b2151109a9e89ac5327c4469454ce0aef0148544c6191e194f30ea09449",
-        "52dca54f7f0bf03aa09ec4572a9b1da49c085a5cdf2b041016fd0e39ccba77fa",
-        "18f3885b080c1b43671c1a13cd8e83aaae58c8bb391988199427ca933ac031aa",
-        "c691358663e1ec6462bbb9ed24d656da53ca2c7daad027f1397420b96fbeecc3",
-        "27305ca693de4cf0aa478326e7747ee986faff57e1285c0936cf843c2a728594",
-        "07152c6368ac1d928e0d39fc97e7d780bd3eb96f88b6c671faf93a19957e2fac",
-        "dbf61868c7dc8a99b9c848a4c4523f0319f13d03ae047eae2d0d47d13d4a7711",
-        "72f78eca98db4823e5fbb1eba4efcce1c149c3218425e8c532321d104336a158",
-        "fef206375d295dfc6c8105d63744d95d78587727d277f2079ec702549c86b70f",
-        "2b058da7afb11bcb3e54a110b3e2759ee30384a666af7c833fd56aa957a5bbea",
-        "04fe0ed5c51b61c5c61ad6d03da892bc57e090d82e89e2d79c211498291f75bd",
-        "39b534bf354350db10b61bd865319b545cd464f3ab114cdf550e9178b9b73f11",
-        "7c72491c564d503bd8d6b6c78f3bd9342505abe604fe3c449e959dac2df6cfc6",
-        "ac6840e2b13b21f3d6258cb0c4fc44860b3e37c41c8097f1843b6a1d3de7e42e",
-        "9e9b8ad1ad032b6a2139b218c0402afb3ce219efb409dda5465160a332c950b9",
-        "a43385a3bab92277efd6a6e3518c987e8175c2749602ed0132c7f15078a7b2ac",
-        "bfde8ce1e6bca3ef34cadbecbc65ac8aca853a6d8badbb8075011bcc6037bab3",
-        "847d939d1e06fa9cbe63224f1fd5b76a23ced5e0e7042bd51d0f00efee495a24",
-        "76a9a12862ed4a1f8d7a1264a79d7ed9d62ca78fca2bca7a2c12a8a0774c76f2",
-        "c9fd79f7719929e6f72398dd0b47dafc8ab18cb650a15918c52798e7802ac178",
-        "a53bb1c0d0f59ee6fd2367aeaa19eb8792dd7290186be0ac9015366b123f7f56",
-        "3b2b5258e2034cd9069782998c080421e1246d09a89e3dee537e0f9c2bb7d2a4",
-        "11bf363057b58074c6ffd562403d82e8cd46de9930e7fff870226990a5b8bd2d",
-        "5eb043525362024d5ce6f69707e1aca9c7aae233b9f15d0fdb47e16644cb633c",
-        "f46e3ff7cb901f8f3e4efebb3a4be89db16ac4bbdba0ed264522e6cc8b66ecf0",
-        "e841c12c364250d8375331a6c04f6af03ebe8813cb58007d0be03cac9b66b6f8",
-        "bb5f9ac060320665f8159600c892372d9fe535797c433da73db4f50187d24017",
-        "c2f234558747cb1d6bcda49192782e39366443086c3749d3d0c21629d33a1457",
-        "5b19b9fc173c0d8f0e40ac7c14c8279531a4dbefe7cdd6b8e161874b896f850e",
-        "3de8565910626d21a189ced7d740e33dd9323522ad4cb3f939f1857b1fd0a66b",
-        "7a52a98a8dfdf6551ccf74e33394f795cff7ef166ce217a054cc9fe6994b8dbe",
-        "87618af444dc3ff099d8556423f9b072d88e370a6342884d0f",
+        "56684f17a07a8214aa598ea9d95953b600ae1667af214cb49cca3a97b6ac4e2b",
+        "c536ecbb694f8c5127aa532e6eef351e61d5c55dbda655f838cb67e04a5b2944",
+        "315822d0680c2f185eb1c5469303a8f16cb97af143861f8b7dd4a278de9452f3",
+        "66d5d84fbca6f7880f01ceb75f3e13b21be1d88cf6c85610916f804a8fd6b2da",
+        "cceddfeafad10502458f3439a30c12371d32db8f4a1cefc3d1ef36f83d148a82",
+        "dcc609e16f3baf972f773b21232306c32253577ae5c89b2708653ae4ffe993df",
+        "c712f6684a4bad05570b230408c476f26a6d3dcb2406420f86af4e64bb57c10a",
+        "1979cbaecf991430cb4f869090093dbb3e7e12077ea6137c01929040ef94a2c0",
+        "6fa0118cb360647061f60c4e73721ba4c60c6ca6f16d1694fc6d541a213c581c",
+        "0576f10a740efc8134e47051eea589ee400a7fb0d0ffc39edbc659e17b22fe79",
+        "79506e30b7192b0f252d09b7b109a88ebe91a6ab8164fc714d0208af8559b090",
+        "9ea5a73ac7be510b2e5c103b0c1f04a529e22f91f2c37234700dafea4b86dca7",
+        "6daffea21dbc01918c69a0dd2208a5fc3ab589a835c0f21ff5ad49a7801827c7",
+        "1f2968dcf57729b322138d901b98e1e2694b25b0d201947b374416c49b139b1f",
+        "c082e1ee1ac312f3aff163d1f11a6444cb80a80476fa421a1e34853d31e2fae7",
+        "6fe2f1a664d76273e619266319b9b08905e249cf2d7aacbd731753a736abeff8",
+        "dcf4eef84fc4352015c42342490fa37550bba0c1fd7c2390938c16517b7e20ca",
+        "2be2ab8006539928c2449e47a3eb36d0e24d28c83c6761f6987aacc90e9072f0",
+        "1df0a407185a7ccb89391ae109dbea20c28f69d281026ccc73545cc9399388dd",
+        "06a8987969e6b174b653153e8a376df6e7df88da773615af5b101a8e62a5b783",
+        "da729921ef04b9adbc0b4983650451036fb117250edc4b9b5b6eed4c3e91683b",
+        "bce8bebc1fb55f459e413cc0860d5d77de84f23a4d43eb142b34c3b5b8f78329",
+        "a4a43f8ff1233adc024a704d23811b812a11ebec4826c0b74f4e3912700c65f4",
+        "6f85ff5f52bb13b9970b70a54404c9fdd7e27f9cf94ecfb2fdc9eb13732b4fd5",
+        "43c586edae93f9a1283b157d43d8dbd65917d7055378b98a8e874ccbcf3e8a4e",
+        "c5bccbd551f4c10d92730c17b4099282ab748f01eaabe80eefdefb07e847d2e0",
+        "6e7afa3a0c584c67916739777b27192050470aac7da4c5eb5a262fbc65db65fc",
+        "ec0428790dfe9400dac45ed4a70d0e5d05ce3b9e3bddfb71728df0fa4d6cbb7c",
+        "c253d6b94c0f531f51e07efa52fb133b34e1cd89b5938b5dec87109f306a780a",
+        "160ec9fe3cf9ab5025137349611b0eb6c842d1980499e1c52afd21560b0dc116",
+        "dd184ac90391ea3fc4720a021e1e49b3c1bfe62fa2a66608237a6c1eb5e27471",
+        "a8a6b315514a2d7b3a3834e45168f9e3b3539a68fd5c5e9971d043fb504cbe82",
+        "e835b8f801761ded5e0f29cabf663cdc9089950303d88ef2466e7c94f6375e96",
+        "63c6f8abd68a4ba20077bcdf1aecd0ec5eb96bb9fe51b373783fccf6aa6627e0",
+        "712c2354172a7df6008f4cc011a2b309bf4e4d3dd07a3621613a306f7217e1a0",
+        "4c8d0883886fa6039bee814fb14f1e69c89328e79775f5e05e579fa6c43dc012",
+        "5c13059021c87ec7f7baf7e3245d10f733afbf4bc5c22dd1ad8b2832e19d6239",
+        "02d3f96b6b2b813069c487ac8c4ce369bfc9e9a71992c8d6de31e4af0d15dce6",
+        "53b999b828ebe432e697aef83e37e843775bf6c4beea182ea61b3b3ba4c69aae",
+        "e11ee3d4f7280fe21737c8ee9b0a3e490e5797fb7c12f87811140733186371e2",
+        "2c8f5d0ca63c001e8e19773499194f2a04b986315ed18bb0ba77bf81e794b556",
+        "7e2547ee81cbf1f5ef9b49eae16e8af23464daf5a7b66fc5c4bfb8dea8b8a334",
+        "3d9aba34b8c68cabf2d5d1a811b51edf07327d3425726163bcb00845a32a6ec7",
+        "0756ad46e0c45dbc8fa2395bfccb08308b371bb0530b5864b82e1fc8d8f17b79",
+        "10430f0a58701ad432473de2554167f8a11e18e5a1f14554e4f2b25931d42366",
+        "9f7dd2903f08c48ac52a62500c262385e6686fd72b4bc6223e124e5c34d164de",
+        "b7ed2a07ee2da23db345475a6d46081c207e72a146c10e775353d3b444ad0e84",
+        "7dacb3c29b92b015c695d8a96e16a2ec2f5834cd832fc7ad7a",
     );
-    const KNOWN_BODY: &str = "7de2f6af97689cf9ab32556741b06d73f3f5ad45e7d10dbe93302d7f0e7993ed";
+    const KNOWN_BODY: &str = "6b2f3d84baa5f88d121d8dd808fac5883dd5299249720bbf9b61f953e56245e5";
     const KNOWN_ARCHIVED: &str = concat!(
-        "1550e151dd86770fb739bab0756873bacddd76f929e8ab4fcd5a9fd4a6634b75",
-        "87329bfe1ffdaffc7052e20c9aca10bd5a7d6d424320e8388798f8f1a3c966ef",
-        "02bc87be02f4b4be4607d0a0a3307e65cb0468c4e70b3436c93ae71770d52d40",
-        "12bfdae94e87dfd17f1782385835522ce637849cef7ee59f49d421fe1a9e86a1",
-        "8848056a9d0d5f97dc9d01f69415c3af44758606cd72c65bbddba4591684da2d",
-        "5fe587b676210b4d68a0ed0d956a082144f250c4c19b22b73b780cc11bcb945a",
-        "84f5d4025f2ed0d9f78ca966f847fd017c70e7b42cfc4b6e031ca3f96c55ec25",
-        "bdd64a2cec4d13d5f5b9b1cc999c828391645fb61a13c326db2ac51f5fc72ff7",
-        "1921fe50762534e5e5074cc87164638e6aa1d9cb75beed4f7667fb18a73163f9",
-        "e4a143b55bb2e2909203b46a1f2cfff7e1786bb7710533a3596cbfa48129a0ca",
-        "2e832ae55f1d9f783d98ba9a1cff9766af59b7530933458560e201249eee9f0e",
-        "c182cc4d15d0e850629ad85b776e4cf818241b1b4f6112ab1d3e809dec2924a5",
-        "0d055a353dc28f4c27cff19c9afdd9c9fceeda6bb338749eb0b625f2d527100a",
-        "24cc35235b4d9e71e7c61a3b289af5564804e528c334ccee4f9288edc7638e54",
-        "2bb3a3399869cf6d6a1547e4a8829e6e5b170a5c593e1439afcaa1610cb42f16",
-        "4af592f50a5c07a247e5f51db44a5336d97f150244d9d0e8a466561408e43eee",
-        "7955beadfd6bc2a73388e9e98cf2754574263289cc340e3d0fb7d4c345f5aef1",
-        "efecd9a251d1b2d88751a667eaea6c98e87e6212dc2d55704f68413f740dbdb9",
-        "7f29fa5fba44a4410a4679c10a703e4769deb28f61f946dbfeba110ac6b6ddf2",
-        "bd846c4cc62196a68a2278328976af822d1507696337e00a662bf53030f87738",
-        "e230909ac5ecd0ff2ec9816ebd379d8265c8e2adbc372f7f0d425a0aa84ad435",
-        "419275551335804179dff9de8b47d34ecf135958cb4d505705e1646947dbac3f",
-        "427f0c78dc61927782d6e9b2658b961f358fc4c119fcbdfc66910f6ee4d5ecf6",
-        "990510438640161003a566d0374c465fef7f467ae0530bc9f699e46ffd72f82f",
-        "cdbd3f07c1188651b84eea328b6809c599a4781273d099337fbec3b1108584d8",
-        "e1480cef3f5d8c6f9f4c74aeda04d2eeb02c7021a60afb67640edaeca60140a2",
-        "53f7ed9519665742108e19070b7d67e6c0e9501f3be0c060cc8208c500428253",
-        "4e57f5d8084b0f29cff50ec280fdea5c97213a207830699bd59710edf8d566b1",
-        "fb60c6260a6e4ae6a193dcaa6565eb68583aa99e6119aa97c44e6f79e1b37550",
-        "e3f97603228c76fbb9ddb85e80098d67f7e4c2f0f9edf424c9a01a456b355181",
-        "bdf03801d71526085b2541e6a356474400c7f569035de5fa5f4ff5b10506a403",
-        "2c3a2b5c36940d9160a1c2f6ad4e61b8c20d20a0af2187d466ded55d1c34fa30",
-        "5a162b35919e77229b6ae7df0878eea5e5d789151ca169de97116ced2e32f453",
-        "63506a2224ccc88150a292cb3d0f4bb41d3095374931714506b5d92895459c34",
-        "ee0cbb1bcda826a86456a733774baf0d34db5dd28cb2feee94fff658e5d66e1d",
-        "958a7c4bbfe697e130a1375331624fe9b2dd5e7aa29bff3093f48e9dbcb1472f",
-        "043ea0e4fa89fdc875614387fb502a69e13ddbe4e91bff7e63212cf9",
+        "fc29cbd9e776d2ed97e664a654f59ac6ff3b395f0dca75cd6ee6855b66f6161a",
+        "7bbe8b9b2d6c002b5966d51599dad052cb24fbe225d948129875908454832f65",
+        "9e9753bdf916a9b119c98dd49d7a2fd65b6a9a74aa0f4c895b2740d4cbe3ffa0",
+        "9d2956376713393c1d31e094b9013ac108beed02d74bac7284517e6f694c5dc8",
+        "528e5fb6afd40661119ca8b2d6e0c91488ef6afe06953ae1a41db1eeb5af23e2",
+        "2f5c412c29d652f3c7730d31449f579baac804c0f573ee75d51e01b6a9e0d9f0",
+        "05f2b850fd6eb7ef5b4361c65847e8961e57b5b8e32bf0886e32ef346b846ebd",
+        "2daac2f87b8f3e463b60e8480d34d2722fbd7c901f027f547839b05853817935",
+        "c4769dd4fb96bbe6c9001c494b3c9ff9ecb5224c2e680967a986e1d5483e2f9e",
+        "2df900953fabe29e0bc6575a64396bffdca4d30926b780d8c14638b4c14db39e",
+        "e661fc8b20c512a326c893b3189cbf030ecb5f46ded420af9b77bae8b394baab",
+        "682fb5bf1268956318c9d1cf6e365ae9b8ae1f1c8d6495f30e579b448cc70ccb",
+        "6258939ac02ad3dd4e20bba8b27abcc369eee8411fc2ea08e55cafa932ee3ff4",
+        "2d29d574506fe5b38f39d8ad421581813a89d2ca7cdf0208e99cca8b6f06303f",
+        "7fa12b102cbd053f6b764f22e7e48659956a29902d4c8200da7b2de646ece380",
+        "15e91c171318f556edd592f9c5568848b46495ccafedfd1476af6d1e139787a6",
+        "8c3d93f392bc169ed2d16e89d7f1b39c9dcdfb627413859175dab4efc1f42ef9",
+        "26278e6bff8499206f1d22034e6d12386a5b216306329eb824756db0e9475c67",
+        "3e888bd06e9bf695524dfc5663ec16175c34a59d8ef9aab982066dd7a001eaa8",
+        "905af8eb732ffb1a981b5e4f738b30933c9e294f231a9bb9131622f9ecbb9ed6",
+        "84bf7c923d709d4c25d7057379eca95142c947d7266f2bd9f33889d56651d1d5",
+        "18ddd1b5ac0ded59e2317df73edd4ba7231033f9f765bb007000a1cb61e233b3",
+        "05e982dbff5a7938f6e10531bac1b044bc3067a18e5409d264f025108b259680",
+        "8a852f5e0fcb477c6e476af1477bad4ea5b6e8a38bcceea83b208f026d018449",
+        "7a11c58f9270ae04bcc6d0eac46d4c0e1e93c268c2802c502069b1d014470aac",
+        "9658158640210af3fd1b56960b7f04282eeb9e3afcbf32760135b98b583a5b6f",
+        "92348ffd71d25e52006285fc22e56d61fbf0bbe912e301d9be760101fa099ca1",
+        "240df6dc9a7fb66104c39f59ad64f4f32f0d25f16dd3c21f8c423ea51ffc9582",
+        "00332516a583ff3a7c6a8c09a0f33fe4accdeea6a987b1fb8b35b842a2bddaaa",
+        "9f5fa352b392d89a3722f7896d6875f80339d10aa10bf66917375c4e34ef8dc9",
+        "d0635667a3c8ef0ba7565be893e622739749773f627c8607910ea5291d46d263",
+        "53e01eca805402f38185804747dc300e1e3025fe8670e5ccb0712e372ce50715",
+        "5816fbd71eb56122e819e437f526ed583dac26e5e1afcbeefe518486405c7c6c",
+        "94f24b52f08cacc45a0d33135ac7db321f6b8c74f7a44ce9580f18c38c3f337c",
+        "3478c0b2a375aeb56b0e8e2dc49492b1228ab11aa6f160bff74c73c6f2553924",
+        "abad9d67822ea5ea18b2f2c219e7f367141e336a2730a0596487b81ea9fdc031",
+        "f2cfbf6b0d05f9d6906525faa10c69b2c7aeb0a16f86e7b4282f29cc",
     );
     const KNOWN_MOVED: &str = concat!(
-        "4063a1dbd80d6757dd56d8ea8d539389f855f04c030a74fb88abd21fa8b2f447",
-        "29714cf76bdaa54325cc3a14ce44f478a514e5fcdfc82412b063f3d6a3a4c7d0",
-        "00f618e201fe1d0b0b182729c1768ba77fa0c4b49f25b8e0ec21ed89cd6aa190",
-        "5ba794bf88d55154bac7a15df1a3a2f8f154b659588ec43cc46a43b1929dd374",
-        "c6fb404983d56b68fb353ef3097691b5d6bd45df8c740896fd3136bd74a48684",
-        "1a9f62c02417e7252e1836addb0f8180b0843f302462ffe0ba392ddeca18d016",
-        "40de5821a6eda891a3b5124aed85a640062282fafa6bd075c0213d759a4bec8a",
-        "5b7c3a6eb9ef75f07f5fb6c7781fd989f6139d898ce4d7be5b3b8da61d622221",
-        "d75865c4759d570aede5f8d4301b49c84a0da36f33396a2126fa3ec29137b273",
-        "40751a7087d8751ed606f392fc0b96b5c023e7ce33f075c4b35c0c76c656e3af",
-        "6e2a674937fee75c927759870d7107aec6a0bdb0952fdde4405ee2e249709470",
-        "04df70a996cda52b3193f71d67649a0f3b62ab3755184d0285fe81b8dc7ba6c5",
-        "412dec46add0e9edf631d7470e9d38000ab0cc98eab727fae4e2da4710a684e3",
-        "6a05cfd3f88009bd5cd5f1be8c846308f6a4b3bea891b7bd7e780d82c8360c0a",
-        "2ffc4db41f5ccfafc8e5a2c40793cf36e2c5840c2d8548325ef22ac6bb41cd73",
-        "b51af37c7614bff1feb9f37cdf49efa3e04cc371cf763c51404705b57534c957",
-        "6e33c70308a667c5b83b3976c3c6fe312f23e419deef3c7c17da78816822ad75",
-        "a8ed83421a0e84cb75922e08bbf8c6609f940f22c944abe0f2b2648fd758b879",
-        "8d41493098b60525964083770cf0618cb297df0bb37c34f0d41da8bbe13461b5",
-        "e2760e2caea37323f4d2c9456180891ffbff5047e9b1f3630af6b5e28984ff8d",
-        "89e0dc4fea708ac196e8d2ac0b1a5b59a210585ef5a9dc6f5c618072aeb9045b",
-        "e5e1107da155cfb6406fb3c7b7fe01f3699325e9bab75e1e4ead4184696dfc18",
-        "bb74d1f6ddcde5726a2aa3b3e055b981a73d5bc48f4d099c57db2b2203e4b8fd",
-        "8d7b46cafe23040154c19efc98f8883e920ae2256d6d66cf22283c99c2ffca0f",
-        "21939196d73e6e18f84e3a6e82ca91c75fc2ffca13f81895e569192a6ac8db5e",
-        "598d68a9d856231ebf644fb35fd6022c9012ff23565a20efdc6f70883339d0ef",
-        "522ed9e9f6f1c049d1aaa6cc12c3f4cc5a7c84cfacbe10d0dba0bb3788fded18",
-        "469cae567ffddda33cc5a4258a792334cf0223a30898206c1d3e0172456526c4",
-        "71df8db25f1631f13ea94653d7e86a122e4a58eef1aff37882f3a08db2cf7b08",
-        "34855b0e575faa8b84e648b3d42d509df39619fd7bd04f74daa644f2ca5321b9",
-        "ea178f795817549e97a6341201e05759e1a6d0833c5a382d3e72597f9624e93c",
-        "0e8e33bb42d0999e838fd7fb78f6bb9491f98bc73826ac11f8a489c1bee6fb5c",
-        "9fc7c6bdbd83270da2426c09280af8b917f4ffbbde203d62bedfa63e70f9a17c",
-        "016874bd90e7364f149b1a62fd0b01a722ed633c10c941e64e3550cfb2d29779",
-        "6d5c48c2d92769bc89fba33f82a5d1d22c604b1ee19e6971ac1a6ba7c15a189d",
-        "383a3ecb2ea648036842a0e00a2bb6a649c8e71275701f574d6fd261348665ea",
-        "8d1db027ec36b65217c411a6f7cef4a8762609e3afc9545a7fd98494",
+        "4063a1dbd80d6757dd56d8ea501961b911e6216f19a9bdfad32835e7b7751353",
+        "450acbc08aab117eb5b872750ab3124b6c3bd9b62a51b6d1f6f92679fed331ca",
+        "e91786dd7960842e2c4328a16f4defb7b5dd64201eec5b99835e57b979effbf8",
+        "62952359e1d569c3fcde78e45da84bfedd8b44e7e85e8d2ec176ce5226133a30",
+        "973b5d849b363e778e3bfdcdb6ff52a9f41a92e36d0ae2765ccad63023f24f07",
+        "6ae94ad24a29b2a1091a1b7ef44b034843f5e6e4af8e717d5981c62aeb915122",
+        "a37aaf87726d22c9ab8fb73f99482f1c180f245b7e0fa50d58e0578d5db108c7",
+        "7770b09d0b532a85e3fad96f40cacc184c6fb4d7a03a625927637eab8415cfce",
+        "6cb0010adb42f80c83a485df60d204941ad04e69542d4ff07768a941d8440c62",
+        "b790829cd1c53c8a024ca1af9a9f13ab4bc572d7f56d5df0ae051cbecc38b376",
+        "fe5458c0445ec775d26841b3de498c36eabdc26d3335b635a592bc6fd47ca79e",
+        "5da349c0072419751a15f06f8addc5b11497f4c6458e250f9c6d5243fb3255e6",
+        "303fc285afa0a97db37c50e1be32455bee41339c92797c63048818c411fa63a6",
+        "c988f0a077ae84a4fc6cdac151fe5c7cbc0719468d49c2a96933c4d5df6976ce",
+        "7a25fdad4cd4e3070616002f669f1b6d6a681c25d1e16d3edcec7d8a18809b93",
+        "f73ea660bdb306f6155ddf8b1a4fe773f2c0adee0ffe26a8b4d577c8cb9c053a",
+        "e7bb99f4aca864b38376c12981e52af1494d433e6f92d302e621d5ca78707864",
+        "2229be2c810649f9a54247070df5e060de2dfb6281c2c6f6e4c4a0265c8d6022",
+        "58c699215700caca1bc948a6a5c4b72d336b5356169fad89c64262e5a52b1a6b",
+        "d92ad617432cf4a8e5855bcd32a3b72490524b4ead4502f735a1834b69243df0",
+        "0e279a81cb3ea2a47301854a433907c1d077764c9334f9b9b3948286528397ec",
+        "a584c4ffb73290927d4421f9c7ff92164110c9d91df036fa9bf95c6d6f3c6155",
+        "09c5b49399c7cfe289d4be94ab48df058fd448080effb51099e90a19d56bc00b",
+        "15bcd8eeadead98a1e3ff07699bbe75e412e60f405f4587c11d7bae1226455ad",
+        "3741938c2b06064a74b2c0d8c59287798161db2af8b78e8637bc01b83174cb1f",
+        "6e7fb38c03d94aa2c66ee53b27ce40dfc9adcbf83ccb151eab31d4b468da7f80",
+        "323db475eccc6600af83bc993501cf48c116f7dcf77fa1cc1ff7e7ca6af458ff",
+        "fb1f107f57d48d20d8fe23b3a7a2ed0dad0654e5f242f0381e3691d7e73a0224",
+        "5f3d9917fba5454673e6e270959908cdfcb75a416efec82deb4f4378a7b6d759",
+        "33ca86236f376af3d1dfb51042f0a410d8835da9c6d6aee6ea7e445e268046b9",
+        "7b00b4f2e103382130a3a4813ac844ed12c71ddc0d481857c12fc9efdb75335d",
+        "9627ec86dc3ab13808dc68fe29abdfec9d7b23d055d2befed74d34ce1906852d",
+        "8f452ca6ed3feb96304c6c3707b1a479599a142a7743babddb88743257203a8f",
+        "b92dfa1e62a09289900047ac6a9f0a146bbc883afd86a3d38120139dfb348d8a",
+        "3d567cbba307d62e73f939957813ada8e78c62113abe69f65d9ac0e59ad9d5cf",
+        "41e15b24263c49295a81148abd2ba33d5ad03b61031ae3a866e097dfeebfaee1",
+        "96dfb497c54a1f33eb271a13b6131222441688381275708dc50b7981",
     );
 
     const KNOWN_EMPTY: &str = concat!(
-        "b3fa92991346d40688ad54554e4f4a9e2476c59d23078f808351a388b3e54a54",
-        "44a60269e65ea0de4718e26ca4e89d84d7fa0ac60c350a30ac597023dd1fb0c5",
-        "519c7f326f5af102b6848383b29ec5ffa6131eaac4bdb72903c1a12ffe1ced8d",
-        "5625fc7293f07bde613f244d67129a2f4e146811d2204f68d205aa27ccdd8bc8",
-        "472918a2aaded1ec75271757c433267e32b74470da40a5b9aa2a016f46339d25",
-        "9760c6518b0dddb055a380d08e8fe62bfbd0d8c158f7ad2fc040a1fa8c34810c",
-        "24cb16701f367afc53379bb1dac10b9d7c5996e7778ebc398482cc520452757d",
-        "75eed0ac01e695504e87447553ff5aab080d46cd53329c09614e5615c7fd3613",
-        "ea98c692c02da352daefdba77a49f8f4508d08f4837b24f8fc4701f8fe76b9c7",
-        "35ff05c32cd6ab4e89c081b50e6cc3431be99b8ef2acff18b116d00a94f68bb0",
-        "d81582c02a5a9c4fa1bc6e575d9c7654bd29561be0d9bf15eaad160b7b85f8ac",
-        "f27957916572a6307ba5fa008c18aa7155b006281d2d01fc409bfa710781f2e4",
-        "18ea75b97fd29736edbd055d07e53f3716420f0119b044b833e1f66742fa46aa",
-        "2b41061d3fdcf0a164a232d5aa65ed121e67c709ec34e61ae6bc1a17c30ef1e1",
-        "70e5487da4a21686f01aa407f0a416fd747e540cdf0a7766180bd3015e47e8f0",
-        "20c1703663ccd496b35d9b06ad1e3a0e478fea4a0cd393feb2f9c3542abdb52c",
-        "6ba20ebd5c1f5259d3724640a8620ac6f1cb86df887c85578ec0ab1f2516e351",
-        "202b80c24b3a15aa3373393eb80b6aede6817c39b5707910abb2eefc53edf40e",
-        "610662e5cf74bcad949b43bf9ede42f733699cff45d690c0a7524ce9b28383bf",
-        "99ffebd954d7a46c23def266c85e5b66aa9028c9554bbe11b39504799cb458c0",
-        "2449840ee2fc0ee221059c8eb1e7cf3d8db7f518cee103f2b7b611ed2f5e4861",
-        "350155c14b97101105799b3e6283e642763034c47a5abf773d7eb4679716a86e",
-        "7a2686e1d988ff8bcf2dd1851696790f8ff67a0bb996addb095edce63b7c32c2",
-        "2860f30de7d007c265fc78ebb0a57a02ee320deed899693cf4043083838903de",
-        "650346871c6b77f0a25af071e57fc365e487c5936c3f0b7a5f38dafd417d187a",
-        "0fabf05fddb76523dc69e657c517b0905223bb9d4ff23b74e9f500df7b49d855",
-        "9c2f2e5a9bbba37ae4deeed122e6b0ad8164deb9665521a192dc59ea9687d525",
-        "968a4ade110d6d3275c320107e72fcdcf2c59b9c8d5947412890a0eb7f653258",
-        "63596a0cecc8c086ef68606b5a00e0d2012a84d0efbb32bf6bbaa5ccbbb07850",
-        "56e886433872d8994025faf70449a79ed4c9e38edbcf44d686877561321f3fc2",
-        "a44f05d43bcdfead6811210b4df7368fde767f25ade9a0c419692da6927a1931",
-        "c5a3956a86af435eba445a846e06c31a09abc3e1f8a6f45cedb9a740641d99df",
-        "02b0fc8b240025005e3e86808f27acad95e9c732d9b17544d3994cc36458cd49",
-        "be93153a61dabe32f1abafc64194380b40f42e8b4c9706b078cdfbb1c6da35bd",
-        "451ccd5d2eb51f9046b88e4ea82cb36d21ab83892a68a46f41b1e2bd4ecc1e1e",
-        "c008d2f59931633785f3e3c0236763bd0e237d042f5ab47893888447bb444338",
-        "012ddd49e7c42f31f7de45be31f59f12a40fdfed6b8634ba4b47dc56",
+        "e827f2e77ab289c405759d7f4e356c9b3543f764568243a347ad0916604c5e53",
+        "f5920f93e9cec81c1a400cb95e8bbe6c7d4abd4d145e84e216647eca8a65d950",
+        "e853dbee969254a2e5785ac5b2584ac6ed546aed8177d661ecca066834f21715",
+        "890ea9b75059f0032d5a0620002a57cafd64b60e89bf5c736460eeb1e8959158",
+        "8b274e55b1005aadc99660b6e639b9bd565a0a829af52dfadb8e4e7aa76bc053",
+        "03171a131048321b766ada68b50e9b9e5ac348c76feef506f8fd34b7a18f2a55",
+        "47d08848526ffceecb59a05ce7e46c629b30b3b13a7745221b4f4a3de8fdc12f",
+        "b178fab0ba06a1ff2e43313e1db35815a96d2141049ffb3be196428fa3b36df3",
+        "5ea50c6cf220c1b34b66dbf1fcdfe8296a37ee4c646009c1cec4edb4a383c4a6",
+        "41ce04edc5c1a9a20fc138430fc890dc051b854d928cc35458316545a2900d3b",
+        "4ce4baebb7664731c68026df26a8c804a14fa4d4e9aa7dfbf7d2223f76cef15a",
+        "1f64f433f5f6ba4d9c5d7e550efad8ccf4a18670795da7cc1f7dc33429b3be01",
+        "8b6c742753dbb1c36129dc5f0b06ad81fda1f6f715211da05634ea693d7b6554",
+        "8661bed67518f6fe136e35607574b392d3ce9c136c4d42886739cba24add876f",
+        "c8128da18741c57b27dfe701a4e183dc09aaa69f5fc0b4759009d92d8b01db43",
+        "82e68732d0cf0f6efc6ca4ce1e4106649606d2773091fc82d91edc426eceac3d",
+        "24dfbd533832d644c4ee72f46acc3ec3c8371ffea6784908e64f9758c6acb399",
+        "39e1109b4eb95e5cf3d7302deafa334d71423132a660a2926b8296076cd7957e",
+        "29614a97cc3f7abe6144c087855ad3871834c7c507ed457b67133740db3bf384",
+        "5cd7d8ca6613c5f8fff0b4e52f3fb5e038c3b092acc01077e5ef565191c3f5e9",
+        "5e6e42cedfe4c3fd5c3d1fadb388db6e884186f5980e13ab1f83d6707b636842",
+        "0db0647442fc996588c19738b041836ee4b6bb22904ea47c07677f673f301651",
+        "4c3b939c175ba1823adfff948c62624da0080825682d5f7d7369a42604ac29ad",
+        "c708a918abef698be0e5fb8430b3783f9be33680fd26cf4fedfee8ec568cc1aa",
+        "885067a96e45e822c3babc7e1691bbdac4704b8cc14c7035754dd826defb75e7",
+        "82280f87844cefaf82b00e0a0766a7263217dbcf41e59e87c03e2e95f3972135",
+        "fb83102928dbec2de7e6a66897ac1c16e6c0d5a057419380ae07030a2d7d1075",
+        "9d76e09aa3dbc148c5a4bfc71cecb2548099d005457348b30f68731fe7295b02",
+        "343630668aae61fafea628d1e9a92b9e29444eb34e3db7e60aee62cd2506a751",
+        "0c06aa5d6e080394cbd5c6552a7f9a7831442fd4e26d9373cf0d1f690879cab9",
+        "6d9e0d725324f964fd685db35336c3646f58eea098fbdcfbc8ecf000f998a787",
+        "91510662904925a44e848f73f0c00144cdb739bed91282902d32e0b4239286ff",
+        "9982b455a89d99959aee1e6d48ebce9a9aa14e6c78e22e0cbebd3960beb88663",
+        "ddb351d09f2c125384b38996e372857165ee6fdb76c823424c2cfa7f31f6aa55",
+        "d62d22bfd70d842500fa10f9e39b3a119311c2f1ca50bb8d3cc920c8d2d84d6b",
+        "502ed3c372eb17fede7d6d10f01fa3c64faa8cace4302dfbb4da9ac3387d9483",
+        "16df7d55bde1ec3e4c8fe31b6a3e876310f6fce86a4b993ce92efb50",
     );
-    const KNOWN_EMPTY_BODY: &str = "043d95a211fe0e6b5a9838b7e94b324d";
+    const KNOWN_EMPTY_BODY: &str = "d58f0a7576206d10ae99027a95da6105";
 
     /// Gives `pattern(17, 5)` for a draw of any length.
     struct Pattern;
@@ -1854,12 +1861,14 @@ pub(super) mod stack {
 
     use super::super::stack::keying_secrets;
     use super::ARCHIVE_KEY_RECORD_LEN;
-    use crate::derive::stack::secrets_of;
+    use crate::derive::stack::{hedge_secrets, secrets_of};
     use crate::derive::{Branch, SALT, derive_archive_key, derive_archive_layer_key};
     use crate::key::Key;
-    use crate::key::tests::{Counting, Failing};
+    use crate::key::tests::{Counting, Failing, counted};
     use crate::record::AssociatedData;
-    use crate::residue::{assert_clean, below_pad, depth_changed, key_dependent, residue};
+    use crate::residue::{
+        assert_clean, below_pad, depth_changed, key_dependent, panic_at, residue,
+    };
     use crate::slots::tests::{EPOCH, flipped_epoch_key};
     use crate::xwing::stack::seed_secrets;
     use crate::{
@@ -1989,9 +1998,10 @@ pub(super) mod stack {
 
     /// Slots over `memory` in an epoch whose key `flip` changes, with a stored key for wrapping and
     /// one of the archive, the record of an archive key under them, and what a creation, a load and
-    /// a carry of it handle: the three keys, the expansion of the seed and what X-Wing makes of it,
-    /// and what opening the record handles; then a change to the next epoch under way, and the
-    /// record carried into it and what that handles.
+    /// a carry of it handle: the three keys, the key of the epoch and the hedges of the three draws
+    /// under it, the expansion of the seed and what X-Wing makes of it, and what opening the record
+    /// handles; then a change to the next epoch under way, and the record carried into it, what
+    /// that handles, the key of that epoch and the hedge of the nonce under it.
     fn archive<'a>(
         memory: &'a mut [Slot],
         epoch: &'a mut Epoch,
@@ -2010,6 +2020,7 @@ pub(super) mod stack {
             .generate(Purpose::ArchiveWrap, KeyLength::Bytes32, &mut Counting)
             .unwrap();
         let mut record = [0; ARCHIVE_KEY_RECORD_LEN];
+        let count = slots.epoch.drawn;
         slots
             .create_archive_key(store, stored, b"archive", &mut Counting, &mut record)
             .unwrap();
@@ -2019,6 +2030,22 @@ pub(super) mod stack {
         let mut secrets = [stored, store, key]
             .map(|handle| slots.memory[handle.index].wrapping_key().0.bytes()[..32].to_vec())
             .to_vec();
+        let epoch_key = flipped_epoch_key(flip);
+        let nonce = counted::<12>();
+        secrets.extend(hedge_secrets(&epoch_key, count, Branch::HedgeNonce, &nonce));
+        secrets.extend(hedge_secrets(
+            &epoch_key,
+            count.wrapping_add(1),
+            Branch::HedgeNonce,
+            &nonce,
+        ));
+        secrets.extend(hedge_secrets(
+            &epoch_key,
+            count.wrapping_add(2),
+            Branch::HedgeKey,
+            &counted::<32>(),
+        ));
+        secrets.push(epoch_key.to_vec());
         let seed: [u8; 32] = secrets[2].as_slice().try_into().unwrap();
         // What X-Wing expands the seed to: the seed of ML-KEM, d and z, and the key of X25519.
         let mut shake = Shake256::default();
@@ -2034,7 +2061,7 @@ pub(super) mod stack {
         );
         secrets.extend(layer_secrets(keys, &record));
         slots.release(key).unwrap();
-        slots.begin_epoch(&mut [8; 32]).unwrap();
+        slots.begin_epoch(&mut next_key(flip)).unwrap();
         let mut carried = [0; ARCHIVE_KEY_RECORD_LEN];
         slots
             .carry_archive_key(
@@ -2051,8 +2078,20 @@ pub(super) mod stack {
             &slots.epoch.next,
             &carried,
         ));
+        secrets.extend(hedge_secrets(
+            &next_key(flip),
+            slots.epoch.drawn.wrapping_sub(1),
+            Branch::HedgeNonce,
+            &nonce,
+        ));
+        secrets.push(next_key(flip).to_vec());
         assert_eq!(slots.abandon_epoch(&mut Platform), Ok(Erasure::Guaranteed));
         (slots, [store, stored], record, secrets)
+    }
+
+    /// The key of the next epoch in the tests of a carry, made from a `flip`ped pattern.
+    fn next_key(flip: u8) -> [u8; 32] {
+        flipped_epoch_key(flip ^ 0x5a)
     }
 
     /// Fresh slots over `memory` in the state [`archive`] creates its archive key in, with the
@@ -2118,7 +2157,7 @@ pub(super) mod stack {
         });
         assert!(residue(range, &pieces) > 0, "a load");
         slots.release(key.unwrap()).unwrap();
-        slots.begin_epoch(&mut [8; 32]).unwrap();
+        slots.begin_epoch(&mut next_key(0)).unwrap();
         let range = below_pad(false, || {
             slots
                 .carry_archive_key_on_stack(
@@ -2167,7 +2206,7 @@ pub(super) mod stack {
             .load_archive_key(store, stored, b"archive", &record)
             .unwrap();
         slots.release(key).unwrap();
-        slots.begin_epoch(&mut [8; 32]).unwrap();
+        slots.begin_epoch(&mut next_key(0)).unwrap();
         let mut carried = [0; ARCHIVE_KEY_RECORD_LEN];
         assert_clean(&pieces, || {
             slots
@@ -2182,6 +2221,53 @@ pub(super) mod stack {
                 .unwrap();
             black_box(&carried);
         });
+    }
+
+    /// A source that panics on any of its calls leaves none of what a creation or a carry handles
+    /// on the stack, at the panic or after it, and writes nothing. Each runs from the state
+    /// [`archive`] runs it from, so it handles the same values until the panic.
+    #[test]
+    fn a_panicking_source_leaves_no_secret_of_a_creation_or_a_carry() {
+        let (mut memory, mut other) = ([const { Slot::empty() }; 4], [const { Slot::empty() }; 4]);
+        let (mut epoch, mut other_epoch) = (Epoch::empty(), Epoch::empty());
+        let (_, _, record, secrets) = archive(&mut memory, &mut epoch, 0);
+        let (_, _, _, others) = archive(&mut other, &mut other_epoch, 0x5a);
+        let pieces = key_dependent(&secrets, &others);
+        for (carry, calls) in [(false, 3), (true, 1)] {
+            for at in 1..=calls + 1 {
+                let (mut again, mut again_epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
+                let (mut slots, [store, stored]) = before_creation(&mut again, &mut again_epoch);
+                let mut written = [0; ARCHIVE_KEY_RECORD_LEN];
+                let reached = if carry {
+                    let mut created = [0; ARCHIVE_KEY_RECORD_LEN];
+                    slots
+                        .create_archive_key(store, stored, b"archive", &mut Counting, &mut created)
+                        .unwrap();
+                    assert_eq!(created, record);
+                    slots.begin_epoch(&mut next_key(0)).unwrap();
+                    panic_at(&pieces, (Counting, at), |source| {
+                        slots
+                            .carry_archive_key(
+                                stored,
+                                stored,
+                                b"archive",
+                                source,
+                                &record,
+                                &mut written,
+                            )
+                            .unwrap();
+                    })
+                } else {
+                    panic_at(&pieces, (Counting, at), |source| {
+                        slots
+                            .create_archive_key(store, stored, b"archive", source, &mut written)
+                            .unwrap();
+                    })
+                };
+                assert_eq!(reached, at <= calls);
+                assert_eq!(written == [0; ARCHIVE_KEY_RECORD_LEN], reached);
+            }
+        }
     }
 
     /// The wipes cover more than the calls use, with the self-test of X-Wing asked for the first

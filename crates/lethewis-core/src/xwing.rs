@@ -568,6 +568,7 @@ pub(crate) mod model {
     /// X-Wing is beyond Kani. The public key of a seed is the seed and then zeros: one seed gives
     /// one public key, and two seeds two.
     pub(crate) fn public_key(seed: &[u8; SEED_LEN], public: &mut [u8; PUBLIC_LEN]) {
+        crate::entropy::model::step();
         *public = [0; PUBLIC_LEN];
         if let Some(first) = public.first_chunk_mut::<SEED_LEN>() {
             *first = *seed;
@@ -588,6 +589,7 @@ pub(crate) mod model {
 
     /// A key pair agrees with itself or not, at will, and the model records which, and the pair.
     pub(crate) fn agrees(_: &Known, seed: &[u8; SEED_LEN], public: &[u8; PUBLIC_LEN]) -> bool {
+        crate::entropy::model::step();
         keep(&PAIR_SEED, seed);
         if let Some(head) = public.first_chunk() {
             keep(&PAIR_PUBLIC, head);
@@ -620,6 +622,7 @@ pub(crate) mod model {
         ciphertext: &mut [u8; CIPHERTEXT_LEN],
         shared: &mut [u8; SHARED_LEN],
     ) -> Result<(), InvalidPublicKey> {
+        crate::entropy::model::step();
         keep(&RANDOMNESS, randomness);
         if let Some(head) = public.first_chunk() {
             keep(&PUBLIC, head);
@@ -642,6 +645,7 @@ pub(crate) mod model {
         ciphertext: &[u8; CIPHERTEXT_LEN],
         shared: &mut [u8; SHARED_LEN],
     ) {
+        crate::entropy::model::step();
         DECAPSULATED.store(true, Ordering::Relaxed);
         keep(&SEED, seed);
         keep_ciphertext(ciphertext);

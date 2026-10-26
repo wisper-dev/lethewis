@@ -536,6 +536,7 @@ pub(crate) mod model {
         _: &[u8],
         buffer: &mut [u8; N],
     ) -> Result<[u8; TAG_LEN], SealFailed> {
+        crate::entropy::model::step();
         *buffer = kani::any();
         if kani::any() {
             Ok(kani::any())
@@ -556,6 +557,7 @@ pub(crate) mod model {
         aad: &[u8],
         buffer: &mut [u8],
     ) -> Result<[u8; TAG_LEN], SealFailed> {
+        crate::entropy::model::step();
         note_inputs(key, nonce, aad);
         for byte in buffer.iter_mut() {
             *byte = kani::any();
@@ -670,6 +672,7 @@ pub(crate) mod model {
         buffer: &mut [u8],
         tag: &[u8; TAG_LEN],
     ) -> Result<(), Rejected> {
+        crate::entropy::model::step();
         note_inputs(key, nonce, aad);
         keep(&OPENED_TAG, tag);
         CHUNK_OPENINGS.store(
@@ -706,6 +709,7 @@ pub(crate) mod model {
         buffer: &mut [u8; N],
         _: &[u8; TAG_LEN],
     ) -> Result<(), Rejected> {
+        crate::entropy::model::step();
         *buffer = kani::any();
         let rejected: bool = kani::any();
         REJECTED.store(rejected, Ordering::Relaxed);
@@ -729,6 +733,7 @@ pub(crate) mod model {
         _: &mut [u8; N],
         _: &[u8; TAG_LEN],
     ) -> Result<(), Rejected> {
+        crate::entropy::model::step();
         ASKED.store(true, Ordering::Relaxed);
         Err(Rejected)
     }
@@ -747,6 +752,7 @@ pub(crate) mod model {
         _: &mut [u8],
         _: &[u8; TAG_LEN],
     ) -> Result<(), Rejected> {
+        crate::entropy::model::step();
         ASKED.store(true, Ordering::Relaxed);
         Err(Rejected)
     }
@@ -759,6 +765,7 @@ pub(crate) mod model {
         _: &[u8],
         _: &mut [u8],
     ) -> Result<[u8; TAG_LEN], SealFailed> {
+        crate::entropy::model::step();
         ASKED.store(true, Ordering::Relaxed);
         Err(SealFailed)
     }

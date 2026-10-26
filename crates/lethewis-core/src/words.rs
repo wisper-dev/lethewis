@@ -86,8 +86,8 @@ impl<'a> Slots<'a> {
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through after the random bytes are wiped; the
-    /// stack is not, and no slot changes.
+    /// Only if `entropy` panics. The panic passes through after the random bytes are wiped, and no
+    /// slot changes.
     pub fn generate_words(
         &mut self,
         entropy: &mut (impl Entropy + ?Sized),
