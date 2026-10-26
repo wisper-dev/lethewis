@@ -328,6 +328,8 @@ struct AnyEntropy {
     requested: usize,
     at: usize,
     failed: bool,
+    steps: u8,
+    late: bool,
 }
 
 impl AnyEntropy {
@@ -339,12 +341,29 @@ impl AnyEntropy {
             requested: 0,
             at: 0,
             failed: false,
+            steps: crate::entropy::model::steps(),
+            late: false,
         }
+    }
+}
+
+// Checked when the source is dropped, so that a proof whose source is never asked reaches it too.
+impl Drop for AnyEntropy {
+    fn drop(&mut self) {
+        kani::assert(
+            !self.late,
+            "the source is asked before any step on a secret",
+        );
+        kani::assert(
+            crate::entropy::model::steps() < u8::MAX,
+            "the count of steps on a secret holds them all",
+        );
     }
 }
 
 impl Entropy for AnyEntropy {
     fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
+        self.late |= crate::entropy::model::steps() != self.steps;
         self.calls = self.calls.saturating_add(1);
         self.requested = dest.len();
         self.at = dest.as_ptr().addr();
@@ -1927,6 +1946,7 @@ impl<const N: usize> AnyCipher<N> {
         buffer: &mut [u8; N],
         tag: &[u8; TAG_LEN],
     ) -> Result<(), Rejected> {
+        crate::entropy::model::step();
         let written: [u8; N] = kani::any();
         let accepted = self.answer.unwrap_or_else(kani::any);
         (self.given, self.tag) = (*buffer, *tag);
@@ -2673,11 +2693,11 @@ fn an_export_changes_no_set_and_writes_only_when_it_succeeds() {
 /// From any state of two slots and of the epoch, with a change to the next under way or not,
 /// for any lock record, any output buffer and any context of up to two bytes, whatever the
 /// platform's source and the cipher do: a carry changes no slot and no epoch but its count of
-/// draws. It refuses an empty context and a missing change before it decrypts, then opens the
-/// record once, under the key derived from the key of this epoch and with the record's nonce,
-/// and refuses it as `StaleRecord`, asking the source nothing, unless the cipher accepts it
-/// and it names this epoch. It writes the output only when it succeeds, starting with the nonce
-/// the source gave, hedged with the key of the next epoch.
+/// draws. It refuses an empty context and a missing change before it asks the source, and a
+/// failed source before it decrypts, then opens the record once, under the key derived from the
+/// key of this epoch and with the record's nonce, and refuses it as `StaleRecord` unless the
+/// cipher accepts it and it names this epoch. It writes the output only when it succeeds,
+/// starting with the nonce the source gave, hedged with the key of the next epoch.
 #[kani::proof]
 #[kani::unwind(270)]
 fn a_carry_changes_no_slot_and_writes_only_when_it_succeeds() {
@@ -2722,24 +2742,25 @@ fn a_carry_changes_no_slot_and_writes_only_when_it_succeeds() {
     let current = layer.accepted && layer.written[..8] == number.to_le_bytes();
     kani::assert(
         if context.is_empty() {
-            result == Err(Error::InvalidContext) && layer.calls == 0
+            result == Err(Error::InvalidContext) && entropy.calls == 0 && layer.calls == 0
         } else if !changing {
-            result == Err(Error::NoEpochChange) && layer.calls == 0
+            result == Err(Error::NoEpochChange) && entropy.calls == 0 && layer.calls == 0
         } else if number == u64::MAX {
-            result == Err(Error::EpochExhausted) && layer.calls == 0
+            result == Err(Error::EpochExhausted) && entropy.calls == 0 && layer.calls == 0
+        } else if entropy.failed {
+            result == Err(Error::EntropyFailed) && layer.calls == 0
         } else if layer.calls == 0 {
             result == Err(Error::DerivationFailed) && any_failed()
         } else if !current {
-            result == Err(Error::StaleRecord) && entropy.calls == 0
-        } else if entropy.failed {
-            result == Err(Error::EntropyFailed)
+            result == Err(Error::StaleRecord)
         } else {
             result.is_ok()
                 || result == Err(Error::DerivationFailed)
                 || result == Err(Error::CipherFailed)
         },
-        "a carry refuses a bad context and a missing change, a failed derivation, a record that \
-         does not open in this epoch and a failed source",
+        "a carry refuses a bad context and a missing change before it asks the source, then a \
+         failed source before it decrypts, a failed derivation and a record that does not open \
+         in this epoch",
     );
     kani::assert(
         !any_failed() || result == Err(Error::DerivationFailed),
@@ -2748,11 +2769,12 @@ fn a_carry_changes_no_slot_and_writes_only_when_it_succeeds() {
     kani::assert(
         layer.calls <= 1
             && (layer.calls == 0
-                || (layer.key == expected_layer_key(&epoch_key)
+                || (entropy.calls == 1
+                    && layer.key == expected_layer_key(&epoch_key)
                     && layer.nonce[..] == from[..NONCE_LEN]
                     && layer.aad == Bound::to(context))),
-        "the record is opened once, under the key of this epoch, with its own nonce and bound \
-         to its context",
+        "the record is opened once, after one draw, under the key of this epoch, with its own \
+         nonce and bound to its context",
     );
     kani::assert(
         (result == Err(Error::CipherFailed)) == seal::model::any_seal_failed(),
@@ -2964,6 +2986,7 @@ impl<const N: usize> AnySeal<N> {
         aad: &[u8],
         buffer: &mut [u8; N],
     ) -> Result<[u8; TAG_LEN], SealFailed> {
+        crate::entropy::model::step();
         (self.key, self.nonce, self.aad, self.given) = (*key, *nonce, Bound::of(aad), *buffer);
         let (written, tag, failed): ([u8; N], [u8; TAG_LEN], bool) =
             (kani::any(), kani::any(), kani::any());
@@ -3023,6 +3046,7 @@ impl AnyBody {
         input: &[u8],
         output: &mut [u8],
     ) -> Result<(), Error> {
+        crate::entropy::model::step();
         (self.key, self.aad) = (*key, Bound::of(aad));
         self.input = (input.as_ptr().addr(), input.len());
         self.output = (output.as_ptr().addr(), output.len());
@@ -3069,26 +3093,28 @@ fn place(bytes: &[u8]) -> (usize, usize) {
     (bytes.as_ptr().addr(), bytes.len())
 }
 
-/// Any source, which keeps what it gave the first time.
-struct FirstKept {
+/// Any source, which keeps what it gave on call number `at`, counted from one.
+struct Kept {
     source: AnyEntropy,
-    first: Bytes,
+    at: u8,
+    kept: Bytes,
 }
 
-impl FirstKept {
-    fn new() -> Self {
+impl Kept {
+    fn at(at: u8) -> Self {
         Self {
             source: AnyEntropy::new(),
-            first: [0; 64],
+            at,
+            kept: [0; 64],
         }
     }
 }
 
-impl Entropy for FirstKept {
+impl Entropy for Kept {
     fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
         let filled = self.source.fill(dest);
-        if self.source.calls == 1 {
-            self.first = self.source.written;
+        if self.source.calls == self.at {
+            self.kept = self.source.written;
         }
         filled
     }
@@ -3219,7 +3245,7 @@ fn a_public_key_is_read_from_its_record() {
 /// wrong answer of X-Wing before it draws, then a failed source; `DerivationFailed` is a failed derivation, `RecordRejected` a public key
 /// X-Wing refuses and `CipherFailed` a failed seal of the record or of the body, each and only
 /// that. It writes the record only when it succeeds, and wipes the body when it fails: after two
-/// draws, the randomness given to X-Wing with the public key is the hedge of the first under the
+/// draws, the randomness given to X-Wing with the public key is the hedge of the second under the
 /// key of this epoch, derived under the key of the chat, and the body is sealed once, from the
 /// data into the body, under the key derived from the shared secret, with the ciphertext as the
 /// salt, and the associated data of a batch of the context.
@@ -3253,7 +3279,7 @@ fn an_archive_writes_only_when_it_succeeds() {
     let body_at = place(&memory_of_body);
     let data_bytes: [u8; 1] = kani::any();
     let data: &[u8] = &data_bytes;
-    let mut entropy = FirstKept::new();
+    let mut entropy = AnyEntropy::new();
     let mut sealer = AnySeal::<ARCHIVED_LEN>::new();
     let mut body = AnyBody::new(Error::CipherFailed);
 
@@ -3266,14 +3292,14 @@ fn an_archive_writes_only_when_it_succeeds() {
         &xwing::KNOWN,
         (sealer.sealing(), body.running()),
     );
-    let draws = count.wrapping_add(u64::from(entropy.source.answered));
+    let draws = count.wrapping_add(u64::from(entropy.answered));
     kani::assert(
         unchanged_except(&slots, &before, 2)
             && epoch_snapshot(&slots) == (number, key, next, changing, draws),
         "archiving changes no slot and no epoch, and counts once each draw the source answers",
     );
     let chat = snapshot_at(&before, seal.index);
-    let asked = entropy.source.calls;
+    let asked = entropy.calls;
     kani::assert(
         if context.is_empty() {
             result == Err(Error::InvalidContext) && asked == 0
@@ -3285,7 +3311,7 @@ fn an_archive_writes_only_when_it_succeeds() {
             result == Err(Error::StaleRecord) && asked == 0
         } else if !xwing_answered() {
             result == Err(Error::CipherFailed) && asked == 0
-        } else if entropy.source.failed {
+        } else if entropy.failed {
             result == Err(Error::EntropyFailed)
         } else if any_failed() {
             result == Err(Error::DerivationFailed)
@@ -3316,7 +3342,12 @@ fn an_archive_writes_only_when_it_succeeds() {
         );
     }
     if result.is_ok() {
-        let hedged = expected_hedge(&epoch_key, count, Branch::HedgeEncaps, &entropy.first);
+        let hedged = expected_hedge(
+            &epoch_key,
+            count.wrapping_add(1),
+            Branch::HedgeEncaps,
+            &entropy.written,
+        );
         kani::assert(
             asked == 2
                 && body.calls == 1
@@ -3360,7 +3391,7 @@ fn an_archive_writes_only_when_it_succeeds() {
 }
 
 /// From the same states as the proof above, a successful archive seals, under the key of the
-/// chat, with the nonce of its second draw hedged with the key of this epoch and with the
+/// chat, with the nonce of its first draw hedged with the key of this epoch and with the
 /// associated data of the context, the identifier of the archive key, the ciphertext X-Wing gave
 /// and the check of its shared secret; and its record holds that nonce, what the cipher wrote
 /// and its tag.
@@ -3389,7 +3420,7 @@ fn an_archive_seals_its_identifier_ciphertext_and_check() {
     let context = any_context(&context_bytes);
     let mut record: [u8; ARCHIVE_RECORD_LEN] = kani::any();
     let mut memory_of_body: [u8; 16] = kani::any();
-    let mut entropy = FirstKept::new();
+    let mut entropy = Kept::at(1);
     let mut sealer = AnySeal::<ARCHIVED_LEN>::new();
     let mut body = AnyBody::new(Error::CipherFailed);
 
@@ -3405,18 +3436,12 @@ fn an_archive_seals_its_identifier_ciphertext_and_check() {
     let chat = snapshot_at(&before, seal.index);
     if result.is_ok() {
         let mut drawn = [0; 12];
-        drawn.copy_from_slice(&entropy.source.written[..12]);
+        drawn.copy_from_slice(&entropy.kept[..12]);
         let (shared, ciphertext) = (xwing::model::shared(), xwing::model::ciphertext_head());
         kani::assert(
             sealer.calls == 1
                 && sealer.key == expected_archive_seal_key(&key_head(&chat))
-                && sealer.nonce
-                    == expected_hedge(
-                        &epoch_key,
-                        count.wrapping_add(1),
-                        Branch::HedgeNonce,
-                        &drawn,
-                    )
+                && sealer.nonce == expected_hedge(&epoch_key, count, Branch::HedgeNonce, &drawn)
                 && sealer.aad == Bound::to(context)
                 && sealer.given[..ID_LEN] == public.id
                 && sealer.given[ID_LEN..ID_LEN + 32] == ciphertext
@@ -3598,11 +3623,12 @@ fn an_opened_archive_opens_its_body_only_under_its_archive_key() {
 
 /// From any state of two slots and of the epoch, for handles of these slots naming any slots
 /// and generations, any record of an archive, any context of up to two bytes and any output, with
-/// a cipher that rejects every record: moving a record changes no slot and no epoch and writes
-/// nothing. It refuses an empty context, then for each handle in turn a stale one and a set not of
-/// a chat for its archive, before it decrypts. It opens the record at most once, under the key of
-/// the first chat, with the record's nonce, ciphertext and tag and the associated data of the
-/// context, and refuses it as `RecordRejected`, asking the source nothing.
+/// a cipher that rejects every record: moving a record changes no slot and no epoch but its count
+/// of draws, and writes nothing. It refuses an empty context, then for each handle in turn a stale one and a set not of
+/// a chat for its archive, before it asks the source, and a failed source before it decrypts. It
+/// opens the record at most once, under the key of the first chat, with the record's nonce,
+/// ciphertext and tag and the associated data of the context, and refuses it as
+/// `RecordRejected`.
 #[kani::proof]
 #[kani::unwind(1181)]
 fn a_reseal_refuses_what_it_cannot_move() {
@@ -3613,7 +3639,7 @@ fn a_reseal_refuses_what_it_cannot_move() {
         memory: &mut memory,
         epoch: &mut epoch,
     };
-    let epoch_before = epoch_snapshot(&slots);
+    let (number, key, next, changing, count) = epoch_snapshot(&slots);
     let before = snapshots(&slots);
     let (from, to) = (forged(id), forged(id));
     let context_bytes: [u8; 2] = kani::any();
@@ -3635,9 +3661,16 @@ fn a_reseal_refuses_what_it_cannot_move() {
     );
     kani::assert(
         unchanged_except(&slots, &before, 2)
-            && epoch_snapshot(&slots) == epoch_before
+            && epoch_snapshot(&slots)
+                == (
+                    number,
+                    key,
+                    next,
+                    changing,
+                    count.wrapping_add(u64::from(entropy.answered)),
+                )
             && same(&out, &original),
-        "a refused move changes no slot and no epoch and writes nothing",
+        "a refused move changes no slot and no epoch but its count of draws, and writes nothing",
     );
     let refusal = |handle: &Handle<'_>| {
         if !names_loaded(&before, handle) {
@@ -3650,32 +3683,36 @@ fn a_reseal_refuses_what_it_cannot_move() {
     };
     let refused = refusal(&from).or_else(|| refusal(&to));
     kani::assert(
-        entropy.calls == 0
-            && sealer.calls == 0
+        sealer.calls == 0
             && if context.is_empty() {
-                result == Err(Error::InvalidContext) && cipher.calls == 0
+                result == Err(Error::InvalidContext) && entropy.calls == 0 && cipher.calls == 0
             } else if let Some(error) = refused {
-                result == Err(error) && cipher.calls == 0
+                result == Err(error) && entropy.calls == 0 && cipher.calls == 0
+            } else if entropy.failed {
+                result == Err(Error::EntropyFailed) && cipher.calls == 0
             } else if cipher.calls == 0 {
                 result == Err(Error::DerivationFailed)
             } else {
                 result == Err(Error::RecordRejected)
             },
         "moving a record refuses a bad context, stale handles and sets not of a chat for its \
-         archive before it decrypts, then a record the first key does not open, asking the source \
-         nothing",
+         archive before it asks the source, then a failed source before it decrypts, then a \
+         record the first key does not open",
     );
     kani::assert(
         cipher.calls <= 1
             && (cipher.calls == 0
-                || (cipher.key
-                    == expected_archive_seal_key(&key_head(&snapshot_at(&before, from.index)))
+                || (entropy.calls == 1
+                    && cipher.key
+                        == expected_archive_seal_key(&key_head(&snapshot_at(
+                            &before, from.index,
+                        )))
                     && cipher.nonce[..] == record[..NONCE_LEN]
                     && same_bytes(&cipher.given, &record[NONCE_LEN..NONCE_LEN + ARCHIVED_LEN])
                     && cipher.tag[..] == record[NONCE_LEN + ARCHIVED_LEN..]
                     && cipher.aad == Bound::to(context))),
-        "the record is opened once, under the key of the first chat, with its nonce, \
-         ciphertext and tag and the associated data of the context",
+        "the record is opened once, after one draw, under the key of the first chat, with its \
+         nonce, ciphertext and tag and the associated data of the context",
     );
     kani::cover!(
         result == Err(Error::RecordRejected),
@@ -3690,9 +3727,9 @@ fn a_reseal_refuses_what_it_cannot_move() {
 /// From any state of two slots and of the epoch, for handles that name sets of chats for their
 /// archive held there now, any record of an archive, any context of one or two bytes and any
 /// output, whatever the platform's source does and with a cipher that accepts every record:
-/// moving a record changes no slot and no epoch but its count of draws. It opens the record once,
-/// under the key of the first chat, with the record's nonce, ciphertext and tag and the associated
-/// data of the context, unless the derivation of that key fails. On success it has drawn once and
+/// moving a record changes no slot and no epoch but its count of draws. It draws once, then opens
+/// the record once, under the key of the first chat, with the record's nonce, ciphertext and tag
+/// and the associated data of the context, unless the source or a derivation fails. On success it
 /// seals what the record held, under the key of the second chat, with the nonce the source gave,
 /// hedged with the key of this epoch, and the same associated data; otherwise it fails as the
 /// source, a derivation or the seal failed, and writes nothing.
@@ -3742,10 +3779,10 @@ fn a_reseal_seals_what_the_record_held() {
          answers",
     );
     kani::assert(
-        if cipher.calls == 0 {
+        if entropy.failed {
+            result == Err(Error::EntropyFailed) && cipher.calls == 0
+        } else if cipher.calls == 0 {
             result == Err(Error::DerivationFailed)
-        } else if entropy.failed {
-            result == Err(Error::EntropyFailed)
         } else if any_failed() {
             result == Err(Error::DerivationFailed)
         } else if sealer.failed {
@@ -3759,14 +3796,17 @@ fn a_reseal_seals_what_the_record_held() {
     kani::assert(
         cipher.calls <= 1
             && (cipher.calls == 0
-                || (cipher.key
-                    == expected_archive_seal_key(&key_head(&snapshot_at(&before, from.index)))
+                || (entropy.calls == 1
+                    && cipher.key
+                        == expected_archive_seal_key(&key_head(&snapshot_at(
+                            &before, from.index,
+                        )))
                     && cipher.nonce[..] == record[..NONCE_LEN]
                     && same_bytes(&cipher.given, &record[NONCE_LEN..NONCE_LEN + ARCHIVED_LEN])
                     && cipher.tag[..] == record[NONCE_LEN + ARCHIVED_LEN..]
                     && cipher.aad == Bound::to(context))),
-        "the record is opened once, under the key of the first chat, with its nonce, \
-         ciphertext and tag and the associated data of the context",
+        "the record is opened once, after one draw, under the key of the first chat, with its \
+         nonce, ciphertext and tag and the associated data of the context",
     );
     if result.is_ok() {
         let mut drawn = [0; 12];
@@ -3998,11 +4038,11 @@ fn a_load_of_an_archive_key_checks_its_public_key() {
 /// for handles of these slots naming any slots and generations, any context of up to two bytes
 /// and any output buffer, whatever the platform's source, X-Wing and the cipher do: a creation
 /// of an archive key changes no slot and no epoch but its count of draws, and writes the record
-/// only when it succeeds, starting with the nonce the source gave last, hedged with the key of
-/// the epoch it is written in. It refuses an empty context, a stale handle, a store not of the
+/// only when it succeeds, starting with the nonce of the second draw, hedged with the key of the
+/// epoch it is written in. It refuses an empty context, a stale handle, a store not of the
 /// archive or a profile not for wrapping, a key from a secret as the profile, a change to the
 /// last epoch and a wrong answer of X-Wing before it asks the source, then a failed source, and
-/// a new key pair that does not agree with itself before it draws again.
+/// a new key pair that does not agree with itself after its three draws.
 #[kani::proof]
 #[kani::unwind(1530)]
 fn a_creation_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds() {
@@ -4025,7 +4065,7 @@ fn a_creation_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds
     let context = any_context(&context_bytes);
     let original: [u8; ARCHIVE_KEY_RECORD_LEN] = kani::any();
     let mut record = original;
-    let mut entropy = AnyEntropy::new();
+    let mut entropy = Kept::at(2);
     let before = snapshots(&slots);
 
     let result = slots.create_archive_key_on_stack(
@@ -4042,7 +4082,7 @@ fn a_creation_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds
             && slots.epoch.changing == changing
             && first_half(&slots.epoch.key) == epoch_key
             && first_half(&slots.epoch.next) == next_key
-            && slots.epoch.drawn == count.wrapping_add(u64::from(entropy.answered)),
+            && slots.epoch.drawn == count.wrapping_add(u64::from(entropy.source.answered)),
         "a creation changes no slot and no epoch, and counts once each draw the source answers",
     );
     let (archive, stored) = (
@@ -4051,18 +4091,18 @@ fn a_creation_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds
     );
     kani::assert(
         if context.is_empty() {
-            result == Err(Error::InvalidContext) && entropy.calls == 0
+            result == Err(Error::InvalidContext) && entropy.source.calls == 0
         } else if !names_loaded(&before, &store) || !names_loaded(&before, &profile) {
-            result == Err(Error::StaleHandle) && entropy.calls == 0
+            result == Err(Error::StaleHandle) && entropy.source.calls == 0
         } else if archive.purpose != Purpose::ArchiveWrap || stored.purpose != Purpose::Wrap {
-            result == Err(Error::WrongPurpose) && entropy.calls == 0
+            result == Err(Error::WrongPurpose) && entropy.source.calls == 0
         } else if stored.unlocks {
-            result == Err(Error::WrongLevel) && entropy.calls == 0
+            result == Err(Error::WrongLevel) && entropy.source.calls == 0
         } else if changing && number == u64::MAX {
-            result == Err(Error::EpochExhausted) && entropy.calls == 0
+            result == Err(Error::EpochExhausted) && entropy.source.calls == 0
         } else if !xwing_answered() {
-            result == Err(Error::CipherFailed) && entropy.calls == 0
-        } else if entropy.failed {
+            result == Err(Error::CipherFailed) && entropy.source.calls == 0
+        } else if entropy.source.failed {
             result == Err(Error::EntropyFailed)
         } else {
             result.is_ok()
@@ -4085,10 +4125,10 @@ fn a_creation_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds
         if result.is_ok() {
             paired && agreed
         } else {
-            !paired || agreed || (result == Err(Error::CipherFailed) && entropy.calls == 1)
+            !paired || agreed || (result == Err(Error::CipherFailed) && entropy.source.calls == 3)
         },
         "a creation succeeds only when its new key pair agrees with itself, and fails as \
-         CipherFailed before it draws again when it does not",
+         CipherFailed after its three draws when it does not",
     );
     kani::assert(
         !paired || pair_public == pair_seed,
@@ -4098,16 +4138,16 @@ fn a_creation_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds
     kani::assert(
         if result.is_ok() {
             let mut drawn = [0; 12];
-            drawn.copy_from_slice(&entropy.written[..12]);
-            entropy.calls == 3
+            drawn.copy_from_slice(&entropy.kept[..12]);
+            entropy.source.calls == 3
                 && record[..12]
-                    == expected_hedge(&writing, count.wrapping_add(2), Branch::HedgeNonce, &drawn)
+                    == expected_hedge(&writing, count.wrapping_add(1), Branch::HedgeNonce, &drawn)
         } else {
             same(&record, &original)
         },
-        "a creation writes its record only when it succeeds, after three draws: the seed, the \
-         nonce of its inner layer and the nonce it starts with, hedged with the key of the epoch \
-         it is written in",
+        "a creation writes its record only when it succeeds, after three draws: the nonce of its \
+         inner layer, the nonce it starts with and the seed, hedged with the key of the epoch it \
+         is written in",
     );
     kani::assert(
         !seal::model::any_seal_failed() || result == Err(Error::CipherFailed),
@@ -4178,10 +4218,10 @@ fn a_creation_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds
 /// any output buffer and any context of up to two bytes, whatever the platform's source and the
 /// cipher do: a carry of the record of an archive key changes no slot and no epoch but its
 /// count of draws. It refuses an empty context, then for each handle in turn a stale one, a set
-/// not for wrapping and a key from a secret, then a missing change, before it decrypts. It
-/// opens the record once, under the key derived from the first stored key and the key of this
-/// epoch and with the record's nonce, and refuses it as `StaleRecord`, asking the source
-/// nothing, unless the cipher accepts it and it names this epoch. It writes the output only
+/// not for wrapping and a key from a secret, then a missing change, before it asks the source,
+/// and a failed source before it decrypts. It opens the record once, under the key derived from
+/// the first stored key and the key of this epoch and with the record's nonce, and refuses it as
+/// `StaleRecord` unless the cipher accepts it and it names this epoch. It writes the output only
 /// when it succeeds, starting with the nonce the source gave, hedged with the key of the next
 /// epoch.
 #[kani::proof]
@@ -4246,27 +4286,28 @@ fn a_carry_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds() 
     let current = layer.accepted && layer.written[..8] == number.to_le_bytes();
     kani::assert(
         if context.is_empty() {
-            result == Err(Error::InvalidContext) && layer.calls == 0
+            result == Err(Error::InvalidContext) && entropy.calls == 0 && layer.calls == 0
         } else if let Some(error) = refused {
-            result == Err(error) && layer.calls == 0
+            result == Err(error) && entropy.calls == 0 && layer.calls == 0
         } else if !changing {
-            result == Err(Error::NoEpochChange) && layer.calls == 0
+            result == Err(Error::NoEpochChange) && entropy.calls == 0 && layer.calls == 0
         } else if number == u64::MAX {
-            result == Err(Error::EpochExhausted) && layer.calls == 0
+            result == Err(Error::EpochExhausted) && entropy.calls == 0 && layer.calls == 0
+        } else if entropy.failed {
+            result == Err(Error::EntropyFailed) && layer.calls == 0
         } else if layer.calls == 0 {
             result == Err(Error::DerivationFailed) && any_failed()
         } else if !current {
-            result == Err(Error::StaleRecord) && entropy.calls == 0
-        } else if entropy.failed {
-            result == Err(Error::EntropyFailed)
+            result == Err(Error::StaleRecord)
         } else {
             result.is_ok()
                 || result == Err(Error::DerivationFailed)
                 || result == Err(Error::CipherFailed)
         },
         "a carry of an archive key refuses a bad context, a stale handle, a set not for \
-         wrapping or a key from a secret, a missing change, a failed derivation, a record \
-         that does not open in this epoch and a failed source",
+         wrapping or a key from a secret and a missing change before it asks the source, then a \
+         failed source before it decrypts, a failed derivation and a record that does not open \
+         in this epoch",
     );
     kani::assert(
         any_failed() == (result == Err(Error::DerivationFailed))
@@ -4277,12 +4318,17 @@ fn a_carry_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds() 
     kani::assert(
         layer.calls <= 1
             && (layer.calls == 0
-                || (layer.key
-                    == expected_archive_layer_key(&stored.keys.0, stored.lengths[0], &epoch_key)
+                || (entropy.calls == 1
+                    && layer.key
+                        == expected_archive_layer_key(
+                            &stored.keys.0,
+                            stored.lengths[0],
+                            &epoch_key,
+                        )
                     && layer.nonce[..] == from[..NONCE_LEN]
                     && layer.aad == Bound::to(context))),
-        "the record is opened once, under the key of the first stored key and this epoch, with \
-         its own nonce and bound to its context",
+        "the record is opened once, after one draw, under the key of the first stored key and \
+         this epoch, with its own nonce and bound to its context",
     );
     kani::assert(
         (result == Err(Error::CipherFailed)) == seal::model::any_seal_failed(),
@@ -5608,6 +5654,7 @@ impl AnyChunk {
         aad: &[u8],
         buffer: &mut [u8],
     ) {
+        crate::entropy::model::step();
         (self.key, self.nonce, self.aad, self.given) =
             (*key, *nonce, Bound::of(aad), chunk_head(buffer));
         for byte in buffer.iter_mut() {
@@ -5739,7 +5786,7 @@ fn a_block_begins_under_the_primary_of_a_recorded_set() {
     let context = any_context(&context_bytes);
     let original: [u8; BLOCK_HEADER_LEN] = kani::any();
     let mut header = original;
-    let mut entropy = FirstKept::new();
+    let mut entropy = Kept::at(1);
 
     let result = slots.begin_seal_in(set, context, &mut entropy, &mut header);
     let draws = count.wrapping_add(u64::from(entropy.source.answered));
@@ -5776,7 +5823,7 @@ fn a_block_begins_under_the_primary_of_a_recorded_set() {
     );
     if let Ok(sealing) = &result {
         let mut drawn = [0; SALT_LEN];
-        drawn.copy_from_slice(&entropy.first[..SALT_LEN]);
+        drawn.copy_from_slice(&entropy.kept[..SALT_LEN]);
         let salt = expected_hedge(&epoch_key, count, Branch::HedgeSalt, &drawn);
         let primary = named.stages.primary();
         kani::assert(
@@ -6968,7 +7015,7 @@ fn a_block_is_carried_out_after_the_chain_of_its_export() {
     let carrier = snapshot_at(&before, transfer.index);
     let original: [u8; BLOCK_HEADER_LEN] = kani::any();
     let mut header = original;
-    let mut entropy = FirstKept::new();
+    let mut entropy = Kept::at(1);
 
     let result = slots.begin_export_block_in(opening, transfer, export, &mut entropy, &mut header);
     let draws = count.wrapping_add(u64::from(entropy.source.answered));
@@ -7007,7 +7054,7 @@ fn a_block_is_carried_out_after_the_chain_of_its_export() {
     );
     if let Ok(exporting) = &result {
         let mut drawn = [0; SALT_LEN];
-        drawn.copy_from_slice(&entropy.first[..SALT_LEN]);
+        drawn.copy_from_slice(&entropy.kept[..SALT_LEN]);
         let salt = expected_hedge(&epoch_key, count, Branch::HedgeSalt, &drawn);
         kani::assert(
             header[..SALT_LEN] == salt
@@ -7186,7 +7233,7 @@ fn a_received_block_is_written_under_a_set_of_its_transfer() {
     let named = snapshot_at(&before, set.index);
     let original: [u8; BLOCK_HEADER_LEN] = kani::any();
     let mut header = original;
-    let mut entropy = FirstKept::new();
+    let mut entropy = Kept::at(1);
 
     let result = slots.receive_into_in(receipt, Some(set), context, &mut entropy, &mut header);
     let draws = count.wrapping_add(u64::from(entropy.source.answered));
@@ -7223,7 +7270,7 @@ fn a_received_block_is_written_under_a_set_of_its_transfer() {
     );
     if let Ok((receiving, handle)) = &result {
         let mut drawn = [0; SALT_LEN];
-        drawn.copy_from_slice(&entropy.first[..SALT_LEN]);
+        drawn.copy_from_slice(&entropy.kept[..SALT_LEN]);
         let salt = expected_hedge(&epoch_key, count, Branch::HedgeSalt, &drawn);
         let primary = named.stages.primary();
         kani::assert(
@@ -7293,7 +7340,7 @@ fn into_new(mut memory: [Slot; 2], free_at: usize) -> (bool, Option<Error>, bool
         (receipt.chain, receipt.salt, receipt.chunks, receipt.last);
     let original: [u8; BLOCK_HEADER_LEN] = kani::any();
     let mut header = original;
-    let mut entropy = FirstKept::new();
+    let mut entropy = Kept::at(1);
 
     let result = slots.receive_into_in(receipt, None, context, &mut entropy, &mut header);
     let after = snapshots(&slots);
@@ -7332,7 +7379,7 @@ fn into_new(mut memory: [Slot; 2], free_at: usize) -> (bool, Option<Error>, bool
     } else if let Ok((receiving, handle)) = &result {
         let new = snapshot_at(&after, changed);
         let mut drawn = [0; SALT_LEN];
-        drawn.copy_from_slice(&entropy.first[..SALT_LEN]);
+        drawn.copy_from_slice(&entropy.kept[..SALT_LEN]);
         let salt = expected_hedge(&epoch_key, count, Branch::HedgeSalt, &drawn);
         kani::assert(
             new.occupancy == Occupancy::Loaded
@@ -7482,7 +7529,7 @@ fn a_received_block_needs_a_free_slot_for_a_new_set() {
     let chain = receipt.chain;
     let original: [u8; BLOCK_HEADER_LEN] = kani::any();
     let mut header = original;
-    let mut entropy = FirstKept::new();
+    let mut entropy = Kept::at(1);
 
     let error = slots
         .receive_into_in(receipt, None, context, &mut entropy, &mut header)
@@ -7591,6 +7638,7 @@ impl ChunkCalls {
         buffer: &mut [u8],
         tag: [u8; TAG_LEN],
     ) -> bool {
+        crate::entropy::model::step();
         let (at, length) = (buffer.as_ptr().addr(), buffer.len());
         let (mut given, written): ([u8; 16], [u8; 16]) = ([0; 16], kani::any());
         given[..length].copy_from_slice(buffer);

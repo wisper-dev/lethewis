@@ -806,6 +806,10 @@ impl<'a> Slots<'a> {
     /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if the nonce cannot
     /// be hedged or the key that encrypts the record cannot be derived, and [`Error::CipherFailed`]
     /// if the cipher gives a known input a wrong answer or fails. `record` is then left as it was.
+    ///
+    /// # Panics
+    ///
+    /// Only if `entropy` panics. The panic passes through, and `record` is left as it was.
     pub fn wrap(
         &mut self,
         set: Handle<'a>,
@@ -845,6 +849,10 @@ impl<'a> Slots<'a> {
     /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if a nonce cannot
     /// be hedged or a key that encrypts a layer cannot be derived, and [`Error::CipherFailed`] if
     /// the cipher gives a known input a wrong answer or fails. `record` is then left as it was.
+    ///
+    /// # Panics
+    ///
+    /// Only if `entropy` panics. The panic passes through, and `record` is left as it was.
     pub fn lock(
         &mut self,
         set: Handle<'a>,
@@ -918,6 +926,11 @@ impl<'a> Slots<'a> {
     /// be hedged or the key that encrypts the record cannot be derived, and [`Error::CipherFailed`]
     /// if the cipher gives a known input a wrong answer or fails. `record` is then left as it was,
     /// and the export goes on as before the call.
+    ///
+    /// # Panics
+    ///
+    /// Only if `entropy` panics. The panic passes through, `record` is left as it was, and the
+    /// export goes on as before the call.
     pub fn export(
         &mut self,
         set: Handle<'a>,
@@ -954,6 +967,11 @@ impl<'a> Slots<'a> {
     /// [`Error::DerivationFailed`] if the nonce cannot be hedged or the key that encrypts the end
     /// cannot be derived, and [`Error::CipherFailed`] if the cipher gives a known input a wrong
     /// answer or fails. `end` is then left as it was, and the export goes on as before the call.
+    ///
+    /// # Panics
+    ///
+    /// Only if `entropy` panics. The panic passes through, `end` is left as it was, and the export
+    /// goes on as before the call.
     pub fn end_export(
         &mut self,
         transfer: Handle<'a>,
@@ -1037,8 +1055,11 @@ impl<'a> Slots<'a> {
             (*number, &*key)
         };
         let (parent_key, parent_id) = wrapping.wrapping_key();
-        let mut nonce = [0; NONCE_LEN];
+        let (mut nonce, mut outer) = ([0; NONCE_LEN], [0; NONCE_LEN]);
         hedged_draw(entropy, epoch_key, drawn, Branch::HedgeNonce, &mut nonce)?;
+        if kind == Kind::Lock {
+            hedged_draw(entropy, epoch_key, drawn, Branch::HedgeNonce, &mut outer)?;
+        }
         let mut cipher_key = [0; CIPHER_KEY_LEN];
         let derived = derive_record_key(kind, parent_key, epoch_key, &mut cipher_key);
         if derived.is_err() {
@@ -1071,8 +1092,7 @@ impl<'a> Slots<'a> {
                 wipe(&mut sealed);
                 let layered = seal_layer(
                     (epoch_key, epoch),
-                    entropy,
-                    drawn,
+                    &outer,
                     associated.bytes(),
                     &inner,
                     record,
@@ -1492,10 +1512,15 @@ impl<'a> Slots<'a> {
     ///
     /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
     /// [`Error::NoEpochChange`] if no change to the next epoch is under way,
-    /// [`Error::DerivationFailed`] if a key that encrypts a layer cannot be derived or the nonce
-    /// cannot be hedged, [`Error::StaleRecord`] if `from` does not open in this epoch for this
-    /// context, [`Error::EntropyFailed`] if `entropy` fails, and [`Error::CipherFailed`] if the
-    /// cipher gives a known input a wrong answer or fails. `to` is then left as it was.
+    /// [`Error::EpochExhausted`] if it is the last, [`Error::EntropyFailed`] if `entropy` fails,
+    /// [`Error::DerivationFailed`] if the nonce cannot be hedged or a key that encrypts a layer
+    /// cannot be derived, [`Error::StaleRecord`] if `from` does not open in this epoch for this
+    /// context, and [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or
+    /// fails. `to` is then left as it was.
+    ///
+    /// # Panics
+    ///
+    /// Only if `entropy` panics. The panic passes through, and `to` is left as it was.
     pub fn carry(
         &mut self,
         context: &[u8],
@@ -1532,6 +1557,8 @@ impl<'a> Slots<'a> {
             return Err(Error::NoEpochChange);
         }
         let following = number.checked_add(1).ok_or(Error::EpochExhausted)?;
+        let mut nonce = [0; NONCE_LEN];
+        hedged_draw(entropy, next, drawn, Branch::HedgeNonce, &mut nonce)?;
         let mut inner = [0; RECORD_LEN];
         let carried = open_layer(
             (&*key, *number),
@@ -1540,16 +1567,7 @@ impl<'a> Slots<'a> {
             &mut inner,
             &mut open,
         )
-        .and_then(|()| {
-            seal_layer(
-                (&*next, following),
-                entropy,
-                drawn,
-                associated.bytes(),
-                &inner,
-                to,
-            )
-        });
+        .and_then(|()| seal_layer((&*next, following), &nonce, associated.bytes(), &inner, to));
         wipe(&mut inner);
         carried
     }
@@ -2160,18 +2178,15 @@ fn hedged_draw(
 }
 
 /// Seals `inner`, the record of a stored key for wrapping, with the number of an epoch under that
-/// epoch's key, given in `epoch`, into the lock record `out`; the nonce comes from `entropy`, hedged
-/// with that key. `out` is written only when this succeeds.
+/// epoch's key, given in `epoch`, under `nonce` into the lock record `out`. `out` is written only
+/// when this succeeds.
 fn seal_layer(
     (epoch_key, number): (&Key, u64),
-    entropy: &mut (impl Entropy + ?Sized),
-    drawn: &mut u64,
+    nonce: &[u8; NONCE_LEN],
     aad: &[u8],
     inner: &[u8; RECORD_LEN],
     out: &mut [u8; LOCK_RECORD_LEN],
 ) -> Result<(), Error> {
-    let mut nonce = [0; NONCE_LEN];
-    hedged_draw(entropy, epoch_key, drawn, Branch::HedgeNonce, &mut nonce)?;
     let mut layer_key = [0; CIPHER_KEY_LEN];
     if derive_layer_key(epoch_key, &mut layer_key).is_err() {
         wipe(&mut layer_key);
@@ -2184,13 +2199,13 @@ fn seal_layer(
         *head = number.to_le_bytes();
         *record = *inner;
     }
-    let tag = seal::seal(&layer_key, &nonce, aad, &mut layer);
+    let tag = seal::seal(&layer_key, nonce, aad, &mut layer);
     wipe(&mut layer_key);
     let tag = tag.map_err(|_| Error::CipherFailed)?;
     if let Some((nonce_out, rest)) = out.split_first_chunk_mut::<NONCE_LEN>()
         && let Some((layer_out, tag_out)) = rest.split_first_chunk_mut::<LAYER_LEN>()
     {
-        *nonce_out = nonce;
+        *nonce_out = *nonce;
         *layer_out = layer;
         tag_out.copy_from_slice(&tag);
     }
@@ -4276,7 +4291,7 @@ mod tests {
         );
         slots.begin_epoch(&mut flipped_epoch_key(0xff)).unwrap();
         assert_eq!(
-            slots.carry(b"other", &mut Untouched, &kept, &mut carried),
+            slots.carry(b"other", &mut Counting, &kept, &mut carried),
             Err(Error::StaleRecord)
         );
         assert_eq!(carried, [0x55; LOCK_RECORD_LEN]);
@@ -4285,7 +4300,7 @@ mod tests {
             .unwrap();
         let mut again = [0x55; LOCK_RECORD_LEN];
         assert_eq!(
-            slots.carry(b"profile", &mut Untouched, &carried, &mut again),
+            slots.carry(b"profile", &mut Counting, &carried, &mut again),
             Err(Error::StaleRecord)
         );
         assert_eq!(slots.commit_epoch(&mut platform), Ok(Erasure::Guaranteed));
@@ -5836,14 +5851,17 @@ mod stack {
     };
     use crate::derive::{
         Branch, CIPHER_STACK_WIPE, SALT, STACK_WIPE, derive_export_key, derive_layer_key,
-        derive_lock_key, derive_wrap_key, stack::secrets,
+        derive_lock_key, derive_wrap_key,
+        stack::{hedge_secrets, secrets},
     };
     use crate::key::{
         Key, KeyLength,
         tests::{Counting, Failing},
     };
     use crate::record::{AssociatedData, PLAINTEXT_LEN};
-    use crate::residue::{assert_clean, below_pad, depth_changed, key_dependent, residue};
+    use crate::residue::{
+        assert_clean, below_pad, depth_changed, key_dependent, panic_at, residue,
+    };
     use crate::seal;
 
     const CONTEXT: &[u8] = b"chat 7";
@@ -6293,12 +6311,9 @@ mod stack {
         Carry,
     }
 
-    /// The slots of the lock tests, made from `flip`ped patterns: a key from a secret, the stored
-    /// key it locks, and their lock record.
-    fn locked(
-        slots: &mut Slots<'_>,
-        flip: u8,
-    ) -> (Handle<'static>, Handle<'static>, [u8; LOCK_RECORD_LEN]) {
+    /// The slots of the lock tests, made from `flip`ped patterns: a key from a secret and the
+    /// stored key it locks.
+    fn before_lock(slots: &mut Slots<'_>, flip: u8) -> (Handle<'static>, Handle<'static>) {
         let secret = widen(
             slots
                 .import32(Purpose::Wrap, &mut secret_bytes(flip))
@@ -6307,7 +6322,15 @@ mod stack {
         let stored = slots
             .import64(Purpose::Wrap, &mut stored_bytes(flip))
             .unwrap();
-        let stored = widen(slots.store(stored));
+        (secret, widen(slots.store(stored)))
+    }
+
+    /// Those keys and their lock record.
+    fn locked(
+        slots: &mut Slots<'_>,
+        flip: u8,
+    ) -> (Handle<'static>, Handle<'static>, [u8; LOCK_RECORD_LEN]) {
+        let (secret, stored) = before_lock(slots, flip);
         let mut record = [0; LOCK_RECORD_LEN];
         slots
             .lock(stored, secret, CONTEXT, &mut Fixed, &mut record)
@@ -6322,9 +6345,11 @@ mod stack {
 
     /// The secrets the work with lock records handles on keys made from `flip`ped patterns: both
     /// layers' derivations, cipher keys, message keys, round keys and keystreams, the record the
-    /// outer layer holds and the plaintext of the inner, both keys, and for an unlock the
-    /// derivation of the stored key's identifier, for a carry the new outer layer.
-    fn lock_handled(flip: u8, work: Locking) -> Vec<Vec<u8>> {
+    /// outer layer holds and the plaintext of the inner, both keys, the key of the epoch and the
+    /// hedges of the nonces under it, and for an unlock the derivation of the stored key's
+    /// identifier, for a carry the new outer layer, the key of the next epoch and the hedge of the
+    /// nonce under it; and the start of each outer layer.
+    fn lock_handled(flip: u8, work: Locking) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         let mut memory = [const { Slot::empty() }; 4];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(
@@ -6335,6 +6360,17 @@ mod stack {
         );
         let (_, _, record) = locked(&mut slots, flip);
         let (mut handled, layer) = layer_secrets(&flipped_epoch_key(flip), &record);
+        let mut open = std::vec![layer[..20].to_vec()];
+        let drawn = slots.epoch.drawn;
+        for count in [drawn.wrapping_sub(2), drawn.wrapping_sub(1)] {
+            handled.extend(hedge_secrets(
+                &flipped_epoch_key(flip),
+                count,
+                Branch::HedgeNonce,
+                &NONCE,
+            ));
+        }
+        handled.push(flipped_epoch_key(flip).to_vec());
         let inner = &layer[8..];
         let mut lock_key = [0; 32];
         derive_lock_key(&key_from(&secret_bytes(flip)), &mut lock_key).unwrap();
@@ -6367,14 +6403,29 @@ mod stack {
                 slots
                     .carry(CONTEXT, &mut Fixed, &record, &mut carried)
                     .unwrap();
-                handled.extend(layer_secrets(&next_key(flip), &carried).0);
+                let (found, layer) = layer_secrets(&next_key(flip), &carried);
+                handled.extend(found);
+                open.push(layer[..20].to_vec());
+                handled.extend(hedge_secrets(
+                    &next_key(flip),
+                    slots.epoch.drawn.wrapping_sub(1),
+                    Branch::HedgeNonce,
+                    &NONCE,
+                ));
+                handled.push(next_key(flip).to_vec());
             }
         }
-        handled
+        (handled, open)
     }
 
+    /// The pieces of [`lock_handled`] that depend on the key, but for the number of an epoch and
+    /// the nonce of the inner record that follows it in an outer layer: the code holds both in the
+    /// open.
     fn lock_pieces(work: Locking) -> Vec<Vec<u8>> {
-        key_dependent(&lock_handled(0, work), &lock_handled(0xff, work))
+        let (handled, open) = lock_handled(0, work);
+        let (mut others, _) = lock_handled(0xff, work);
+        others.extend(open);
+        key_dependent(&handled, &others)
     }
 
     #[test]
@@ -6383,7 +6434,7 @@ mod stack {
         let mut memory = [const { Slot::empty() }; 4];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let (secret, stored, _) = locked(&mut slots, 0);
+        let (secret, stored) = before_lock(&mut slots, 0);
         let mut record = [0; LOCK_RECORD_LEN];
         let range = below_pad(false, || {
             slots
@@ -6400,7 +6451,7 @@ mod stack {
         let mut memory = [const { Slot::empty() }; 4];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
-        let (secret, stored, _) = locked(&mut slots, 0);
+        let (secret, stored) = before_lock(&mut slots, 0);
         let mut record = [0; LOCK_RECORD_LEN];
         assert_clean(&pieces, || {
             slots
@@ -6498,6 +6549,38 @@ mod stack {
                 .unwrap();
             black_box(&carried);
         });
+    }
+
+    /// A source that panics on any of its calls leaves none of what a lock or a carry handles on
+    /// the stack, at the panic or after it, and writes nothing. Each runs from the state its test
+    /// above runs it from, so it handles the same values until the panic.
+    #[test]
+    fn a_panicking_source_leaves_no_secret_of_a_lock_or_a_carry() {
+        for (work, calls) in [(Locking::Lock, 2), (Locking::Carry, 1)] {
+            let pieces = lock_pieces(work);
+            for at in 1..=calls + 1 {
+                let mut memory = [const { Slot::empty() }; 4];
+                let mut epoch_memory = Epoch::empty();
+                let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
+                let mut written = [0; LOCK_RECORD_LEN];
+                let reached = if work == Locking::Lock {
+                    let (secret, stored) = before_lock(&mut slots, 0);
+                    panic_at(&pieces, (Fixed, at), |source| {
+                        slots
+                            .lock(stored, secret, CONTEXT, source, &mut written)
+                            .unwrap();
+                    })
+                } else {
+                    let (_, _, record) = locked(&mut slots, 0);
+                    slots.begin_epoch(&mut next_key(0)).unwrap();
+                    panic_at(&pieces, (Fixed, at), |source| {
+                        slots.carry(CONTEXT, source, &record, &mut written).unwrap();
+                    })
+                };
+                assert_eq!(reached, at <= calls);
+                assert_eq!(written == [0; LOCK_RECORD_LEN], reached);
+            }
+        }
     }
 
     /// The secrets a combination of keys made from `flip`ped patterns handles: the derivation of the

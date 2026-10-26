@@ -139,10 +139,11 @@ impl<'a> Slots<'a> {
     /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::ArchiveSeal`],
     /// [`Error::StaleRecord`] if `public` was read from other slots or in another epoch,
     /// [`Error::WrongLength`] if `body` is not as long as the chunks of `data` take,
-    /// [`Error::CipherFailed`] if X-Wing or the cipher gives a known input a wrong answer or the
-    /// cipher fails, [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if a
-    /// value cannot be derived from a key, and [`Error::RecordRejected`] if X-Wing refuses the
-    /// public key. `record` is then left as it was, and `body` is wiped.
+    /// [`Error::CipherFailed`] if X-Wing gives a known input a wrong answer,
+    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if a value cannot
+    /// be derived from a key, [`Error::RecordRejected`] if X-Wing refuses the public key, and
+    /// [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or fails. `record`
+    /// is then left as it was, and `body` is wiped.
     ///
     /// # Panics
     ///
@@ -232,6 +233,8 @@ impl<'a> Slots<'a> {
         let Self { memory, epoch } = self;
         let chat = memory.get(seal).ok_or(Error::StaleHandle)?.wrapping_key().0;
         let Epoch { key, drawn, .. } = &mut **epoch;
+        let mut nonce = [0; NONCE_LEN];
+        hedged_draw(entropy, key, drawn, Branch::HedgeNonce, &mut nonce)?;
         let mut hedged = [0; RANDOMNESS_LEN];
         hedged_draw(entropy, key, drawn, Branch::HedgeEncaps, &mut hedged)?;
         let mut randomness = [0; RANDOMNESS_LEN];
@@ -251,7 +254,7 @@ impl<'a> Slots<'a> {
             .and_then(|()| {
                 seal_archived(
                     chat,
-                    (entropy, key, drawn),
+                    &nonce,
                     associated.bytes(),
                     (&public.id, &ciphertext, &check.bytes()),
                     (&mut sealed, seal_with),
@@ -408,10 +411,15 @@ impl<'a> Slots<'a> {
     /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
     /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
     /// [`Error::WrongPurpose`] if either set does not serve [`Purpose::ArchiveSeal`],
-    /// [`Error::DerivationFailed`] if a key that encrypts a record cannot be derived or the nonce
-    /// cannot be hedged, [`Error::RecordRejected`] if `record` does not open with the first key and
-    /// this context, [`Error::EntropyFailed`] if `entropy` fails, and [`Error::CipherFailed`] if
-    /// the cipher gives a known input a wrong answer or fails. `out` is then left as it was.
+    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if the nonce
+    /// cannot be hedged or a key that encrypts a record cannot be derived,
+    /// [`Error::RecordRejected`] if `record` does not open with the first key and this context,
+    /// and [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or fails.
+    /// `out` is then left as it was.
+    ///
+    /// # Panics
+    ///
+    /// Only if `entropy` panics. The panic passes through, and `out` is left as it was.
     pub fn reseal_archive(
         &mut self,
         from: Handle<'a>,
@@ -455,6 +463,8 @@ impl<'a> Slots<'a> {
             return Err(Error::StaleHandle);
         };
         let Epoch { key, drawn, .. } = &mut **epoch;
+        let mut nonce = [0; NONCE_LEN];
+        hedged_draw(entropy, key, drawn, Branch::HedgeNonce, &mut nonce)?;
         let mut sealed = [0; ARCHIVED_LEN];
         open_archived(
             old.wrapping_key().0,
@@ -466,7 +476,7 @@ impl<'a> Slots<'a> {
         let (id, ciphertext, check) = split_archived(&sealed);
         seal_archived(
             new.wrapping_key().0,
-            (entropy, key, drawn),
+            &nonce,
             associated.bytes(),
             (&id, &ciphertext, &check),
             (out, seal_with),
@@ -492,17 +502,14 @@ fn batch_keys(
 
 /// Seals the identifier `id` of an archive key, the ciphertext to it and the check of its shared
 /// secret with `seal_with` under the key derived from the key of a chat for its archive `chat`,
-/// into `out`; the nonce comes from `entropy`, hedged with the key of the epoch `epoch_key`. `out`
-/// is written only when this succeeds.
+/// under `nonce` into `out`. `out` is written only when this succeeds.
 fn seal_archived(
     chat: &Key,
-    (entropy, epoch_key, drawn): (&mut (impl Entropy + ?Sized), &Key, &mut u64),
+    nonce: &[u8; NONCE_LEN],
     aad: &[u8],
     (id, ciphertext, check): (&[u8; ID_LEN], &[u8; CIPHERTEXT_LEN], &[u8; ID_LEN]),
     (out, mut seal_with): (&mut [u8; ARCHIVE_RECORD_LEN], impl Seal<ARCHIVED_LEN>),
 ) -> Result<(), Error> {
-    let mut nonce = [0; NONCE_LEN];
-    hedged_draw(entropy, epoch_key, drawn, Branch::HedgeNonce, &mut nonce)?;
     let mut cipher_key = [0; CIPHER_KEY_LEN];
     if derive_archive_seal_key(chat, &mut cipher_key).is_err() {
         wipe(&mut cipher_key);
@@ -517,13 +524,13 @@ fn seal_archived(
         *ciphertext_out = *ciphertext;
         *check_out = *check;
     }
-    let tag = seal_with.seal(&cipher_key, &nonce, aad, &mut sealed);
+    let tag = seal_with.seal(&cipher_key, nonce, aad, &mut sealed);
     wipe(&mut cipher_key);
     let tag = tag.map_err(|_| Error::CipherFailed)?;
     if let Some((nonce_out, rest)) = out.split_first_chunk_mut::<NONCE_LEN>()
         && let Some((sealed_out, tag_out)) = rest.split_first_chunk_mut::<ARCHIVED_LEN>()
     {
-        *nonce_out = nonce;
+        *nonce_out = *nonce;
         *sealed_out = sealed;
         tag_out.copy_from_slice(&tag);
     }
@@ -995,12 +1002,9 @@ mod tests {
         let (id, mut ciphertext, check) = super::split_archived(&sealed);
         ciphertext[CIPHERTEXT_LEN - 1] ^= 1;
         let mut changed = [0; ARCHIVE_RECORD_LEN];
-        let Epoch {
-            key: epoch, drawn, ..
-        } = &mut *slots.epoch;
         super::seal_archived(
             slots.memory[chat.index].wrapping_key().0,
-            (&mut Counting, &*epoch, drawn),
+            &[2; 12],
             associated.bytes(),
             (&id, &ciphertext, &check),
             (&mut changed, seal::seal),
@@ -1550,15 +1554,17 @@ mod stack {
     use super::super::stack::keying_secrets;
     use super::{ARCHIVE_RECORD_LEN, ARCHIVED_LEN, ArchivePublic, open_archived, split_archived};
     use crate::block::chunk_nonce;
-    use crate::derive::stack::secrets_of;
+    use crate::derive::stack::{hedge_secrets, secrets_of};
     use crate::derive::{
         Branch, SALT, derive_archive_batch, derive_archive_randomness, derive_archive_seal_key,
         hedge,
     };
     use crate::key::Key;
-    use crate::key::tests::{Counting, Failing};
+    use crate::key::tests::{Counting, Failing, counted};
     use crate::record::AssociatedData;
-    use crate::residue::{assert_clean, below_pad, depth_changed, key_dependent, residue};
+    use crate::residue::{
+        assert_clean, below_pad, depth_changed, key_dependent, panic_at, residue,
+    };
     use crate::slots::batch::{self, Chunks};
     use crate::slots::tests::{EPOCH, flipped_epoch_key};
     use crate::xwing::stack::{encapsulation_secrets, seed_secrets};
@@ -1642,8 +1648,8 @@ mod stack {
     /// body of a batch of [`data_of`] archived to it under the first key of a chat, and what the
     /// calls on it handle: the keys, the seed and what X-Wing makes of it, the randomness of the
     /// encapsulation and what X-Wing makes of that, the shared secret, the key of the body, the
-    /// data, and what the ciphers of the record and the body and the derivation of the key of the
-    /// record handle.
+    /// data, what the ciphers of the record and the body and the derivation of the key of the
+    /// record handle, and the key of the epoch and the hedges of both draws under it.
     #[expect(
         clippy::too_many_lines,
         reason = "the secrets of every call are gathered at once"
@@ -1733,7 +1739,7 @@ mod stack {
         let mut hedged = [0; 64];
         hedge(
             &slots.epoch.key,
-            count,
+            count.wrapping_add(1),
             Branch::HedgeEncaps,
             &drawn,
             &mut hedged,
@@ -1742,6 +1748,20 @@ mod stack {
         let mut randomness = [0; 64];
         derive_archive_randomness(chat_key, &hedged, &mut randomness).unwrap();
         secrets.extend([hedged.to_vec(), randomness.to_vec()]);
+        let epoch_key = flipped_epoch_key(flip);
+        secrets.extend(hedge_secrets(
+            &epoch_key,
+            count,
+            Branch::HedgeNonce,
+            &drawn[..12],
+        ));
+        secrets.extend(hedge_secrets(
+            &epoch_key,
+            count.wrapping_add(1),
+            Branch::HedgeEncaps,
+            &drawn,
+        ));
+        secrets.push(epoch_key.to_vec());
         secrets.extend(encapsulation_secrets(&public.public, &randomness));
         let mut seal_key = [0; 32];
         derive_archive_seal_key(chat_key, &mut seal_key).unwrap();
@@ -1765,12 +1785,13 @@ mod stack {
     }
 
     /// What moving the record of a batch from the slots [`archived`] makes with `flip` to the second
-    /// key of a chat handles to seal it: the cipher of the moved record and the derivation of its
-    /// key.
+    /// key of a chat handles to seal it: the cipher of the moved record, the derivation of its key
+    /// and the hedge of its nonce.
     fn moved_secrets(flip: u8) -> Vec<Vec<u8>> {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
         let (mut slots, [_, chat, other_chat, _], _, (record, _), _) =
             archived(&mut memory, &mut epoch, flip);
+        let count = slots.epoch.drawn;
         let mut moved = [0; ARCHIVE_RECORD_LEN];
         slots
             .reseal_archive(
@@ -1795,15 +1816,21 @@ mod stack {
             SALT,
             Branch::ArchiveSeal,
         ));
+        secrets.extend(hedge_secrets(
+            &flipped_epoch_key(flip),
+            count,
+            Branch::HedgeNonce,
+            &counted::<12>(),
+        ));
         secrets
     }
 
-    /// Fresh slots over `memory` in the state [`archived`] archives its batch in, with its keys and
-    /// the public key of its archive key.
+    /// Fresh slots over `memory` in the state [`archived`] archives its batch in, with both keys of
+    /// a chat and the public key of its archive key.
     fn before_archiving<'a>(
         memory: &'a mut [Slot],
         epoch: &'a mut Epoch,
-    ) -> (Slots<'a>, Handle<'a>, ArchivePublic<'a>) {
+    ) -> (Slots<'a>, [Handle<'a>; 2], ArchivePublic<'a>) {
         let mut slots = Slots::new(memory, epoch, EPOCH, &mut flipped_epoch_key(0));
         let mut generate = |purpose| {
             slots
@@ -1812,8 +1839,7 @@ mod stack {
         };
         let stored = generate(Purpose::Wrap);
         let store = generate(Purpose::ArchiveWrap);
-        let chat = generate(Purpose::ArchiveSeal);
-        generate(Purpose::ArchiveSeal);
+        let chats = [Purpose::ArchiveSeal; 2].map(&mut generate);
         let mut created = [0; ARCHIVE_KEY_RECORD_LEN];
         slots
             .create_archive_key(store, stored, b"archive", &mut Counting, &mut created)
@@ -1821,7 +1847,7 @@ mod stack {
         let public = slots
             .archive_public_key(stored, b"archive", &created)
             .unwrap();
-        (slots, chat, public)
+        (slots, chats, public)
     }
 
     /// Reading a public key, archiving, opening and moving a record without the wipe after them
@@ -1883,8 +1909,9 @@ mod stack {
         });
         assert!(residue(range, &pieces) > 0, "a move");
         let (mut again, mut again_epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
-        let (mut slots, chat, public) = before_archiving(&mut again, &mut again_epoch);
+        let (mut slots, [chat, _], public) = before_archiving(&mut again, &mut again_epoch);
         let mut written = ([0; ARCHIVE_RECORD_LEN], [0; 64]);
+        let data = data_of(0);
         let range = below_pad(false, || {
             slots
                 .archive_on_stack(
@@ -1892,7 +1919,7 @@ mod stack {
                     &public,
                     b"chat",
                     &mut Counting,
-                    (&data_of(0), &mut written.0, &mut written.1),
+                    (&data, &mut written.0, &mut written.1),
                     &known,
                     (seal::seal, Chunks),
                 )
@@ -1951,7 +1978,7 @@ mod stack {
             black_box(&moved);
         });
         let (mut again, mut again_epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
-        let (mut slots, chat, public) = before_archiving(&mut again, &mut again_epoch);
+        let (mut slots, [chat, _], public) = before_archiving(&mut again, &mut again_epoch);
         let mut written = ([0; ARCHIVE_RECORD_LEN], [0; 64]);
         let data = data_of(0);
         assert_clean(&pieces, || {
@@ -1969,6 +1996,75 @@ mod stack {
             black_box(&written);
         });
         assert_eq!(written, (record, body));
+    }
+
+    /// A source that panics on any of its calls leaves none of what archiving or a move handles on
+    /// the stack, at the panic or after it, and writes nothing. Each runs from the state
+    /// [`archived`] runs it from, so it handles the same values until the panic.
+    #[test]
+    fn a_panicking_source_leaves_no_secret_of_archiving_or_a_move() {
+        let (mut memory, mut other) = ([const { Slot::empty() }; 6], [const { Slot::empty() }; 6]);
+        let (mut epoch, mut other_epoch) = (Epoch::empty(), Epoch::empty());
+        let (_, _, _, (record, body), mut secrets) = archived(&mut memory, &mut epoch, 0);
+        let (.., mut others) = archived(&mut other, &mut other_epoch, 0x5a);
+        secrets.extend(moved_secrets(0));
+        others.extend(moved_secrets(0x5a));
+        let pieces = key_dependent(&secrets, &others);
+        let data = data_of(0);
+        for (moving, calls) in [(false, 2), (true, 1)] {
+            for at in 1..=calls + 1 {
+                let (mut again, mut again_epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
+                let (mut slots, [chat, other_chat], public) =
+                    before_archiving(&mut again, &mut again_epoch);
+                let mut written = ([0; ARCHIVE_RECORD_LEN], [0; 64]);
+                let reached = if moving {
+                    let mut archived = ([0; ARCHIVE_RECORD_LEN], [0; 64]);
+                    slots
+                        .archive(
+                            chat,
+                            &public,
+                            b"chat",
+                            &mut Counting,
+                            &data,
+                            &mut archived.0,
+                            &mut archived.1,
+                        )
+                        .unwrap();
+                    assert_eq!(archived, (record, body));
+                    panic_at(&pieces, (Counting, at), |source| {
+                        slots
+                            .reseal_archive(
+                                chat,
+                                other_chat,
+                                b"chat",
+                                source,
+                                &record,
+                                &mut written.0,
+                            )
+                            .unwrap();
+                    })
+                } else {
+                    panic_at(&pieces, (Counting, at), |source| {
+                        slots
+                            .archive(
+                                chat,
+                                &public,
+                                b"chat",
+                                source,
+                                &data,
+                                &mut written.0,
+                                &mut written.1,
+                            )
+                            .unwrap();
+                    })
+                };
+                assert_eq!(reached, at <= calls);
+                assert_eq!(written.0 == [0; ARCHIVE_RECORD_LEN], reached);
+                if reached {
+                    assert_eq!(written.1, [0; 64]);
+                }
+            }
+        }
     }
 
     /// The wipes cover more than the calls use, with the self-test of X-Wing asked for the first

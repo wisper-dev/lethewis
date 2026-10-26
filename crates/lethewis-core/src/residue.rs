@@ -5,19 +5,30 @@
 
 extern crate std;
 
+use core::cell::Cell;
 use core::hint::black_box;
 use core::ops::Range;
+use core::panic::AssertUnwindSafe;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
+use std::panic::catch_unwind;
 use std::vec::Vec;
 
-/// Room between the test's frame and the code under test, so that reading the memory back,
-/// which runs at the test's depth, does not reach the stack that code used.
+use crate::entropy::{Entropy, EntropyError};
+
+/// Room between the test's frame and the code under test, so that reading the memory back after
+/// the code, at the test's depth, does not reach the stack that code used.
 const PAD: usize = 64 * 1024;
 /// How far below the pad the stack is read: deeper than the deepest wipe.
 const SCAN: usize = 256 * 1024;
 const PAINT: u8 = 0xa7;
+
+std::thread_local! {
+    /// The bottom of the pad that [`below_pad`] ran its code under last, or zero before it did.
+    static LOW: Cell<usize> = const { Cell::new(0) };
+}
 
 /// Runs `code` below the pad, after painting the stack it is about to use when asked to, and
 /// returns the addresses under the pad.
@@ -29,6 +40,7 @@ const PAINT: u8 = 0xa7;
 pub(crate) fn below_pad(paint: bool, code: impl FnOnce()) -> Range<usize> {
     let pad = black_box([0x11_u8; PAD]);
     let low = black_box(&pad).as_ptr().addr();
+    LOW.set(low);
     if paint {
         paint_stack();
     }
@@ -79,7 +91,11 @@ pub(crate) fn key_dependent(secrets: &[Vec<u8>], of_another: &[Vec<u8>]) -> Vec<
 
 /// How many of `pieces` the stack in `range` still holds.
 pub(crate) fn residue(range: Range<usize>, pieces: &[Vec<u8>]) -> usize {
-    let stack = read(range);
+    count(&read(range), pieces)
+}
+
+/// How many of `pieces` the bytes of `stack` hold.
+fn count(stack: &[u8], pieces: &[Vec<u8>]) -> usize {
     let windows: HashSet<&[u8]> = stack.windows(16).collect();
     pieces
         .iter()
@@ -87,9 +103,10 @@ pub(crate) fn residue(range: Range<usize>, pieces: &[Vec<u8>]) -> usize {
         .count()
 }
 
-/// Runs `code` below the pad and asserts that it leaves none of `pieces` there.
+/// Runs `code` below the pad, over a stack painted where earlier calls left their values, and
+/// asserts that it leaves none of `pieces` there.
 pub(crate) fn assert_clean(pieces: &[Vec<u8>], code: impl FnOnce()) {
-    let range = below_pad(false, code);
+    let range = below_pad(true, code);
     assert_eq!(residue(range, pieces), 0);
 }
 
@@ -99,4 +116,63 @@ pub(crate) fn depth_changed(code: impl FnOnce()) -> usize {
     let stack = read(range);
     let lowest = stack.iter().position(|&byte| byte != PAINT).unwrap();
     stack.len().saturating_sub(lowest)
+}
+
+/// Passes each call on to `source`; on call number `at`, counted from one, reads the stack under
+/// the pad of [`below_pad`] into `stack`, counts the `pieces` it holds, then panics. The memory of
+/// the process is open and `stack` is allocated before, so that the read uses little stack below
+/// the call.
+struct PanicsAt<'a, E> {
+    source: E,
+    at: usize,
+    pieces: &'a [Vec<u8>],
+    memory: File,
+    stack: Vec<u8>,
+    calls: usize,
+    found: Option<usize>,
+}
+
+impl<E: Entropy> Entropy for PanicsAt<'_, E> {
+    fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
+        self.calls = self.calls.wrapping_add(1);
+        self.source.fill(dest)?;
+        if self.calls == self.at {
+            let low = LOW.get();
+            assert_ne!(low, 0, "no code ran below the pad");
+            let start = u64::try_from(low.saturating_sub(SCAN)).unwrap();
+            self.memory.read_exact_at(&mut self.stack, start).unwrap();
+            self.found = Some(count(&self.stack, self.pieces));
+            // The count may leave pieces on the stack below, where the read after the unwinding
+            // would find them.
+            paint_stack();
+            panic!("the source broke");
+        }
+        Ok(())
+    }
+}
+
+/// Runs `run` below the pad with `source`, made to panic on its call number `at`, and tells whether
+/// `run` got that far. Asserts that `run` panics only there, and that the stack holds none of
+/// `pieces` at the panic, nor after it.
+pub(crate) fn panic_at(
+    pieces: &[Vec<u8>],
+    (source, at): (impl Entropy, usize),
+    run: impl FnOnce(&mut dyn Entropy),
+) -> bool {
+    let mut source = PanicsAt {
+        source,
+        at,
+        pieces,
+        memory: File::open("/proc/self/mem").unwrap(),
+        stack: std::vec![0; SCAN],
+        calls: 0,
+        found: None,
+    };
+    assert_clean(pieces, || {
+        let outcome = catch_unwind(AssertUnwindSafe(|| run(&mut source)));
+        assert_eq!(outcome.is_err(), source.calls == at);
+    });
+    let reached = source.calls == at;
+    assert_eq!(source.found, reached.then_some(0));
+    reached
 }

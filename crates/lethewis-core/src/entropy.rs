@@ -9,6 +9,9 @@ use core::fmt;
 /// so that within one `Slots` a broken source alone does not make them predictable, and into the
 /// salt of password parameters as they are. An implementation writes them straight into `dest` and
 /// keeps no copy of what it wrote, including in a buffer of its own.
+///
+/// A call asks the source before any step on a secret but hedging nonces and salts drawn before,
+/// which wipes its stack, so a panic of `fill` leaves none of the call's secrets behind.
 pub trait Entropy {
     /// Fills `dest` entirely with random bytes.
     ///
@@ -29,6 +32,27 @@ impl fmt::Display for EntropyError {
 }
 
 impl core::error::Error for EntropyError {}
+
+/// What the proofs know of the order of a call: the steps it has taken on a secret.
+#[cfg(kani)]
+pub(crate) mod model {
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    /// The derivations, but for the hedges of nonces and salts, the calls of X-Wing other than its
+    /// self-test, and the encryptions and decryptions run so far.
+    static STEPS: AtomicU8 = AtomicU8::new(0);
+
+    pub(crate) fn step() {
+        STEPS.store(
+            STEPS.load(Ordering::Relaxed).saturating_add(1),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(crate) fn steps() -> u8 {
+        STEPS.load(Ordering::Relaxed)
+    }
+}
 
 #[cfg(test)]
 mod tests {

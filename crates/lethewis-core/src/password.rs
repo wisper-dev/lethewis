@@ -59,6 +59,10 @@ impl PasswordParams {
     ///
     /// [`Error::InvalidParams`] if `memory` or `passes` is out of bounds, and `entropy` is then not
     /// asked, and [`Error::EntropyFailed`] if `entropy` fails.
+    ///
+    /// # Panics
+    ///
+    /// Only if `entropy` panics. The panic passes through.
     pub fn new(
         memory: u32,
         passes: u32,

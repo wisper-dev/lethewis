@@ -184,6 +184,9 @@ A new key is the hedge of the platform's random bytes under the key of the epoch
 into its slot; the bytes drawn are wiped, and if the source fails or panics, so is the slot. The
 keys of a set are wiped when it is released, and every key is wiped when its slots are dropped.
 
+A call asks the source before any step on a secret but hedging nonces and salts drawn before.
+Hedges wipe their stack, so a panic of the source leaves none of the call's secrets behind.
+
 Only a key for external data is returned, to a call that names its purpose, into the caller's
 buffer. The stack below the call is wiped after it, 8 KiB, or 64 KiB without optimisation, and a
 test reads it back for the key.

@@ -454,6 +454,8 @@ pub(crate) fn derive_from_words(
 ) -> Result<(), DerivationFailed> {
     #[cfg(test)]
     crate::timing::note();
+    #[cfg(kani)]
+    crate::entropy::model::step();
     let derived = words_on_stack(entropy, purpose, out);
     wipe_stack();
     derived
@@ -489,6 +491,8 @@ pub(crate) fn derive(
 ) -> Result<(), DerivationFailed> {
     #[cfg(test)]
     crate::timing::note();
+    #[cfg(kani)]
+    crate::entropy::model::step();
     let derived = derive_on_stack(key, salt, purpose, branch, out);
     wipe_stack();
     derived
@@ -509,6 +513,13 @@ pub(crate) fn hedge(
 ) -> Result<(), DerivationFailed> {
     #[cfg(test)]
     crate::timing::note();
+    #[cfg(kani)]
+    if matches!(
+        branch,
+        Branch::HedgeKey | Branch::HedgeWords | Branch::HedgeEncaps
+    ) {
+        crate::entropy::model::step();
+    }
     let hedged = hedge_on_stack(epoch, count, branch, drawn, out);
     wipe_stack();
     hedged
@@ -861,6 +872,19 @@ pub(crate) mod stack {
     /// or the material of a hedge.
     pub(crate) fn secrets_of(key: &[u8], salt: &[u8], branch: Branch) -> Vec<Vec<u8>> {
         secrets_for(key, salt, branch, purpose_of(branch))
+    }
+
+    /// The secrets a hedge of `drawn` for `branch` at `count`, under the key of the epoch `epoch`,
+    /// handles.
+    pub(crate) fn hedge_secrets(
+        epoch: &[u8],
+        count: u64,
+        branch: Branch,
+        drawn: &[u8],
+    ) -> Vec<Vec<u8>> {
+        let mut material = drawn.to_vec();
+        material.extend_from_slice(&count.to_le_bytes());
+        secrets_of(&material, epoch, branch)
     }
 
     /// The same for a derivation for `purpose`, or for none.

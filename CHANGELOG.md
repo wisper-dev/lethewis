@@ -287,5 +287,7 @@ Nothing is published while the version is below 0.1.0.
 - Proofs with Kani 0.68.0 of the beginnings, of each chunk carried out and received, and of their
   refusals. Tests against carried blocks an independent implementation computes, every changed bit,
   blocks out of order, dropped and mixed, data-independent timing and the stack.
+- A call asks the random source before any step on a secret but hedging earlier nonces and salts.
+  Hedges wipe their stack, so a panic of the source leaves no secret; Kani proof, stack test.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main
