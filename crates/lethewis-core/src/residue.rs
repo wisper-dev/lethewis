@@ -96,10 +96,17 @@ pub(crate) fn residue(range: Range<usize>, pieces: &[Vec<u8>]) -> usize {
 
 /// How many of `pieces` the bytes of `stack` hold.
 fn count(stack: &[u8], pieces: &[Vec<u8>]) -> usize {
-    let windows: HashSet<&[u8]> = stack.windows(16).collect();
+    let mut starts = std::vec![false; 1 << 16];
+    for piece in pieces {
+        starts[usize::from(u16::from_le_bytes([piece[0], piece[1]]))] = true;
+    }
+    let held: HashSet<&[u8]> = stack
+        .windows(16)
+        .filter(|window| starts[usize::from(u16::from_le_bytes([window[0], window[1]]))])
+        .collect();
     pieces
         .iter()
-        .filter(|piece| windows.contains(piece.as_slice()))
+        .filter(|piece| held.contains(piece.as_slice()))
         .count()
 }
 
