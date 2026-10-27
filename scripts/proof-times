@@ -92,6 +92,9 @@
 317 5128 slots::proofs::the_last_chunk_received_moves_the_chain_of_the_export
 38 1115 slots::proofs::words_are_wiped_exactly_when_their_key_is_derived
 58 1157 slots::proofs::words_are_written_exactly_when_their_key_is_generated
+4 349 slots::table::proofs::the_table_changes_every_slot_once
+3 289 slots::table::proofs::the_table_finds_the_first_slot_that_passes
+10 346 slots::table::proofs::the_table_reaches_a_slot_by_its_number
 2 285 words::proofs::a_word_is_found_exactly_where_it_is_listed
 5 306 words::proofs::bytes_are_read_back_from_their_numbers
 6 359 words::proofs::numbers_stand_for_one_set_of_bytes

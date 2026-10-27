@@ -992,7 +992,7 @@ mod tests {
         let associated = AssociatedData::new(b"chat").unwrap();
         let mut sealed = [0; ARCHIVED_LEN];
         super::open_archived(
-            slots.memory[chat.index].wrapping_key().0,
+            slots.memory[chat.index.number()].wrapping_key().0,
             associated.bytes(),
             &record,
             &mut sealed,
@@ -1003,7 +1003,7 @@ mod tests {
         ciphertext[CIPHERTEXT_LEN - 1] ^= 1;
         let mut changed = [0; ARCHIVE_RECORD_LEN];
         super::seal_archived(
-            slots.memory[chat.index].wrapping_key().0,
+            slots.memory[chat.index.number()].wrapping_key().0,
             &[2; 12],
             associated.bytes(),
             (&id, &ciphertext, &check),
@@ -1113,7 +1113,7 @@ mod tests {
             .load_archive_key(store, stored, b"archive", &key_record)
             .unwrap();
         let mut seed_public = [0; PUBLIC_LEN];
-        let (seed, id) = slots.memory[key.index].wrapping_key();
+        let (seed, id) = slots.memory[key.index.number()].wrapping_key();
         xwing::public_key(super::seed_of(seed).unwrap(), &mut seed_public);
         assert_eq!(public.public, seed_public);
         assert_eq!(public.id, id.bytes());
@@ -1461,9 +1461,9 @@ mod tests {
             let sealed_by = if has(Fault::Outsider) {
                 &outsider
             } else if has(Fault::OtherChat) {
-                slots.memory[other_chat.index].wrapping_key().0
+                slots.memory[other_chat.index.number()].wrapping_key().0
             } else {
-                slots.memory[chat.index].wrapping_key().0
+                slots.memory[chat.index.number()].wrapping_key().0
             };
             let parts = (&id, &ciphertext, &check);
             let mut record = seal_parts(sealed_by, sealed_for, &random.bytes(), parts);
@@ -1513,7 +1513,7 @@ mod tests {
                 parts[..16].copy_from_slice(&id);
                 parts[16..1136].copy_from_slice(&ciphertext);
                 parts[1136..].copy_from_slice(&check);
-                let other = slots.memory[other_chat.index].wrapping_key().0;
+                let other = slots.memory[other_chat.index.number()].wrapping_key().0;
                 assert_eq!(opened_parts(other, sealed_for, &moved), Ok(parts), "{at}");
             } else {
                 assert_eq!(moved, [9; ARCHIVE_RECORD_LEN], "{at}");
@@ -1690,14 +1690,14 @@ mod stack {
             .load_archive_key(store, stored, b"archive", &key_record)
             .unwrap();
         let keys = (
-            slots.memory[stored.index].wrapping_key().0,
-            slots.memory[store.index].wrapping_key().0,
+            slots.memory[stored.index.number()].wrapping_key().0,
+            slots.memory[store.index.number()].wrapping_key().0,
             &slots.epoch.key,
         );
         let layers = layer_secrets(keys, &key_record);
         slots.release(store).unwrap();
         let bytes = |slots: &Slots<'_>, handle: Handle<'_>| {
-            slots.memory[handle.index].wrapping_key().0.bytes()[..32].to_vec()
+            slots.memory[handle.index.number()].wrapping_key().0.bytes()[..32].to_vec()
         };
         let mut secrets: Vec<Vec<u8>> = [stored, chat, other, key]
             .iter()
@@ -1710,7 +1710,7 @@ mod stack {
         secrets.push(expanded.to_vec());
         let mut sealed = [0; ARCHIVED_LEN];
         open_archived(
-            slots.memory[chat.index].wrapping_key().0,
+            slots.memory[chat.index.number()].wrapping_key().0,
             AssociatedData::new(b"chat").unwrap().bytes(),
             &record,
             &mut sealed,
@@ -1734,7 +1734,7 @@ mod stack {
         secrets.push(data.to_vec());
         secrets.extend(seed_secrets(secrets[3].as_slice().try_into().unwrap()));
         secrets.extend(layers);
-        let chat_key = slots.memory[chat.index].wrapping_key().0;
+        let chat_key = slots.memory[chat.index.number()].wrapping_key().0;
         let drawn: [u8; 64] = core::array::from_fn(|at| u8::try_from(at).unwrap().wrapping_add(1));
         let mut hedged = [0; 64];
         hedge(
@@ -1803,7 +1803,7 @@ mod stack {
                 &mut moved,
             )
             .unwrap();
-        let other = slots.memory[other_chat.index].wrapping_key().0;
+        let other = slots.memory[other_chat.index.number()].wrapping_key().0;
         let mut seal_key = [0; 32];
         derive_archive_seal_key(other, &mut seal_key).unwrap();
         let (nonce, tag) = (

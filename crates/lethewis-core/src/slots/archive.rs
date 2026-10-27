@@ -4,7 +4,7 @@
 //! The record of an archive key: its seed under a stored key of the archive, and its public key,
 //! under the profile's stored key for wrapping and the key of an epoch.
 
-use super::{Handle, Kind, Open, Slots, derive_record_key, hedged_draw, write_record};
+use super::{Handle, Index, Kind, Open, Slots, derive_record_key, hedged_draw, write_record};
 use crate::{
     derive::{Branch, KeyId, derive_archive_layer_key, derive_archive_seed, derive_key_id},
     entropy::Entropy,
@@ -344,7 +344,7 @@ impl<'a> Slots<'a> {
         &self,
         store: Handle<'a>,
         profile: Handle<'a>,
-    ) -> Result<(usize, usize), Error> {
+    ) -> Result<(Index, Index), Error> {
         let (store, profile) = (self.loaded(store)?, self.loaded(profile)?);
         let (Some(archive), Some(stored)) = (self.memory.get(store), self.memory.get(profile))
         else {
@@ -360,7 +360,7 @@ impl<'a> Slots<'a> {
     }
 
     /// The slot of the stored key for wrapping that `profile` refers to.
-    pub(super) fn profile_key(&self, profile: Handle<'a>) -> Result<usize, Error> {
+    pub(super) fn profile_key(&self, profile: Handle<'a>) -> Result<Index, Error> {
         let index = self.serving(profile, Purpose::Wrap)?;
         if self.memory.get(index).is_none_or(|stored| stored.unlocks) {
             return Err(Error::WrongLevel);
@@ -644,7 +644,7 @@ mod tests {
         let mut body = [0; ARCHIVE_BODY_LEN];
         open_archive_layer(
             (
-                slots.memory[profile.index].wrapping_key().0,
+                slots.memory[profile.index.number()].wrapping_key().0,
                 &slots.epoch.key,
                 slots.epoch.number,
             ),
@@ -712,7 +712,7 @@ mod tests {
         let key = slots
             .load_archive_key(archive, stored, b"archive", &record)
             .unwrap();
-        let slot = &slots.memory[key.index];
+        let slot = &slots.memory[key.index.number()];
         assert_eq!((slot.purpose, slot.unlocks), (Purpose::Archive, false));
         let (id, public, _) = split_body(&opened(&slots, stored, &record));
         let mut given = [0; PUBLIC_LEN];
@@ -765,7 +765,11 @@ mod tests {
             let mut changed = [0; ARCHIVE_KEY_RECORD_LEN];
             let Epoch { key, number, .. } = &*slots.epoch;
             seal_archive_layer(
-                (slots.memory[stored.index].wrapping_key().0, key, *number),
+                (
+                    slots.memory[stored.index.number()].wrapping_key().0,
+                    key,
+                    *number,
+                ),
                 &[2; 12],
                 AssociatedData::new(b"archive").unwrap().bytes(),
                 &body,
@@ -842,7 +846,7 @@ mod tests {
             (Purpose::Archive, 0, two),
             (Purpose::ExternalData, 0, Stages::one()),
         ] {
-            let (archive_key, archive_id) = slots.memory[archive.index].wrapping_key();
+            let (archive_key, archive_id) = slots.memory[archive.index.number()].wrapping_key();
             let header = Header {
                 purpose,
                 parent: archive_id.bytes(),
@@ -866,7 +870,11 @@ mod tests {
             let mut changed = [0; ARCHIVE_KEY_RECORD_LEN];
             let Epoch { key, number, .. } = &*slots.epoch;
             seal_archive_layer(
-                (slots.memory[stored.index].wrapping_key().0, key, *number),
+                (
+                    slots.memory[stored.index.number()].wrapping_key().0,
+                    key,
+                    *number,
+                ),
                 &[2; 12],
                 associated.bytes(),
                 &body,
@@ -1235,12 +1243,13 @@ mod tests {
                 let key = slots
                     .load_archive_key(store, stored, b"archive", &record)
                     .unwrap();
-                <[u8; 32]>::try_from(&slots.memory[key.index].keys[0].bytes()[..32]).unwrap()
+                <[u8; 32]>::try_from(&slots.memory[key.index.number()].keys[0].bytes()[..32])
+                    .unwrap()
             });
             let mut outsider = Key::empty();
             outsider.copy32(&random.bytes());
 
-            let (archive_key, archive_id) = slots.memory[store.index].wrapping_key();
+            let (archive_key, archive_id) = slots.memory[store.index.number()].wrapping_key();
             let mut plaintext = [0; PLAINTEXT_LEN];
             plaintext[..3].copy_from_slice(&[1, 4, 0]);
             plaintext[3..19].copy_from_slice(&if has(Fault::Parent) {
@@ -1319,7 +1328,7 @@ mod tests {
                 if has(Fault::Profile) {
                     &outsider
                 } else {
-                    slots.memory[stored.index].wrapping_key().0
+                    slots.memory[stored.index.number()].wrapping_key().0
                 },
                 &slots.epoch.key,
                 &mut layer_key,
@@ -1405,7 +1414,7 @@ mod tests {
             if carry.is_ok() {
                 let mut next_key = [0; 32];
                 derive_archive_layer_key(
-                    slots.memory[next_profile.index].wrapping_key().0,
+                    slots.memory[next_profile.index.number()].wrapping_key().0,
                     &slots.epoch.next,
                     &mut next_key,
                 )
@@ -2028,7 +2037,9 @@ pub(super) mod stack {
             .load_archive_key(store, stored, b"archive", &record)
             .unwrap();
         let mut secrets = [stored, store, key]
-            .map(|handle| slots.memory[handle.index].wrapping_key().0.bytes()[..32].to_vec())
+            .map(|handle| {
+                slots.memory[handle.index.number()].wrapping_key().0.bytes()[..32].to_vec()
+            })
             .to_vec();
         let epoch_key = flipped_epoch_key(flip);
         let nonce = counted::<12>();
@@ -2055,8 +2066,8 @@ pub(super) mod stack {
         secrets.push(expanded.to_vec());
         secrets.extend(seed_secrets(&seed));
         let keys = (
-            slots.memory[stored.index].wrapping_key().0,
-            slots.memory[store.index].wrapping_key().0,
+            slots.memory[stored.index.number()].wrapping_key().0,
+            slots.memory[store.index.number()].wrapping_key().0,
             &slots.epoch.key,
         );
         secrets.extend(layer_secrets(keys, &record));
@@ -2074,7 +2085,7 @@ pub(super) mod stack {
             )
             .unwrap();
         secrets.extend(carried_secrets(
-            slots.memory[stored.index].wrapping_key().0,
+            slots.memory[stored.index.number()].wrapping_key().0,
             &slots.epoch.next,
             &carried,
         ));
