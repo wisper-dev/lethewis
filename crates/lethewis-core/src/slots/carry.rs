@@ -6,7 +6,7 @@
 //! is the next element of the export under that key, after its records, and its end covers it.
 
 use super::data::{OpenChunk, Opening, SealChunk};
-use super::{Direction, Handle, Slots, hedged_draw};
+use super::{Direction, Handle, Index, Slots, hedged_draw};
 use crate::{
     block::{
         BLOCK_HEADER_LEN, CARRY_LABEL, CHECK_LEN, CHUNK_LEN, CHUNK_TAG_LEN, SALT_LEN, chunk_nonce,
@@ -502,25 +502,26 @@ impl<'a> Slots<'a> {
             return Err(Error::StaleHandle);
         }
         let mark = Some((transfer_index, carrier.generation));
-        if let Some(set) = set {
-            let index = self.serving(set, Purpose::Data)?;
-            if self.memory.get(index).map(|slot| slot.pending) != Some(mark) {
-                return Err(Error::NotReceived);
+        let given = match set {
+            Some(set) => {
+                let index = self.serving(set, Purpose::Data)?;
+                if self.memory.get(index).map(|slot| slot.pending) != Some(mark) {
+                    return Err(Error::NotReceived);
+                }
+                Some((set, index))
             }
-        }
+            None => None,
+        };
         let Epoch { key, drawn, .. } = &mut *self.epoch;
         let mut salt = [0; SALT_LEN];
         hedged_draw(entropy, key, drawn, Branch::HedgeSalt, &mut salt)?;
-        let (set, new) = match set {
-            Some(set) => (set, false),
-            None => (
-                self.generate(Purpose::Data, KeyLength::Bytes32, entropy)?,
-                true,
-            ),
+        let (set, index, new) = if let Some((set, index)) = given {
+            (set, index, false)
+        } else {
+            let set = self.generate(Purpose::Data, KeyLength::Bytes32, entropy)?;
+            (set, self.loaded(set)?, true)
         };
-        let begun = self.header_of_received(set, &salt, header);
-        let index = set.index;
-        match begun {
+        match self.header_of_received(index, &salt, header) {
             Ok(at) => {
                 if new && let Some(slot) = self.memory.get_mut(index) {
                     slot.pending = mark;
@@ -544,15 +545,15 @@ impl<'a> Slots<'a> {
         }
     }
 
-    /// Writes into `header` the salt `salt` and the check of the primary key of the set at `set`,
-    /// when the check is derived, and gives the position of that key.
+    /// Writes into `header` the salt `salt` and the check of the primary key of the set in slot
+    /// `index`, when the check is derived, and gives the position of that key.
     fn header_of_received(
         &self,
-        set: Handle<'a>,
+        index: Index,
         salt: &[u8; SALT_LEN],
         header: &mut [u8; BLOCK_HEADER_LEN],
     ) -> Result<Position, Error> {
-        let slot = self.memory.get(set.index).ok_or(Error::StaleHandle)?;
+        let slot = self.memory.get(index).ok_or(Error::StaleHandle)?;
         let at = slot.stages.primary_position().ok_or(Error::StaleHandle)?;
         let mut check = [0; CHECK_LEN];
         let derived = derive_data_check(slot.key(at), salt, &mut check);
@@ -1943,9 +1944,9 @@ mod stack {
         to.receive_last(receiving, &mut last, &carried_last, &mut kept_last)
             .unwrap();
 
-        let data_key = slots.memory[set.index].key(Position::First);
-        let carry_key = slots.memory[transfer.index].key(Position::First);
-        let new_key = to.memory[new.index].key(Position::First);
+        let data_key = slots.memory[set.index.number()].key(Position::First);
+        let carry_key = slots.memory[transfer.index.number()].key(Position::First);
+        let new_key = to.memory[new.index.number()].key(Position::First);
         let (epoch_key, other_epoch_key) =
             (flipped_epoch_key(flip), flipped_epoch_key(flip ^ 0x33));
         let mut secrets = std::vec![

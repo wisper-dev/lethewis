@@ -26,6 +26,9 @@ mod archived;
 mod batch;
 mod carry;
 mod data;
+mod table;
+
+use table::{Index, Table};
 
 pub use archived::ArchivePublic;
 pub use carry::{Exporting, Receipt, Receiving};
@@ -59,7 +62,7 @@ pub struct Slot {
     recorded: bool,
     /// The slot and generation of the key for transfers the set came under, until the end of that
     /// transfer is received.
-    pending: Option<(usize, u64)>,
+    pending: Option<(Index, u64)>,
     /// For a key for transfers: the tag of the last record or block of the export it writes or
     /// receives, or
     /// zero before the first.
@@ -234,7 +237,7 @@ impl fmt::Debug for Slot {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Handle<'a> {
     slots: usize,
-    index: usize,
+    index: Index,
     generation: u64,
     memory: PhantomData<&'a [Slot]>,
 }
@@ -274,7 +277,7 @@ impl fmt::Debug for Handle<'_> {
 /// # Ok::<(), lethewis_core::Error>(())
 /// ```
 pub struct Slots<'a> {
-    memory: &'a mut [Slot],
+    memory: Table<'a>,
     epoch: &'a mut Epoch,
 }
 
@@ -455,7 +458,7 @@ impl<'a> Slots<'a> {
         epoch.key.copy32(key);
         wipe(key);
         let mut this = Self {
-            memory: slots,
+            memory: Table::new(slots),
             epoch,
         };
         this.unload_all();
@@ -709,7 +712,7 @@ impl<'a> Slots<'a> {
 
     /// The slots of the sets `key` and `salt` refer to, if they are two keys from a secret, the
     /// second of 32 bytes, and a slot is free.
-    fn combinable(&self, key: Handle<'a>, salt: Handle<'a>) -> Result<(usize, usize), Error> {
+    fn combinable(&self, key: Handle<'a>, salt: Handle<'a>) -> Result<(Index, Index), Error> {
         let (first, second) = (self.loaded(key)?, self.loaded(salt)?);
         if first == second {
             return Err(Error::SameKey);
@@ -870,7 +873,7 @@ impl<'a> Slots<'a> {
 
     /// Refuses a record of `kind` of the set in slot `index` under the set in slot `parent`, for
     /// the first reason that applies once both handles are live.
-    fn wrappable(&self, index: usize, parent: usize, kind: Kind) -> Result<(), Error> {
+    fn wrappable(&self, index: Index, parent: Index, kind: Kind) -> Result<(), Error> {
         if index == parent {
             return Err(Error::SameKey);
         }
@@ -1224,7 +1227,8 @@ impl<'a> Slots<'a> {
             slot.generation,
         );
         let handle = self.take(index, associated.bytes(), record, Kind::Export, &mut open)?;
-        if let Some(received) = self.memory.get_mut(handle.index) {
+        let taken = self.loaded(handle)?;
+        if let Some(received) = self.memory.get_mut(taken) {
             received.pending = Some((index, generation));
         }
         if let (Some(slot), Some(tag)) = (self.memory.get_mut(index), record.last_chunk()) {
@@ -1301,11 +1305,11 @@ impl<'a> Slots<'a> {
         if !opened {
             return Err(Error::RecordRejected);
         }
-        for slot in self.memory.iter_mut() {
+        self.memory.each(|slot| {
             if slot.pending == Some((index, generation)) {
                 slot.pending = None;
             }
-        }
+        });
         if let Some(slot) = self.memory.get_mut(index) {
             slot.chain = [0; TAG_LEN];
             slot.direction = Direction::Idle;
@@ -1374,7 +1378,7 @@ impl<'a> Slots<'a> {
     }
 
     /// The slot of the set `handle` refers to, if it serves `purpose`.
-    fn serving(&self, handle: Handle<'a>, purpose: Purpose) -> Result<usize, Error> {
+    fn serving(&self, handle: Handle<'a>, purpose: Purpose) -> Result<Index, Error> {
         let index = self.loaded(handle)?;
         let set = self.memory.get(index).ok_or(Error::StaleHandle)?;
         if set.purpose != purpose {
@@ -1385,7 +1389,7 @@ impl<'a> Slots<'a> {
 
     /// The slot of the set `parent` refers to, if it is the key records of `kind` are wrapped
     /// under, of the level they take, and a slot is free.
-    fn parent(&self, parent: Handle<'a>, kind: Kind) -> Result<usize, Error> {
+    fn parent(&self, parent: Handle<'a>, kind: Kind) -> Result<Index, Error> {
         let index = self.serving(parent, kind.parent_purpose())?;
         let set = self.memory.get(index).ok_or(Error::StaleHandle)?;
         if set.unlocks != (kind == Kind::Lock) {
@@ -1401,7 +1405,7 @@ impl<'a> Slots<'a> {
     /// holds.
     fn take(
         &mut self,
-        parent: usize,
+        parent: Index,
         aad: &[u8],
         record: &[u8; RECORD_LEN],
         kind: Kind,
@@ -1419,7 +1423,7 @@ impl<'a> Slots<'a> {
     /// plaintext in `found` if it names that key's identifier as the parent's.
     fn open_under(
         &self,
-        parent: usize,
+        parent: Index,
         aad: &[u8],
         record: &[u8; RECORD_LEN],
         found: &mut [u8; PLAINTEXT_LEN],
@@ -1573,13 +1577,11 @@ impl<'a> Slots<'a> {
     }
 
     pub(crate) fn has_free(&self) -> bool {
-        self.memory
-            .iter()
-            .any(|slot| slot.occupancy == Occupancy::Free)
+        self.memory.any(|slot| slot.occupancy == Occupancy::Free)
     }
 
     /// The index of the slot `handle` refers to, if it is loaded with the handle's generation.
-    fn loaded(&self, handle: Handle<'a>) -> Result<usize, Error> {
+    fn loaded(&self, handle: Handle<'a>) -> Result<Index, Error> {
         if handle.slots != self.id() {
             return Err(Error::StaleHandle);
         }
@@ -1645,8 +1647,7 @@ impl<'a> Slots<'a> {
         let slots = self.id();
         let index = self
             .memory
-            .iter()
-            .position(|slot| slot.occupancy == Occupancy::Free)
+            .find(|slot| slot.occupancy == Occupancy::Free)
             .ok_or(Error::NoFreeSlot)?;
         let filled = self
             .memory
@@ -1685,7 +1686,7 @@ impl<'a> Slots<'a> {
     /// slot holds, for any purpose, or that the set holds twice, is refused.
     // Derived into local buffers and copied in at once: the derivation writes byte by byte, and
     // each write through a reference to a slot chosen at run time multiplies the proofs' work.
-    fn identify(&self, index: usize, stages: &Stages) -> Result<[KeyId; MEMBERS], Error> {
+    fn identify(&self, index: Index, stages: &Stages) -> Result<[KeyId; MEMBERS], Error> {
         let slot = self.memory.get(index).ok_or(Error::NoFreeSlot)?;
         let derive = |position: usize, key: &Key, id: &mut KeyId| -> Result<(), Error> {
             if stages.stage(position).is_some() {
@@ -1701,7 +1702,7 @@ impl<'a> Slots<'a> {
         derive(2, third, third_id)?;
         let [first_id, second_id, third_id] = &ids;
         let filled = |position: usize| stages.stage(position).is_some();
-        let held = |id: &KeyId| self.memory.iter().any(|other| other.holds(id));
+        let held = |id: &KeyId| self.memory.any(|other| other.holds(id));
         let repeated = (filled(0) && held(first_id))
             || (filled(1) && (held(second_id) || (filled(0) && first_id.same(second_id))))
             || (filled(2)
@@ -1940,7 +1941,7 @@ impl<'a> Slots<'a> {
         let identified = filled.and_then(|()| {
             let key = self.memory.get(index).ok_or(Error::StaleHandle)?.key(at);
             derive_key_id(key, &mut id).map_err(|_| Error::DerivationFailed)?;
-            if self.memory.iter().any(|other| other.holds(&id)) {
+            if self.memory.any(|other| other.holds(&id)) {
                 return Err(Error::DuplicateKey);
             }
             Ok(())
@@ -1999,9 +2000,7 @@ impl<'a> Slots<'a> {
             .ok_or(Error::EpochExhausted)?;
         self.epoch.next.wipe();
         self.epoch.changing = false;
-        for slot in self.memory.iter_mut() {
-            slot.sealed = false;
-        }
+        self.memory.each(|slot| slot.sealed = false);
         Ok(root.erase(next))
     }
 
@@ -2029,7 +2028,6 @@ impl<'a> Slots<'a> {
             .ok_or(Error::EpochExhausted)?;
         if self
             .memory
-            .iter()
             .any(|slot| slot.occupancy == Occupancy::Loaded && slot.changed && !slot.sealed)
         {
             return Err(Error::Unsaved);
@@ -2046,11 +2044,11 @@ impl<'a> Slots<'a> {
         self.epoch.next.wipe();
         self.epoch.number = next;
         self.epoch.changing = false;
-        for slot in self.memory.iter_mut() {
+        self.memory.each(|slot| {
             slot.recorded = slot.sealed;
             slot.changed = false;
             slot.sealed = false;
-        }
+        });
         Ok(root.erase(old))
     }
 
@@ -2092,18 +2090,18 @@ impl<'a> Slots<'a> {
     /// addresses. Empty ones may share an address, but they issue no handles. A handle keeps its
     /// memory borrowed, so no other `Slots` can take that memory over while the handle exists.
     fn id(&self) -> usize {
-        self.memory.as_ptr().addr()
+        self.memory.id()
     }
 
     /// Wipes every key and identifier in every slot, loaded or not, and frees the loaded ones.
     fn unload_all(&mut self) {
-        for slot in self.memory.iter_mut() {
+        self.memory.each(|slot| {
             if slot.occupancy == Occupancy::Loaded {
                 slot.unload();
             } else {
                 slot.wipe_keys();
             }
-        }
+        });
     }
 }
 
@@ -2312,7 +2310,7 @@ mod tests {
 
     use super::{
         AssociatedData, CIPHER_KEY_LEN, END_RECORD_LEN, Entropy, EntropyError, Epoch, Erasure,
-        Error, Handle, Header, KeyLength, LAYER_LEN, LOCK_RECORD_LEN, MEMBERS, Occupancy,
+        Error, Handle, Header, Index, KeyLength, LAYER_LEN, LOCK_RECORD_LEN, MEMBERS, Occupancy,
         PLAINTEXT_LEN, Position, Purpose, RECORD_LEN, Root, RootFailed, Slot, Slots, Stages,
         Status, derive_layer_key, derive_lock_key, derive_wrap_key, keyset, opening, seal,
         write_record,
@@ -2801,7 +2799,7 @@ mod tests {
             let expected = unhex32(expected);
             let only = [Some((Status::Enabled, &expected[..])), None, None];
             assert_holds_for(&slots, combined, only, 0, Purpose::Wrap);
-            assert!(slots.memory[combined.index].unlocks);
+            assert!(slots.memory[combined.index.number()].unlocks);
             for (handle, at) in [(password, 0), (answer, 1)] {
                 assert_eq!(slots.release(handle), Err(Error::StaleHandle));
                 assert_eq!(slots.memory[at].occupancy, Occupancy::Free);
@@ -3205,7 +3203,7 @@ mod tests {
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let mut source = secret();
         let handle = slots.import32(Purpose::Wrap, &mut source).unwrap();
-        assert_eq!((handle.index, handle.generation), (0, 0));
+        assert_eq!((handle.index, handle.generation), (Index::new(0), 0));
         assert_eq!(slots.memory[0].keys[0].bytes(), &padded(&secret()));
         assert_eq!(slots.memory[0].keys[0].length(), KeyLength::Bytes32);
         assert_eq!(slots.memory[0].occupancy, Occupancy::Loaded);
@@ -3236,7 +3234,7 @@ mod tests {
         let long = slots
             .generate(Purpose::Wrap, KeyLength::Bytes64, &mut Counting)
             .unwrap();
-        assert_eq!((short.index, long.index), (0, 1));
+        assert_eq!((short.index, long.index), (Index::new(0), Index::new(1)));
         assert_eq!(
             slots.memory[0].keys[0].bytes(),
             &padded(&hedged(0, b"hedge key", &counted::<32>(), 32))
@@ -3384,7 +3382,7 @@ mod tests {
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         let handle = slots.import64(Purpose::Wrap, &mut [5; 64]).unwrap();
-        assert_eq!(handle.index, 2);
+        assert_eq!(handle.index, Index::new(2));
     }
 
     #[test]
@@ -3481,7 +3479,7 @@ mod tests {
         slots.import32(Purpose::Wrap, &mut secret()).unwrap();
         let outside = Handle {
             slots: id,
-            index: 1,
+            index: Index::new(1),
             generation: 0,
             memory: PhantomData,
         };
@@ -3655,7 +3653,7 @@ mod tests {
         primary: usize,
         purpose: Purpose,
     ) {
-        let slot = &slots.memory[handle.index];
+        let slot = &slots.memory[handle.index.number()];
         assert_eq!(slot.occupancy, Occupancy::Loaded);
         assert_eq!((slot.stages.primary(), slot.purpose), (primary, purpose));
         for (at, member) in members.into_iter().enumerate() {
@@ -3899,7 +3897,7 @@ mod tests {
         primary: usize,
         context: &[u8],
     ) -> [u8; RECORD_LEN] {
-        let slot = &slots.memory[parent.index];
+        let slot = &slots.memory[parent.index.number()];
         let plaintext = set_plaintext(members, primary, slot.ids[0].bytes());
         seal_plaintext(&slot.keys[0], &plaintext, context, &NONCE)
     }
@@ -3915,7 +3913,7 @@ mod tests {
         let parent = slots.store(parent);
         let child = pattern::<32>(13, 5);
         let only = [Some((Status::Enabled, &child[..])), None, None];
-        let plaintext = set_plaintext(only, 0, slots.memory[parent.index].ids[0].bytes());
+        let plaintext = set_plaintext(only, 0, slots.memory[parent.index.number()].ids[0].bytes());
         for (sealer, expected) in [
             (pattern::<32>(3, 1), Ok(())),
             (pattern::<32>(3, 2), Err(Error::RecordRejected)),
@@ -4000,7 +3998,7 @@ mod tests {
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let stored = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
         let stored = slots.store(stored);
-        let named = slots.memory[stored.index].ids[0].bytes();
+        let named = slots.memory[stored.index.number()].ids[0].bytes();
         let (first, second) = (pattern::<32>(5, 2), pattern::<64>(7, 3));
         let one = [Some((Status::Enabled, &first[..])), None, None];
         let plain = set_plaintext_for(one, 0, named, Purpose::Wrap);
@@ -4011,7 +4009,7 @@ mod tests {
         );
 
         let secret = slots.import32(Purpose::Wrap, &mut pattern(3, 4)).unwrap();
-        let named = slots.memory[secret.index].ids[0].bytes();
+        let named = slots.memory[secret.index.number()].ids[0].bytes();
         let sealer = key_from(&pattern::<32>(3, 4));
         let epoch = (&epoch(), EPOCH);
         let lock = |plaintext: &[u8; PLAINTEXT_LEN]| {
@@ -4044,7 +4042,7 @@ mod tests {
         }
         let set = slots.unlock(secret, b"set", &accepted).unwrap();
         assert_holds_for(&slots, set, one, 0, Purpose::Wrap);
-        assert!(!slots.memory[set.index].unlocks);
+        assert!(!slots.memory[set.index.number()].unlocks);
     }
 
     /// A stored key for wrapping comes back from its lock record under the key from a secret it was
@@ -4067,7 +4065,10 @@ mod tests {
         let generated = hedged(0, b"hedge key", &counted::<64>(), 64);
         let only = [Some((Status::Enabled, &generated[..])), None, None];
         assert_holds_for(&slots, back, only, 0, Purpose::Wrap);
-        assert!(slots.memory[secret.index].unlocks && !slots.memory[back.index].unlocks);
+        assert!(
+            slots.memory[secret.index.number()].unlocks
+                && !slots.memory[back.index.number()].unlocks
+        );
         let data = slots
             .import32(Purpose::ExternalData, &mut pattern(5, 2))
             .unwrap();
@@ -4232,10 +4233,16 @@ mod tests {
         slots.release(seal).unwrap();
         slots.release(archive).unwrap();
         let seal = slots.unwrap(stored, b"chat", &record).unwrap();
-        assert_eq!(slots.memory[seal.index].purpose, Purpose::ArchiveSeal);
+        assert_eq!(
+            slots.memory[seal.index.number()].purpose,
+            Purpose::ArchiveSeal
+        );
         let archive = slots.unlock(secret, b"archive", &lock).unwrap();
-        assert_eq!(slots.memory[archive.index].purpose, Purpose::ArchiveWrap);
-        assert!(!slots.memory[archive.index].unlocks);
+        assert_eq!(
+            slots.memory[archive.index.number()].purpose,
+            Purpose::ArchiveWrap
+        );
+        assert!(!slots.memory[archive.index.number()].unlocks);
         let mut out = [0; 32];
         assert_eq!(
             slots.reveal32(seal, Position::First, Purpose::ArchiveSeal, &mut out),
@@ -5113,9 +5120,14 @@ mod tests {
         let root = slots.import32(Purpose::Wrap, &mut pattern(3, 1)).unwrap();
 
         let root = slots.store(root);
-        let named = slots.memory[root.index].ids[0].bytes();
+        let named = slots.memory[root.index.number()].ids[0].bytes();
         let plaintext = set_plaintext([Some((Status::Enabled, &long)), None, None], 0, named);
-        let record = seal_plaintext(&slots.memory[root.index].keys[0], &plaintext, b"x", &NONCE);
+        let record = seal_plaintext(
+            &slots.memory[root.index.number()].keys[0],
+            &plaintext,
+            b"x",
+            &NONCE,
+        );
         slots.settle();
         let before = holdings(&slots);
         assert_eq!(
@@ -5225,7 +5237,10 @@ mod tests {
             .unwrap();
         slots.release(data).unwrap();
         let back = slots.unwrap(root, b"chat 9", &record).unwrap();
-        assert_eq!(slots.memory[back.index].purpose, Purpose::ExternalData);
+        assert_eq!(
+            slots.memory[back.index.number()].purpose,
+            Purpose::ExternalData
+        );
         let mut out = [0; 32];
         slots
             .reveal32(back, Position::First, Purpose::ExternalData, &mut out)
@@ -5258,7 +5273,7 @@ mod tests {
         slots
             .wrap(set, root, b"chat 7", &mut Fixed(&NONCE), &mut out)
             .unwrap();
-        let slot = &slots.memory[root.index];
+        let slot = &slots.memory[root.index.number()];
         let plaintext = set_plaintext(members, 0, slot.ids[0].bytes());
         let nonce = hedged(0, b"hedge nonce", &NONCE, 12).try_into().unwrap();
         assert_eq!(
@@ -5348,8 +5363,8 @@ mod tests {
             .generate(Purpose::ExternalData, KeyLength::Bytes32, &mut Counting)
             .unwrap();
         assert_ne!(
-            slots.memory[first.index].keys[0].bytes(),
-            slots.memory[second.index].keys[0].bytes()
+            slots.memory[first.index.number()].keys[0].bytes(),
+            slots.memory[second.index.number()].keys[0].bytes()
         );
         let (mut one, mut two) = ([0; RECORD_LEN], [0; RECORD_LEN]);
         slots
@@ -5726,7 +5741,7 @@ mod tests {
             let mut epoch_memory = Epoch::empty();
             let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
             let parent = random_parent(&mut slots, &mut random);
-            let parent_slot = &slots.memory[parent.index];
+            let parent_slot = &slots.memory[parent.index.number()];
             let parent_key = &parent_slot.keys[0];
             let outsider = key_from(&random.key());
             let by_parent = random.below(8) != 0;
@@ -5798,7 +5813,7 @@ mod tests {
                 after[at] = loaded_from(&plaintext, before[at].1);
                 assert_eq!(
                     (handle.index, handle.generation),
-                    (at, before[at].1),
+                    (Index::new(at), before[at].1),
                     "round {round} of seed {seed}"
                 );
             }
@@ -6065,7 +6080,7 @@ mod stack {
         let keys = keys.each_ref().map(|bytes| key_from(bytes));
         let header = Header {
             purpose: Purpose::ExternalData,
-            parent: slots.memory[parent.index].ids[0].bytes(),
+            parent: slots.memory[parent.index.number()].ids[0].bytes(),
             epoch: EPOCH,
         };
         let mut plaintext = [0; PLAINTEXT_LEN];
@@ -6077,7 +6092,7 @@ mod stack {
         );
         let mut cipher_key = [0; 32];
         derive_wrap_key(
-            &slots.memory[parent.index].keys[0],
+            &slots.memory[parent.index.number()].keys[0],
             &slots.epoch.key,
             &mut cipher_key,
         )

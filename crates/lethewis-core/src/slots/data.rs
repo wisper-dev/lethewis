@@ -1533,7 +1533,7 @@ mod stack {
         block.extend_from_slice(&first_tag);
         block.extend_from_slice(&last);
         block.extend_from_slice(&last_tag);
-        let key = slots.memory[set.index].key(crate::Position::First);
+        let key = slots.memory[set.index.number()].key(crate::Position::First);
         let salt: [u8; 16] = header[..16].try_into().unwrap();
         let mut chunk_key = [0; 32];
         derive_data_chunk(key, &salt, &mut chunk_key).unwrap();

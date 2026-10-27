@@ -289,5 +289,6 @@ Nothing is published while the version is below 0.1.0.
   blocks out of order, dropped and mixed, data-independent timing and the stack.
 - A call asks the random source before any step on a secret but hedging earlier nonces and salts.
   Hedges wipe their stack, so a panic of the source leaves no secret; Kani proof, stack test.
+- Slots are reached only through a table, which Kani proves for eight slots.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main
