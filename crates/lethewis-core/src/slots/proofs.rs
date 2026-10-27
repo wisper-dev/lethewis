@@ -89,14 +89,12 @@ fn snapshot(slot: &Slot) -> Snapshot {
 // Kani 0.68.0 reports spurious failures when a key buffer is read through a symbolic index, so
 // the reads below take every element and then pick one, with no check left behind a branch.
 
-fn slot_at<'s>(slots: &'s Slots<'_>, index: impl Into<usize>) -> &'s Slot {
-    let index = index.into();
+fn slot_at<'s>(slots: &'s Slots<'_>, index: usize) -> &'s Slot {
     let (first, second) = (&slots.memory[0], &slots.memory[1]);
     if index == 0 { first } else { second }
 }
 
-fn snapshot_at(before: &[Snapshot; 2], index: impl Into<usize>) -> Snapshot {
-    let index = index.into();
+fn snapshot_at(before: &[Snapshot; 2], index: usize) -> Snapshot {
     let [first, second] = *before;
     if index == 0 { first } else { second }
 }
@@ -133,15 +131,13 @@ fn snapshots(slots: &Slots<'_>) -> [Snapshot; 2] {
 }
 
 /// Every slot but `changed` matches its snapshot.
-fn unchanged_except(slots: &Slots<'_>, before: &[Snapshot; 2], changed: impl Into<usize>) -> bool {
-    let changed = changed.into();
+fn unchanged_except(slots: &Slots<'_>, before: &[Snapshot; 2], changed: usize) -> bool {
     (0..2).all(|index| index == changed || snapshot(&slots.memory[index]) == before[index])
 }
 
 /// The same, from the snapshots taken after a call: slots read once cost the solver about half
 /// of what a read at each check costs.
-fn unchanged_but(after: &[Snapshot; 2], before: &[Snapshot; 2], changed: impl Into<usize>) -> bool {
-    let changed = changed.into();
+fn unchanged_but(after: &[Snapshot; 2], before: &[Snapshot; 2], changed: usize) -> bool {
     (0..2).all(|index| index == changed || after[index] == before[index])
 }
 
@@ -463,7 +459,10 @@ fn load_any(
         "a draw the source answers is counted once",
     );
     if let Ok(handle) = result {
-        let buffer = slot_at(slots, handle.index).keys[0].bytes().as_ptr().addr();
+        let buffer = slot_at(slots, handle.index.number()).keys[0]
+            .bytes()
+            .as_ptr()
+            .addr();
         kani::assert(
             entropy.at != buffer,
             "the source writes into a buffer of the library's, not into the slot",
@@ -513,7 +512,7 @@ fn own_key_or_never_again(
     length: KeyLength,
 ) -> bool {
     // Read field by field: a whole snapshot of a slot chosen at run time costs a copy of both.
-    let slot = slot_at(slots, handle.index);
+    let slot = slot_at(slots, handle.index.number());
     let [first, second, third] = &slot.keys;
     let key = match position {
         0 => first,
@@ -569,7 +568,7 @@ struct Tracked {
 
 fn live(slots: &Slots<'_>, id: usize, handle: &Handle<'_>) -> bool {
     handle.slots == id && handle.index.number() < 2 && {
-        let slot = slot_at(slots, handle.index);
+        let slot = slot_at(slots, handle.index.number());
         slot.occupancy == Occupancy::Loaded && slot.generation == handle.generation
     }
 }
@@ -708,7 +707,7 @@ fn a_step_by_a_release() {
         forged(id)
     };
     let target_live = live(&slots, id, &target);
-    let target_changed = target_live && slot_at(&slots, target.index).changed;
+    let target_changed = target_live && slot_at(&slots, target.index.number()).changed;
     let result = slots.release(target);
     let released =
         target_live && !target_changed && tracked.live && target.index == tracked.handle.index;
@@ -716,7 +715,7 @@ fn a_step_by_a_release() {
         if target_changed {
             result == Err(Error::Unsaved)
         } else if target_live {
-            result == Ok(()) && wiped(slot_at(&slots, target.index))
+            result == Ok(()) && wiped(slot_at(&slots, target.index.number()))
         } else {
             result == Err(Error::StaleHandle)
         },
@@ -729,7 +728,7 @@ fn a_step_by_a_release() {
             && !target_live
             && target.index == tracked.handle.index
             && target.generation == tracked.handle.generation
-            && slot_at(&slots, tracked.handle.index).occupancy == Occupancy::Loaded,
+            && slot_at(&slots, tracked.handle.index.number()).occupancy == Occupancy::Loaded,
         "a released handle is refused while its slot holds a new set"
     );
     kept(&slots, id, &tracked, released);
@@ -758,7 +757,7 @@ fn a_handle_from_other_slots_is_refused() {
     kani::assume(foreign.slots != id);
     kani::cover!(
         foreign.index.number() < 2 && {
-            let named = snapshot_at(&before, foreign.index);
+            let named = snapshot_at(&before, foreign.index.number());
             named.occupancy == Occupancy::Loaded && named.generation == foreign.generation
         },
         "the foreign handle names a loaded slot and its generation"
@@ -768,10 +767,7 @@ fn a_handle_from_other_slots_is_refused() {
         slots.release(foreign) == Err(Error::StaleHandle),
         "a handle from other slots is refused",
     );
-    kani::assert(
-        unchanged_except(&slots, &before, 2_usize),
-        "no slot changes",
-    );
+    kani::assert(unchanged_except(&slots, &before, 2), "no slot changes");
 }
 
 /// A slot in any state and with any generation whose buffers hold keys of any bytes and either
@@ -1006,7 +1002,7 @@ fn load_from(mut memory: [Slot; 2]) -> (Result<Handle<'static>, Error>, bool) {
         kani::cover!(purpose == Purpose::Data, "a key for data is generated");
     } else {
         kani::assert(
-            unchanged_except(&slots, &before, 2_usize),
+            unchanged_except(&slots, &before, 2),
             "a failed load changes no slot",
         );
     }
@@ -1092,7 +1088,7 @@ fn derivation_from(mut memory: [Slot; 2]) -> Result<Handle<'static>, Error> {
         "the password is wiped exactly when the derivation succeeds",
     );
     if let Ok(handle) = result {
-        let now = snapshot(slot_at(&slots, handle.index));
+        let now = snapshot(slot_at(&slots, handle.index.number()));
         kani::assert(
             first_free(&before) == Some(handle.index.number())
                 && now.occupancy == Occupancy::Loaded
@@ -1107,12 +1103,12 @@ fn derivation_from(mut memory: [Slot; 2]) -> Result<Handle<'static>, Error> {
              no record",
         );
         kani::assert(
-            unchanged_except(&slots, &before, handle.index),
+            unchanged_except(&slots, &before, handle.index.number()),
             "a derivation changes no other slot",
         );
     } else {
         kani::assert(
-            unchanged_except(&slots, &before, 2_usize),
+            unchanged_except(&slots, &before, 2),
             "a failed derivation changes no slot",
         );
     }
@@ -1176,7 +1172,7 @@ fn derivation_from_words(mut memory: [Slot; 2]) -> Result<Handle<'static>, Error
         "a failure of a derivation is DerivationFailed, and nothing else is",
     );
     if let Ok(handle) = result {
-        let now = snapshot(slot_at(&slots, handle.index));
+        let now = snapshot(slot_at(&slots, handle.index.number()));
         let key = expected_words_key(&bytes, purpose);
         kani::assert(
             first_free(&before) == Some(handle.index.number())
@@ -1194,12 +1190,12 @@ fn derivation_from_words(mut memory: [Slot; 2]) -> Result<Handle<'static>, Error
              record",
         );
         kani::assert(
-            unchanged_except(&slots, &before, handle.index),
+            unchanged_except(&slots, &before, handle.index.number()),
             "a derivation changes no other slot",
         );
     } else {
         kani::assert(
-            unchanged_except(&slots, &before, 2_usize),
+            unchanged_except(&slots, &before, 2),
             "a failed derivation changes no slot",
         );
     }
@@ -1306,7 +1302,7 @@ fn words_are_wiped_exactly_when_their_key_is_derived() {
             );
         } else {
             kani::assert(
-                unchanged_except(&slots, &before, 2_usize),
+                unchanged_except(&slots, &before, 2),
                 "a failed derivation changes no slot",
             );
         }
@@ -1383,7 +1379,7 @@ fn words_are_written_exactly_when_their_key_is_generated() {
             );
         } else {
             kani::assert(
-                unchanged_except(&slots, &before, 2_usize),
+                unchanged_except(&slots, &before, 2),
                 "a failed generation changes no slot",
             );
         }
@@ -1422,7 +1418,7 @@ fn generation_without_a_free_slot(mut memory: [Slot; 2]) {
         "without a free slot nothing is asked",
     );
     kani::assert(
-        same_words(&words, &original) && unchanged_except(&slots, &before, 2_usize),
+        same_words(&words, &original) && unchanged_except(&slots, &before, 2),
         "nothing changes",
     );
 }
@@ -1480,13 +1476,13 @@ fn a_handle_releases_only_a_matching_loaded_slot() {
     let result = slots.release(handle);
     if target.is_some_and(|named| named.changed) {
         kani::assert(
-            result == Err(Error::Unsaved) && unchanged_except(&slots, &before, 2_usize),
+            result == Err(Error::Unsaved) && unchanged_except(&slots, &before, 2),
             "a set changed in this epoch is not released, and no slot changes",
         );
         kani::cover!(true, "a changed set is kept");
     } else if let Some(named) = target {
         kani::assert(result == Ok(()), "a matching handle releases its set");
-        let slot = slot_at(&slots, handle.index);
+        let slot = slot_at(&slots, handle.index.number());
         kani::assert(
             wiped(slot),
             "a release wipes every key and identifier of the set",
@@ -1506,7 +1502,7 @@ fn a_handle_releases_only_a_matching_loaded_slot() {
             kani::cover!(true, "a release advances the generation by one");
         }
         kani::assert(
-            unchanged_except(&slots, &before, handle.index),
+            unchanged_except(&slots, &before, handle.index.number()),
             "a release changes no other slot",
         );
     } else {
@@ -1515,7 +1511,7 @@ fn a_handle_releases_only_a_matching_loaded_slot() {
             "any other handle is refused",
         );
         kani::assert(
-            unchanged_except(&slots, &before, 2_usize),
+            unchanged_except(&slots, &before, 2),
             "a refused handle changes no slot",
         );
         kani::cover!(
@@ -1551,7 +1547,7 @@ fn only_an_enabled_key_for_external_data_is_revealed() {
     let mut out = original;
     let result = slots.reveal32(handle, position, purpose, &mut out);
 
-    let named = snapshot_at(&before, handle.index);
+    let named = snapshot_at(&before, handle.index.number());
     let at_position = position.index();
     let stage = at(
         &[
@@ -1587,7 +1583,7 @@ fn only_an_enabled_key_for_external_data_is_revealed() {
         "a reveal writes exactly the 32-byte key at the position, or nothing",
     );
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize),
+        unchanged_except(&slots, &before, 2),
         "a reveal changes no slot",
     );
     kani::cover!(result.is_ok(), "a key is revealed");
@@ -1676,7 +1672,7 @@ fn admit_from(mut memory: [Slot; 2]) {
     let result = slots.admit(&plaintext, kind);
     kani::assert(
         first_free.is_some()
-            || (result == Err(Error::NoFreeSlot) && unchanged_except(&slots, &before, 2_usize)),
+            || (result == Err(Error::NoFreeSlot) && unchanged_except(&slots, &before, 2)),
         "with no slot free a plaintext is refused as NoFreeSlot and changes no slot",
     );
     // Worked out only when a slot is free, so that the states with none cost the solver
@@ -1828,7 +1824,7 @@ fn admit_from(mut memory: [Slot; 2]) {
         );
     } else {
         kani::assert(
-            unchanged_except(&slots, &before, 2_usize),
+            unchanged_except(&slots, &before, 2),
             "a refused plaintext changes no slot",
         );
     }
@@ -2076,7 +2072,7 @@ fn any_context(bytes: &[u8; 2]) -> &[u8] {
 /// Whether `handle` names a loaded slot with its generation, read from the snapshots.
 fn names_loaded(before: &[Snapshot; 2], handle: &Handle<'_>) -> bool {
     handle.index.number() < 2 && {
-        let named = snapshot_at(before, handle.index);
+        let named = snapshot_at(before, handle.index.number());
         named.occupancy == Occupancy::Loaded && named.generation == handle.generation
     }
 }
@@ -2117,7 +2113,7 @@ fn unwrap_from(mut memory: [Slot; 2], receipt: bool) -> (Result<(), Error>, Kind
     let context = any_context(&context_bytes);
     let before = snapshots(&slots);
     let parent_live = names_loaded(&before, &parent);
-    let named = snapshot_at(&before, parent.index);
+    let named = snapshot_at(&before, parent.index.number());
     let wanted = if receipt {
         Purpose::Transfer
     } else {
@@ -2257,7 +2253,7 @@ fn unwrap_from(mut memory: [Slot; 2], receipt: bool) -> (Result<(), Error>, Kind
                         unchanged_but(&after, &before, index)
                     }
             }
-            _ => result.is_err() && unchanged_but(&after, &before, 2_usize),
+            _ => result.is_err() && unchanged_but(&after, &before, 2),
         },
         "a refused call changes no slot, and one that succeeds only the first free slot, whose \
          handle names these slots and that slot's generation, and for a receipt the chain and \
@@ -2399,8 +2395,8 @@ fn wrap_from(kind: Kind) -> (Result<(), Error>, Snapshot, bool) {
     let before = snapshots(&slots);
     let live = names_loaded(&before, &set) && names_loaded(&before, &parent);
     let (child, wrapping) = (
-        snapshot_at(&before, set.index),
-        snapshot_at(&before, parent.index),
+        snapshot_at(&before, set.index.number()),
+        snapshot_at(&before, parent.index.number()),
     );
 
     let (epoch_key, next_key) = (*slots.epoch.key.bytes(), *slots.epoch.next.bytes());
@@ -2431,15 +2427,16 @@ fn wrap_from(kind: Kind) -> (Result<(), Error>, Snapshot, bool) {
     let after = snapshots(&slots);
     kani::assert(
         if sealing {
-            unchanged_but(&after, &before, set.index)
-                && snapshot_at(&after, set.index) == marked(child, child.changed, true)
+            unchanged_but(&after, &before, set.index.number())
+                && snapshot_at(&after, set.index.number()) == marked(child, child.changed, true)
         } else if recording {
-            unchanged_but(&after, &before, set.index) && snapshot_at(&after, set.index) == held
+            unchanged_but(&after, &before, set.index.number())
+                && snapshot_at(&after, set.index.number()) == held
         } else if result.is_ok() && !in_epoch {
-            unchanged_but(&after, &before, parent.index)
-                && snapshot_at(&after, parent.index) == chained
+            unchanged_but(&after, &before, parent.index.number())
+                && snapshot_at(&after, parent.index.number()) == chained
         } else {
-            unchanged_but(&after, &before, 2_usize)
+            unchanged_but(&after, &before, 2)
         },
         "a wrap changes no key or stage, a wrap or a lock marks the set wrapped for the next \
          epoch only when it succeeds during a change, a wrap outside one marks the set held by \
@@ -2738,7 +2735,7 @@ fn a_carry_changes_no_slot_and_writes_only_when_it_succeeds() {
         opening(|key, nonce, aad, buffer, tag| layer.open_bound(key, nonce, aad, buffer, tag)),
     );
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize)
+        unchanged_except(&slots, &before, 2)
             && slots.epoch.number == number
             && slots.epoch.changing == changing
             && first_half(&slots.epoch.key) == epoch_key
@@ -2858,8 +2855,8 @@ fn a_load_of_an_archive_key_refuses_its_parents_before_it_decrypts() {
         seal::model::refuse,
     );
     let (archive, stored) = (
-        snapshot_at(&before, store.index),
-        snapshot_at(&before, profile.index),
+        snapshot_at(&before, store.index.number()),
+        snapshot_at(&before, profile.index.number()),
     );
     let refusal = if context.is_empty() {
         Error::InvalidContext
@@ -2875,7 +2872,7 @@ fn a_load_of_an_archive_key_refuses_its_parents_before_it_decrypts() {
     kani::assert(
         result.err() == Some(refusal)
             && !seal::model::asked()
-            && unchanged_except(&slots, &before, 2_usize)
+            && unchanged_except(&slots, &before, 2)
             && epoch_snapshot(&slots) == epoch_before,
         "a load refuses a bad context, a stale handle, keys of other purposes and a key from a \
          secret, then finds no free slot, before it decrypts, and changes no slot and no epoch",
@@ -3169,10 +3166,10 @@ fn a_public_key_is_read_from_its_record() {
         opening(|key, nonce, aad, buffer, tag| layer.open_bound(key, nonce, aad, buffer, tag)),
     );
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize) && epoch_snapshot(&slots) == epoch_before,
+        unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
         "reading a public key changes no slot and no epoch",
     );
-    let stored = snapshot_at(&before, profile.index);
+    let stored = snapshot_at(&before, profile.index.number());
     let refusal = if context.is_empty() {
         Some(Error::InvalidContext)
     } else if !names_loaded(&before, &profile) {
@@ -3301,11 +3298,11 @@ fn an_archive_writes_only_when_it_succeeds() {
     );
     let draws = count.wrapping_add(u64::from(entropy.answered));
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize)
+        unchanged_except(&slots, &before, 2)
             && epoch_snapshot(&slots) == (number, key, next, changing, draws),
         "archiving changes no slot and no epoch, and counts once each draw the source answers",
     );
-    let chat = snapshot_at(&before, seal.index);
+    let chat = snapshot_at(&before, seal.index.number());
     let asked = entropy.calls;
     kani::assert(
         if context.is_empty() {
@@ -3440,7 +3437,7 @@ fn an_archive_seals_its_identifier_ciphertext_and_check() {
         &xwing::KNOWN,
         (sealer.sealing(), body.running()),
     );
-    let chat = snapshot_at(&before, seal.index);
+    let chat = snapshot_at(&before, seal.index.number());
     if result.is_ok() {
         let mut drawn = [0; 12];
         drawn.copy_from_slice(&entropy.kept[..12]);
@@ -3513,17 +3510,17 @@ fn an_opened_archive_opens_its_body_only_under_its_archive_key() {
         (cipher.opening(), body.running()),
     );
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize) && epoch_snapshot(&slots) == epoch_before,
+        unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
         "opening a record of an archive changes no slot and no epoch",
     );
     let (archived, chat) = (
-        snapshot_at(&before, archive.index),
-        snapshot_at(&before, seal.index),
+        snapshot_at(&before, archive.index.number()),
+        snapshot_at(&before, seal.index.number()),
     );
     let refusal = |handle: &Handle<'_>, purpose| {
         if !names_loaded(&before, handle) {
             Some(Error::StaleHandle)
-        } else if snapshot_at(&before, handle.index).purpose != purpose {
+        } else if snapshot_at(&before, handle.index.number()).purpose != purpose {
             Some(Error::WrongPurpose)
         } else {
             None
@@ -3667,7 +3664,7 @@ fn a_reseal_refuses_what_it_cannot_move() {
         sealer.sealing(),
     );
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize)
+        unchanged_except(&slots, &before, 2)
             && epoch_snapshot(&slots)
                 == (
                     number,
@@ -3682,7 +3679,7 @@ fn a_reseal_refuses_what_it_cannot_move() {
     let refusal = |handle: &Handle<'_>| {
         if !names_loaded(&before, handle) {
             Some(Error::StaleHandle)
-        } else if snapshot_at(&before, handle.index).purpose != Purpose::ArchiveSeal {
+        } else if snapshot_at(&before, handle.index.number()).purpose != Purpose::ArchiveSeal {
             Some(Error::WrongPurpose)
         } else {
             None
@@ -3712,7 +3709,8 @@ fn a_reseal_refuses_what_it_cannot_move() {
                 || (entropy.calls == 1
                     && cipher.key
                         == expected_archive_seal_key(&key_head(&snapshot_at(
-                            &before, from.index,
+                            &before,
+                            from.index.number(),
                         )))
                     && cipher.nonce[..] == record[..NONCE_LEN]
                     && same_bytes(&cipher.given, &record[NONCE_LEN..NONCE_LEN + ARCHIVED_LEN])
@@ -3757,7 +3755,7 @@ fn a_reseal_seals_what_the_record_held() {
     let (from, to) = (forged(id), forged(id));
     let of_a_chat = |handle: &Handle<'_>| {
         names_loaded(&before, handle)
-            && snapshot_at(&before, handle.index).purpose == Purpose::ArchiveSeal
+            && snapshot_at(&before, handle.index.number()).purpose == Purpose::ArchiveSeal
     };
     kani::assume(of_a_chat(&from) && of_a_chat(&to));
     let context_bytes: [u8; 2] = kani::any();
@@ -3780,7 +3778,7 @@ fn a_reseal_seals_what_the_record_held() {
     );
     let draws = count.wrapping_add(u64::from(entropy.answered));
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize)
+        unchanged_except(&slots, &before, 2)
             && epoch_snapshot(&slots) == (number, key, next, changing, draws),
         "moving a record changes no slot and no epoch, and counts once each draw the source \
          answers",
@@ -3806,7 +3804,8 @@ fn a_reseal_seals_what_the_record_held() {
                 || (entropy.calls == 1
                     && cipher.key
                         == expected_archive_seal_key(&key_head(&snapshot_at(
-                            &before, from.index,
+                            &before,
+                            from.index.number(),
                         )))
                     && cipher.nonce[..] == record[..NONCE_LEN]
                     && same_bytes(&cipher.given, &record[NONCE_LEN..NONCE_LEN + ARCHIVED_LEN])
@@ -3822,7 +3821,10 @@ fn a_reseal_seals_what_the_record_held() {
             entropy.calls == 1
                 && sealer.calls == 1
                 && sealer.key
-                    == expected_archive_seal_key(&key_head(&snapshot_at(&before, to.index)))
+                    == expected_archive_seal_key(&key_head(&snapshot_at(
+                        &before,
+                        to.index.number(),
+                    )))
                 && sealer.nonce == expected_hedge(&epoch_key, count, Branch::HedgeNonce, &drawn)
                 && sealer.aad == Bound::to(context)
                 && same(&sealer.given, &cipher.written)
@@ -3902,8 +3904,8 @@ fn a_load_of_an_archive_key_checks_its_public_key() {
         opening(|key, nonce, aad, buffer, tag| cipher.open_bound(key, nonce, aad, buffer, tag)),
     );
     let (archive, stored) = (
-        snapshot_at(&named, store.index),
-        snapshot_at(&named, profile.index),
+        snapshot_at(&named, store.index.number()),
+        snapshot_at(&named, profile.index.number()),
     );
     let current = layer.accepted && layer.written[..8] == number.to_le_bytes();
     let body = &layer.written[8..];
@@ -4084,7 +4086,7 @@ fn a_creation_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds
         &xwing::KNOWN,
     );
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize)
+        unchanged_except(&slots, &before, 2)
             && slots.epoch.number == number
             && slots.epoch.changing == changing
             && first_half(&slots.epoch.key) == epoch_key
@@ -4093,8 +4095,8 @@ fn a_creation_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds
         "a creation changes no slot and no epoch, and counts once each draw the source answers",
     );
     let (archive, stored) = (
-        snapshot_at(&before, store.index),
-        snapshot_at(&before, profile.index),
+        snapshot_at(&before, store.index.number()),
+        snapshot_at(&before, profile.index.number()),
     );
     kani::assert(
         if context.is_empty() {
@@ -4267,7 +4269,7 @@ fn a_carry_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds() 
         opening(|key, nonce, aad, buffer, tag| layer.open_bound(key, nonce, aad, buffer, tag)),
     );
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize)
+        unchanged_except(&slots, &before, 2)
             && slots.epoch.number == number
             && slots.epoch.changing == changing
             && first_half(&slots.epoch.key) == epoch_key
@@ -4277,7 +4279,7 @@ fn a_carry_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds() 
          the source answers",
     );
     let refusal = |handle: &Handle<'_>| {
-        let named = snapshot_at(&before, handle.index);
+        let named = snapshot_at(&before, handle.index.number());
         if !names_loaded(&before, handle) {
             Some(Error::StaleHandle)
         } else if named.purpose != Purpose::Wrap {
@@ -4289,7 +4291,7 @@ fn a_carry_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds() 
         }
     };
     let refused = refusal(&profile).or_else(|| refusal(&next_profile));
-    let stored = snapshot_at(&before, profile.index);
+    let stored = snapshot_at(&before, profile.index.number());
     let current = layer.accepted && layer.written[..8] == number.to_le_bytes();
     kani::assert(
         if context.is_empty() {
@@ -4341,7 +4343,7 @@ fn a_carry_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds() 
         (result == Err(Error::CipherFailed)) == seal::model::any_seal_failed(),
         "a carry of an archive key fails with CipherFailed exactly when its seal fails",
     );
-    let next_stored = snapshot_at(&before, next_profile.index);
+    let next_stored = snapshot_at(&before, next_profile.index.number());
     let carried = seal::model::sealed(seal::model::LAYER);
     kani::assert(
         result.is_err()
@@ -4440,7 +4442,7 @@ fn end_from(receiving: bool) -> (Result<(), Error>, Snapshot, Handle<'static>) {
     let context = any_context(&context_bytes);
     let before = snapshots(&slots);
     let live = names_loaded(&before, &transfer);
-    let named = snapshot_at(&before, transfer.index);
+    let named = snapshot_at(&before, transfer.index.number());
     let serving = live && named.purpose == Purpose::Transfer;
     let way = if receiving {
         Direction::In
@@ -4574,7 +4576,7 @@ fn end_from(receiving: bool) -> (Result<(), Error>, Snapshot, Handle<'static>) {
         }
     } else {
         kani::assert(
-            unchanged_except(&slots, &before, 2_usize),
+            unchanged_except(&slots, &before, 2),
             "a failed end changes no slot",
         );
     }
@@ -4844,7 +4846,7 @@ fn only_a_key_from_a_secret_gives_a_challenge() {
     let original: [u8; 32] = kani::any();
     let mut out = original;
     let result = slots.challenge(handle, &mut out);
-    let named = snapshot_at(&before, handle.index);
+    let named = snapshot_at(&before, handle.index.number());
     let expected = if !names_loaded(&before, &handle) {
         Err(Error::StaleHandle)
     } else if named.purpose != Purpose::Wrap {
@@ -4870,7 +4872,7 @@ fn only_a_key_from_a_secret_gives_a_challenge() {
         "a challenge writes exactly the derivation of the key, or nothing",
     );
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize),
+        unchanged_except(&slots, &before, 2),
         "a challenge changes no slot",
     );
     kani::cover!(result.is_ok(), "a challenge is given");
@@ -5087,11 +5089,12 @@ fn a_change_of_stage_with_a_stale_handle_changes_nothing() {
         result == Err(Error::StaleHandle)
             && added == Err(Error::StaleHandle)
             && source == original
-            && unchanged_except(&slots, &before, 2_usize),
+            && unchanged_except(&slots, &before, 2),
         "a stale handle is refused by every change and addition, and changes nothing",
     );
     kani::cover!(
-        handle.index.number() < 2 && slot_at(&slots, handle.index).occupancy == Occupancy::Loaded,
+        handle.index.number() < 2
+            && slot_at(&slots, handle.index.number()).occupancy == Occupancy::Loaded,
         "the stale handle names a loaded slot"
     );
 }
@@ -5195,7 +5198,7 @@ fn add_in(mut memory: [Slot; 2], index: usize) -> (Result<Position, Error>, Purp
         kani::cover!(at == 2, "a key is added last");
     } else {
         kani::assert(
-            unchanged_except(&slots, &before, 2_usize),
+            unchanged_except(&slots, &before, 2),
             "a failed addition changes no slot",
         );
     }
@@ -5305,7 +5308,7 @@ fn an_epoch_changes_only_in_order() {
         *slots.epoch.next.bytes(),
     );
     let unchanged = |slots: &Slots<'_>| {
-        unchanged_except(slots, &before, 2_usize)
+        unchanged_except(slots, &before, 2)
             && slots.epoch.number == epoch
             && *slots.epoch.key.bytes() == epoch_key
             && *slots.epoch.next.bytes() == next_key
@@ -5332,7 +5335,7 @@ fn an_epoch_changes_only_in_order() {
                         && first_half(&slots.epoch.next) == original
                         && slots.epoch.next.length() == KeyLength::Bytes32
                         && source == [0; 32]
-                        && unchanged_except(&slots, &before, 2_usize)
+                        && unchanged_except(&slots, &before, 2)
                         && slots.epoch.number == epoch
                         && *slots.epoch.key.bytes() == epoch_key
                 } else {
@@ -5504,7 +5507,7 @@ fn a_long_addition_in_the_first_slot() {
         };
     kani::assert(
         match refusal {
-            Some(refusal) => result == Err(refusal) && unchanged_except(&slots, &before, 2_usize),
+            Some(refusal) => result == Err(refusal) && unchanged_except(&slots, &before, 2),
             None => {
                 result.is_ok()
                     || [
@@ -5564,7 +5567,7 @@ fn no_set_changes_during_a_change_of_epoch() {
     let handle = forged(id);
     let live = live(&slots, id, &handle);
     let before = snapshots(&slots);
-    let purpose = snapshot_at(&before, handle.index).purpose;
+    let purpose = snapshot_at(&before, handle.index.number()).purpose;
     let unstaged = live && purpose != Purpose::ExternalData && purpose != Purpose::Data;
     let wrapping = live && purpose != Purpose::ExternalData;
     let (result, _, _) = any_change(&mut slots, handle, any_position(), &mut Stages::one());
@@ -5584,7 +5587,7 @@ fn no_set_changes_during_a_change_of_epoch() {
         result == Err(refusal(unstaged))
             && added == Err(refusal(wrapping))
             && source == original
-            && unchanged_except(&slots, &before, 2_usize)
+            && unchanged_except(&slots, &before, 2)
             && slots.epoch.changing,
         "during a change of epoch no set changes or takes a key, and nothing changes",
     );
@@ -5798,12 +5801,12 @@ fn a_block_begins_under_the_primary_of_a_recorded_set() {
     let result = slots.begin_seal_in(set, context, &mut entropy, &mut header);
     let draws = count.wrapping_add(u64::from(entropy.source.answered));
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize)
+        unchanged_except(&slots, &before, 2)
             && epoch_snapshot(&slots) == (number, key, next, changing, draws),
         "beginning a block changes no slot and no epoch, and counts once each draw the source \
          answers",
     );
-    let named = snapshot_at(&before, set.index);
+    let named = snapshot_at(&before, set.index.number());
     let asked = entropy.source.calls;
     let error = result.as_ref().err().copied();
     kani::assert(
@@ -5914,7 +5917,7 @@ fn a_chunk_is_sealed_under_the_key_its_block_began_with() {
     let context_bytes: [u8; 2] = kani::any();
     let context = any_block_context(&context_bytes);
     let mut sealing = any_sealing(id, context);
-    let named = snapshot_at(&before, sealing.set.index);
+    let named = snapshot_at(&before, sealing.set.index.number());
     kani::assume(!names_loaded(&before, &sealing.set) || named.purpose == Purpose::Data);
     let (set, at, revision, salt, next) = (
         sealing.set,
@@ -5946,7 +5949,7 @@ fn a_chunk_is_sealed_under_the_key_its_block_began_with() {
         )
     };
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize) && epoch_snapshot(&slots) == epoch_before,
+        unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
         "sealing a chunk changes no slot and no epoch",
     );
     kani::assert(
@@ -6076,10 +6079,10 @@ fn a_block_opens_only_under_the_key_its_header_names() {
     let result = slots.begin_open_in::<16>(set, context, &header, block);
     let derived = runs().wrapping_sub(runs_before);
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize) && epoch_snapshot(&slots) == epoch_before,
+        unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
         "beginning to read a block changes no slot and no epoch",
     );
-    let named = snapshot_at(&before, set.index);
+    let named = snapshot_at(&before, set.index.number());
     let mut salt = [0; SALT_LEN];
     salt.copy_from_slice(&header[..SALT_LEN]);
     let stages = [
@@ -6209,7 +6212,7 @@ fn a_chunk_opens_only_as_the_next_of_its_block() {
     let context_bytes: [u8; 2] = kani::any();
     let context = any_block_context(&context_bytes);
     let mut opening = any_opening(id, context);
-    let named = snapshot_at(&before, opening.set.index);
+    let named = snapshot_at(&before, opening.set.index.number());
     kani::assume(!names_loaded(&before, &opening.set) || named.purpose == Purpose::Data);
     let (set, at, revision, salt, next, chunks, last_len) = (
         opening.set,
@@ -6236,7 +6239,7 @@ fn a_chunk_opens_only_as_the_next_of_its_block() {
         slots.open_next_in(&mut opening, &mut buffer[..length], &tag, open_with)
     };
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize) && epoch_snapshot(&slots) == epoch_before,
+        unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
         "opening a chunk changes no slot and no epoch",
     );
     // In numbers of 128 bits, apart from the code: the chunk after `next` is the last when it
@@ -6367,8 +6370,8 @@ fn carry_out(last: bool) {
     let mut exporting = any_exporting(id, context, export);
     let (set, transfer) = (exporting.source.set, exporting.transfer);
     let (source, carrier) = (
-        snapshot_at(&before, set.index),
-        snapshot_at(&before, transfer.index),
+        snapshot_at(&before, set.index.number()),
+        snapshot_at(&before, transfer.index.number()),
     );
     kani::assume(!names_loaded(&before, &set) || source.purpose == Purpose::Data);
     kani::assume(!names_loaded(&before, &transfer) || carrier.purpose == Purpose::Transfer);
@@ -6428,10 +6431,10 @@ fn carry_out(last: bool) {
     kani::assert(
         epoch_snapshot(&slots) == epoch_before
             && if result.is_ok() && last {
-                unchanged_but(&after, &before, transfer.index)
-                    && snapshot_at(&after, transfer.index) == moved
+                unchanged_but(&after, &before, transfer.index.number())
+                    && snapshot_at(&after, transfer.index.number()) == moved
             } else {
-                unchanged_but(&after, &before, 2_usize)
+                unchanged_but(&after, &before, 2)
             },
         "carrying a chunk out changes no slot and no epoch, but the last one moves the chain of \
          the key for transfers to its tag and marks the key as writing an export",
@@ -6546,8 +6549,8 @@ fn a_chunk_carried_out_of_its_place_or_stream_is_refused() {
     let mut exporting = any_exporting(id, context, export);
     let (set, transfer) = (exporting.source.set, exporting.transfer);
     let (source, carrier) = (
-        snapshot_at(&before, set.index),
-        snapshot_at(&before, transfer.index),
+        snapshot_at(&before, set.index.number()),
+        snapshot_at(&before, transfer.index.number()),
     );
     kani::assume(!names_loaded(&before, &set) || source.purpose == Purpose::Data);
     kani::assume(!names_loaded(&before, &transfer) || carrier.purpose == Purpose::Transfer);
@@ -6611,7 +6614,7 @@ fn a_chunk_carried_out_of_its_place_or_stream_is_refused() {
          run",
     );
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize)
+        unchanged_except(&slots, &before, 2)
             && epoch_snapshot(&slots) == epoch_before
             && out == original_out
             && buffer == original
@@ -6696,8 +6699,8 @@ fn receive_in(last: bool) {
     let mut receiving = any_receiving(id, export, context);
     let (transfer, set) = (receiving.receipt.transfer, receiving.set);
     let (carrier, target) = (
-        snapshot_at(&before, transfer.index),
-        snapshot_at(&before, set.index),
+        snapshot_at(&before, transfer.index.number()),
+        snapshot_at(&before, set.index.number()),
     );
     kani::assume(!names_loaded(&before, &transfer) || carrier.purpose == Purpose::Transfer);
     kani::assume(!names_loaded(&before, &set) || target.purpose == Purpose::Data);
@@ -6755,10 +6758,10 @@ fn receive_in(last: bool) {
     kani::assert(
         epoch_snapshot(&slots) == epoch_before
             && if result.is_ok() && last {
-                unchanged_but(&after, &before, transfer.index)
-                    && snapshot_at(&after, transfer.index) == moved
+                unchanged_but(&after, &before, transfer.index.number())
+                    && snapshot_at(&after, transfer.index.number()) == moved
             } else {
-                unchanged_but(&after, &before, 2_usize)
+                unchanged_but(&after, &before, 2)
             },
         "receiving a chunk changes no slot and no epoch, but the last one moves the chain of the \
          key for transfers to the tag it came with and marks the key as receiving an export",
@@ -6871,10 +6874,11 @@ fn a_chunk_received_out_of_its_place_or_stream_is_refused() {
     let context = any_block_context(&context_bytes);
     let mut receiving = any_receiving(id, export, context);
     let (transfer, set) = (receiving.receipt.transfer, receiving.set);
-    let carrier = snapshot_at(&before, transfer.index);
+    let carrier = snapshot_at(&before, transfer.index.number());
     kani::assume(!names_loaded(&before, &transfer) || carrier.purpose == Purpose::Transfer);
     kani::assume(
-        !names_loaded(&before, &set) || snapshot_at(&before, set.index).purpose == Purpose::Data,
+        !names_loaded(&before, &set)
+            || snapshot_at(&before, set.index.number()).purpose == Purpose::Data,
     );
     let (chunks, last_len, next) = (
         receiving.receipt.chunks,
@@ -6892,7 +6896,8 @@ fn a_chunk_received_out_of_its_place_or_stream_is_refused() {
     let stale = !names_loaded(&before, &transfer)
         || !names_loaded(&before, &set)
         || u128::from_ne_bytes(carrier.chain) != u128::from_ne_bytes(receiving.receipt.chain)
-        || snapshot_at(&before, set.index).pending != Some((transfer.index, carrier.generation));
+        || snapshot_at(&before, set.index.number()).pending
+            != Some((transfer.index, carrier.generation));
     let turned = carrier.direction == Direction::Out;
     kani::assume(out_of_place || stale || turned);
     let original: [u8; 17] = kani::any();
@@ -6936,7 +6941,7 @@ fn a_chunk_received_out_of_its_place_or_stream_is_refused() {
          derivation and before the ciphers run",
     );
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize)
+        unchanged_except(&slots, &before, 2)
             && epoch_snapshot(&slots) == epoch_before
             && out == original_out
             && buffer == original
@@ -7007,7 +7012,7 @@ fn a_block_is_carried_out_after_the_chain_of_its_export() {
     let block_context = any_block_context(&block_bytes);
     let export = any_context(&export_bytes);
     let opening = any_opening(id, block_context);
-    let source = snapshot_at(&before, opening.set.index);
+    let source = snapshot_at(&before, opening.set.index.number());
     kani::assume(!names_loaded(&before, &opening.set) || source.purpose == Purpose::Data);
     let (set, at, revision, block_salt, read, chunks, last) = (
         opening.set,
@@ -7019,7 +7024,7 @@ fn a_block_is_carried_out_after_the_chain_of_its_export() {
         opening.last,
     );
     let transfer = forged(id);
-    let carrier = snapshot_at(&before, transfer.index);
+    let carrier = snapshot_at(&before, transfer.index.number());
     let original: [u8; BLOCK_HEADER_LEN] = kani::any();
     let mut header = original;
     let mut entropy = Kept::at(1);
@@ -7027,7 +7032,7 @@ fn a_block_is_carried_out_after_the_chain_of_its_export() {
     let result = slots.begin_export_block_in(opening, transfer, export, &mut entropy, &mut header);
     let draws = count.wrapping_add(u64::from(entropy.source.answered));
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize)
+        unchanged_except(&slots, &before, 2)
             && epoch_snapshot(&slots) == (number, key, next, changing, draws),
         "beginning to carry a block out changes no slot and no epoch, and counts once each draw \
          the source answers",
@@ -7145,10 +7150,10 @@ fn a_carried_block_is_received_only_under_the_key_its_header_names() {
     let result = slots.begin_receive_block_in::<16>(transfer, export, &header, block);
     let derived = runs().wrapping_sub(runs_before);
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize) && epoch_snapshot(&slots) == epoch_before,
+        unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
         "beginning to receive a block changes no slot and no epoch",
     );
-    let carrier = snapshot_at(&before, transfer.index);
+    let carrier = snapshot_at(&before, transfer.index.number());
     let len = data_len_in::<16>(block);
     let mut salt = [0; SALT_LEN];
     salt.copy_from_slice(&header[..SALT_LEN]);
@@ -7232,12 +7237,12 @@ fn a_received_block_is_written_under_a_set_of_its_transfer() {
     let context = any_context(&context_bytes);
     let receipt = any_receiving(id, export, context.get(..1).unwrap_or(b"x")).receipt;
     let transfer = receipt.transfer;
-    let carrier = snapshot_at(&before, transfer.index);
+    let carrier = snapshot_at(&before, transfer.index.number());
     kani::assume(!names_loaded(&before, &transfer) || carrier.purpose == Purpose::Transfer);
     let (chain, carried_salt, chunks, last) =
         (receipt.chain, receipt.salt, receipt.chunks, receipt.last);
     let set = forged(id);
-    let named = snapshot_at(&before, set.index);
+    let named = snapshot_at(&before, set.index.number());
     let original: [u8; BLOCK_HEADER_LEN] = kani::any();
     let mut header = original;
     let mut entropy = Kept::at(1);
@@ -7245,7 +7250,7 @@ fn a_received_block_is_written_under_a_set_of_its_transfer() {
     let result = slots.receive_into_in(receipt, Some(set), context, &mut entropy, &mut header);
     let draws = count.wrapping_add(u64::from(entropy.source.answered));
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize)
+        unchanged_except(&slots, &before, 2)
             && epoch_snapshot(&slots) == (number, key, next, changing, draws),
         "giving a receipt a set of its transfer changes no slot and no epoch, and counts once \
          each draw the source answers",
@@ -7341,7 +7346,7 @@ fn into_new(mut memory: [Slot; 2], free_at: usize) -> (bool, Option<Error>, bool
     let context = any_context(&context_bytes);
     let receipt = any_receiving(id, export, b"x").receipt;
     let transfer = receipt.transfer;
-    let carrier = snapshot_at(&before, transfer.index);
+    let carrier = snapshot_at(&before, transfer.index.number());
     kani::assume(!names_loaded(&before, &transfer) || carrier.purpose == Purpose::Transfer);
     let (chain, carried_salt, chunks, last) =
         (receipt.chain, receipt.salt, receipt.chunks, receipt.last);
@@ -7531,7 +7536,7 @@ fn a_received_block_needs_a_free_slot_for_a_new_set() {
     let context = any_context(&context_bytes);
     let receipt = any_receiving(id, export, b"x").receipt;
     let transfer = receipt.transfer;
-    let carrier = snapshot_at(&before, transfer.index);
+    let carrier = snapshot_at(&before, transfer.index.number());
     kani::assume(!names_loaded(&before, &transfer) || carrier.purpose == Purpose::Transfer);
     let chain = receipt.chain;
     let original: [u8; BLOCK_HEADER_LEN] = kani::any();
@@ -7996,7 +8001,7 @@ fn buffers_of_another_length_are_refused_before_anything_else() {
         &xwing::KNOWN,
         (sealer.sealing(), body.running()),
     );
-    let chat = snapshot_at(&before, seal.index);
+    let chat = snapshot_at(&before, seal.index.number());
     kani::assert(
         if context.is_empty() {
             archived == Err(Error::InvalidContext)
@@ -8023,7 +8028,7 @@ fn buffers_of_another_length_are_refused_before_anything_else() {
     let refusal = |handle: &Handle<'_>, purpose| {
         if !names_loaded(&before, handle) {
             Some(Error::StaleHandle)
-        } else if snapshot_at(&before, handle.index).purpose != purpose {
+        } else if snapshot_at(&before, handle.index.number()).purpose != purpose {
             Some(Error::WrongPurpose)
         } else {
             None
@@ -8070,7 +8075,7 @@ fn buffers_of_another_length_are_refused_before_anything_else() {
         "a refused opening decrypts nothing and wipes the data",
     );
     kani::assert(
-        unchanged_except(&slots, &before, 2_usize) && epoch_snapshot(&slots) == epoch_before,
+        unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
         "refusals change no slot and no epoch",
     );
     kani::cover!(

@@ -13,16 +13,13 @@ use super::Slot;
 pub(super) struct Index(usize);
 
 #[cfg(kani)]
-impl kani::Arbitrary for Index {
-    fn any() -> Self {
-        Self(kani::any())
-    }
-}
+mod model {
+    use super::Index;
 
-#[cfg(kani)]
-impl From<Index> for usize {
-    fn from(index: Index) -> Self {
-        index.0
+    impl kani::Arbitrary for Index {
+        fn any() -> Self {
+            Self(kani::any())
+        }
     }
 }
 
