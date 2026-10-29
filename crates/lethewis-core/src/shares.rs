@@ -175,6 +175,17 @@ fn same_check(a: [u8; CHECK_LEN], b: [u8; CHECK_LEN]) -> bool {
     // The comparison ends in inline assembly, which Kani cannot model.
     #[cfg(kani)]
     {
+        model::same_check(a, b)
+    }
+}
+
+/// What stands in under Kani for the comparison that ends in inline assembly.
+#[cfg(kani)]
+mod model {
+    use super::CHECK_LEN;
+
+    /// [`super::same_check`] as Kani sees it: the two checks as numbers.
+    pub(super) fn same_check(a: [u8; CHECK_LEN], b: [u8; CHECK_LEN]) -> bool {
         u32::from_ne_bytes(a) == u32::from_ne_bytes(b)
     }
 }
@@ -838,15 +849,19 @@ mod stack {
         assert!(residue(range, &pieces()) > 0);
     }
 
+    /// Splits the draw into shares in a frame of its own.
+    #[inline(never)]
+    fn splitting(check: [u8; CHECK_LEN]) {
+        let mut shares = [[0; SHARE_LEN]; SHARE_COUNT];
+        split(&drawn(), check, &mut shares);
+        black_box(&shares);
+    }
+
     /// The same for splitting a secret.
     #[test]
     fn splitting_without_a_wipe_leaves_residue() {
         let check = check_for(&drawn()[0]);
-        let range = below_pad(false, || {
-            let mut shares = [[0; SHARE_LEN]; SHARE_COUNT];
-            split(&drawn(), check, &mut shares);
-            black_box(&shares);
-        });
+        let range = below_pad(false, || splitting(check));
         assert!(residue(range, &pieces()) > 0);
     }
 

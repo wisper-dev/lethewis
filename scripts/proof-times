@@ -94,7 +94,7 @@
 39 1154 slots::proofs::only_a_key_from_a_secret_gives_a_challenge
 40 1084 slots::proofs::only_an_enabled_key_for_external_data_is_revealed
 30 755 slots::proofs::opening_uses_the_key_of_the_parent
-41 2108 slots::proofs::shares_are_wiped_exactly_when_their_key_is_derived
+44 2107 slots::proofs::shares_are_wiped_exactly_when_their_key_is_derived
 89 3431 slots::proofs::shares_are_written_exactly_when_their_key_is_generated
 310 5040 slots::proofs::the_last_chunk_carried_out_moves_the_chain_of_the_export
 317 5128 slots::proofs::the_last_chunk_received_moves_the_chain_of_the_export
