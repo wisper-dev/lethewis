@@ -20,13 +20,18 @@ All six must hold. A row missing any one of them is not written.
 
 | Property | Statement | Crate |
 |---|---|---|
-| Key destruction | once destroyed and the next epoch committed, the key is in no slot here and no record of that epoch. An older record opens only while the old root or other slots keep it; an export made before opens in any epoch. The commit reports how surely the root was erased; the bytes, password or words bring it back | `lethewis-core` |
-| No key leak | A key leaves the library only wrapped, and a key for data never in an export: no call returns it in the clear or writes it out. Only a key for external data goes in the clear, to a call naming its purpose. Words go out once; a challenge only from a key from a secret. | `lethewis-core` |
+| Key destruction | Once destroyed and the next epoch committed, the key is in no slot here and no record of that epoch. | `lethewis-core` |
+| Key destruction, older copies | An older record opens only while the old root or other slots hold it; earlier exports open in any epoch. | `lethewis-core` |
+| Key destruction, what remains | The commit reports how surely the root was erased; the bytes, password, words or shares bring the key back. | `lethewis-core` |
+| No key leak | A key leaves the library only wrapped, a key for data never in an export; no call returns it otherwise. | `lethewis-core` |
+| No key leak, in the clear | Only a key for external data goes out in the clear, to a call naming its purpose. | `lethewis-core` |
+| No key leak, for people | Words and shares go out once, when made; a challenge only from a key from a secret. | `lethewis-core` |
 | Two-tier access | the key of an archived batch never leaves the library; its body opens only with its archive key and its chat's key. Against a holder of the chat key, its secrecy rests on the random source when archived. Seeds open only under stored keys of the archive; records move to another chat key without the archive key | `lethewis-core` |
 | No silent substitution | when a key is lost the data either opens or is honestly marked unavailable; a replacement is never created silently | `lethewis-core` |
 | Handle isolation | a handle reaches only the keys of its own set: never keys loaded later into the same slot, never keys in another set of slots | `lethewis-core` |
 | One key, one place | a set of slots holds a key in one place only, whatever purpose it serves: a load or an addition that would hold it a second time is refused | `lethewis-core` |
-| Hedged randomness | a key, words, a nonce, the salt of a block or an encapsulation's randomness the library draws is the hedge of the platform's bytes under the key of the epoch and a count of draws: within one set of slots, a broken source alone does not make them predictable, and draws differ even when the source repeats | `lethewis-core` |
+| Hedged randomness | Keys, words, shares, nonces, salts and encapsulation randomness hedge the platform's bytes with the epoch key and a draw count. | `lethewis-core` |
+| Hedged randomness, a broken source | Within one set of slots, a broken source alone leaves them unpredictable, and draws differ even when it repeats. | `lethewis-core` |
 | Purpose separation | a key serves only its purpose: only keys for wrapping wrap and unwrap, for transfers export and receive, for external data are revealed, for data seal and open blocks; no key of a length its purpose refuses is loaded or read; a set of any other purpose holds one key and never changes | `lethewis-core` |
 | No panic | no call panics or overflows, whatever the state of the slots and whatever handle is passed, unless the caller's random source panics | `lethewis-core` |
 | Source before secrets | a call draws before every step on a secret but nonce and salt hedges, which wipe their stack | `lethewis-core` |
@@ -36,6 +41,7 @@ All six must hold. A row missing any one of them is not written.
 | Key set stages | a set of keys always has exactly one primary key, and it is enabled; only an enabled key becomes the primary or is disabled, only a disabled key is enabled again or destroyed, and a transition out of this order is refused and changes nothing | `lethewis-core` |
 | Password parameters | the parameters of a derivation from a password are read back exactly as written, and none out of the bounds is made or read: memory from 64 MiB to 2 GiB, at least 3 passes, memory times passes up to 8 GiB | `lethewis-core` |
 | Words | twelve words are read exactly when each is a word of the English list of BIP 39 and their checksum holds, and the words read are the words of the bytes they stand for: a set of bytes has one set of words | `lethewis-core` |
+| Key shares | Any two of three shares give the secret back, with its check; one share fits every secret alike. | `lethewis-core` |
 | Key levels | a key from a secret is never wrapped and wraps only stored keys, in lock records. A stored key for wrapping wraps only keys for external data, transfers, a chat's archive or data; a key for transfers exports only keys for external data. Two keys from a secret combine and go. An uncarried lock record dies with its epoch | `lethewis-core` |
 | Archive keys | keys of the archive are never imported or derived from a password or words, and an archive seed is never generated; a stored key of the archive lies only in lock records and wraps only seeds; a key of a chat for its archive lies only under a stored key for wrapping | `lethewis-core` |
 | Archive key records | the record of an archive key opens only with its stored key of the archive, its profile key and the key of its epoch, and loads only when its identifier and public key are its seed's. A carry moves it to the next epoch without the stored key of the archive; an uncarried one dies with its epoch | `lethewis-core` |
@@ -44,10 +50,11 @@ All six must hold. A row missing any one of them is not written.
 | Carried data blocks | a block leaves the library only sealed again under a key for transfers, chunk by chunk, as the next element of its export, which the end covers. A carried block is received only in that order, into a new set for data of that transfer, which begins and reads no block until the end is received | `lethewis-core` |
 | Whole transfers | a set that came in an export is revealed, wrapped, exported or changed only once the end of that export is received under the same load of its key for transfers. That key carries one export at a time. The records of an export open only in the order they were written, and its end only after the last | `lethewis-core` |
 
-Key shares and the time lock will each add a row when the crate exists. A call into the operating
-system is covered by tests and by measurements on real devices, not by proof, so the crates that
-make such calls, `lethewis-dit` among them, appear in neither table. Under Kani, `lethewis-dit` only
-runs the work it is given.
+The time lock will add a row when its crate exists.
+
+Calls into the operating system are checked by tests and measurements on real devices, not by
+proof. Crates that make them, `lethewis-dit` among them, are in neither table; under Kani,
+`lethewis-dit` only runs its work.
 
 ## Proven
 
@@ -127,6 +134,17 @@ runs the work it is given.
 | No panic, for a derivation from words | From any state of two slots and any 16 bytes the words stand for, for a key from a secret or for transfers: a failed derivation is `DerivationFailed`, nothing else is, and it changes no slot. With the first slot free and a list of three, refused words derive nothing, and the words are wiped exactly on success. No call panics. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | HKDF-SHA-256 as on slots, given the 16 bytes twice so that a 32-byte key takes every byte; the list as above; the calls on words are checked with the first slot free, where they differ from a load, whose rest is proven past a loaded and a retired slot as well | the values of HKDF from the bytes, which unit tests check against an independent implementation; the stack wipe, which tests check; panics inside HKDF-SHA-256 and SHA-256; more than two slots; copies the compiler makes |
 | Handle isolation, within a set of slots, for a derivation from words | From the same states, a derivation that succeeds loads the first free slot with one 32-byte key for the purpose, derived from the bytes under a label naming it, with its identifier. It is a key from a secret if it is for wrapping, and no other slot changes. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
 | Generation of words | with the first slot free and a list of three, a generation asks the platform source once for 16 bytes, fails with `EntropyFailed` exactly when it fails, and on success writes the words of their hedge and loads their key, else changes nothing; without a free slot, in all four ways two slots are taken, it asks nothing and changes nothing | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the rows above; the source writes any bytes and may fail | the quality of the platform's random bytes; the stack wipe, which tests check; more than two slots; copies the compiler makes |
+| Shares, the field | For any two bytes, the product is that of GF(2^8) modulo the polynomial of AES; nonzero bytes have inverses. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: every pair of bytes is covered | the timing, beyond straight-line machine code of the product on four targets |
+| Shares, split | For any draw and check, three shares carry their numbers, the mark and the lines drawn; any two give both. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: the draw is any 64 bytes, the check any 4 | the quality of the platform's random bytes; the stack, which tests read back |
+| Shares, one share | Any byte of secret or check, share byte and number 1, 2 or 3: exactly one coefficient joins them. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: every byte and every number of a share is covered | that a share alone tells nothing, which also needs uniform coefficients from the hedged source |
+| Shares, refused | For any two shares, a bad number, two marks, then one number twice are refused, writing nothing. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any 25 bytes stand for a share | the timing of refusals, which read only numbers and marks |
+| Shares, read | Two shares that fit give each byte of the secret and check where the line through their bytes meets zero. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | the timing, beyond the product's machine code; the stack, which tests read back |
+| No panic, for a derivation from shares | With the first slot free and any two shares, refused ones derive nothing, and shares are wiped exactly on success. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | HKDF-SHA-256 as on slots; the rest of a load as for words | the values of HKDF, which unit tests check against an independent implementation; the stack wipe |
+| Shares, the check | With the first slot free, shares whose secret fails its check are refused and load no key. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | HKDF-SHA-256 as on slots, the comparison of checks as plain equality, the real one checked by unit tests | the values of HKDF, which unit tests check against an independent implementation; a change passing the check, once in 2^32 |
+| Handle isolation, within a set of slots, for a derivation from shares | With the first slot free, a success loads only it, with one 32-byte key from a secret labelled for shares. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
+| Generation of shares | Asks the source once for 64 bytes; writes the shares of their hedge exactly when their key loads. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the source writes any bytes and may fail; HKDF-SHA-256 as on slots | the quality of the platform's random bytes; the stack wipe, which tests check; more than two slots |
+| Generation of shares, the count of draws | A generation adds one to the count of draws exactly when the source answers. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
+| Generation of shares, no free slot | In all four ways two slots are taken, a generation asks nothing and changes nothing. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the four ways stand for every state without a free slot | more than two slots |
 | Record layout, the format | A record's plaintext has 233 bytes: version, purpose and primary position (1 byte each), parent identifier (16), epoch and revision (8 each, least significant byte first). Three positions of 66 bytes follow, each a stage (1 enabled, 2 disabled), a key length (1) and a key (64, zero past a 32-byte key), or zeros when empty. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the accepted values and the offsets are written from the layout, independently of the parser and the builder; a key is built only by the functions that load it, so its bytes past its length are zero, as the proofs on slots and the round trip in this row show | the encryption of the record, which the rows on wrapping and on record integrity cover with a model of the cipher; whether the checks of a 32-byte key's tail and of an empty position take the same time for every key |
 | Record layout, parsing | For any 233 bytes, parsing never panics or overflows and accepts them exactly when the version is 1 and the purpose one of the seven values of `Purpose`, 1 to 7. A position is zero or holds stage 1 or 2, length 32, or 64 for purpose 1 (wrapping), zeros past a short key. The primary, 0 to 2, is enabled.| `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
 | Record layout, building | For any header of any purpose, any stages whose primary position holds an enabled key and keys of lengths the purpose takes, building writes every field at its offset and an empty position as zeros. The parent identifier is read back from its offset, and parsing gives back the same set. Bytes that parse build back to the same bytes. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
@@ -295,7 +313,7 @@ compile error.
 | an admission from a lock record that names an epoch | `admitting_into_the_first_slot`, unit tests |
 | an unlocked key loaded as a key from a secret | `admitting_into_the_first_slot` |
 | an imported key for wrapping loaded as a stored key, or a generated one as a key from a secret | `a_load_into_the_first_slot`, unit tests |
-| a key from a password or from words loaded as a stored key | `a_derivation_from_a_password_into_the_first_slot`, `a_derivation_from_words_into_the_first_slot`, `words_are_written_exactly_when_their_key_is_generated` |
+| a key from a password or from words loaded as a stored key | `a_derivation_from_a_password_into_the_first_slot`, `a_derivation_from_a_secret_into_the_first_slot`, `words_are_written_exactly_when_their_key_is_generated` |
 | an inner layer of a lock record naming the epoch | no proof: the unit tests against lock records computed by an independent implementation |
 | an inner layer of a lock record under a key derived with the key of the epoch | `opening_uses_the_key_of_the_parent`, `a_lock_changes_no_slot_and_writes_only_when_it_succeeds`, unit tests |
 | an outer layer read whatever epoch it names | `an_unwrap_into_the_first_slot`, `a_carry_changes_no_slot_and_writes_only_when_it_succeeds` |
@@ -448,14 +466,46 @@ compile error.
 | two shifts of the numbers swapped | no proof: the unit tests against the vectors of the reference implementation |
 | words read with a bad checksum before an unknown word, refused words that keep their bytes, words read whatever their checksum when it is zero, or read without the first word looked up | `words_are_read_exactly_when_listed_with_their_checksum` |
 | words written in the wrong order | `words_are_read_exactly_when_listed_with_their_checksum` and the unit tests against the vectors |
-| a derivation from words that reports a failed derivation as a failed source, of a 64-byte key, or of the key of zero bytes | `a_derivation_from_words_into_the_first_slot` |
-| a derivation from words under the label of a wrap key, or whose label states 32 bytes | `a_derivation_from_words_into_the_first_slot` and the unit tests against an independent HKDF-SHA-256 |
+| a derivation from a secret that reports a failed derivation as a failed source | `a_derivation_from_a_secret_into_the_first_slot` |
+| a derivation from a secret of a 64-byte key, or of the key of zero bytes | `a_derivation_from_a_secret_into_the_first_slot` |
+| a derivation from a secret under the label of a wrap key, or whose label states 32 bytes | `a_derivation_from_a_secret_into_the_first_slot` and the unit tests against an independent HKDF-SHA-256 |
 | a derivation from words that leaves the words, wipes them when the key is held already, or loads the key of zero bytes once the words are read | `words_are_wiped_exactly_when_their_key_is_derived` |
 | a generation of words that writes them when the key is held already, reports a failed source as a failed derivation, asks the source for 32 bytes, or loads the key of zero bytes | `words_are_written_exactly_when_their_key_is_generated` |
 | a generation of words that asks the source without a free slot | `no_words_are_generated_without_a_free_slot` |
 | a word list with one word changed, or a checksum from the low 4 bits of the first byte of SHA-256 | no proof: the unit tests against the published list and the vectors of the reference implementation |
 | a derivation from words or a generation of words not followed by the stack wipe, or a derivation from words inlined into its caller with the hash code | no proof: the tests that read the stack back, with and without optimisation |
 | calls on words documented with another stack | no proof: the test that checks the documentation against the stack the tests allow |
+| a product reduced by another polynomial | `the_product_is_that_of_the_field`, and the unit tests against FIPS 197 and tables of the field |
+| a product that skips the last bit of its second factor | `the_product_is_that_of_the_field`, `every_byte_but_zero_has_its_inverse` |
+| a product that branches on a zero factor | no proof: the check of the machine code of the product |
+| an inverse one power short | `every_byte_but_zero_has_its_inverse`, `any_two_shares_give_the_secret_back`, `shares_are_read_exactly_when_they_fit_together`, `a_share_alone_fits_every_secret_alike` |
+| shares numbered from zero | `any_two_shares_give_the_secret_back`, `shares_are_read_exactly_when_they_fit_together` |
+| a mark whose last byte is drawn past it, or shares written over that byte | `any_two_shares_give_the_secret_back` |
+| the check split with the coefficients of the first bytes of the secret, or with the bytes of the mark | `any_two_shares_give_the_secret_back`, unit tests |
+| shares split without their check, over the secret's last byte, or the check read from the secret's bytes | `any_two_shares_give_the_secret_back`, `shares_are_read_exactly_when_they_fit_together` |
+| a coefficient of the secret, or of the check, that is never zero | `any_two_shares_give_the_secret_back` |
+| shares read from the last byte of the mark | `shares_are_read_exactly_when_they_fit_together` |
+| shares that keep the secret as the slope of the line | `any_two_shares_give_the_secret_back`, `a_share_alone_fits_every_secret_alike` |
+| a second share of no number taken, shares of two splits taken, or one share taken twice | `shares_are_read_exactly_when_they_fit_together` |
+| one share twice refused before shares of two splits, or a refusal of shares of two splits that writes | `shares_are_read_exactly_when_they_fit_together` |
+| the coefficients of Lagrange swapped | `any_two_shares_give_the_secret_back`, `shares_are_read_exactly_when_they_fit_together` |
+| a derivation from shares that leaves either share, or wipes them when the key is held already | `shares_are_wiped_exactly_when_their_key_is_derived` |
+| a key from shares under the label of words | `shares_are_wiped_exactly_when_their_key_is_derived`, and the unit tests against an independent HKDF-SHA-256 |
+| a check of shares not compared, or compared on two of its bytes | `shares_are_wiped_exactly_when_their_key_is_derived`, unit tests |
+| a check of shares derived for the purpose of wrapping | `shares_are_wiped_exactly_when_their_key_is_derived`, `shares_are_written_exactly_when_their_key_is_generated`, unit tests |
+| a generation of shares that derives their check after their key | `shares_are_written_exactly_when_their_key_is_generated` |
+| a derivation from shares that looks for a free slot before their check | no proof: unit tests |
+| a comparison of the checks of shares that returns early on its first byte, or inlined into its caller | no proof: the check of the machine code on four targets |
+| a generation of shares under the label of words, or that loads the key of the coefficients | `shares_are_written_exactly_when_their_key_is_generated`, unit tests |
+| shares hedged under the label of words | `shares_are_written_exactly_when_their_key_is_generated` |
+| a generation of shares that asks the source for 32 bytes | `shares_are_written_exactly_when_their_key_is_generated`, unit tests |
+| a generation of shares that writes them when the key is held already | `shares_are_written_exactly_when_their_key_is_generated` |
+| a generation of shares that asks the source without a free slot | `no_shares_are_generated_without_a_free_slot` |
+| the label of shares, of their hedge or of their check spelt otherwise | no proof: the unit tests against an independent HKDF-SHA-256 and the label written by hand |
+| shares derived under the name of words, or their check under the name of their key | `different_derivations_have_different_labels` |
+| a derivation or a generation of shares not followed by the stack wipe | no proof: the tests that read the stack back, with and without optimisation |
+| calls on shares documented with another stack | no proof: the test that checks the documentation against the stack the tests allow |
+| a split, a check of shares, or shares combined, outside the mode of data-independent timing | no proof: the unit test that runs every call on a secret in that mode |
 | a wrap that does not check the purpose of its parent, checks the purpose of the set it wraps instead, or checks it only after it asks the source | `a_wrap_changes_no_slot_and_writes_only_when_it_succeeds` |
 | an unwrap that does not check the purpose of its parent, or checks it only after it decrypts | `an_unwrap_into_the_first_slot` |
 | a load that does not check the length its purpose takes, or checks it only after it asks the source | `a_load_into_the_first_slot` |
@@ -469,7 +519,7 @@ compile error.
 | a held key looked for only among keys for wrapping, or an identifier derived for the purpose of wrapping | `a_load_into_the_first_slot` |
 | an addition that looks for its key only among sets for wrapping | `an_addition_in_the_first_slot` |
 | a derivation label without the purpose, or one that writes no purpose as the first | `different_derivations_have_different_labels`, and for the second the unit test of the label's layout |
-| a key from words or from a password for external data | `a_derivation_from_words_into_the_first_slot`, `a_derivation_from_a_password_into_the_first_slot` |
+| a key from a secret or from a password for external data | `a_derivation_from_a_secret_into_the_first_slot`, `a_derivation_from_a_password_into_the_first_slot` |
 | a reveal that does not check the purpose named or its handle, reveals a key for wrapping named so, a disabled key or the first position whatever is named, or writes before it refuses | `only_an_enabled_key_for_external_data_is_revealed` |
 | a reveal not followed by the stack wipe | no proof: the test that reads the stack back after a reveal, without optimisation, and the test of how deep the wipe after it reaches |
 | a reveal inlined into the call that wipes after it | no proof: the test that reads the stack back after a reveal, without optimisation |
@@ -485,7 +535,7 @@ compile error.
 | a generated key or words hedged with the next key during a change | `a_load_into_the_first_slot`, `words_are_written_exactly_when_their_key_is_generated` |
 | a count of draws that does not grow | `a_load_into_the_first_slot`, `a_wrap_changes_no_slot_and_writes_only_when_it_succeeds`, `words_are_written_exactly_when_their_key_is_generated` |
 | a count of draws that grows when the source fails | `a_load_into_the_first_slot` |
-| a key from words through the hedge | `a_derivation_from_words_into_the_first_slot` |
+| a key from a secret through the hedge | `a_derivation_from_a_secret_into_the_first_slot` |
 | a key from a password through the hedge | no proof: the unit tests of the derivation from a password against an independent implementation |
 | a hedge without the count | no proof: the unit tests against known answers, against HKDF called directly, and of a source that repeats itself |
 | a commit that starts the count of draws again | no proof: the unit test of the count across calls that do not draw |
@@ -506,7 +556,8 @@ compile error.
 | ends bound to the export by no record | `an_end_of_an_export_is_written_only_when_it_succeeds`, unit tests |
 | a change or an addition of a set of an unfinished transfer, or of a key for transfers | `a_change_of_stage_in_the_first_slot`, `an_addition_in_the_first_slot`, unit tests |
 | a generation of a key for transfers | `a_load_into_the_first_slot`, unit tests |
-| a key for transfers from words under the label of the key from a secret, or loaded as a key from a secret | `a_derivation_from_words_into_the_first_slot`, and the unit tests against an independent HKDF-SHA-256 |
+| a key for transfers from a secret under the label of the key from a secret | `a_derivation_from_a_secret_into_the_first_slot`, and the unit tests against an independent HKDF-SHA-256 |
+| a key for transfers from words loaded as a key from a secret | `a_derivation_from_a_secret_into_the_first_slot` |
 | an unload that keeps the state of a transfer | `a_step_by_a_release`, `a_handle_releases_only_a_matching_loaded_slot`, `creating_slots_wipes_every_key` |
 | a set parser that refuses a key for transfers | `parsing_a_set_accepts_exactly_what_building_can_write`, `a_parsed_set_builds_back_to_the_same_bytes` |
 | an export, a receipt or an end not followed by the stack wipe | no proof: the tests that read the stack back after each, with and without optimisation |

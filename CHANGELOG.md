@@ -290,5 +290,15 @@ Nothing is published while the version is below 0.1.0.
 - A call asks the random source before any step on a secret but hedging earlier nonces and salts.
   Hedges wipe their stack, so a panic of the source leaves no secret; Kani proof, stack test.
 - Slots are reached only through a table, which Kani proves for eight slots.
+- Key shares: `Slots::generate_shares` creates a key for wrapping from 16 random bytes and writes
+  three shares (`Share`, `Shares`); any two give it back. `Slots::derive_from_shares` derives that
+  key from two of them, and wipes them.
+- Shamir's scheme over GF(2^8), with no branch or lookup on secret bytes; a build step checks the
+  product's machine code. `Error::InvalidShare`, `Error::MixedShares` and `Error::SameShare` refuse
+  shares before their bytes are combined.
+- A 4-byte check of the secret is split with it; `Error::ChangedShare` refuses shares whose secret
+  fails it.
+- Kani 0.68.0 proves the field, the split, one share against every secret, the check, and reading
+  and loading shares. Tests against an independent implementation, and of the stack.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

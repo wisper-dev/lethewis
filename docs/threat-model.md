@@ -29,9 +29,17 @@ writes stand for 128 bits of the platform's random source, hedged with the key o
 cannot be guessed. Other words derive another key, under which no record wrapped under the first
 key opens.
 
-A key for wrapping from a password, from words or imported is never wrapped. It wraps only stored
-keys, in lock records of two layers: the inner one opens only under that key, the outer
-only under the key of the epoch. A guess at a password against a lock record needs that epoch's key too.
+A key is also derived from any two of three shares, split from 128 bits hedged as for words. One
+share alone fits every secret alike, so it narrows no guess.
+
+A 4-byte check of the secret is split with it, each byte on a line of its own. Shares whose secret
+fails the check are refused.
+
+A key for wrapping from a password, words, shares or an import is never wrapped. It wraps only
+stored keys, in lock records of two layers.
+
+The inner layer opens only under that key, the outer only under the key of the epoch. A guess at a
+password against a lock record needs that epoch's key too.
 
 A key from a password can be combined with the chip's answer to a challenge derived from it: the key
 the two make needs both, so each guess at the password needs the chip of the device.
@@ -78,6 +86,9 @@ some jurisdictions using it is itself an offence.
 An export made before the profile is destroyed still holds the keys of the chats it carried, and
 opens with its key for transfers: the words, or the secret shared with the other device. Asking the
 owner again before an export, and how long a key for transfers lives, are the application's.
+
+Two holders of shares who agree, are forced or are deceived open what the shares protect. The
+library cannot tell a share given willingly from one taken.
 
 ### 3. A laboratory reading the flash chip
 
@@ -255,8 +266,14 @@ optimisation. Tests read it back and find no 16-byte piece of the bytes in eithe
 byte order, of the numbers or of the words laid out together, of the checksum's hash, of the
 derivation or of the key.
 
-The words are wiped when their key is derived, and left as they were when it is not. A generation
-of words is the one call that gives out what a key derives from: its twelve words, once.
+After each call on shares, the stack below the caller is wiped: 8 KiB, or 64 KiB without
+optimisation.
+
+Tests read it back and find no 16-byte piece of a share, the secret, the derivation or the key.
+
+Words and shares are wiped when their key is derived, and left as they were when it is not.
+
+Generations of words and of shares are the only calls that give out what a key derives from, once.
 
 A key for external data is added enabled, and only a disabled key other than the primary is
 destroyed, wiped with its identifier. A record of its set wrapped afterwards does not hold it; one
@@ -378,6 +395,11 @@ The words a generation writes are the caller's to show once and to wipe, and cop
 before a derivation are not reached. Whoever reads the words holds the key. A call on words needs at
 least the 8 KiB, or 64 KiB, its wipe reaches.
 
+The shares a generation writes are the caller's to hand out once and to wipe. Whoever reads two of
+them holds the key.
+
+A call on shares needs at least the 8 KiB, or 64 KiB, its wipe reaches.
+
 ### 5. The supply chain
 
 **Capability.** A compromised dependency, a stolen maintainer credential, a rewritten tag.
@@ -444,6 +466,12 @@ A word is looked up by comparing it with every word of the list, and written by 
 in steps whose machine code the same build step checks on the same four targets. `lethewis-dit`
 switches the mode on around reading and writing words as well.
 
+Shares are split and combined by a product in the field with no branch or lookup on their bytes.
+Their check is compared in constant time.
+
+The same build step checks the machine code of both on the same four targets. The mode is on around
+all of it.
+
 ## Assumptions
 
 1. The device's hardware element behaves as documented by its manufacturer. An application cannot
@@ -454,11 +482,13 @@ switches the mode on around reading and writing words as well.
    password typed as text into one Unicode form, NFC, before it reaches the library is the
    application's as well.
 4. The third-party cryptographic primitives are sound. They are not proven here.
-5. The platform's random source is unpredictable to the adversary, or the key of the epoch that
-   keys, words and nonces drawn from it are hedged with is, provided the source does not repeat its
-   bytes in another `Slots` under that key. The library does not test the source's output.
+5. The platform's random source, or the epoch key hedging its draws, is unpredictable to the
+   adversary. The source repeats no bytes in another `Slots` under that key; its output is not
+   tested here.
 6. The twelve words are kept where only the owner reads them. Bringing typed words into twelve
    fields of 8 bytes, lowercase ASCII followed by zeros, is the application's.
+7. The holders of shares keep them apart, and no two of them act against the owner. Bringing a
+   share into its 25 bytes is the application's.
 
 ## Known gaps
 

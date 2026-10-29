@@ -17,7 +17,7 @@ Suggestions for functionality not listed here are accepted as issues.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/rustc-1.99.0-orange.svg)
-![Readiness](https://img.shields.io/badge/readiness-47%25-orange.svg)
+![Readiness](https://img.shields.io/badge/readiness-48%25-orange.svg)
 
 ## How the keys relate
 
@@ -50,8 +50,8 @@ password and the hardware secret at each unlock, and neither alone is enough.
   root.** Records of the old epoch, on flash or in an earlier copy of the device, then no longer open,
   unless the hardware's own keys leak. Without such a root a destroyed key is most likely gone, not
   certainly.
-- **A key derived from a password or from twelve words comes back from them.** Destroying it does
-  not reach the password or the words; destroying the profile key it opens does.
+- **A key derived from a password, twelve words or two shares comes back from them.** Destroying it
+  does not reach them; destroying the profile key it opens does.
 - **An export outlives what happens on the device after it.** Its records and blocks open with its
   key for transfers in any epoch, so destroying a chat or the profile does not reach an export made
   before. No export tells its age: an older backup under the same words opens as a newer one does.
@@ -80,18 +80,23 @@ password and the hardware secret at each unlock, and neither alone is enough.
 - **The cost of a derivation from a password is not tuned here.** The library refuses less than 64
   MiB of memory and fewer than 3 passes. Choosing parameters that take a few seconds on a device is
   the caller's, and so is bringing a password typed as text into one Unicode form.
-- **A key handed out is the caller's to wipe.** A key for external data, such as a database key,
-  leaves the library in the clear only through `Slots::reveal32`. The library does not reach that
-  copy or what its engine keeps. Keys for wrapping and for transfers leave in the clear only as the
-  words of a generation.
-- **A broken random source is covered only in part.** Keys, words and nonces are hedged with the
-  key of the epoch, as RFC 8937 has it: within one `Slots`, a broken source alone makes none
-  predictable. Not covered: a key of the epoch from that source, a copied process or machine,
-  repeated bytes in another `Slots`, and password salts.
+- **A key handed out is the caller's to wipe.** A key for external data leaves in the clear only
+  through `Slots::reveal32`, and that copy is out of the library's reach.
+- **Keys for wrapping and for transfers leave in the clear only as words or shares of a
+  generation.** Keeping them is the caller's.
+- **A broken random source is covered only in part.** Keys, words, shares and nonces are hedged
+  with the key of the epoch, as RFC 8937 has it.
+- **Within one `Slots`, a broken source alone makes none of them predictable.** Not covered: an
+  epoch key from that source, a copied process or machine, repeats across `Slots`, and password
+  salts.
 - **Twelve words are as safe as the place they are kept.** Whoever reads them derives the key. The
   library writes them once, from the English list of BIP 39; keeping them off screenshots, the
   clipboard, the keyboard's memory and backups is the caller's. About one changed word in sixteen
   passes the checksum, and its key opens no record.
+- **Any two holders of shares open what the shares protect.** Two of them agreeing, forced or
+  deceived are enough; one alone learns nothing.
+- **A changed share is refused, not named.** A 4-byte check split with the secret catches a change,
+  except once in 2^32; nothing tells which share changed.
 - **Hardware-backed keys are not available everywhere.** A dedicated secure element is absent on a
   large share of Android devices, and our figure for that share is an estimate rather than a
   measurement. Where the element is missing, protection falls back and records the level actually
@@ -112,11 +117,10 @@ separate crate, so the proof perimeter is visible from the directory listing.
 
 | Crate | Contents |
 |---|---|
-| `lethewis-core` | derivation, hierarchy, lifecycle, destruction, two-tier access, encryption of data in blocks. Pure logic: no network, no clock; the system is asked, through `lethewis-dit`, only whether the processor offers data-independent timing |
+| `lethewis-core` | derivation, hierarchy, lifecycle, destruction, two-tier access, key shares, data in blocks; no network or clock, the system only through `lethewis-dit` |
 | `lethewis-dit` | data-independent timing on aarch64 for a piece of work, where Linux, Android or an Apple system reports it; the one crate with unsafe code |
 
-Hardware binding, key shares and the time lock will each be a crate of its own, listed here when it
-exists.
+Hardware binding and the time lock will each be a crate of its own, listed here when it exists.
 
 Claimed and proven properties: [docs/proofs.md](docs/proofs.md).
 

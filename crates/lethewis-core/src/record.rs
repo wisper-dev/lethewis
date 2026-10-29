@@ -67,7 +67,8 @@ pub enum Purpose {
     /// wraps only keys for external data, keys for transfers, keys of chats for their archives and
     /// keys for data.
     /// Leaves the library only wrapped, or as the words
-    /// [`Slots::generate_words`](crate::Slots::generate_words) writes once; a key from a secret
+    /// [`Slots::generate_words`](crate::Slots::generate_words) or the shares
+    /// [`Slots::generate_shares`](crate::Slots::generate_shares) write once; a key from a secret
     /// gives out a [`Slots::challenge`](crate::Slots::challenge) derived from it.
     Wrap = 1,
     /// A key of 32 bytes for data an engine outside the library encrypts, such as a database. It
