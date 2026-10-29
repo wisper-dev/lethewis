@@ -4,11 +4,8 @@
 
 """The lockfile of checks/no-alloc agrees with the main one.
 
-Every package in it, apart from the check itself, appears in the main lockfile with the same
-version, source and checksum. In both files, a package comes either from crates.io or from a path,
-and a package from a path is a crate of the main workspace, or the check itself in its own file,
-built from this repository's own manifest. The two lockfiles are resolved separately, and the
-manifests only set lower bounds.
+Its packages but the check match Cargo.lock in version, source and checksum, all from crates.io or
+this repository.
 """
 
 import json

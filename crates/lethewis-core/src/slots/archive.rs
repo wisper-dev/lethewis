@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The record of an archive key: its seed under a stored key of the archive, and its public key,
-//! under the profile's stored key for wrapping and the key of an epoch.
+//! The record of an archive key.
 
 use super::{Handle, Index, Kind, Open, Slots, derive_record_key, hedged_draw, write_record};
 use crate::{
@@ -21,39 +20,22 @@ use crate::{
 };
 
 impl<'a> Slots<'a> {
-    /// Creates an archive key under the stored key of the archive that `store` refers to, and
-    /// writes its record into `record`, in this epoch, or in the next while a change to it is under
-    /// way; no slot holds the new key. The record has two layers, both bound to `context`, from 1 to
-    /// 255 bytes. The inner one holds the seed of the key and opens only with that stored key,
-    /// whatever the epoch. The outer one holds the inner one, the key's identifier and its public
-    /// key, and opens only with the stored key for wrapping that `profile` refers to and the key of
-    /// the epoch; [`Slots::carry_archive_key`] moves it on to the next epoch without the stored key
-    /// of the archive. The seed is derived from that stored key and bytes from `entropy`, hedged
-    /// with the key of the epoch, as the nonces are. X-Wing gives a known answer first, once in a
-    /// process, and the new key pair has to agree with itself: an encapsulation to its public key
-    /// and the decapsulation with its seed give one secret.
+    /// Creates an archive key and writes its record into `record`, for this epoch or the next
+    /// during a change. It opens with the stored wrapping key `profile`, the epoch key and
+    /// `context`; its seed needs `store` too.
     ///
-    /// Needs 100 KiB of stack, or 232 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 96 KiB, or 224 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the code it calls has
-    /// to set that flag.
+    /// Needs 100 KiB of stack, or 232 KiB when unoptimised, and wipes 96 KiB, or 224 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set `store` refers to does not serve
-    /// [`Purpose::ArchiveWrap`] or the one `profile` refers to [`Purpose::Wrap`],
-    /// [`Error::WrongLevel`] if `profile` refers to a key from a secret, [`Error::EpochExhausted`]
-    /// if a change to the last epoch is under way, [`Error::CipherFailed`] if X-Wing gives a known
-    /// input a wrong answer, [`Error::EntropyFailed`] if `entropy` fails,
-    /// [`Error::DerivationFailed`] if a value cannot be derived from a key, and
-    /// [`Error::CipherFailed`] if the new key pair does not agree with itself or the cipher gives a
-    /// known input a wrong answer or fails. `record` is then left as it was.
+    /// [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::WrongLevel`], [`Error::EpochExhausted`], [`Error::EntropyFailed`],
+    /// [`Error::DerivationFailed`] or [`Error::CipherFailed`], with `record` left as it was.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through, and `record` is left as it was.
+    /// Only if `entropy` panics, with `record` left as it was.
     pub fn create_archive_key(
         &mut self,
         store: Handle<'a>,
@@ -69,8 +51,6 @@ impl<'a> Slots<'a> {
         created
     }
 
-    /// The creation itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts. X-Wing has to give `known` first.
     #[inline(never)]
     pub(super) fn create_archive_key_on_stack(
         &mut self,
@@ -129,33 +109,19 @@ impl<'a> Slots<'a> {
         written
     }
 
-    /// Loads the archive key whose record is `record`, for the `context` it was written for, into
-    /// a free slot: the record opens with the stored key for wrapping that `profile` refers to and
-    /// the key of this epoch, and its seed with the stored key of the archive that `store` refers
-    /// to. X-Wing gives a known answer first, once in a process, and the public key in the record is
-    /// then the one the seed gives; otherwise the record was changed by someone who held the key of
-    /// the epoch and the stored key for wrapping, and the call fails with
-    /// [`Error::PublicKeyMismatch`].
+    /// Loads the archive key of `record` into a free slot, with the keys and `context`
+    /// [`Slots::create_archive_key`] takes, in this epoch. The record's public key has to be the
+    /// one its seed gives.
     ///
-    /// Needs 100 KiB of stack, or 232 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 96 KiB, or 224 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the code it calls has
-    /// to set that flag.
+    /// Needs 100 KiB of stack, or 232 KiB when unoptimised, and wipes 96 KiB, or 224 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set `store` refers to does not serve
-    /// [`Purpose::ArchiveWrap`] or the one `profile` refers to [`Purpose::Wrap`],
-    /// [`Error::WrongLevel`] if `profile` refers to a key from a secret, [`Error::NoFreeSlot`] if
-    /// no slot is free, [`Error::CipherFailed`] if X-Wing gives a known input a wrong answer,
-    /// [`Error::DerivationFailed`] if a value cannot be derived from a key,
-    /// [`Error::StaleRecord`] if the record does not open with that stored key for wrapping, this
-    /// context and the key of this epoch, or names another epoch, [`Error::RecordRejected`] if its
-    /// seed does not open with the stored key of the archive or is not the seed of one archive key,
-    /// [`Error::PublicKeyMismatch`] if its identifier or public key is not the seed's, and
-    /// [`Error::DuplicateKey`] if these slots hold the key already. No slot changes then.
+    /// [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::WrongLevel`], [`Error::NoFreeSlot`], [`Error::CipherFailed`],
+    /// [`Error::DerivationFailed`], [`Error::StaleRecord`], [`Error::RecordRejected`],
+    /// [`Error::PublicKeyMismatch`] or [`Error::DuplicateKey`], with no slot changed.
     pub fn load_archive_key(
         &mut self,
         store: Handle<'a>,
@@ -178,8 +144,6 @@ impl<'a> Slots<'a> {
         loaded
     }
 
-    /// The load itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts. X-Wing has to give `known` first.
     #[inline(never)]
     #[expect(
         clippy::too_many_arguments,
@@ -231,34 +195,23 @@ impl<'a> Slots<'a> {
         loaded
     }
 
-    /// Carries the record of an archive key `from` into the next epoch while a change to it is
-    /// under way, from the stored key for wrapping that `profile` refers to to the one
-    /// `next_profile` refers to, which may be the same, and writes it into `to`, for the same
-    /// `context`; the stored key of the archive is not needed. The nonce comes from `entropy`,
-    /// hedged with the key of the next epoch. A record not carried opens no more once the change
-    /// is committed, and the archive key with it.
+    /// Carries the archive key record `from`, under the stored wrapping key `profile`, into the
+    /// next epoch under `next_profile`, writing `to`. A record not carried opens no more once the
+    /// change is committed.
     ///
-    /// Needs 100 KiB of stack, or 232 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 96 KiB, or 224 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the code it calls has
-    /// to set that flag.
+    /// Needs 100 KiB of stack, or 232 KiB when unoptimised, and wipes 96 KiB, or 224 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if either set does not serve [`Purpose::Wrap`],
-    /// [`Error::WrongLevel`] if either is a key from a secret, [`Error::NoEpochChange`] if no
-    /// change to the next epoch is under way, [`Error::EpochExhausted`] if it is the last,
-    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if the nonce
-    /// cannot be hedged or a key that encrypts a layer cannot be derived, [`Error::StaleRecord`]
-    /// if `from` does not open with the first stored key, this context and the key of this epoch,
-    /// and [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or fails. `to`
-    /// is then left as it was.
+    /// [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::WrongLevel`], [`Error::NoEpochChange`], [`Error::EpochExhausted`],
+    /// [`Error::EntropyFailed`], [`Error::DerivationFailed`], [`Error::StaleRecord`] or
+    /// [`Error::CipherFailed`], with `to` left as it was.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through, and `to` is left as it was.
+    /// Only if `entropy` panics, with `to` left as it was.
     pub fn carry_archive_key(
         &mut self,
         profile: Handle<'a>,
@@ -282,8 +235,6 @@ impl<'a> Slots<'a> {
         carried
     }
 
-    /// The carry itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     pub(super) fn carry_archive_key_on_stack(
         &mut self,
@@ -338,8 +289,6 @@ impl<'a> Slots<'a> {
         carried
     }
 
-    /// The slots of the stored key of the archive that `store` refers to and of the stored key for
-    /// wrapping that `profile` refers to.
     fn archive_parents(
         &self,
         store: Handle<'a>,
@@ -359,7 +308,6 @@ impl<'a> Slots<'a> {
         Ok((store, profile))
     }
 
-    /// The slot of the stored key for wrapping that `profile` refers to.
     pub(super) fn profile_key(&self, profile: Handle<'a>) -> Result<Index, Error> {
         let index = self.serving(profile, Purpose::Wrap)?;
         if self.memory.get(index).is_none_or(|stored| stored.unlocks) {
@@ -369,17 +317,12 @@ impl<'a> Slots<'a> {
     }
 }
 
-/// Wipes the stack below the caller's frame, as deep as X-Wing and the layers of a record reach.
 pub(super) fn wipe_archive_stack() {
     // The wipe ends in inline assembly, which Kani cannot model.
     #[cfg(not(kani))]
     zeroize::zeroize_stack::<{ xwing::STACK_WIPE }>();
 }
 
-/// Writes the record of the archive key `seed`, once its key pair agrees with itself, which makes
-/// `known` asked for again if it does not: its inner layer under `archive`, the stored key of the
-/// archive and its identifier, its outer layer under `outer`, a stored key for wrapping, the key of
-/// an epoch and its number, each under its nonce of `nonces`.
 fn write_archive_key(
     (seed, known): (&Key, &Known),
     (archive, archive_id): (&Key, &KeyId),
@@ -426,8 +369,6 @@ fn write_archive_key(
     sealed
 }
 
-/// Whether the seed that `plaintext` holds gives `id` and `public`: the plaintext is a set of one
-/// seed of an archive key, of epoch zero, or `RecordRejected`.
 fn seed_gives(
     plaintext: &[u8; PLAINTEXT_LEN],
     id: &[u8; ID_LEN],
@@ -458,17 +399,14 @@ fn seed_gives(
     }
 }
 
-/// The 32 bytes of the seed of an archive key.
 pub(super) fn seed_of(seed: &Key) -> Option<&[u8; SEED_LEN]> {
     seed.as32()
 }
 
-/// Whether two public keys are the same, compared in pieces no longer than a key.
 fn same_public(a: &[u8; PUBLIC_LEN], b: &[u8; PUBLIC_LEN]) -> bool {
     a.chunks(64).zip(b.chunks(64)).all(|(x, y)| x == y)
 }
 
-/// The identifier, the public key and the inner record that `body` holds.
 pub(super) fn split_body(
     body: &[u8; ARCHIVE_BODY_LEN],
 ) -> ([u8; ID_LEN], [u8; PUBLIC_LEN], [u8; RECORD_LEN]) {
@@ -482,7 +420,6 @@ pub(super) fn split_body(
     parts
 }
 
-/// Writes the identifier, the public key and the inner record into `body`.
 fn join_body(
     body: &mut [u8; ARCHIVE_BODY_LEN],
     id: &[u8; ID_LEN],
@@ -499,9 +436,7 @@ fn join_body(
     }
 }
 
-/// Seals `body` with the epoch's `number` under the key derived from the stored key for wrapping
-/// `stored` and the key of the epoch `epoch_key`, under `nonce` into `out`. `out` is written only
-/// when this succeeds.
+/// `out` is written only when this succeeds.
 fn seal_archive_layer(
     (stored, epoch_key, number): (&Key, &Key, u64),
     nonce: &[u8; NONCE_LEN],
@@ -535,9 +470,8 @@ fn seal_archive_layer(
     Ok(())
 }
 
-/// Opens the record of an archive key `record` under the key derived from the stored key for
-/// wrapping `stored` and the key of the epoch `epoch_key`, and keeps what it holds after the number
-/// in `body` if it names `number`; otherwise `StaleRecord`, and `body` is left as it was.
+/// Keeps what the layer holds after the number in `body` if it names `number`. Otherwise it is
+/// `StaleRecord`, and `body` stays as it was.
 pub(super) fn open_archive_layer(
     (stored, epoch_key, number): (&Key, &Key, u64),
     aad: &[u8],
@@ -634,8 +568,6 @@ mod tests {
         ]
     }
 
-    /// What the outer layer of `record` holds, opened under the stored key `profile` and the key of
-    /// this epoch.
     fn opened(
         slots: &Slots<'_>,
         profile: Handle<'_>,
@@ -657,8 +589,6 @@ mod tests {
         body
     }
 
-    /// An archive key opens with its two stored keys, its context and the key of its epoch only;
-    /// the public key in its record is the one its seed gives, and it never leaves the library.
     #[test]
     fn an_archive_key_opens_with_its_two_keys_only() {
         let mut memory = [const { Slot::empty() }; 8];
@@ -740,8 +670,6 @@ mod tests {
         );
     }
 
-    /// A record whose public key or identifier was changed under its two keys is refused, and the
-    /// slots stay as they were.
     #[test]
     fn a_changed_public_key_is_refused_at_load() {
         let mut memory = [const { Slot::empty() }; 6];
@@ -785,8 +713,6 @@ mod tests {
         }
     }
 
-    /// Every call on an archive key derives and runs the cipher and X-Wing inside the switch of
-    /// data-independent timing, and with the mode on where it is offered.
     #[test]
     fn every_call_on_an_archive_key_holds_data_independent_timing() {
         let mut memory = [const { Slot::empty() }; 6];
@@ -821,9 +747,6 @@ mod tests {
         });
     }
 
-    /// An inner layer that opens under the stored key of the archive but holds no seed of an archive
-    /// key, of epoch zero and alone in its set, is refused as such before its public key is looked
-    /// at: a set of another epoch, of two keys or of another purpose.
     #[test]
     fn an_inner_layer_without_one_seed_is_refused() {
         let mut memory = [const { Slot::empty() }; 6];
@@ -890,8 +813,6 @@ mod tests {
         }
     }
 
-    /// The record is carried into the next epoch under another stored key without the stored key
-    /// of the archive; after the commit only the carried copy opens.
     #[test]
     fn an_archive_key_is_carried_without_its_store() {
         let mut memory = [const { Slot::empty() }; 7];
@@ -964,8 +885,6 @@ mod tests {
         );
     }
 
-    /// A wrong answer from X-Wing refuses the creation and the load, which write and change
-    /// nothing.
     #[test]
     fn a_wrong_answer_of_x_wing_refuses_the_archive_key() {
         let mut memory = [const { Slot::empty() }; 6];
@@ -1003,10 +922,8 @@ mod tests {
         assert_eq!(slots.memory[5].occupancy, Occupancy::Free);
     }
 
-    /// Every changed bit of the record of an archive key is refused by the reading of its public key,
-    /// which opens it as the load and the carry do; without optimisation, where the cipher is slow,
-    /// one bit of every byte. A changed byte at each end of each part of it is refused by the carry,
-    /// which writes nothing then.
+    /// The reading of the public key opens the record as the load and the carry do. Without
+    /// optimisation, where the cipher is slow, one bit of every byte.
     #[test]
     #[expect(clippy::integer_division, reason = "a test picks bits of a record")]
     fn every_changed_bit_of_the_record_of_an_archive_key_is_refused() {
@@ -1098,13 +1015,11 @@ mod tests {
             .collect()
     }
 
-    /// What a round of random records of archive keys gets wrong.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Fault {
         Nothing,
         /// A context of no bytes or of more than 255.
         Context,
-        /// A context other than the record's.
         OtherContext,
         /// A changed bit of the record.
         Record,
@@ -1132,7 +1047,6 @@ mod tests {
         Held,
     }
 
-    /// Each fault in turn; one round in four gets a second, at random.
     const FAULTS: [Fault; 19] = [
         Fault::Nothing,
         Fault::Nothing,
@@ -1155,15 +1069,12 @@ mod tests {
         Fault::Held,
     ];
 
-    /// The fields a set of one seed is read by, in its layout: the version, the purpose, the
-    /// primary position, both ends of the epoch and of the revision, the stage and the length of
-    /// the first position, both ends of its padding, the stage and the length of the second, and
-    /// the last byte.
+    /// The version, purpose and primary; the ends of epoch and revision; the first position's
+    /// stage, length and padding ends. Then the second's stage and length, and the last byte.
     const FIELDS: [usize; 14] = [0, 1, 2, 19, 26, 27, 34, 35, 36, 69, 100, 101, 102, 232];
 
-    /// Whether `plaintext` holds the set of one seed of an archive key, read from the layout: version
-    /// 1, purpose 4, the primary at the first position, epoch and revision zero, the first position
-    /// enabled with 32 bytes and zeros past them, and the other two zero throughout.
+    /// Read from the layout: version 1, purpose 4, primary first, epoch and revision zero. The
+    /// first position is enabled with 32 bytes and zeros past them; the other two are zero.
     fn holds_one_seed(plaintext: &[u8; PLAINTEXT_LEN]) -> bool {
         plaintext[..3] == [1, 4, 0]
             && plaintext[19..35].iter().all(|&byte| byte == 0)
@@ -1171,7 +1082,7 @@ mod tests {
             && plaintext[69..].iter().all(|&byte| byte == 0)
     }
 
-    /// `plaintext` sealed under `key` with `nonce`, laid out without the library's code for it.
+    /// Laid out without the library's code for it.
     fn sealed_by_hand<const N: usize, const R: usize>(
         key: &[u8; 32],
         nonce: &[u8; 12],
@@ -1189,7 +1100,7 @@ mod tests {
         record
     }
 
-    /// What `record` holds under `key`, read without the library's code for it.
+    /// Read without the library's code for it.
     fn opened_by_hand<const N: usize, const R: usize>(
         key: &[u8; 32],
         aad: &[u8],
@@ -1202,13 +1113,7 @@ mod tests {
         seal::open(key, nonce, aad, &mut sealed, tag).map(|()| sealed)
     }
 
-    /// Records of archive keys sealed through the real derivations and cipher and laid out by hand,
-    /// with every fault of [`FAULTS`] in turn and at times a second: a context, either layer or its
-    /// key, the epoch, the set, the identifier or the public key wrong, or the seed held already.
-    /// The load, the reading of the public key and the carry, to the same stored key or another,
-    /// never panic, refuse exactly what they should, with the error they should, and change or
-    /// write nothing then; the load fills the first free slot with the seed, the reading gives the
-    /// identifier and the public key the record holds, and the carry the same under the next epoch.
+    /// Records sealed through the real derivations and cipher and laid out by hand.
     #[expect(clippy::too_many_lines, reason = "one round builds and reads a record")]
     fn load_random_archive_keys(rounds: u64, seed: u64) {
         let mut random = Random(seed);
@@ -1435,8 +1340,6 @@ mod tests {
         load_random_archive_keys(100, 1);
     }
 
-    /// The same over as many rounds and from the seed `LETHEWIS_RANDOM_ROUNDS` and
-    /// `LETHEWIS_RANDOM_SEED` give.
     #[test]
     #[ignore = "long; the rounds and the seed come from the environment"]
     fn many_random_records_of_archive_keys_load_as_their_layers_say() {
@@ -1446,15 +1349,8 @@ mod tests {
         );
     }
 
-    /// The record of an archive key and the same record carried into the next epoch, computed by an
-    /// implementation independent of this library: a source that gives `pattern(17, 5)` for a draw
-    /// of any length, the stored key of the archive generated as the first draw, a 64-byte stored
-    /// key for wrapping, the record in "archive" from the next three draws, and the carry as the
-    /// fifth, into an epoch whose key is the key of the test epoch with every bit flipped; then a
-    /// second archive key created during that change, from the next three draws. Once that epoch
-    /// is committed, a key of a chat for its archive from the ninth draw, a batch of "chat" archived
-    /// to the second archive key from the next two, another key of a chat from the twelfth, and the
-    /// record moved to it with the thirteenth.
+    /// Computed by an implementation independent of this library through the test's calls in turn.
+    /// Its source gives `pattern(17, 5)` for a draw of any length.
     const KNOWN_RECORD: &str = concat!(
         "27bae2fc323c379d396cc79bbdf51002a439a6a94cbdf763d122b78635d67108",
         "10af90cacf926bd3f24cf02a42d2f09ee008316790fe361e9f7e4b1fd69fbc92",
@@ -1726,7 +1622,6 @@ mod tests {
     );
     const KNOWN_EMPTY_BODY: &str = "d58f0a7576206d10ae99027a95da6105";
 
-    /// Gives `pattern(17, 5)` for a draw of any length.
     struct Pattern;
 
     impl Entropy for Pattern {
@@ -1885,12 +1780,11 @@ pub(super) mod stack {
         xwing,
     };
 
-    /// The stack each call needs, and the depth of the wipe after it, in KiB, in an optimised build
-    /// and in one without optimisation.
+    /// The stack each call needs, and the depth of the wipe after it, in KiB. For an optimised
+    /// build and for one without optimisation.
     const NEEDS: [usize; 2] = [100, 232];
     const WIPES: [usize; 2] = [96, 224];
 
-    /// The documentation of the public call `name` in this file, its lines joined.
     fn documentation(name: &str) -> String {
         let source = include_str!("archive.rs");
         let at = source.find(&format!("    pub fn {name}(")).unwrap();
@@ -1904,8 +1798,6 @@ pub(super) mod stack {
         lines.join(" ")
     }
 
-    /// The documentation of each call on an archive key states the stack it needs and the depth
-    /// of the wipe after it, and those depths are the library's.
     #[test]
     fn the_documentation_states_the_stack_calls_need() {
         let build = usize::from(cfg!(lethewis_unoptimised));
@@ -1937,9 +1829,6 @@ pub(super) mod stack {
         }
     }
 
-    /// What opening the record of an archive key under the stored keys `stored` and `store` and the
-    /// key of the epoch `epoch` handles: AES-256-GCM-SIV on both layers, the plaintext of the inner
-    /// one, which holds the seed, and the derivations of the keys of both layers.
     pub(in crate::slots) fn layer_secrets(
         (stored, store, epoch): (&Key, &Key, &Key),
         record: &[u8; ARCHIVE_KEY_RECORD_LEN],
@@ -1985,8 +1874,6 @@ pub(super) mod stack {
         secrets
     }
 
-    /// What sealing the outer layer of `carried` under the stored key `stored` and the key of the
-    /// next epoch `next` handles.
     fn carried_secrets(
         stored: &Key,
         next: &Key,
@@ -2005,12 +1892,8 @@ pub(super) mod stack {
         secrets
     }
 
-    /// Slots over `memory` in an epoch whose key `flip` changes, with a stored key for wrapping and
-    /// one of the archive, the record of an archive key under them, and what a creation, a load and
-    /// a carry of it handle: the three keys, the key of the epoch and the hedges of the three draws
-    /// under it, the expansion of the seed and what X-Wing makes of it, and what opening the record
-    /// handles; then a change to the next epoch under way, and the record carried into it, what
-    /// that handles, the key of that epoch and the hedge of the nonce under it.
+    /// Slots in an epoch whose key `flip` changes, with an archive key's record created, loaded and
+    /// carried in them. Also what those calls handle.
     fn archive<'a>(
         memory: &'a mut [Slot],
         epoch: &'a mut Epoch,
@@ -2100,7 +1983,6 @@ pub(super) mod stack {
         (slots, [store, stored], record, secrets)
     }
 
-    /// The key of the next epoch in the tests of a carry, made from a `flip`ped pattern.
     fn next_key(flip: u8) -> [u8; 32] {
         flipped_epoch_key(flip ^ 0x5a)
     }
@@ -2121,9 +2003,8 @@ pub(super) mod stack {
         (slots, [store, stored])
     }
 
-    /// A creation, a load and a carry without the wipe after them leave on the stack some of what
-    /// they handle, so that the tests below can tell the wipe from its absence. Each runs from the
-    /// state [`archive`] runs it from, so it handles the same values.
+    /// The tests below can tell the wipe from its absence. Each call runs from the state
+    /// [`archive`] runs it from, so it handles the same values.
     #[test]
     fn the_calls_on_an_archive_key_without_the_wipe_leave_residue() {
         let (mut memory, mut other) = ([const { Slot::empty() }; 4], [const { Slot::empty() }; 4]);
@@ -2185,10 +2066,7 @@ pub(super) mod stack {
         assert!(residue(range, &pieces) > 0, "a carry");
     }
 
-    /// A creation, a load and a carry leave none of what they handle on the stack: the three keys,
-    /// the seed and what X-Wing makes of it, the keys, keystreams and plaintext of the cipher and
-    /// the derivations of its keys. The creation and the carry run again from the same state, so
-    /// they make the same records.
+    /// The creation and the carry run again from the same state, so they make the same records.
     #[test]
     fn the_calls_on_an_archive_key_leave_no_key_on_the_stack() {
         let (mut memory, mut other) = ([const { Slot::empty() }; 4], [const { Slot::empty() }; 4]);
@@ -2234,9 +2112,8 @@ pub(super) mod stack {
         });
     }
 
-    /// A source that panics on any of its calls leaves none of what a creation or a carry handles
-    /// on the stack, at the panic or after it, and writes nothing. Each runs from the state
-    /// [`archive`] runs it from, so it handles the same values until the panic.
+    /// Each call runs from the state [`archive`] runs it from, so it handles the same values until
+    /// the panic.
     #[test]
     fn a_panicking_source_leaves_no_secret_of_a_creation_or_a_carry() {
         let (mut memory, mut other) = ([const { Slot::empty() }; 4], [const { Slot::empty() }; 4]);
@@ -2281,8 +2158,7 @@ pub(super) mod stack {
         }
     }
 
-    /// The wipes cover more than the calls use, with the self-test of X-Wing asked for the first
-    /// time, and not needlessly more.
+    /// Each call asks for the self-test of X-Wing for the first time.
     #[test]
     fn the_wipes_are_deeper_than_the_calls_on_an_archive_key() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
@@ -2344,8 +2220,6 @@ pub(super) mod stack {
         }
     }
 
-    /// The wipes that follow each call reach as deep as they are meant to, also when the call
-    /// fails, and no call reaches deeper than its documentation says it needs.
     #[test]
     fn the_calls_on_an_archive_key_wipe_and_need_the_stack_documented() {
         let build = usize::from(cfg!(lethewis_unoptimised));

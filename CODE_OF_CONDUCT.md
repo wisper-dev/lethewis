@@ -2,14 +2,14 @@
 
 This applies to issues, pull requests and any other space of this project.
 
-**Expected:** stay on the technical question. Disagree with the work, not with the person. Accept
-that a report may be answered with "this is out of scope" or "this is not a vulnerability".
+Stay on the technical question and disagree with the work, not with the person. A report may be
+answered with "this is out of scope" or "this is not a vulnerability".
 
-**Not accepted:** personal attacks, harassment, discriminatory remarks, posting anyone's private
-information, deliberate derailing, repeated contact after being asked to stop.
+Personal attacks, harassment, discriminatory remarks, posting anyone's private information,
+derailing and contact after being asked to stop are not accepted.
 
-**Reporting.** Write to <hi@alanwisper.com>. Reports are read by the maintainers and not shared
-further. A report concerning a maintainer is still answered.
+Report a breach to <hi@alanwisper.com>; the maintainers read it and share it no further. A report
+about a maintainer is answered too.
 
-**Consequences,** decided by the maintainers and stated in writing: a request to stop, deletion of
-the content, or a block from the project. Severity and repetition decide which.
+The maintainers answer in writing: a request to stop, deletion of the content or a block from the
+project. Severity and repetition decide which.

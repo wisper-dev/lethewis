@@ -59,10 +59,9 @@ unsafe fn read() -> u64 {
 /// The operating system reports the feature: elsewhere the instruction is undefined.
 #[allow(unsafe_code)]
 unsafe fn write(value: u64) {
-    // SAFETY: the feature is reported, so the register exists and user code may write it; only the
-    // DIT bit is defined there. The barriers make the instructions that follow run in the new mode.
-    // The assembly is not declared free of effects on memory, so the compiler moves no memory
-    // access and no call with side effects across it.
+    // SAFETY: the feature is reported, so user code may write the register, where only DIT is
+    // defined. The barriers put what follows in the new mode; without `nomem`, no memory access
+    // moves across.
     unsafe {
         asm!(
             "msr S3_3_C4_C2_5, {}",
@@ -97,8 +96,8 @@ mod sysctl {
     pub(super) fn detect() -> bool {
         let mut value: u32 = 0;
         let mut size = size_of::<u32>();
-        // SAFETY: the name ends in NUL; `value` and `size` are valid for writes of the size
-        // given; the null pointer and zero length set nothing.
+        // SAFETY: the name ends in NUL, and `value` and `size` are valid for writes of the size
+        // given. A null pointer and zero length set nothing.
         let status = unsafe {
             libc::sysctlbyname(
                 c"hw.optional.arm.FEAT_DIT".as_ptr(),

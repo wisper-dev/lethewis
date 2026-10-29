@@ -1,14 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Key derivation, hierarchy, lifecycle and destruction for a device that may be taken from its
-//! owner.
-//!
-//! Pure logic: no filesystem, no network, no clock. The one question put to the system, through
-//! `lethewis-dit`, is whether the processor offers data-independent timing.
-//!
-//! What is guaranteed, what is not, and which properties are proven:
-//! <https://github.com/wisper-dev/lethewis>.
+//! Key derivation, hierarchy, lifecycle and destruction for a device that may be seized, with no
+//! filesystem, network or clock. A build optimising this crate but not the hash, cipher and X-Wing
+//! code it calls sets `--cfg lethewis_unoptimised`.
 
 #![deny(missing_docs, unused_crate_dependencies)]
 #![no_std]

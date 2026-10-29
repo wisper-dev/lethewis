@@ -29,9 +29,8 @@ impl KeyLength {
     }
 }
 
-/// Key material in a fixed buffer. It cannot be copied, cloned, compared or printed, and it is
-/// wiped when dropped. It lives in a slot and is never moved out of it. The bytes past its length
-/// are always zero.
+/// Cannot be copied, cloned, compared or printed, is wiped when dropped and never leaves its slot.
+/// The bytes past its length are always zero.
 pub(crate) struct Key {
     bytes: [u8; CAPACITY],
     length: KeyLength,
@@ -45,7 +44,6 @@ impl Key {
         }
     }
 
-    /// Copies the bytes of `source` in; the rest of the buffer is zero. `source` is left as it is.
     pub(crate) fn copy32(&mut self, source: &[u8; 32]) {
         self.wipe();
         if let Some((head, _)) = self.bytes.split_first_chunk_mut::<32>() {
@@ -54,28 +52,24 @@ impl Key {
         self.length = KeyLength::Bytes32;
     }
 
-    /// Copies the bytes of `source` in. `source` is left as it is.
     pub(crate) fn copy64(&mut self, source: &[u8; 64]) {
         self.bytes.copy_from_slice(source.as_slice());
         self.length = KeyLength::Bytes64;
     }
 
-    /// Takes the bytes of `source` and wipes `source`.
     #[cfg(any(test, kani))]
     pub(crate) fn load32(&mut self, source: &mut [u8; 32]) {
         self.copy32(source);
         wipe(source);
     }
 
-    /// Takes the bytes of `source` and wipes `source`.
     #[cfg(any(test, kani))]
     pub(crate) fn load64(&mut self, source: &mut [u8; 64]) {
         self.copy64(source);
         wipe(source);
     }
 
-    /// Fills the key with `length` random bytes, asking `entropy` once. On failure the key is
-    /// wiped, and so it is if `entropy` panics.
+    /// Asks `entropy` once. On failure the key is wiped, and so it is if `entropy` panics.
     pub(crate) fn fill(
         &mut self,
         length: KeyLength,
@@ -117,12 +111,10 @@ impl Key {
         self.length
     }
 
-    /// Writes the key into `dest`, followed by zeros up to the capacity.
     pub(crate) fn write_into(&self, dest: &mut [u8; CAPACITY]) {
         dest.copy_from_slice(&self.bytes);
     }
 
-    /// The key, if it has 32 bytes.
     pub(crate) fn as32(&self) -> Option<&[u8; 32]> {
         match self.length {
             KeyLength::Bytes32 => self.bytes.first_chunk(),
@@ -130,7 +122,6 @@ impl Key {
         }
     }
 
-    /// The key itself: as many bytes as its length.
     pub(crate) fn material(&self) -> Option<&[u8]> {
         self.bytes
             .split_at_checked(self.length.bytes())
@@ -138,8 +129,8 @@ impl Key {
     }
 }
 
-/// Key bytes borrowed from a buffer, with the length they hold. They can only be loaded into a
-/// [`Key`], and loading leaves the buffer as it is.
+/// Key bytes borrowed from a buffer. They can only be loaded into a [`Key`], and loading leaves
+/// the buffer as it is.
 pub(crate) struct KeyBytes<'a> {
     bytes: &'a [u8; CAPACITY],
     length: KeyLength,
@@ -150,7 +141,6 @@ impl<'a> KeyBytes<'a> {
         Self { bytes, length }
     }
 
-    /// Loads as many of the bytes as the length into `key`; the rest of `key` is zero.
     pub(crate) fn load_into(self, key: &mut Key) {
         key.wipe();
         match self.length {
@@ -168,8 +158,8 @@ impl<'a> KeyBytes<'a> {
     }
 }
 
-/// Wipes the key when dropped unless told to keep it, so that the wipe also runs when a source of
-/// random bytes panics halfway through.
+/// Wipes the key when dropped unless kept, so the wipe also runs when a random source panics
+/// halfway.
 struct WipeUnlessKept<'k> {
     key: &'k mut Key,
     keep: bool,
@@ -194,7 +184,6 @@ pub(crate) fn wipe<const N: usize>(bytes: &mut [u8; N]) {
     }
 }
 
-/// Wipes `bytes`, of any length.
 pub(crate) fn wipe_slice(bytes: &mut [u8]) {
     #[cfg(not(kani))]
     zeroize::Zeroize::zeroize(bytes);
@@ -207,7 +196,6 @@ pub(crate) mod model {
     use super::{Key, KeyLength};
 
     impl Key {
-        /// Any bytes of either length, zero past it, for the proofs.
         pub(crate) fn fill_any(&mut self) {
             self.bytes = kani::any();
             self.length = if kani::any() {
@@ -274,7 +262,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// The number the environment variable `name` holds, or `default` when it is not set.
     pub(crate) fn from_environment(name: &str, default: u64) -> u64 {
         std::env::var(name).map_or(default, |value| {
             value
@@ -283,7 +270,6 @@ pub(crate) mod tests {
         })
     }
 
-    /// Writes 1, 2, 3, ... into every buffer it fills.
     pub(crate) struct Counting;
 
     impl Entropy for Counting {
@@ -297,7 +283,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Counts its calls, and remembers how many bytes it was last asked for and where.
     #[derive(Default)]
     pub(crate) struct Recording {
         pub(crate) calls: usize,
@@ -315,7 +300,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Writes some bytes, then panics.
     pub(crate) struct Panicking;
 
     impl Entropy for Panicking {
@@ -325,7 +309,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Writes some bytes, then fails.
     pub(crate) struct Failing;
 
     impl Entropy for Failing {
@@ -335,14 +318,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// `prefix` followed by zeros, as a key buffer holds it.
     pub(crate) fn padded(prefix: &[u8]) -> [u8; CAPACITY] {
         let mut bytes = [0; CAPACITY];
         bytes[..prefix.len()].copy_from_slice(prefix);
         bytes
     }
 
-    /// 1, 2, 3, ... as `Counting` writes them.
     pub(crate) fn counted<const N: usize>() -> [u8; N] {
         core::array::from_fn(|i| u8::try_from(i.wrapping_add(1)).unwrap())
     }

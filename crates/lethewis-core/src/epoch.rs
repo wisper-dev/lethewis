@@ -5,8 +5,7 @@ use core::fmt;
 
 use crate::key::Key;
 
-/// Memory for the epoch of [`Slots`](crate::Slots), provided by the caller: the number and key of
-/// the current epoch, and the key of the next while a change to it is under way.
+/// Memory for the epoch of [`Slots`](crate::Slots), provided by the caller.
 ///
 /// It cannot be copied, cloned or compared, and holds keys only while a `Slots` over it is alive.
 pub struct Epoch {
@@ -14,8 +13,7 @@ pub struct Epoch {
     pub(crate) key: Key,
     pub(crate) next: Key,
     pub(crate) changing: bool,
-    /// How many draws the platform's source has answered since the slots were created: each draw
-    /// is hedged with its own count.
+    /// Each draw of the platform's source is hedged with its own count.
     pub(crate) drawn: u64,
 }
 
@@ -32,7 +30,6 @@ impl Epoch {
         }
     }
 
-    /// Wipes both keys, forgets any change under way and starts the count of draws again.
     pub(crate) fn wipe(&mut self) {
         self.key.wipe();
         self.next.wipe();
@@ -63,12 +60,9 @@ pub enum Erasure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RootFailed;
 
-/// The platform, which keeps the root of each epoch: the secret that the key of the epoch is
-/// wrapped under on the device.
-///
-/// Before a change to the next epoch begins, the platform makes a new root and the key of the next
-/// epoch, never used before. At every start, and before it makes a new root, it erases every root
-/// but the current one, so that a root left by a failure or a weaker erasure goes as soon as it can.
+/// The platform's keeper of each epoch's root, the secret the epoch key is wrapped under on the
+/// device. It makes a new root and an unused key for each change, erasing other roots at start and
+/// before each.
 pub trait Root {
     /// Makes the root of epoch `next` the current one in one step.
     ///

@@ -5,9 +5,8 @@
 
 #[cfg(kani)]
 mod proofs {
-    /// A cover reached and one never reached, an assertion that holds and one that fails, an
-    /// overflow, an assertion and a region that nothing reaches, and a check that CBMC places in
-    /// a file other than its function's.
+    /// Covers reached and not; assertions that hold, fail or are never reached; and an overflow.
+    /// Also a check that CBMC places outside its function's file.
     #[kani::proof]
     fn every_outcome() {
         let value: u8 = kani::any();

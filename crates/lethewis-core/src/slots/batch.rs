@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The body of a batch of an archive: its data in chunks, each sealed with AES-256-GCM-SIV under
-//! the key of the body and followed by its tag, as the chunks of a block are.
+//! The body of a batch of an archive, sealed in chunks as the chunks of a block are.
 
 use super::data::{OpenChunk, SealChunk};
 use crate::{
@@ -11,22 +10,20 @@ use crate::{
     seal::{self, KEY_LEN as CIPHER_KEY_LEN, TAG_LEN},
 };
 
-/// How many bytes of stack archiving or opening a batch is followed by a wipe of: at least twice
-/// what each uses, with a chunk of the body in a buffer of its own, as tests measure in each build.
+/// At least twice what archiving or opening a batch uses, chunk buffer included, as tests measure
+/// in each build.
 #[cfg(all(not(kani), not(lethewis_unoptimised)))]
 pub(super) const STACK_WIPE: usize = 163_840;
 #[cfg(all(not(kani), lethewis_unoptimised))]
 pub(super) const STACK_WIPE: usize = crate::xwing::STACK_WIPE;
 
-/// Wipes the stack below the caller, as deep as archiving or opening a batch may reach.
 pub(super) fn wipe_batch_stack() {
     // The wipe ends in inline assembly, which Kani cannot model.
     #[cfg(not(kani))]
     zeroize::zeroize_stack::<STACK_WIPE>();
 }
 
-/// What seals the data of a batch into its body: [`Chunks`], which is all a build outside the
-/// proofs and the tests has, or a model of it in them.
+/// [`Chunks`] in a build outside the proofs and the tests, or a model of it in them.
 pub(super) trait SealBatch {
     fn seal(
         &mut self,
@@ -37,7 +34,6 @@ pub(super) trait SealBatch {
     ) -> Result<(), Error>;
 }
 
-/// What opens the body of a batch into its data.
 pub(super) trait OpenBatch {
     fn open(
         &mut self,
@@ -48,7 +44,6 @@ pub(super) trait OpenBatch {
     ) -> Result<(), Error>;
 }
 
-/// Chunks of [`CHUNK_LEN`] bytes under AES-256-GCM-SIV.
 pub(super) struct Chunks;
 
 impl SealBatch for Chunks {
@@ -107,8 +102,6 @@ where
     }
 }
 
-/// Whether a body of `body` bytes is as long as the chunks of `C` bytes that `data` bytes take,
-/// with their tags; otherwise `WrongLength`.
 pub(super) fn fits<const C: usize>(data: usize, body: usize) -> Result<(), Error> {
     let len = u64::try_from(data)
         .ok()
@@ -121,11 +114,8 @@ pub(super) fn fits<const C: usize>(data: usize, body: usize) -> Result<(), Error
     }
 }
 
-/// Seals `data` into `body` in chunks of `C` bytes, each followed by its tag, under `key`, with
-/// the nonce of its number and of whether it is the last, and the associated data `aad`. Each
-/// chunk is sealed in a buffer of this frame and only its ciphertext goes into `body`, so the data
-/// never pass through it. A body of another length is refused as `WrongLength`, writing nothing,
-/// and a failed seal as `CipherFailed`, after the chunks before it; the caller wipes the body.
+/// Each chunk is sealed in a buffer of this frame, so the data never pass through `body`. A failed
+/// seal stops after the chunks before it; the caller wipes the body.
 #[inline(never)]
 pub(super) fn seal_batch_in<const C: usize>(
     key: &[u8; CIPHER_KEY_LEN],
@@ -170,8 +160,6 @@ fn seal_chunks<const C: usize>(
     Ok(())
 }
 
-/// Whether a body of `body` bytes is one a batch has, otherwise `RecordRejected`, and holds `data`
-/// bytes, otherwise `WrongLength`.
 pub(super) fn holds<const C: usize>(body: usize, data: usize) -> Result<(), Error> {
     let held = u64::try_from(body)
         .ok()
@@ -184,12 +172,8 @@ pub(super) fn holds<const C: usize>(body: usize, data: usize) -> Result<(), Erro
     }
 }
 
-/// Opens `body`, chunks of `C` bytes each followed by its tag, into `data`, under `key`, with the
-/// nonce of each chunk's number and of whether it is the last, and the associated data `aad`. Each
-/// chunk is opened in a buffer of this frame and goes into `data` only once it has opened. A body
-/// of a length no batch has is refused as `RecordRejected` and data of another length than it
-/// holds as `WrongLength`, writing nothing, and a chunk that does not open as `RecordRejected`,
-/// after the chunks before it; the caller wipes the data.
+/// Each chunk is opened in a buffer of this frame and goes into `data` only once it has opened.
+/// One that does not open stops the opening after those before it; the caller wipes the data.
 #[inline(never)]
 pub(super) fn open_batch_in<const C: usize>(
     key: &[u8; CIPHER_KEY_LEN],
@@ -268,8 +252,6 @@ mod tests {
         (result, data)
     }
 
-    /// Data of any length up to three chunks are sealed chunk by chunk, each under the nonce of
-    /// its number and of whether it is the last, with its tag after it, and open back.
     #[test]
     fn a_body_is_its_chunks_each_followed_by_its_tag() {
         for len in [0, 1, 15, 16, 17, 32, 33, 48] {
@@ -295,8 +277,6 @@ mod tests {
         }
     }
 
-    /// The data are sealed, and the body opened, in a buffer of the library: the cipher never sees
-    /// the body when sealing nor the data when opening.
     #[test]
     fn the_cipher_sees_neither_the_body_nor_the_data() {
         let data = data_of(40);
@@ -329,9 +309,6 @@ mod tests {
         assert_eq!(held, data);
     }
 
-    /// A body cut by a chunk, grown by one, with two chunks swapped, changed in any byte, under
-    /// another key or other associated data, does not open. The data then hold the chunks that
-    /// opened before the one refused, and nothing of it or after it.
     #[test]
     #[expect(
         clippy::integer_division,
@@ -370,8 +347,6 @@ mod tests {
         }
     }
 
-    /// A body of a length no body has is refused as `RecordRejected`, and a body or data of
-    /// another length than the other takes as `WrongLength`, before anything is written.
     #[test]
     fn buffers_of_other_lengths_are_refused() {
         assert_eq!(fits::<16>(40, 88), Ok(()));
@@ -399,8 +374,6 @@ mod tests {
         );
     }
 
-    /// A seal that fails on any chunk, the last too, stops there: the body holds the chunks sealed
-    /// before it and nothing of it or after it. An opening refused on any chunk stops likewise.
     #[test]
     fn a_failure_on_any_chunk_stops_there() {
         let data = data_of(40);

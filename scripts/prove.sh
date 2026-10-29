@@ -2,35 +2,21 @@
 # SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 # SPDX-License-Identifier: AGPL-3.0-only
 
-# Runs the Kani proofs, each in a Kani run of its own, and judges them.
+# Runs the Kani proofs, each in a run of its own, and judges every check they report. Kani itself
+# reports success with an unreached cover property.
 #
 #   prove.sh             runs every proof, two at a time or LETHEWIS_PROOF_JOBS, then judges them
 #   prove.sh list        writes the declared proofs and prints their names as a JSON array
 #   prove.sh run PROOF   runs one proof; its results and peak memory go to target/proofs/runs/
-#   prove.sh part K N    runs the K-th of N parts of the proofs, for N machines at once, balanced
-#                        by the seconds in scripts/proof-times, LETHEWIS_PROOF_JOBS at a time; a
-#                        proof starts beside others only if their peaks there and its own come
-#                        within LETHEWIS_PROOF_MEMORY megabytes; `prove.sh judge` judges the parts
-#   prove.sh times       updates in scripts/proof-times the seconds and peaks of the proofs whose
-#                        results are in target/proofs/runs/
-#   prove.sh judge       judges the results in target/proofs/runs/ against the declared proofs
-#   prove.sh agree       compares, on a few proofs, Kani's own results with how a run reads them
-#   prove.sh sources     prints a digest of Kani and of every file but the documents; a run
-#                        writes it beside its results if the files did not change while it ran
-#
-# A run reads its results from CBMC's plain output with scripts/cbmc-results.py: Kani's own results
-# have CBMC build a trace for every region coverage reaches, which costs most of the time. Kani
-# itself stops at the end of such a run, on coverage it cannot read; the reading refuses anything
-# incomplete, and `agree` holds it to Kani's results on proofs with every outcome.
-#
-# The judgement accepts the results only if each file holds the one proof it is named after, all of
-# them come from the same tools, the pinned Kani ran, every declared proof ran and succeeded, every
-# proof lives in a module `proofs`, has a cover property and reached all of them, every proof checks
-# code in this repository, every kani::assert( and kani::cover!( written out in the source is in the
-# results, some proof reaches every region that Kani compiled of the code in the modules `proofs`,
-# and Kani reported no check in this repository's code as unreachable. Kani itself reports success
-# with an unreached cover property, so each check is judged here. Writes the manifest of what was
-# proven to target/proofs/manifest.json.
+#   prove.sh part K N    runs part K of N, balanced by scripts/proof-times, LETHEWIS_PROOF_JOBS at
+#                        a time. A proof joins others only if their peaks fit LETHEWIS_PROOF_MEMORY
+#                        megabytes.
+#   prove.sh times       updates scripts/proof-times from the results in target/proofs/runs/
+#   prove.sh judge       judges target/proofs/runs/ against the declared proofs and writes
+#                        target/proofs/manifest.json
+#   prove.sh agree       compares Kani's own results with a run's reading, on a few proofs
+#   prove.sh sources     prints a digest of Kani and of every file but the documents. A run writes
+#                        it beside its results if no file changed meanwhile.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 # shellcheck source=scripts/kani-pin.sh
@@ -43,7 +29,6 @@ times=scripts/proof-times
 
 placed() {
   local misplaced
-  # The reading of the results knows nothing of a proof that must panic.
   if git grep -q 'kani::should_panic' -- '*.rs' ':!checks/'; then
     echo "prove: a proof that must panic, which the reading of the results does not support" >&2
     exit 1
@@ -68,14 +53,12 @@ declare_proofs() {
   placed
 }
 
-# Paths inside an artifact refuse a colon, so the path separators of a proof's name become dots in
-# the name of its file.
+# Artifact paths refuse a colon, so `::` in a proof's name becomes a dot in its file name.
 run_file() {
   printf '%s/%s.json' "$runs" "${1//::/.}"
 }
 
-# Runs a command, and writes into FILE the peak memory, in megabytes, of the largest process it
-# started.
+# Runs a command and writes into FILE the peak memory, in megabytes, of its largest process.
 peak() {
   python3 -c 'import math, resource, subprocess, sys
 status = subprocess.call(sys.argv[2:])
@@ -89,8 +72,8 @@ read_run() {
   local manifest=$1 proof=$2 file=$3 started
   rm -f "$file" "$file.part" "${file%.json}.peak"
   started=${EPOCHREALTIME//[^0-9]/}
-  # In a crate without the standard library Kani reports an assert! or unwrap that is never reached
-  # as a success; line coverage shows it.
+  # Without the standard library Kani reports a never-reached assert! or unwrap as a success; line
+  # coverage shows it.
   peak "${file%.json}.peak" cargo kani --manifest-path "$manifest" --harness "$proof" --exact \
     --output-format old --harness-timeout 10m --coverage -Z source-coverage -Z unstable-options \
     >"${file%.json}.txt" 2>&1 || true
@@ -131,8 +114,8 @@ run_proof() {
   fi
 }
 
-# Kani's own results against the reading of the same run: a proof with every outcome, failures
-# among them, and two of this repository's.
+# Kani's own results against our reading of the same run: a proof with every outcome, and two of
+# ours.
 agree() {
   local manifest_proof manifest proof file
   for manifest_proof in checks/kani-reading/Cargo.toml:proofs::every_outcome \
@@ -162,7 +145,7 @@ agree() {
       grep -q '^\[.*\] file [^ ]* line ' "$file.read.txt" ||
         { echo "prove: $proof no longer gives a check placed in another file" >&2; exit 1; }
     fi
-    # A run cut short, or with a line of its results lost, is refused, not read as far as it goes.
+    # A run cut short, or missing a line of results, is refused, not read as far as it goes.
     awk '/^\*\* Results:$/ { at = NR } at && NR > at + 10 { exit } { print }' \
       "$file.read.txt" >"$file.cut.txt"
     awk '/^\*\* Results:$/ { at = NR } !(at && /\.code_coverage\.[0-9]+\] / && !lost++) { print }' \
@@ -193,7 +176,6 @@ prove_all() {
   judge
 }
 
-# The K-th of N parts of the declared proofs.
 prove_part() {
   local part=$1 parts=$2 jobs=${LETHEWIS_PROOF_JOBS:-2}
   local memory=${LETHEWIS_PROOF_MEMORY:-$((1 << 40))}
@@ -237,9 +219,8 @@ prove_part() {
   run_within "$jobs" "$memory" "${ordered[@]}"
 }
 
-# Runs the proofs of the lines "<megabytes> <proof>" in their order, at most JOBS at once; beside
-# running proofs one starts only if its peak fits with theirs within MEMORY megabytes, and one that
-# does not fit lets the next one start. Fails if a proof failed; a signal stops them all.
+# Runs the proofs of the lines "<megabytes> <proof>", at most JOBS at once. One starts beside others
+# only if their peaks fit in MEMORY megabytes; fails if a proof failed.
 run_within() {
   local jobs=$1 memory=$2 failed=0 used=0 index size pid running slot started
   shift 2
@@ -329,8 +310,8 @@ judge() {
   fi
   placed
   git -c core.excludesFile=/dev/null ls-files -z --cached --others --exclude-standard >"$out/files"
-  # Every kani::assert( and kani::cover!( written out in the source; each must be in the results.
-  # checks/ holds workspaces of their own, which Kani does not build.
+  # Every kani::assert( and kani::cover!( in the source must be in the results. Kani does not build
+  # checks/, which holds workspaces of its own.
   local file
   while IFS= read -r -d '' file; do
     [[ $file == *.rs && $file != checks/* && -f $file ]] || continue
@@ -343,8 +324,7 @@ judge() {
   if [ -d "$runs" ]; then
     mapfile -d '' files < <(find "$runs" -maxdepth 1 -name '*.json' -print0 | sort -z)
   fi
-  # Only the results and the descriptions of the proofs are merged: the summary and the time of a
-  # file belong to its own run.
+  # Only results and proof descriptions are merged: a file's summary and time belong to its own run.
   split=$(jq -rn '
     [inputs | {name: (input_filename | split("/") | last | rtrimstr(".json") | gsub("\\."; "::")),
                run: .}] as $runs
@@ -391,10 +371,8 @@ judge() {
     fail=1
   fi
 
-  # Every check is judged by itself, not by a summary: a summary field that disappears in another
-  # Kani version would read as zero and pass. A file is ours if git tracks it, or if it is new and
-  # neither .gitignore nor .git/info/exclude ignores it: Kani also writes relative paths for its own
-  # library and for built-in functions.
+  # Every check is judged by itself, not by a summary field that another Kani version may drop.
+  # A file is ours if git lists it, since Kani also writes relative paths for its own library.
   problems=$(jq -r --rawfile names "$out/files" --rawfile asserted "$out/asserted" '
     (.project.workspace_root // "") as $root
     | ($names | split("\u0000") | map(select(. != ""))) as $files

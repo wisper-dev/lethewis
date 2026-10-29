@@ -1,12 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The hierarchy of keys end to end, through the public interface alone: ways in from a password
-//! with the chip and from words, a profile key locked under each, keys of chats under the profile
-//! key, a change of epoch that destroys a chat and revokes a way in replaced by another, and the
-//! keys of chats carried to another device and into a backup under the words. Each block of slots
-//! stands for a run of the application on one device, which keeps between runs only its records,
-//! the password parameters, and the number and root of the epoch.
+//! The hierarchy of keys end to end; each block of slots stands for a run on one device.
 
 use hkdf::Hkdf;
 use lethewis_core::{
@@ -40,7 +35,6 @@ impl Entropy for Source {
     }
 }
 
-/// The platform's root of each epoch: it records each switch and erasure, and erases for certain.
 #[derive(Default)]
 struct Platform(Vec<(&'static str, u64)>);
 
@@ -69,8 +63,6 @@ fn answer(challenge: &[u8; 32]) -> [u8; 32] {
     Hkdf::<Sha256>::extract(Some(&CHIP), challenge).0.into()
 }
 
-/// The way in from `password` and the chip: the key from the password combined with the chip's
-/// answer to its challenge.
 fn with_the_chip<'a>(
     slots: &mut Slots<'a>,
     password: &[u8],
@@ -86,7 +78,6 @@ fn with_the_chip<'a>(
     slots.combine(key, answered)
 }
 
-/// The key of the chat in `record` under `profile`.
 fn chat_key<'a>(
     slots: &mut Slots<'a>,
     profile: Handle<'a>,
@@ -155,7 +146,6 @@ fn a_profile_opens_with_a_password_and_the_chip_or_with_the_words() {
     assert_eq!(chat_key(&mut slots, profile, b"chat", &chat), Ok(key));
 }
 
-/// What the application keeps after the first run in epoch 1.
 struct Kept {
     words: Words,
     by_words: [u8; LOCK_RECORD_LEN],
@@ -164,8 +154,6 @@ struct Kept {
     keys: [[u8; 32]; 2],
 }
 
-/// The first run: a profile key locked under words and under the old passkey, and the keys of two
-/// chats under it.
 fn first_run(source: &mut Source) -> Result<Kept, Error> {
     let mut kept = Kept {
         words: [[0; WORD_LEN]; WORD_COUNT],
@@ -197,7 +185,6 @@ fn first_run(source: &mut Source) -> Result<Kept, Error> {
     Ok(kept)
 }
 
-/// The key of the second chat through the old passkey, in a run of epoch 1 with the root `of`.
 fn left_behind(of: u8, kept: &Kept) -> Result<[u8; 32], Error> {
     let mut memory = [const { Slot::empty() }; 4];
     let mut epoch = Epoch::empty();
@@ -286,13 +273,11 @@ fn a_change_of_epoch_destroys_a_chat_and_revokes_a_replaced_way_in() {
 /// The secret both devices share once they agree on it, as a key agreement gives it.
 const SHARED: [u8; 32] = [0x2e; 32];
 
-/// The records of an export and its end.
 struct Export {
     records: Vec<[u8; RECORD_LEN]>,
     end: [u8; END_RECORD_LEN],
 }
 
-/// Exports the chats in `chats`, under `profile`, under the key for transfers `transfer`.
 fn export_chats<'a>(
     slots: &mut Slots<'a>,
     source: &mut Source,
@@ -314,8 +299,7 @@ fn export_chats<'a>(
     Ok(export)
 }
 
-/// Receives `export` under `transfer` and wraps each chat under `profile`, in the order the chats
-/// went out, once the end is received; returns the records of the chats on this device.
+/// Wraps each chat under `profile`, in the order the chats went out, once the end is received.
 fn receive_chats<'a>(
     slots: &mut Slots<'a>,
     source: &mut Source,
@@ -337,8 +321,6 @@ fn receive_chats<'a>(
     Ok(records)
 }
 
-/// The chats of the first run go to a second device in another epoch under a secret both share:
-/// there they come under its own profile key; an export cut short leaves nothing to keep.
 #[test]
 fn chats_move_to_a_second_device() {
     let mut source = Source(3);
@@ -394,10 +376,7 @@ fn chats_move_to_a_second_device() {
     }
 }
 
-/// A backup under the words of the first run: the device keeps its key for transfers under the
-/// profile key and writes the backup without the words; a new phone restores it from the words
-/// alone. A backup made before a chat is destroyed keeps that chat, and an older backup under the
-/// same words opens as well as a newer one: no backup tells its age.
+/// An older backup under the same words opens as well as a newer one: no backup tells its age.
 #[test]
 fn a_backup_under_the_words_restores_on_a_new_phone() {
     let mut source = Source(4);

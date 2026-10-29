@@ -46,66 +46,49 @@ password and the hardware secret at each unlock, and neither alone is enough.
 
 ## What is not guaranteed
 
-- **A destroyed key is gone once the epoch change is committed and the hardware erases the old
-  root.** Records of the old epoch, on flash or in an earlier copy of the device, then no longer open,
-  unless the hardware's own keys leak. Without such a root a destroyed key is most likely gone, not
-  certainly.
-- **A key derived from a password, twelve words or two shares comes back from them.** Destroying it
+- A destroyed key is gone only after the epoch change is committed and the hardware erases the old
+  root. If that root survives or the hardware's keys leak, old records may still open.
+- A key derived from a password, twelve words or two shares comes back from them. Destroying it
   does not reach them; destroying the profile key it opens does.
-- **An export outlives what happens on the device after it.** Its records and blocks open with its
-  key for transfers in any epoch, so destroying a chat or the profile does not reach an export made
-  before. No export tells its age: an older backup under the same words opens as a newer one does.
-- **A way in is revoked only by the next change of epoch.** A lock record left behind opens until
-  the change is committed and the old root erased. Against someone who held an epoch's key while
-  the record lived and knows its secret, only a new profile key helps.
-- **A changed public key of an archive key is found only at its next load.** Whoever holds the key
-  of the epoch and the profile's stored key can change it in its record. Batches archived until
-  then go to their key and no longer open under the archive key; they come from chats whose keys
-  that holder reads already.
-- **The archive keeps batches secret but does not prove where they came from,** and their secrecy
-  against whoever holds the main password rests on the random source when they are archived.
-- **A block of data or a batch of the archive shows its length, and which exist is the caller's to
-  keep.** An older block or batch put back in the same place, or one deleted, goes unnoticed unless
-  the caller's index catches it. Padding is the caller's too.
-- **A challenge to the chip is as sensitive as a hash of the password.** Whoever reads one on its
-  way to the chip can test guesses at the password without the chip. Wiping it after use and
-  passing it only to the chip is the caller's.
-- **Wiping a value from memory does not reach every copy.** Copies from a move, a reallocation, a
-  register, swap or a crash dump are beyond this library. Every call that derives from a key, runs
-  the cipher or X-Wing wipes the stack it used, as measured on x86-64 and aarch64 Linux.
-- **The stack a call needs is not measured on microcontrollers.** On a target such as Cortex-M a
-  call needs at least the depth of the wipe after it, which its documentation states, and an
-  overflow of an unguarded stack corrupts memory silently. A derivation from a password needs at
-  least 64 MiB of working memory, which few microcontrollers have.
-- **The cost of a derivation from a password is not tuned here.** The library refuses less than 64
-  MiB of memory and fewer than 3 passes. Choosing parameters that take a few seconds on a device is
-  the caller's, and so is bringing a password typed as text into one Unicode form.
-- **A key handed out is the caller's to wipe.** A key for external data leaves in the clear only
-  through `Slots::reveal32`, and that copy is out of the library's reach.
-- **Keys for wrapping and for transfers leave in the clear only as words or shares of a
-  generation.** Keeping them is the caller's.
-- **A broken random source is covered only in part.** Keys, words, shares and nonces are hedged
-  with the key of the epoch, as RFC 8937 has it.
-- **Within one `Slots`, a broken source alone makes none of them predictable.** Not covered: an
-  epoch key from that source, a copied process or machine, repeats across `Slots`, and password
-  salts.
-- **Twelve words are as safe as the place they are kept.** Whoever reads them derives the key. The
-  library writes them once, from the English list of BIP 39; keeping them off screenshots, the
-  clipboard, the keyboard's memory and backups is the caller's. About one changed word in sixteen
-  passes the checksum, and its key opens no record.
-- **Any two holders of shares open what the shares protect.** Two of them agreeing, forced or
-  deceived are enough; one alone learns nothing.
-- **A changed share is refused, not named.** A 4-byte check split with the secret catches a change,
-  except once in 2^32; nothing tells which share changed.
-- **Hardware-backed keys are not available everywhere.** A dedicated secure element is absent on a
-  large share of Android devices, and our figure for that share is an estimate rather than a
-  measurement. Where the element is missing, protection falls back and records the level actually
-  reached.
-- **A device unlocked since boot has its keys in memory already.** No key-storage library changes
-  that, and a lock screen is not a defence against someone holding such a device.
-- **A proof is about one named statement, not about safety.** Where a property is proven, the claim
-  names the tool, its version, the assumptions and what is not covered. The phrase "formally
-  verified" is not used here on its own.
+- An export outlives later changes on the device: its key for transfers opens it in any epoch. No
+  export tells its age, so an older backup opens as a newer one does.
+- A lock record left behind opens until the next change of epoch. Against someone who held that
+  epoch's key and the record's secret, only a new profile key helps.
+- A changed public key of an archive key is found only at its next load. Batches archived before
+  that go to the changed key, and only someone who already reads those chats can change it.
+- The archive keeps batches secret but does not prove where they came from. Against whoever holds
+  the main password, their secrecy rests on the random source at archiving.
+- A block of data or a batch shows its length; padding and the list of blocks are the caller's.
+  An older block put back, or one deleted, goes unnoticed unless the caller's index catches it.
+- A challenge to the chip is as sensitive as a hash of the password. Whoever reads one can test
+  guesses without the chip; keeping it to the chip and wiping it is the caller's.
+- Wiping does not reach copies left by a move, a reallocation, a register, swap or a crash dump.
+  Every call that derives, encrypts or runs X-Wing wipes its stack, measured on Linux.
+- The stack a call needs is not measured on microcontrollers, where an unguarded overflow corrupts
+  memory silently. Each call documents the least it needs; a derivation from a password also needs
+  64 MiB of memory.
+- The cost of a derivation from a password is the caller's, past a floor of 64 MiB and 3 passes.
+  So is bringing typed text into one Unicode form.
+- A key handed out is the caller's to wipe. Only a key for external data leaves in the clear,
+  through `Slots::reveal32`.
+- Keys for wrapping and for transfers leave in the clear only as words or shares of a generation.
+  Keeping them is the caller's.
+- A broken random source is covered in part, by hedging with the epoch key per RFC 8937. Not
+  covered: an epoch key from that source, a copied process or machine, repeats across `Slots`, and
+  password salts.
+- Twelve words are as safe as the place they are kept: whoever reads them derives the key. Keeping
+  them off screenshots, the clipboard and backups is the caller's.
+- About one changed word in sixteen passes the checksum; the key it gives opens no record.
+- Any two holders of shares open what the shares protect, agreeing, forced or deceived. One alone
+  learns nothing.
+- A changed share is refused, not named. A 4-byte check split with the secret catches a change,
+  except once in 2^32.
+- A dedicated secure element is missing on a large share of Android devices, by our estimate.
+  There protection falls back and records the level it reached.
+- A device unlocked since boot has its keys in memory already. No key-storage library changes
+  that, and a lock screen is no defence against someone holding such a device.
+- A proof is about one named statement, not about safety. Each claim names the tool, its version,
+  the assumptions and what is not covered, and never says "formally verified" alone.
 
 The full statement of what is and is not defended, with the assumptions behind each:
 [docs/threat-model.md](docs/threat-model.md).
@@ -124,26 +107,25 @@ Hardware binding and the time lock will each be a crate of its own, listed here 
 
 Claimed and proven properties: [docs/proofs.md](docs/proofs.md).
 
-Minimum supported Rust version: **1.99**, as declared in the manifest. Newer compilers work, and a
-raise of this minimum is recorded in [CHANGELOG.md](CHANGELOG.md). Building this repository uses
-exactly 1.99.0, pinned in `rust-toolchain.toml`: a build that reproduces byte for byte needs one exact
-compiler rather than a channel. That pin is not part of the published package and does not constrain
-what a dependent builds with.
+Minimum supported Rust version: 1.99, as declared in the manifest; newer compilers work. A raise is
+recorded in [CHANGELOG.md](CHANGELOG.md).
+
+This repository builds with exactly 1.99.0, pinned in `rust-toolchain.toml` so that builds reproduce
+byte for byte. The pin is not part of the published package.
 
 How dependencies are reviewed, and which versions a dependent receives:
 [SECURITY.md](SECURITY.md#dependencies).
 
 ## Reporting and contributing
 
-- **Security:** report through the private advisory form, not as a public issue. Terms and
-  timings: [SECURITY.md](SECURITY.md).
-- **Bugs and problems with a proof:** open an issue. A property that does not hold is the single most
-  useful report this project can get.
-- **Suggestions and requests for functionality** not listed above: open an issue. A use the library
-  does not cover yet is worth knowing about.
-- **Code:** not accepted yet; [CONTRIBUTING.md](CONTRIBUTING.md) explains why. Describe the fix in
-  an issue instead.
-- **Conduct:** [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+Report a security problem through the private advisory form, not as a public issue. Terms and
+timings are in [SECURITY.md](SECURITY.md).
+
+Bugs, problems with a proof and requests for functionality go in issues. A property that does not
+hold is the most useful report this project can get.
+
+Code is not accepted yet, for the reasons in [CONTRIBUTING.md](CONTRIBUTING.md); describe the fix in
+an issue instead. The code of conduct is in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## Licence
 
@@ -151,5 +133,4 @@ How dependencies are reviewed, and which versions a dependent receives:
 `crates/lethewis-core/src/words/english.txt` is under the
 [MIT licence](crates/lethewis-core/LICENSE-MIT), and its notice goes with any build that holds it.
 
-**A commercial licence without the AGPL's obligations is available.** Write to
-<hi@alanwisper.com>.
+A commercial licence without the AGPL's obligations is available from <hi@alanwisper.com>.

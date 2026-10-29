@@ -12,24 +12,20 @@ use polyval::{Polyval, universal_hash::UniversalHash};
 use crate::key::{wipe, wipe_slice};
 use crate::record::PLAINTEXT_LEN;
 
-/// The size of the key a record is encrypted with, in bytes.
 pub(crate) const KEY_LEN: usize = 32;
 pub(crate) const NONCE_LEN: usize = 12;
 pub(crate) const TAG_LEN: usize = 16;
 
-/// Nothing was encrypted: the cipher refused the input, or it gave a known input a wrong answer, so
-/// this build or this processor does not compute AES-256-GCM-SIV.
+/// Nothing was encrypted: the cipher refused the input or gave a known input a wrong answer. This
+/// build or processor does not compute AES-256-GCM-SIV.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SealFailed;
 
-/// The record does not open under this key, nonce and associated data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Rejected;
 
-/// AES-256-GCM-SIV, as the calls of the slots seal and open with it: [`seal`] and [`open`].
 pub(crate) struct Aes;
 
-/// An input of the shape of a record, and what AES-256-GCM-SIV makes of it.
 struct Known {
     key: [u8; KEY_LEN],
     nonce: [u8; NONCE_LEN],
@@ -39,7 +35,7 @@ struct Known {
     tag: [u8; TAG_LEN],
 }
 
-/// Computed by an implementation of RFC 8452 that shares no code with this one and gives the
+/// Computed by an implementation of RFC 8452 that shares no code with this one. It gives the
 /// vectors of its appendices C.2 and C.3.
 #[rustfmt::skip]
 const KNOWN: Known = Known {
@@ -102,9 +98,8 @@ const KNOWN: Known = Known {
     ],
 };
 
-/// Encrypts `buffer` in place with AES-256-GCM-SIV and returns the tag. The cipher first encrypts a
-/// known input; if its answer is wrong or the cipher fails, `buffer` is wiped and nothing is
-/// encrypted. The cipher runs the same code for every length.
+/// The cipher first encrypts a known input. If the answer is wrong or the cipher fails, `buffer` is
+/// wiped and nothing is encrypted.
 pub(crate) fn seal<const N: usize>(
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],
@@ -146,15 +141,12 @@ fn seal_checked<const N: usize>(
     sealed
 }
 
-/// Whether the cipher gives the known answer.
 fn answers(known: &Known) -> bool {
     let mut buffer = known.plaintext;
     encrypt(&known.key, &known.nonce, known.aad, &mut buffer)
         .is_ok_and(|tag| buffer == known.ciphertext && tag == known.tag)
 }
 
-/// Decrypts `buffer` in place if `tag` matches it, the key, the nonce and the associated data, and
-/// otherwise wipes it.
 pub(crate) fn open<const N: usize>(
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],
@@ -169,10 +161,8 @@ pub(crate) fn open<const N: usize>(
     opened
 }
 
-/// Encrypts `buffer`, a chunk of a block of data of any length, in place as [`seal`] does, and
-/// returns the tag. The cipher first encrypts a known input, and then the chunk is opened under its
-/// tag and sealed again, which gives the same bytes and tag unless the cipher erred in one of these
-/// passes. On any failure `buffer` is wiped.
+/// Encrypts `buffer`, a chunk of any length, in place as [`seal`] does, and returns the tag. The
+/// chunk is then opened under its tag and sealed again; on any failure `buffer` is wiped.
 pub(crate) fn seal_data(
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],
@@ -182,7 +172,6 @@ pub(crate) fn seal_data(
     seal_data_checked(&KNOWN, encrypt_data, key, nonce, aad, buffer)
 }
 
-/// An encryption of a chunk in place, which gives its tag.
 trait Encrypt:
     FnMut(&[u8; KEY_LEN], &[u8; NONCE_LEN], &[u8], &mut [u8]) -> Result<[u8; TAG_LEN], SealFailed>
 {
@@ -232,9 +221,8 @@ fn seal_data_checked(
     sealed
 }
 
-/// Opens the chunk `buffer` sealed under `tag` and seals it again with `encrypt_chunk`: AES-256-GCM-SIV gives the same
-/// ciphertext and tag for the same input, so a chunk that does not open, another tag or another
-/// digest of the ciphertext is a fault of the cipher on this chunk.
+/// AES-256-GCM-SIV gives the same ciphertext and tag for the same input. So a chunk that does not
+/// open, or gives another tag or digest, shows a cipher fault.
 fn sealed_again(
     encrypt_chunk: &mut impl Encrypt,
     key: &[u8; KEY_LEN],
@@ -253,12 +241,11 @@ fn sealed_again(
     }
 }
 
-/// The key of [`digest`].
 #[cfg(not(kani))]
 const DIGEST_KEY: [u8; 16] = *b"lethewis digest.";
 
-/// POLYVAL of `bytes` under a fixed key. A change of `bytes` that does not depend on the key
-/// leaves it as it was with a chance of at most one in 2^128 for each block of 16 bytes.
+/// A key-independent change of `bytes` keeps the digest with a chance of at most 2^-128 per 16-byte
+/// block.
 #[cfg(not(kani))]
 fn digest(bytes: &[u8]) -> [u8; 16] {
     let mut hash = Polyval::new(&DIGEST_KEY.into());
@@ -266,8 +253,6 @@ fn digest(bytes: &[u8]) -> [u8; 16] {
     hash.finalize().into()
 }
 
-/// Decrypts `buffer`, a chunk of a block of data, in place if `tag` matches it, the key, the nonce
-/// and the associated data, and otherwise wipes it.
 pub(crate) fn open_data(
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],
@@ -332,11 +317,8 @@ pub(crate) mod model {
 
     use super::{KEY_LEN, NONCE_LEN, PLAINTEXT_LEN, Rejected, SealFailed, TAG_LEN};
 
-    /// The places the model keeps a seal in, by the length of what is sealed: the last seal of the
-    /// plaintext of a record, or of nothing, and the last seal of any other length, which in the
-    /// proofs that read it is a layer; and how many bytes of the plaintext, of what was written and
-    /// of the associated data the model keeps: the associated data as far as a context of two
-    /// bytes reaches.
+    /// Where the model keeps a seal: a record, nothing, or any other length, which proofs read as a
+    /// layer. Associated data is kept as far as a context of two bytes reaches.
     pub(crate) const RECORD: usize = 0;
     pub(crate) const LAYER: usize = 1;
     /// The last seal of a chunk of a block of data, whatever its length.
@@ -346,9 +328,7 @@ pub(crate) mod model {
     pub(crate) const AAD_HEAD: usize = 39;
 
     /// What the last seal that succeeded in each place was given and gave, so that a proof can
-    /// follow it: the key, the nonce, the first bytes of the associated data and its length, the
-    /// first and the last bytes of the plaintext, the first bytes of what was written, and the tag.
-    /// Kept in words of eight bytes: a store per byte multiplies the proofs' work.
+    /// follow it. Kept in words of eight bytes: a store per byte multiplies the proofs' work.
     static SEALED: [AtomicBool; KEPT] = [const { AtomicBool::new(false) }; KEPT];
     static KEYS: [[AtomicU64; 4]; KEPT] = [const { [const { AtomicU64::new(0) }; 4] }; KEPT];
     static NONCES: [[AtomicU64; 2]; KEPT] = [const { [const { AtomicU64::new(0) }; 2] }; KEPT];
@@ -359,9 +339,8 @@ pub(crate) mod model {
     static WRITTEN: [[AtomicU64; 4]; KEPT] = [const { [const { AtomicU64::new(0) }; 4] }; KEPT];
     static TAGS: [[AtomicU64; 2]; KEPT] = [const { [const { AtomicU64::new(0) }; 2] }; KEPT];
 
-    /// What a seal was given and gave: the key, the nonce, the first bytes of the associated data,
-    /// zero past its end, and its length, the first and the last bytes of the plaintext, the first
-    /// bytes of what was written, and the tag.
+    /// What a seal was given and gave: the start of associated data, zero past its end, and both
+    /// plaintext ends. Also the start of what was written.
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub(crate) struct Sealed {
         pub(crate) key: [u8; KEY_LEN],
@@ -374,18 +353,15 @@ pub(crate) mod model {
         pub(crate) tag: [u8; TAG_LEN],
     }
 
-    /// The first bytes of `buffer`, or zeros for a shorter one.
     pub(super) fn head<const N: usize>(buffer: &[u8; N]) -> [u8; HEAD] {
         buffer.first_chunk::<HEAD>().copied().unwrap_or([0; HEAD])
     }
 
-    /// The first bytes of a chunk, zero past its end, read one by one: Kani 0.68.0 reads stale
-    /// bytes in a slice copy of unknown length.
+    /// Read one by one: Kani 0.68.0 reads stale bytes in a slice copy of unknown length.
     pub(super) fn head_of(buffer: &[u8]) -> [u8; HEAD] {
         core::array::from_fn(|place| buffer.get(place).copied().unwrap_or(0))
     }
 
-    /// The last bytes of a chunk, as many as a tag, or zeros for a shorter one, read one by one.
     pub(super) fn end_of(buffer: &[u8]) -> [u8; TAG_LEN] {
         match buffer.len().checked_sub(TAG_LEN) {
             Some(from) => core::array::from_fn(|place| {
@@ -395,7 +371,6 @@ pub(crate) mod model {
         }
     }
 
-    /// The last bytes of `buffer`, as many as a tag, or zeros for a shorter one.
     pub(super) fn end<const N: usize>(buffer: &[u8; N]) -> [u8; TAG_LEN] {
         buffer
             .last_chunk::<TAG_LEN>()
@@ -403,9 +378,8 @@ pub(crate) mod model {
             .unwrap_or([0; TAG_LEN])
     }
 
-    /// Keeps what a seal of `N` bytes that succeeded was given and gave, in the place its length
-    /// takes: the place is known when the proof is built, so that the model reads and writes no
-    /// place the proof has to work out.
+    /// The place is known when the proof is built, so the model touches no place the proof must
+    /// work out.
     pub(super) fn keep_seal<const N: usize>(
         key: &[u8; KEY_LEN],
         nonce: &[u8; NONCE_LEN],
@@ -421,7 +395,6 @@ pub(crate) mod model {
         keep_in(at, key, nonce, aad, kept, tag);
     }
 
-    /// Keeps what a seal of a chunk that succeeded was given and gave, in its own place.
     pub(super) fn keep_data_seal(
         key: &[u8; KEY_LEN],
         nonce: &[u8; NONCE_LEN],
@@ -475,14 +448,12 @@ pub(crate) mod model {
         }
     }
 
-    /// Whether a seal that succeeded is kept at `at`.
     pub(crate) fn kept_at(at: usize) -> bool {
         SEALED
             .get(at)
             .is_some_and(|sealed| sealed.load(Ordering::Relaxed))
     }
 
-    /// What the last seal that succeeded and is kept at `at` was given and gave.
     pub(crate) fn sealed(at: usize) -> Sealed {
         Sealed {
             key: KEYS.get(at).map_or([0; KEY_LEN], kept),
@@ -511,7 +482,6 @@ pub(crate) mod model {
         }
     }
 
-    /// The `N` bytes kept in `words`.
     fn kept<const N: usize, const W: usize>(words: &[AtomicU64; W]) -> [u8; N] {
         let mut padded = [0; 40];
         for (word, chunk) in words.iter().zip(padded.chunks_exact_mut(8)) {
@@ -524,12 +494,12 @@ pub(crate) mod model {
         bytes
     }
 
-    /// Whether the last decryption was rejected, so a proof can tell a rejection by the cipher from
+    /// Whether the last decryption was rejected, so a proof can tell the cipher's rejection from
     /// one the code makes up.
     static REJECTED: AtomicBool = AtomicBool::new(false);
 
-    /// AES-256-GCM-SIV is beyond Kani. Encryption writes any bytes, then gives any tag or fails. The
-    /// buffer is written whole: a write per byte multiplies the proofs' work.
+    /// AES-256-GCM-SIV is beyond Kani. The buffer is written whole: a write per byte multiplies the
+    /// proofs' work.
     pub(super) fn encrypt<const N: usize>(
         _: &[u8; KEY_LEN],
         _: &[u8; NONCE_LEN],
@@ -545,12 +515,11 @@ pub(crate) mod model {
         }
     }
 
-    /// The tags the last two encryptions of a chunk gave, as numbers, and how many decryptions of
-    /// a chunk ran, so that a proof can tell a chunk checked by opening and sealing it again.
+    /// The tags of the last two encryptions of a chunk, as numbers, and how many chunk decryptions
+    /// ran. A proof then tells a chunk checked by opening and sealing it again.
     static CHUNK_TAGS: [[AtomicU64; 2]; 2] = [const { [const { AtomicU64::new(0) }; 2] }; 2];
     static CHUNK_OPENINGS: AtomicUsize = AtomicUsize::new(0);
 
-    /// The same for a chunk of any length, written byte by byte, recording what it was given.
     pub(super) fn encrypt_data(
         key: &[u8; KEY_LEN],
         nonce: &[u8; NONCE_LEN],
@@ -573,19 +542,16 @@ pub(crate) mod model {
         }
     }
 
-    /// The tags the last two encryptions of a chunk gave, the earlier first.
     pub(crate) fn chunk_tags() -> [[u8; TAG_LEN]; 2] {
         let [earlier, last] = &CHUNK_TAGS;
         [kept(earlier), kept(last)]
     }
 
-    /// How many decryptions of a chunk ran.
     pub(crate) fn chunk_openings() -> usize {
         CHUNK_OPENINGS.load(Ordering::Relaxed)
     }
 
-    /// What a call of the cipher on a chunk was given: the key, the nonce, the first bytes of the
-    /// associated data, zero past its end, as far as the proofs' reach, and its length.
+    /// What a cipher call on a chunk was given, with the associated data zero past its end.
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub(crate) struct Inputs {
         key: [u8; KEY_LEN],
@@ -595,7 +561,6 @@ pub(crate) mod model {
     }
 
     impl Inputs {
-        /// The inputs `key`, `nonce` and `aad`.
         pub(crate) fn of(key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], aad: &[u8]) -> Self {
             Self {
                 key: *key,
@@ -606,9 +571,8 @@ pub(crate) mod model {
         }
     }
 
-    /// The inputs of the first call of the cipher on a chunk, whether a later call was given
-    /// others, and the tag the last decryption of a chunk was given. Kept in places known when the
-    /// proof is built, which a count of the calls would not give.
+    /// Only the first call's inputs are kept: their places are known when the proof is built. A
+    /// count of the calls would not give that.
     static FIRST_KEY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
     static FIRST_NONCE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     static FIRST_AAD: [AtomicU64; 1] = [const { AtomicU64::new(0) }; 1];
@@ -639,32 +603,26 @@ pub(crate) mod model {
         }
     }
 
-    /// The inputs every call of the cipher on a chunk was given, if any ran and all were given the
-    /// same.
     pub(crate) fn chunk_inputs() -> Option<Inputs> {
         (CALLED.load(Ordering::Relaxed) && !OTHER_INPUTS.load(Ordering::Relaxed)).then(first_inputs)
     }
 
-    /// The tag the last decryption of a chunk was given.
     pub(crate) fn opened_tag() -> [u8; TAG_LEN] {
         kept(&OPENED_TAG)
     }
 
-    /// The first bytes of the chunk the last decryption of a chunk was given.
     static OPENED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-    /// The first bytes of the chunk the last decryption of a chunk was given.
     pub(crate) fn opened_chunk() -> [u8; TAG_LEN] {
         kept(&OPENED)
     }
 
-    /// The digest of a chunk is its first 16 bytes, zero past its end: exact for the chunks the
-    /// proofs take.
+    /// A chunk's digest is its first 16 bytes, zero past its end: exact for the chunks the proofs
+    /// take.
     pub(super) fn digest(bytes: &[u8]) -> [u8; 16] {
         core::array::from_fn(|place| bytes.get(place).copied().unwrap_or(0))
     }
 
-    /// The same for a chunk of any length, written byte by byte, recording what it was given.
     pub(super) fn decrypt_data(
         key: &[u8; KEY_LEN],
         nonce: &[u8; NONCE_LEN],
@@ -688,20 +646,18 @@ pub(crate) mod model {
         if rejected { Err(Rejected) } else { Ok(()) }
     }
 
-    /// Whether any seal has failed, the check on a known input or the encryption, so that a proof
-    /// can tell a success from one the code makes up after a failure.
+    /// Whether any seal has failed, on the known input or in encrypting. A proof then tells a
+    /// success from one the code makes up after a failure.
     static SEAL_FAILED: AtomicBool = AtomicBool::new(false);
 
     pub(super) fn note_seal_failed() {
         SEAL_FAILED.store(true, Ordering::Relaxed);
     }
 
-    /// Whether any seal has failed.
     pub(crate) fn any_seal_failed() -> bool {
         SEAL_FAILED.load(Ordering::Relaxed)
     }
 
-    /// Decryption writes any bytes, then accepts or rejects at will and records which.
     pub(super) fn decrypt<const N: usize>(
         _: &[u8; KEY_LEN],
         _: &[u8; NONCE_LEN],
@@ -716,12 +672,10 @@ pub(crate) mod model {
         if rejected { Err(Rejected) } else { Ok(()) }
     }
 
-    /// Whether the last decryption was rejected.
     pub(crate) fn rejected() -> bool {
         REJECTED.load(Ordering::Relaxed)
     }
 
-    /// Whether `refuse` was asked to decrypt.
     static ASKED: AtomicBool = AtomicBool::new(false);
 
     /// Rejects every decryption and records that one was asked, so that a proof can show that the
@@ -738,13 +692,12 @@ pub(crate) mod model {
         Err(Rejected)
     }
 
-    /// Whether `refuse` was asked to decrypt, or `refuse_chunk` or `fail_chunk` to run.
     pub(crate) fn asked() -> bool {
         ASKED.load(Ordering::Relaxed)
     }
 
-    /// Rejects every chunk and records that one was asked, so that a proof can show that the code
-    /// opens no chunk.
+    /// Rejects every chunk and records that one was asked, so a proof can show the code opens no
+    /// chunk.
     pub(crate) fn refuse_chunk(
         _: &[u8; KEY_LEN],
         _: &[u8; NONCE_LEN],
@@ -757,8 +710,8 @@ pub(crate) mod model {
         Err(Rejected)
     }
 
-    /// Fails every seal of a chunk and records that one was asked, so that a proof can show that
-    /// the code seals no chunk.
+    /// Fails every chunk seal and records that one was asked, so a proof can show the code seals no
+    /// chunk.
     pub(crate) fn fail_chunk(
         _: &[u8; KEY_LEN],
         _: &[u8; NONCE_LEN],
@@ -1221,7 +1174,6 @@ mod tests {
         }
     }
 
-    /// The known input with one byte of one field changed.
     fn changed(field: usize, at: usize) -> Known {
         let mut known = Known { ..KNOWN };
         match field {
@@ -1310,8 +1262,6 @@ mod tests {
         assert_eq!(chunk, [7; 100]);
     }
 
-    /// A fault of the first encryption of a chunk or of the second, in one byte of the chunk or in
-    /// its tag, fails the seal and wipes the chunk.
     #[test]
     fn a_fault_of_the_cipher_fails_the_seal_of_a_chunk_and_wipes_it() {
         for pass in 0..2 {
@@ -1382,8 +1332,6 @@ mod proofs {
     };
     use crate::record::{LAYER_LEN, PLAINTEXT_LEN};
 
-    /// Sealing any `N` bytes: it gives a tag, or fails and leaves the buffer zero. Returns whether it
-    /// sealed.
     fn seal_any<const N: usize>() -> bool {
         let mut buffer: [u8; N] = kani::any();
         let aad: [u8; 4] = kani::any();
@@ -1395,9 +1343,6 @@ mod proofs {
         sealed.is_ok()
     }
 
-    /// For any key, nonce, associated data and plaintext of a record or of the outer layer of a lock
-    /// record, and whatever the cipher does: sealing either gives a tag, or fails and leaves the
-    /// buffer zero.
     #[kani::proof]
     #[kani::unwind(270)]
     fn a_failed_seal_leaves_the_buffer_wiped() {
@@ -1410,8 +1355,6 @@ mod proofs {
         kani::cover!(!sealed, "a seal fails");
     }
 
-    /// Opening any `N` bytes: it fails exactly when the cipher rejects them, and then leaves the
-    /// buffer zero. Returns whether it opened.
     fn open_any<const N: usize>() -> bool {
         let mut buffer: [u8; N] = kani::any();
         let aad: [u8; 4] = kani::any();
@@ -1427,9 +1370,6 @@ mod proofs {
         opened.is_ok()
     }
 
-    /// For any key, nonce, associated data, tag and encrypted record or outer layer of a lock record,
-    /// and whatever the cipher does: opening fails exactly when the cipher rejects it, and then
-    /// leaves the buffer zero.
     #[kani::proof]
     #[kani::unwind(270)]
     fn a_rejected_record_leaves_the_buffer_wiped() {
@@ -1442,12 +1382,8 @@ mod proofs {
         kani::cover!(!opened, "a record is refused");
     }
 
-    /// For any key, nonce, associated data and chunk of `N` bytes, whatever the cipher does:
-    /// sealing the chunk either fails and leaves it zero, or gives the tag of its first encryption
-    /// once the chunk opened under it and sealed again to that tag and to the bytes that opened,
-    /// each pass under the same key, nonce and associated data.
-    /// The chunk is the start of a buffer of 16 bytes, so that an empty one is no object of size
-    /// zero, on which Kani 0.68.0 runs out of time.
+    /// The chunk starts a 16-byte buffer, so an empty one is no zero-sized object. On those Kani
+    /// 0.68.0 runs out of time.
     fn seal_chunk_of<const N: usize>() {
         let mut buffer: [u8; 16] = kani::any();
         let chunk = &mut buffer[..N];
@@ -1479,8 +1415,8 @@ mod proofs {
         );
     }
 
-    /// As above for a chunk of 16 bytes, of one byte and of none, which stand for every length:
-    /// this code reads their bytes only through the digest, which is exact for them.
+    /// Chunks of 16 bytes, one byte and none stand for every length. This code reads their bytes
+    /// only through the digest, which is exact for them.
     #[kani::proof]
     #[kani::unwind(270)]
     fn a_seal_of_a_full_chunk_is_checked() {
@@ -1499,9 +1435,6 @@ mod proofs {
         seal_chunk_of::<0>();
     }
 
-    /// For any key, nonce, associated data, tag and chunk of any length up to 16 bytes, and
-    /// whatever the cipher does: opening the chunk fails exactly when the cipher rejects it, and
-    /// then leaves it zero.
     #[kani::proof]
     #[kani::unwind(17)]
     fn a_rejected_chunk_leaves_it_wiped() {

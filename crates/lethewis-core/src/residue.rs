@@ -18,20 +18,17 @@ use std::vec::Vec;
 
 use crate::entropy::{Entropy, EntropyError};
 
-/// Room between the test's frame and the code under test, so that reading the memory back after
-/// the code, at the test's depth, does not reach the stack that code used.
+/// Room between the test's frame and the code under test. Reading memory back at the test's depth
+/// then misses the stack that code used.
 const PAD: usize = 64 * 1024;
 /// How far below the pad the stack is read: deeper than the deepest wipe.
 const SCAN: usize = 256 * 1024;
 const PAINT: u8 = 0xa7;
 
 std::thread_local! {
-    /// The bottom of the pad that [`below_pad`] ran its code under last, or zero before it did.
     static LOW: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Runs `code` below the pad, after painting the stack it is about to use when asked to, and
-/// returns the addresses under the pad.
 #[inline(never)]
 #[expect(
     clippy::large_stack_arrays,
@@ -66,8 +63,8 @@ fn read(range: Range<usize>) -> Vec<u8> {
     bytes
 }
 
-/// Whether a 16-byte piece looks like data rather than a pattern: the zeros and the padding in a
-/// block would match the wiped stack itself.
+/// Whether a 16-byte piece looks like data, not a pattern: a block's zeros and padding would match
+/// the wiped stack.
 fn varied(piece: &[u8]) -> bool {
     let mut bytes = piece.to_vec();
     bytes.sort_unstable();
@@ -75,8 +72,8 @@ fn varied(piece: &[u8]) -> bool {
     bytes.len() >= 10
 }
 
-/// The 16-byte pieces of `secrets` that depend on the key: varied, and absent from `of_another`,
-/// the same secrets of another key, so that constants and padding are not counted.
+/// `of_another` holds the same secrets of another key, so that constants and padding are not
+/// counted.
 pub(crate) fn key_dependent(secrets: &[Vec<u8>], of_another: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let public: HashSet<Vec<u8>> = of_another
         .iter()
@@ -89,12 +86,10 @@ pub(crate) fn key_dependent(secrets: &[Vec<u8>], of_another: &[Vec<u8>]) -> Vec<
         .collect()
 }
 
-/// How many of `pieces` the stack in `range` still holds.
 pub(crate) fn residue(range: Range<usize>, pieces: &[Vec<u8>]) -> usize {
     count(&read(range), pieces)
 }
 
-/// How many of `pieces` the bytes of `stack` hold.
 fn count(stack: &[u8], pieces: &[Vec<u8>]) -> usize {
     let mut starts = std::vec![false; 1 << 16];
     for piece in pieces {
@@ -110,14 +105,11 @@ fn count(stack: &[u8], pieces: &[Vec<u8>]) -> usize {
         .count()
 }
 
-/// Runs `code` below the pad, over a stack painted where earlier calls left their values, and
-/// asserts that it leaves none of `pieces` there.
 pub(crate) fn assert_clean(pieces: &[Vec<u8>], code: impl FnOnce()) {
     let range = below_pad(true, code);
     assert_eq!(residue(range, pieces), 0);
 }
 
-/// How deep below the pad `code` changed the painted stack.
 pub(crate) fn depth_changed(code: impl FnOnce()) -> usize {
     let range = below_pad(true, code);
     let stack = read(range);
@@ -125,10 +117,8 @@ pub(crate) fn depth_changed(code: impl FnOnce()) -> usize {
     stack.len().saturating_sub(lowest)
 }
 
-/// Passes each call on to `source`; on call number `at`, counted from one, reads the stack under
-/// the pad of [`below_pad`] into `stack`, counts the `pieces` it holds, then panics. The memory of
-/// the process is open and `stack` is allocated before, so that the read uses little stack below
-/// the call.
+/// The process memory is open and `stack` allocated beforehand, so reading at the panic uses little
+/// stack below.
 struct PanicsAt<'a, E> {
     source: E,
     at: usize,
@@ -158,9 +148,7 @@ impl<E: Entropy> Entropy for PanicsAt<'_, E> {
     }
 }
 
-/// Runs `run` below the pad with `source`, made to panic on its call number `at`, and tells whether
-/// `run` got that far. Asserts that `run` panics only there, and that the stack holds none of
-/// `pieces` at the panic, nor after it.
+/// Makes `source` panic on its call number `at`, and tells whether `run` got that far.
 pub(crate) fn panic_at(
     pieces: &[Vec<u8>],
     (source, at): (impl Entropy, usize),

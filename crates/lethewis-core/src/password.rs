@@ -22,8 +22,7 @@ const MAX_MEMORY: u32 = 1 << 21;
 const MIN_PASSES: u32 = 3;
 /// The most memory times passes, in KiB.
 const MAX_WORK: u64 = 1 << 23;
-/// How many bytes of stack a derivation from a password is followed by a wipe of: at least twice
-/// what it uses, as a test measures in each build. Without optimisation it uses far more.
+/// At least twice the stack a derivation from a password uses, as a test measures in each build.
 #[cfg(all(not(kani), not(lethewis_unoptimised)))]
 const STACK_WIPE: usize = 32_768;
 #[cfg(all(not(kani), lethewis_unoptimised))]
@@ -41,10 +40,8 @@ pub use argon2::Block as MemoryBlock;
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryBlock;
 
-/// How a key is derived from a password: Argon2id, version 0x13, in one lane, over `memory` KiB
-/// for `passes` passes, with a salt of 16 bytes. Memory runs from 64 MiB to 2 GiB, passes from 3,
-/// and memory times passes up to 8 GiB; no parameters out of these bounds are made or read. A
-/// 32-bit target cannot hold 2 GiB of working memory.
+/// Argon2id parameters, version 0x13, one lane, 16-byte salt: memory from 64 MiB to 2 GiB and
+/// passes from 3. Memory times passes is at most 8 GiB, and a 32-bit target cannot hold 2 GiB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PasswordParams {
     memory: u32,
@@ -62,7 +59,7 @@ impl PasswordParams {
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through.
+    /// Only if `entropy` panics.
     pub fn new(
         memory: u32,
         passes: u32,
@@ -126,8 +123,7 @@ impl PasswordParams {
     }
 }
 
-/// Whether a password of `length` bytes is taken: not empty, and at most 2^32 - 1 bytes, the most
-/// Argon2id takes.
+/// Not empty, and at most 2^32 - 1 bytes, the most Argon2id takes.
 fn password_fits(length: usize) -> bool {
     length != 0 && u32::try_from(length).is_ok()
 }
@@ -141,31 +137,22 @@ fn within(memory: u32, passes: u32) -> bool {
 }
 
 impl<'a> Slots<'a> {
-    /// Derives a 32-byte wrapping key from `password` with `params` into a free slot, as a set of
-    /// one whose key is the primary, and wipes `password`. The key is written straight into the
-    /// slot. `memory` is the working memory, of at least [`PasswordParams::memory_blocks`] blocks;
-    /// the blocks the derivation used are wiped after it, whether it succeeded or not.
+    /// Derives a 32-byte wrapping key from `password` into a free slot and wipes `password`. The
+    /// `memory` blocks it used are wiped either way; normalise text to NFC first, per RFC 8265.
     ///
-    /// `password` is taken as the bytes it is. Text is to be normalised to NFC first, as RFC 8265
-    /// has it for passwords: otherwise the same password typed another way derives another key.
-    ///
-    /// Needs 33 KiB of stack, or 196 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation is followed by a wipe of 32 KiB, or 192 KiB,
-    /// below it. A build that optimises this crate but not the hash code it calls has to set that
-    /// flag.
+    /// Needs 33 KiB of stack, or 196 KiB when unoptimised, and wipes 32 KiB, or 192 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidPassword`] if `password` is empty or longer than 2^32 - 1 bytes,
-    /// [`Error::NotEnoughMemory`] if `memory` holds fewer blocks than `params` take,
-    /// [`Error::NoFreeSlot`] if no slot is free, [`Error::DerivationFailed`] if the key or its
-    /// identifier cannot be derived, and [`Error::DuplicateKey`] if these slots hold the key
-    /// already. `password` is then left as it was, and no slot changes.
+    /// [`Error::InvalidPassword`], [`Error::NotEnoughMemory`], [`Error::NoFreeSlot`],
+    /// [`Error::DerivationFailed`] or [`Error::DuplicateKey`], with `password` and the slots left
+    /// as they were.
     ///
     /// # Panics
     ///
-    /// Only if Argon2id panics. The panic passes through after the slot and the blocks of working
-    /// memory used are wiped; the stack and `password` are not.
+    /// Only if Argon2id panics; the slot and the blocks used are wiped first, the stack and
+    /// `password` are not.
     pub fn derive_from_password(
         &mut self,
         password: &mut [u8],
@@ -227,8 +214,6 @@ impl Drop for WipeOnDrop<'_> {
     }
 }
 
-/// Fills `out` with Argon2id, version 0x13, in one lane, from `password` and `salt` over
-/// `memory_kib` KiB of `memory` for `passes` passes.
 #[cfg(not(kani))]
 fn stretch(
     password: &[u8],
@@ -269,8 +254,7 @@ fn wipe_stack() {
 #[cfg(kani)]
 use model::stretch;
 
-/// What stands in for Argon2id under Kani: any key, then success or failure, as a real derivation
-/// may fail after writing part of its output. It records whether it failed.
+/// Any key, then success or failure: a real derivation may fail after writing part of its output.
 #[cfg(kani)]
 pub(crate) mod model {
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -297,7 +281,6 @@ pub(crate) mod model {
         Ok(())
     }
 
-    /// Whether the derivation failed.
     pub(crate) fn argon2_failed() -> bool {
         FAILED.load(Ordering::Relaxed)
     }
@@ -336,13 +319,10 @@ mod tests {
         std::vec![MemoryBlock::new(); count]
     }
 
-    /// The stack, in KiB, that a derivation from a password needs, and the depth of the wipe that
-    /// follows it, in an optimised build and in one without optimisation.
+    /// In KiB, for an optimised build and for one without optimisation.
     pub(super) const NEEDS: [usize; 2] = [33, 196];
     const WIPES: [usize; 2] = [32, 192];
 
-    /// The documentation of the derivation states the stack it needs and the depth of the wipe
-    /// after it, and that depth is the library's.
     #[test]
     fn the_documentation_states_the_stack_a_derivation_needs() {
         let build = usize::from(cfg!(lethewis_unoptimised));
@@ -395,8 +375,7 @@ mod tests {
         }
     }
 
-    /// The key derived through the slots, at the least parameters, is the one libsodium derives
-    /// from the same password, salt and parameters.
+    /// The expected key is the one libsodium derives from the same password, salt and parameters.
     #[test]
     fn a_key_from_a_password_matches_another_implementation() {
         let params =
@@ -471,8 +450,8 @@ mod tests {
         );
     }
 
-    /// Parameters of 256 KiB, below the bounds, made directly: the stack a derivation uses does
-    /// not grow with its memory, and the tests below run in every build.
+    /// Parameters of 256 KiB, below the bounds, made directly. A derivation's stack does not grow
+    /// with its memory, and the tests below run in every build.
     fn small(salt: u8) -> PasswordParams {
         PasswordParams {
             memory: 256,
@@ -481,8 +460,6 @@ mod tests {
         }
     }
 
-    /// A derivation from a password runs Argon2id and derives inside the switch of data-independent
-    /// timing, with the mode on where it is offered.
     #[test]
     fn a_derivation_from_a_password_holds_data_independent_timing() {
         let mut memory = [const { Slot::empty() }; 1];
@@ -545,8 +522,6 @@ mod tests {
         assert_eq!(&password, b"password");
     }
 
-    /// The blocks a derivation used are wiped whether it succeeded or not, and the rest of the
-    /// memory is left as it was.
     #[test]
     fn the_working_memory_is_wiped() {
         let mut memory = [const { Slot::empty() }; 2];
@@ -577,8 +552,7 @@ mod tests {
 #[cfg(test)]
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod stack {
-    //! What a derivation from a password leaves on the stack, read back from the memory of this
-    //! process.
+    //! What a derivation leaves on the stack, read back from the memory of this process.
 
     extern crate std;
 
@@ -622,9 +596,8 @@ mod stack {
             .collect()
     }
 
-    /// The secrets Argon2id leaves on the stack in a derivation from `password`, by name: the
-    /// password; H0, from which the key follows without the password; the last block of its working
-    /// memory; and the key.
+    /// The secrets Argon2id leaves on the stack, by name; H0 counts, as the key follows from it
+    /// without the password.
     fn argon2_secrets(password: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
         let salt = [5; SALT_LEN];
         let h0 = Blake2b512::new()
@@ -658,8 +631,6 @@ mod stack {
         ]
     }
 
-    /// The secrets a derivation from `password` handles: those of Argon2id, and those of the
-    /// derivation of the key's identifier.
     fn derivation_secrets(password: &[u8]) -> Vec<Vec<u8>> {
         let argon2 = argon2_secrets(password);
         let key = argon2.last().unwrap().1.clone();
@@ -679,7 +650,6 @@ mod stack {
         )
     }
 
-    /// The test can see residue: Argon2id without a wipe leaves some.
     #[test]
     fn argon2_without_a_wipe_leaves_residue() {
         let others = derivation_secrets(&other_password());
@@ -743,8 +713,6 @@ mod stack {
         });
     }
 
-    /// The wipe that follows a derivation from a password reaches as deep as it is meant to, also
-    /// when the derivation fails after Argon2id has run, and no deeper than the documentation says.
     #[test]
     fn the_wipe_reaches_its_depth() {
         let mut memory = [const { Slot::empty() }; 2];
@@ -763,8 +731,8 @@ mod stack {
         }
     }
 
-    /// The wipe covers more than the derivation uses: the generation with Argon2id as its source,
-    /// which is all the derivation does after its checks.
+    /// Measured on the generation with Argon2id as its source, which is all the derivation does
+    /// after its checks.
     #[test]
     fn the_wipe_is_deeper_than_the_derivation() {
         let mut memory = [const { Slot::empty() }; 1];
@@ -816,8 +784,6 @@ pub(crate) mod proofs {
         u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
     }
 
-    /// Bytes are read exactly when they are version 1 and parameters within the bounds, and what
-    /// is read writes back the same bytes: no two encodings of one set of parameters.
     #[kani::proof]
     fn parameters_are_read_exactly_as_written() {
         let bytes: [u8; PASSWORD_PARAMS_LEN] = kani::any();
@@ -858,8 +824,6 @@ pub(crate) mod proofs {
         );
     }
 
-    /// A password is refused exactly when it is empty or longer than 2^32 - 1 bytes, whatever its
-    /// length.
     #[kani::proof]
     fn passwords_are_taken_by_their_length() {
         let length: usize = kani::any();
@@ -875,8 +839,6 @@ pub(crate) mod proofs {
         );
     }
 
-    /// Writes any 16 bytes, then succeeds or fails, and remembers how often it was asked and what
-    /// it wrote.
     struct AnySalt {
         calls: u8,
         written: [u8; SALT_LEN],
@@ -896,9 +858,6 @@ pub(crate) mod proofs {
         }
     }
 
-    /// Parameters are made only within the bounds, without asking the source otherwise, with the
-    /// memory and passes asked for and the source's bytes as the salt; and parameters made are read
-    /// back as they are.
     #[kani::proof]
     fn parameters_are_made_only_within_the_bounds() {
         let (memory, passes): (u32, u32) = (kani::any(), kani::any());

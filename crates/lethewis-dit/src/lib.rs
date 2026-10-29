@@ -1,23 +1,16 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Data-independent timing on aarch64 for a piece of work.
-//!
-//! [`with`] runs work with data-independent timing on: the processor then takes the same time for
-//! an instruction whatever data it works on, for the instructions the architecture lists under
-//! `FEAT_DIT`. The mode is switched on only where the operating system reports the feature, on
-//! Linux, Android and Apple's systems, and only when it is off, and back off when the work returns
-//! or unwinds. Elsewhere the work runs as it is.
+//! [`with`] runs work with `FEAT_DIT` on, so the instructions it lists take the same time whatever
+//! data they work on. Where Linux, Android or Apple's systems report the mode and it is off, it
+//! goes on around the work.
 
 #![no_std]
 #![deny(missing_docs, unused_crate_dependencies)]
 
 /// Runs `work` on the current thread with data-independent timing on, where the processor and the
-/// operating system offer it.
-///
-/// The switch orders memory accesses and calls, and the work is called through a function that is
-/// not inlined; a value the caller already holds in a register may still be computed on before the
-/// switch.
+/// operating system offer it. The switch orders memory accesses and calls, but a value already in a
+/// register may be computed on before it.
 pub fn with<R>(work: impl FnOnce() -> R) -> R {
     let _guard = Guard::enable();
     apart(work)
@@ -100,7 +93,7 @@ mod tests {
     use super::{Guard, active, supported, with};
 
     /// On aarch64 the run states what the operating system reports, `present` or `absent`, read
-    /// apart from this crate; elsewhere the feature does not exist.
+    /// apart from this crate. Elsewhere the feature does not exist.
     #[test]
     fn the_feature_is_found_as_the_system_reports_it() {
         let expected = if cfg!(target_arch = "aarch64") {

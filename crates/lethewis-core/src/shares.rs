@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! A key from a secret of 16 bytes split into three shares, any two of which give the secret back:
-//! Shamir's scheme over GF(2^8), a line for each byte of the secret and of its check.
+//! Shamir's scheme over GF(2^8): a line for each byte of the secret and of its check.
 
 use crate::derive::{Branch, SECRET_LEN, derive_from_secret, wipe_stack};
 use crate::entropy::Entropy;
@@ -21,49 +20,31 @@ pub type Share = [u8; SHARE_LEN];
 /// The three shares of a split, numbered 1, 2 and 3 in that order.
 pub type Shares = [Share; SHARE_COUNT];
 
-/// The length of the mark of a split.
 const MARK_LEN: usize = 4;
-/// The length of the check of a secret, split with it.
 pub(crate) const CHECK_LEN: usize = 4;
-/// Where the bytes of a share begin, past its number and its mark.
 const BYTES_AT: usize = 1 + MARK_LEN;
-/// Where the bytes of the check begin, past those of the secret.
 const CHECK_AT: usize = BYTES_AT + SECRET_LEN;
 /// The numbers of the shares, where each line is read.
 const NUMBERS: [u8; SHARE_COUNT] = [1, 2, 3];
 
-/// One draw of 64 bytes for a split: the secret, a coefficient for each of its bytes, and in the
-/// first bytes of the third part the mark and a coefficient for each byte of the check; the rest
-/// goes unused.
+/// The secret, its coefficients, then the mark and the coefficients of the check; the rest unused.
 type Drawn = [[u8; SECRET_LEN]; 4];
 
 impl<'a> Slots<'a> {
-    /// Creates a 32-byte wrapping key from 16 random bytes in a free slot, as a set of one whose key
-    /// is the primary, and writes three shares of those bytes and of their check into `shares`, any
-    /// two of which give them back. One draw of 64 bytes from `entropy`, hedged with the key of the
-    /// epoch, gives the bytes, a coefficient for each byte and for each byte of the check, and the
-    /// mark of the split, so a share alone fits every secret alike. [`Self::derive_from_shares`]
-    /// derives the same key from any two of the shares; nothing else gives them again. `entropy` is
-    /// asked once, and only when a slot is free.
+    /// Creates a 32-byte wrapping key from 16 random bytes and writes three shares of them into
+    /// `shares`. Any two give the key back through [`Self::derive_from_shares`]; `entropy` is asked
+    /// once, only when a slot is free.
     ///
-    /// Needs 10 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the hedge, the derivation of the check, the derivation of the
-    /// key, the derivation of its identifier, the whole load and the whole call are each followed by
-    /// a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate but not the hash
-    /// code it calls has to set that flag.
+    /// Needs 10 KiB of stack, or 72 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::NoFreeSlot`] if no slot is free, [`Error::EntropyFailed`] if `entropy` fails,
-    /// [`Error::DerivationFailed`] if the hedge, the check, the key or its identifier cannot be
-    /// derived, and
-    /// [`Error::DuplicateKey`] if these slots hold the key already. `shares` is then left as it
-    /// was, and no slot changes.
+    /// [`Error::NoFreeSlot`], [`Error::EntropyFailed`], [`Error::DerivationFailed`] or
+    /// [`Error::DuplicateKey`], with `shares` and the slots left as they were.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through after the random bytes are wiped, and no
-    /// slot changes.
+    /// Only if `entropy` panics; the random bytes are wiped first and no slot changes.
     pub fn generate_shares(
         &mut self,
         entropy: &mut (impl Entropy + ?Sized),
@@ -78,24 +59,16 @@ impl<'a> Slots<'a> {
     }
 
     /// Derives the key [`Self::generate_shares`] created from any two of its shares, in either
-    /// order, into a free slot, as a set of one whose key is the primary, and wipes both shares.
-    /// The numbers and the marks of the shares are judged first; the bytes are then combined in
-    /// steps with no branch on them, and the secret they give is taken only with its check.
+    /// order, and wipes both. Their bytes are combined with no branch, and the secret is taken only
+    /// with its check.
     ///
-    /// Needs 10 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation of the check, the derivation of the key, the
-    /// derivation of its identifier, the whole load and the whole call are each followed by a wipe
-    /// of 8 KiB, or 64 KiB, below them. A build that optimises this crate but not the hash code it
-    /// calls has to set that flag.
+    /// Needs 10 KiB of stack, or 72 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidShare`] if a share is numbered other than 1, 2 or 3, [`Error::MixedShares`]
-    /// if their marks differ, [`Error::SameShare`] if their numbers are the same,
-    /// [`Error::ChangedShare`] if the secret they give fails its check, [`Error::NoFreeSlot`] if no
-    /// slot is free, [`Error::DerivationFailed`] if the check, the key or its identifier cannot be
-    /// derived, and [`Error::DuplicateKey`] if these slots hold the key already. The shares are
-    /// then left as they were, and no slot changes.
+    /// [`Error::InvalidShare`], [`Error::MixedShares`], [`Error::SameShare`],
+    /// [`Error::ChangedShare`], [`Error::NoFreeSlot`], [`Error::DerivationFailed`] or
+    /// [`Error::DuplicateKey`], with the shares and the slots left as they were.
     pub fn derive_from_shares(
         &mut self,
         first: &mut Share,
@@ -110,8 +83,6 @@ impl<'a> Slots<'a> {
         derived
     }
 
-    /// The generation itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     fn generate_shares_on_stack(
         &mut self,
@@ -134,8 +105,6 @@ impl<'a> Slots<'a> {
         generated
     }
 
-    /// The derivation itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     fn derive_from_shares_on_stack(
         &mut self,
@@ -158,13 +127,11 @@ impl<'a> Slots<'a> {
     }
 }
 
-/// Writes into `check` the check of `secret` that its shares carry.
 fn check_of(secret: &[u8; SECRET_LEN], check: &mut [u8; CHECK_LEN]) -> Result<(), Error> {
     derive_from_secret(secret, None, Branch::ShareCheck, check).map_err(|_| Error::DerivationFailed)
 }
 
-/// Whether two checks are the same, compared in constant time. Kept out of line, so that the check
-/// of its machine code finds it.
+/// Constant time, and out of line so that the check of its machine code finds it.
 #[inline(never)]
 fn same_check(a: [u8; CHECK_LEN], b: [u8; CHECK_LEN]) -> bool {
     #[cfg(not(kani))]
@@ -179,20 +146,15 @@ fn same_check(a: [u8; CHECK_LEN], b: [u8; CHECK_LEN]) -> bool {
     }
 }
 
-/// What stands in under Kani for the comparison that ends in inline assembly.
 #[cfg(kani)]
 mod model {
     use super::CHECK_LEN;
 
-    /// [`super::same_check`] as Kani sees it: the two checks as numbers.
     pub(super) fn same_check(a: [u8; CHECK_LEN], b: [u8; CHECK_LEN]) -> bool {
         u32::from_ne_bytes(a) == u32::from_ne_bytes(b)
     }
 }
 
-/// Writes into `shares` the three shares of the secret `drawn` begins with and of its check,
-/// `check`: each holds its number, the mark drawn, and the value at its number of the line through
-/// each byte of the secret and of the check with the coefficient drawn for that byte.
 fn split(drawn: &Drawn, check: [u8; CHECK_LEN], shares: &mut Shares) {
     #[cfg(test)]
     crate::timing::note();
@@ -221,15 +183,11 @@ fn split(drawn: &Drawn, check: [u8; CHECK_LEN], shares: &mut Shares) {
     }
 }
 
-/// The byte of the share numbered `number` of a byte of the secret, `secret`, on the line with
-/// `coefficient`.
 fn share_byte(secret: u8, coefficient: u8, number: u8) -> u8 {
     secret ^ product(coefficient, number)
 }
 
-/// Writes into `secret` and `check` the bytes that `first` and `second`, two shares of one split,
-/// stand for: the value at zero of the line through each pair of their bytes. The numbers and the
-/// marks are judged first, and nothing is written when they are refused.
+/// The numbers and the marks are judged first, and nothing is written when they are refused.
 fn combine(
     first: &Share,
     second: &Share,
@@ -272,15 +230,13 @@ fn combine(
     Ok(())
 }
 
-/// The number and the mark of `share`.
 fn number_and_mark(share: &Share) -> (u8, [u8; MARK_LEN]) {
     let [number, m0, m1, m2, m3, ..] = *share;
     (number, [m0, m1, m2, m3])
 }
 
-/// The product of `a` and `b` in GF(2^8) modulo x^8 + x^4 + x^3 + x + 1, the field of AES, in
-/// steps with no branch on either. Kept out of line, so that the check of its machine code finds
-/// it.
+/// In GF(2^8) modulo x^8 + x^4 + x^3 + x + 1, the field of AES, with no branch on either.
+/// Kept out of line, so that the check of its machine code finds it.
 #[inline(never)]
 fn product(a: u8, b: u8) -> u8 {
     let mut product = 0;
@@ -292,7 +248,7 @@ fn product(a: u8, b: u8) -> u8 {
     product
 }
 
-/// The inverse of `a` in the field: `a` to the power 254, which is zero for zero.
+/// `a` to the power 254, which is zero for zero.
 fn inverse(a: u8) -> u8 {
     let mut power = product(a, a);
     let mut inverse = power;
@@ -326,17 +282,16 @@ pub(crate) mod tests {
     use crate::slots::{Slot, Slots};
     use crate::words::tests::words_for;
 
-    /// The shares of the draw 0, 1, ..., 63, worked out by an independent implementation of the
-    /// field by tables of logarithms and of HKDF-SHA-256 for the check: they fix the split for every
-    /// share already written.
+    /// From an independent implementation of the field and of HKDF-SHA-256: they fix the split for
+    /// every share already written.
     const SHARES: [&str; SHARE_COUNT] = [
         "012021222310101010101010101010101010101010275b69d3",
         "0220212223202326252c2f2a29383b3e3d343732314b3403ba",
         "032021222330323436383a3c3e20222426282a2c2e6f11259d",
     ];
 
-    /// Keys from shares, computed by an independent implementation of HKDF-SHA-256 from the
-    /// documented salt and label: they fix the derivation for every split already made.
+    /// From an independent implementation of HKDF-SHA-256: they fix the derivation for every split
+    /// already made.
     const KEYS: [(&str, &str); 4] = [
         (
             "00000000000000000000000000000000",
@@ -396,8 +351,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// A draw of the secret, the coefficients of its bytes and of the bytes of its check, and the
-    /// mark given.
     pub(crate) fn drawn_of(
         secret: &[u8; SECRET_LEN],
         coefficients: &[u8; SECRET_LEN + CHECK_LEN],
@@ -414,7 +367,6 @@ pub(crate) mod tests {
         ]
     }
 
-    /// The check of `secret`.
     pub(crate) fn check_for(secret: &[u8; SECRET_LEN]) -> [u8; CHECK_LEN] {
         let mut check = [0; CHECK_LEN];
         check_of(secret, &mut check).unwrap();
@@ -478,8 +430,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Random secrets, coefficients and marks: every share is the one the tables give, and any
-    /// two of them in either order give the secret and its check back.
     #[test]
     fn any_two_shares_give_the_secret_back() {
         let tables = Tables::new();
@@ -564,7 +514,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// The same 16 bytes give one key as words and another as shares.
     #[test]
     fn a_key_from_shares_is_not_the_key_from_words_of_its_bytes() {
         let mut memory = [const { Slot::empty() }; 2];
@@ -687,8 +636,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// A change to any bit of the bytes of either share, or shares of two splits that share a
-    /// mark: the secret the shares give fails its check, and nothing changes.
     #[test]
     fn a_changed_share_is_refused() {
         let mut memory = [const { Slot::empty() }; 1];
@@ -721,8 +668,7 @@ pub(crate) mod tests {
 #[cfg(test)]
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod stack {
-    //! What a derivation from shares and a generation of shares leave on the stack, read back from
-    //! the memory of this process.
+    //! What the calls leave on the stack, read back from the memory of this process.
 
     extern crate std;
 
@@ -744,13 +690,12 @@ mod stack {
     use crate::residue::{assert_clean, below_pad, depth_changed, key_dependent, residue};
     use crate::slots::{Slot, Slots};
 
-    /// The stack, in KiB, that a derivation from shares and a generation of shares need, and the
-    /// depth of the wipe after them, in an optimised build and in one without optimisation.
+    /// In KiB, for an optimised build and for one without optimisation.
     const NEEDS: [usize; 2] = [10, 72];
     const WIPES: [usize; 2] = [8, 64];
 
-    /// Bytes whose values appear nowhere else, in static memory, so that no copy of them is made
-    /// on the stack but the ones looked for.
+    /// Bytes whose values appear nowhere else, kept static so that only the copies looked for reach
+    /// the stack.
     static BYTES: [u8; 64] = [
         29, 130, 231, 76, 177, 22, 123, 224, 69, 170, 15, 116, 217, 62, 163, 8, 109, 210, 55, 156,
         1, 102, 203, 48, 149, 250, 95, 196, 41, 142, 243, 88, 189, 34, 135, 236, 81, 182, 27, 128,
@@ -772,7 +717,6 @@ mod stack {
         drawn_from(&BYTES.map(|byte| byte ^ 0xff))
     }
 
-    /// Writes [`BYTES`].
     struct Fixed;
 
     impl Entropy for Fixed {
@@ -782,8 +726,6 @@ mod stack {
         }
     }
 
-    /// The secrets the shares of `drawn` are: their bytes, alone and with the number and the
-    /// mark, either way round.
     fn share_secrets(shares: &Shares) -> Vec<Vec<u8>> {
         let mut found = Vec::new();
         for share in shares {
@@ -795,9 +737,6 @@ mod stack {
         found
     }
 
-    /// The secrets a derivation from two shares of `drawn` handles: the shares, the secret they
-    /// give either way round, those of HKDF from the secret for its check and for the key, and
-    /// those of the identifier of the key.
     fn derivation_secrets(drawn: &Drawn) -> Vec<Vec<u8>> {
         let [secret, ..] = drawn;
         let mut found = share_secrets(&shares_of(drawn));
@@ -841,7 +780,6 @@ mod stack {
         black_box(&read);
     }
 
-    /// The test can see residue: combining shares without a wipe leaves some.
     #[test]
     fn combining_shares_without_a_wipe_leaves_residue() {
         let [first, second, _] = shares_of(&drawn());
@@ -857,7 +795,6 @@ mod stack {
         black_box(&shares);
     }
 
-    /// The same for splitting a secret.
     #[test]
     fn splitting_without_a_wipe_leaves_residue() {
         let check = check_for(&drawn()[0]);
@@ -937,8 +874,6 @@ mod stack {
                 .try_into()
                 .unwrap()
         };
-        // What the source gave, the draw once it is hedged and what it splits into, and the hedge
-        // itself, the key of the epoch among its secrets.
         let found = |bytes: &[u8; 64], epoch: &[u8; 32]| {
             let drawn = hedged(bytes, epoch);
             let mut material = bytes.to_vec();
@@ -967,7 +902,6 @@ mod stack {
         );
     }
 
-    /// Writes [`BYTES`], then panics.
     struct Panicking;
 
     impl Entropy for Panicking {
@@ -977,9 +911,8 @@ mod stack {
         }
     }
 
-    /// A source that panics after writing leaves neither its bytes nor a key: the panic unwinds
-    /// past a wipe of the bytes, and the slot stays free. With optimisation the unwinding itself
-    /// overwrites where the bytes were, so only a build without it can tell.
+    /// With optimisation the unwinding itself overwrites where the bytes were, so only a build
+    /// without it can tell.
     #[test]
     fn a_panicking_source_leaves_no_bytes() {
         let pieces = key_dependent(&[BYTES.to_vec()], &[BYTES.map(|byte| byte ^ 0xff).to_vec()]);
@@ -997,9 +930,6 @@ mod stack {
         slots.generate_shares(&mut Fixed, &mut shares).unwrap();
     }
 
-    /// The wipe that follows a derivation from shares and a generation of shares reaches as deep
-    /// as it is meant to, also when the derivation fails after the key is derived, and no deeper
-    /// than the documentation says.
     #[test]
     fn the_wipe_reaches_its_depth() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -1023,7 +953,7 @@ mod stack {
         }
     }
 
-    /// The wipe covers more than combining and splitting use; the load has wipes of its own.
+    /// Only combining and splitting: the load has wipes of its own.
     #[test]
     fn the_wipe_is_deeper_than_combining_and_splitting() {
         let [first, second, _]: [Share; SHARE_COUNT] = shares_of(&drawn());
@@ -1045,8 +975,6 @@ mod stack {
         }
     }
 
-    /// The documentation of every call states the stack it needs and the depth of the wipe after
-    /// them, and that depth is the library's.
     #[test]
     fn the_documentation_states_the_stack_the_calls_need() {
         let build = usize::from(cfg!(lethewis_unoptimised));
@@ -1086,8 +1014,8 @@ pub(crate) mod proofs {
     /// The numbers of the shares, written from the documentation apart from the code.
     const NUMBERED: [u8; SHARE_COUNT] = [1, 2, 3];
 
-    /// The product worked out apart from [`product`]: the product of the two polynomials, then
-    /// the remainder after division by x^8 + x^4 + x^3 + x + 1.
+    /// The product worked out apart from [`product`]: the polynomials multiplied, then reduced by
+    /// x^8 + x^4 + x^3 + x + 1.
     fn reference(a: u8, b: u8) -> u8 {
         let mut wide: u16 = 0;
         for bit in 0..8 {
@@ -1103,8 +1031,6 @@ pub(crate) mod proofs {
         wide as u8
     }
 
-    /// The shares [`split`] writes for the draw `drawn`, with the check the model of HKDF gives for
-    /// the secret it begins with.
     pub(crate) fn expected_shares(drawn: &[u8; 64]) -> Shares {
         let mut parts: Drawn = [[0; SECRET_LEN]; 4];
         parts.as_flattened_mut().copy_from_slice(drawn);
@@ -1113,7 +1039,6 @@ pub(crate) mod proofs {
         shares
     }
 
-    /// The secret and the check [`combine`] reads from `first` and `second`, or its refusal.
     pub(crate) fn expected_secret_and_check(
         first: &Share,
         second: &Share,
@@ -1122,7 +1047,6 @@ pub(crate) mod proofs {
         combine(first, second, &mut read.0, &mut read.1).map(|()| read)
     }
 
-    /// Any of the numbers of the shares.
     fn any_number() -> u8 {
         let number: u8 = kani::any();
         kani::assume(NUMBERED.contains(&number));
@@ -1139,7 +1063,6 @@ pub(crate) mod proofs {
         }
     }
 
-    /// For any two bytes, the product is the one of GF(2^8) with the polynomial of AES.
     #[kani::proof]
     #[kani::unwind(9)]
     fn the_product_is_that_of_the_field() {
@@ -1151,7 +1074,6 @@ pub(crate) mod proofs {
         kani::cover!(a == 0x57 && b == 0x83, "the product FIPS 197 works out");
     }
 
-    /// For any byte but zero, the product with its inverse is one.
     #[kani::proof]
     #[kani::unwind(9)]
     fn every_byte_but_zero_has_its_inverse() {
@@ -1164,10 +1086,6 @@ pub(crate) mod proofs {
         kani::cover!(a == 0xff, "the last byte");
     }
 
-    /// For any draw and any check, the shares are numbered 1, 2 and 3, carry the mark drawn, and
-    /// hold the value at their number of the line through each byte of the secret and of the check
-    /// with the coefficient drawn for it, a byte of the draw of its own; any two of them, in either
-    /// order, give the secret and the check back.
     #[kani::proof]
     #[kani::unwind(21)]
     fn any_two_shares_give_the_secret_back() {
@@ -1208,9 +1126,8 @@ pub(crate) mod proofs {
         kani::cover!(first == 2 && second == 0, "the third and the first");
     }
 
-    /// For any byte of a secret or of its check, any byte of a share and any number of a share,
-    /// exactly one coefficient puts that byte of the share on the line through that byte: a share
-    /// alone fits every secret alike, and only the coefficient, drawn at random, decides it.
+    /// Exactly one coefficient puts a share byte on the line through a secret byte: only the random
+    /// coefficient decides.
     #[kani::proof]
     #[kani::unwind(9)]
     fn a_share_alone_fits_every_secret_alike() {
@@ -1232,11 +1149,8 @@ pub(crate) mod proofs {
         );
     }
 
-    /// For any two shares: a number other than 1, 2 or 3 is refused first, then marks that differ,
-    /// then the same number twice, and nothing is written then. Otherwise each byte written, of the
-    /// secret or of its check, is the value at zero of the line through the two bytes of the
-    /// shares: the byte of each share less that value, divided by the share's number, is one
-    /// coefficient for both.
+    /// Each byte read is the value at zero of the line through the shares' bytes. Each share's byte
+    /// less that value, over its number, gives one coefficient for both.
     #[kani::proof]
     #[kani::unwind(21)]
     fn shares_are_read_exactly_when_they_fit_together() {

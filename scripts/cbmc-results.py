@@ -2,16 +2,11 @@
 # SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Reads what one proof printed under `cargo kani --output-format old` into the results Kani gives
-with `--export-json`, for scripts/prove.sh to judge, and compares the two.
+"""Reads one proof's `cargo kani --output-format old` output as the slower `--export-json` would
+give it, or compares the two. Anything not read in full is refused.
 
     cbmc-results.py read PROOF OUTPUT MILLISECONDS > results.json
     cbmc-results.py agree KANI.json READ.json
-
-With --export-json, Kani has CBMC build a trace for every region coverage reaches, which costs
-most of the run. The statuses are read here as Kani reads them: a check whose reachability check
-holds is unreachable, a cover that fails is satisfied, and a coverage check that fails is covered.
-Anything not read in full is a refusal.
 """
 
 import collections

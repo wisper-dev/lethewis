@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Blocks of data carried to another device or into a backup under a key for transfers: each chunk
-//! is opened and sealed again in the library, so that no key for data leaves it. A carried block
-//! is the next element of the export under that key, after its records, and its end covers it.
+//! Blocks of data carried to another device or into a backup under a key for transfers.
 
 use super::data::{OpenChunk, Opening, SealChunk};
 use super::{Direction, Handle, Index, Slots, hedged_draw};
@@ -25,11 +23,8 @@ use crate::{
     seal::{self, KEY_LEN as CIPHER_KEY_LEN, Rejected, TAG_LEN},
 };
 
-/// A block of data being carried out under a key for transfers, from
-/// [`Slots::begin_export_block`]: it reads the block under its set for data and writes it under the
-/// key for transfers, and holds no key. It cannot be copied or cloned, and it stops working once
-/// the set changes, the key turns to receiving or its chain moves on. One begun as the first
-/// element of an export goes on as the first of the next, if that export ends between its chunks.
+/// A block of data being carried out, from [`Slots::begin_export_block`]; it holds no key. It
+/// stops working once the set changes, the key turns to receiving or its chain moves on.
 pub struct Exporting<'a> {
     pub(super) source: Opening<'a>,
     pub(super) transfer: Handle<'a>,
@@ -38,8 +33,8 @@ pub struct Exporting<'a> {
     pub(super) associated: AssociatedData,
 }
 
-/// A carried block whose header opened under a key for transfers, from [`Slots::begin_receive_block`],
-/// before [`Slots::receive_into`] gives it a set for data to be written under.
+/// A carried block whose header opened, from [`Slots::begin_receive_block`], before
+/// [`Slots::receive_into`] gives it a set to be written under.
 pub struct Receipt<'a> {
     pub(super) transfer: Handle<'a>,
     pub(super) chain: [u8; TAG_LEN],
@@ -49,11 +44,9 @@ pub struct Receipt<'a> {
     pub(super) last: u64,
 }
 
-/// A carried block being received, from [`Slots::receive_into`]: it reads the block under the key
-/// for transfers and writes it under the primary key of a set for data that came in the same
-/// transfer, and holds no key. It cannot be copied or cloned, and it stops working once another
-/// record or block goes under the key for transfers, the end of that transfer is received, or the
-/// set is released.
+/// A carried block being received, from [`Slots::receive_into`]; it holds no key. It stops
+/// working once another element goes under the key for transfers, the transfer ends or the set is
+/// released.
 pub struct Receiving<'a> {
     pub(super) receipt: Receipt<'a>,
     pub(super) set: Handle<'a>,
@@ -96,7 +89,6 @@ impl core::fmt::Debug for Receiving<'_> {
     }
 }
 
-/// Where a chunk is carried from and to: the key, the nonce and the associated data of each side.
 struct Passes<'k> {
     open_key: &'k [u8; CIPHER_KEY_LEN],
     open_aad: &'k [u8],
@@ -106,14 +98,13 @@ struct Passes<'k> {
     last: bool,
 }
 
-/// Whether two chains of an export are the same. Compared as numbers: Kani 0.68.0 reads bytes from
-/// before the latest write when it compares arrays whole.
+/// Compared as numbers: Kani 0.68.0 reads bytes from before the latest write when it compares
+/// arrays whole.
 fn same_chain(a: &[u8; TAG_LEN], b: &[u8; TAG_LEN]) -> bool {
     u128::from_ne_bytes(*a) == u128::from_ne_bytes(*b)
 }
 
-/// Opens `chunk` under `tag` and seals it again, in place, and gives the new tag: `RecordRejected`
-/// if it does not open, `CipherFailed` if the seal fails. Either wipes the chunk.
+/// A chunk that does not open or does not seal is wiped.
 fn reseal(
     passes: &Passes<'_>,
     chunk: &mut [u8],
@@ -131,32 +122,21 @@ fn reseal(
 }
 
 impl<'a> Slots<'a> {
-    /// Begins to carry the block `opening` reads, from its first chunk, as the next element of the
-    /// export under the key for transfers that `transfer` refers to, for the export's `context`,
-    /// from 1 to 255 bytes, and writes the header of the carried block into `header`: a salt from
-    /// `entropy`, hedged with the key of this epoch, and a check derived from the key for transfers
-    /// and the salt. The chunks follow with [`Slots::export_chunk`] and [`Slots::export_last`]; the
-    /// carried block opens only with that key, the same `context` and the records and blocks before
-    /// it, in any epoch: neither a change of epoch nor a destruction afterwards reaches it.
+    /// Begins carrying the block `opening` reads as the next export element under `transfer`, and
+    /// writes its header into `header`. The carried block opens in any epoch with that key, the
+    /// same `context` and all before it.
     ///
-    /// Needs 12 KiB of stack, or 74 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the hedge, the derivation and the whole call are each followed
-    /// by a wipe of 8 KiB, or 64 KiB, below them, whether it succeeded or not. A build that
-    /// optimises this crate but not the hash code it calls has to set that flag.
+    /// Needs 12 KiB of stack, or 74 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if either handle does not refer to a set held here now or the set
-    /// for data has changed since the block began to be read, [`Error::WrongPurpose`] if
-    /// `transfer` does not serve [`Purpose::Transfer`], [`Error::Unfinished`] if the key for
-    /// transfers receives an export, [`Error::WrongChunk`] if a chunk has been read from the block,
-    /// [`Error::EntropyFailed`] if `entropy` fails, and [`Error::DerivationFailed`] if the salt
-    /// cannot be hedged or the check cannot be derived. `header` is then left as it was.
+    /// [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::Unfinished`], [`Error::WrongChunk`], [`Error::EntropyFailed`] or
+    /// [`Error::DerivationFailed`]; `header` is then left as it was.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through, and `header` is left as it was.
+    /// Only if `entropy` panics; `header` is then left as it was.
     pub fn begin_export_block(
         &mut self,
         opening: Opening<'a>,
@@ -172,8 +152,6 @@ impl<'a> Slots<'a> {
         begun
     }
 
-    /// The beginning itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     pub(super) fn begin_export_block_in(
         &mut self,
@@ -218,27 +196,17 @@ impl<'a> Slots<'a> {
         })
     }
 
-    /// Carries `chunk`, the next chunk of the block `exporting` carries and not its last, in place:
-    /// it opens under the set for data if `tag` is its tag, is sealed under the key for transfers,
-    /// and its new tag goes into `out`.
+    /// Reseals `chunk`, the next but not last chunk of `exporting`, in place from the data key to
+    /// the transfer key. Its tag is `tag`; the new one goes into `out`.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::WrongChunk`] if the last chunk is due, [`Error::StaleHandle`] if either set is not
-    /// held here now, the set for data has changed since the block began to be read, or another
-    /// record or block has gone under the key for transfers, [`Error::Unfinished`] if the key
-    /// receives an export, [`Error::DerivationFailed`] if a key
-    /// that encrypts the chunks cannot be derived, [`Error::RecordRejected`] if the chunk does not
-    /// open as the next of the block, and [`Error::CipherFailed`] if the cipher gives a known input
-    /// a wrong answer or fails, or the chunk does not open and seal again to the same tag and
-    /// ciphertext. `chunk` is then wiped if the cipher ran, and left as it was if not, `out` is
-    /// left as it was, and the block goes on as before the call: the caller keeps its own copy of
-    /// the chunk until the call succeeds.
+    /// [`Error::WrongChunk`], [`Error::StaleHandle`], [`Error::Unfinished`],
+    /// [`Error::DerivationFailed`], [`Error::RecordRejected`] or [`Error::CipherFailed`]. `chunk`
+    /// may be wiped, `out` stays as it was and the block goes on as before.
     pub fn export_chunk(
         &mut self,
         exporting: &mut Exporting<'a>,
@@ -253,7 +221,6 @@ impl<'a> Slots<'a> {
         carried
     }
 
-    /// A chunk carried out that is not the last.
     pub(super) fn export_next_in(
         &mut self,
         exporting: &mut Exporting<'a>,
@@ -273,20 +240,16 @@ impl<'a> Slots<'a> {
         self.export_chunk_on_stack(exporting, chunk, false, tags, open_with, seal_with)
     }
 
-    /// Carries `chunk`, the last chunk of the block `exporting` carries, in place, as
-    /// [`Slots::export_chunk`] does, and ends the block: the export under the key for transfers
-    /// goes on after it.
+    /// Reseals `chunk`, the last chunk of `exporting`, as [`Slots::export_chunk`] does, and ends the
+    /// block. The export goes on after it.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::WrongChunk`] if more chunks are due before the last, or `chunk` is not as long as
-    /// the block's last chunk, and the errors of [`Slots::export_chunk`]. The block is then not
-    /// carried.
+    /// The errors of [`Slots::export_chunk`], or [`Error::WrongChunk`] if more chunks are due or
+    /// `chunk` is not as long as the last. The block is then not carried.
     pub fn export_last(
         &mut self,
         mut exporting: Exporting<'a>,
@@ -301,7 +264,6 @@ impl<'a> Slots<'a> {
         carried
     }
 
-    /// The last chunk carried out.
     pub(super) fn export_last_in(
         &mut self,
         exporting: &mut Exporting<'a>,
@@ -318,8 +280,7 @@ impl<'a> Slots<'a> {
         self.export_chunk_on_stack(exporting, chunk, true, tags, open_with, seal_with)
     }
 
-    /// The carriage of a chunk out itself, in a frame of its own: the wipe that follows starts
-    /// where this frame starts. Every check and both derivations come before the cipher.
+    /// Every check and both derivations come before the cipher.
     #[inline(never)]
     pub(super) fn export_chunk_on_stack(
         &mut self,
@@ -371,26 +332,17 @@ impl<'a> Slots<'a> {
         Ok(())
     }
 
-    /// Begins to receive the carried block of `block` bytes whose header is `header`, the next
-    /// element of the export under the key for transfers that `transfer` refers to, for the
-    /// `context` it was exported for: the header's check is derived from that key and compared,
-    /// and the block opens only after the records and blocks received under that key before it, in
-    /// the order they were exported. [`Slots::receive_into`] then gives it a set to be written
+    /// Begins receiving the carried block of `block` bytes with `header`, the next export element
+    /// under `transfer` for `context`. [`Slots::receive_into`] then gives it a set to be written
     /// under.
     ///
-    /// Needs 11 KiB of stack, or 70 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation and the whole call are each followed by a wipe
-    /// of 8 KiB, or 64 KiB, below them. A build that optimises this crate but not the hash code it
-    /// calls has to set that flag.
+    /// Needs 11 KiB of stack, or 70 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if `transfer` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Transfer`],
-    /// [`Error::Unfinished`] if the key writes an export, [`Error::RecordRejected`] if no block is
-    /// `block` bytes long, [`Error::DerivationFailed`] if the check cannot be derived, and
-    /// [`Error::RecordRejected`] if the header does not name the key.
+    /// [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::Unfinished`], [`Error::DerivationFailed`], or [`Error::RecordRejected`] if the
+    /// length or the header does not fit that key.
     pub fn begin_receive_block(
         &self,
         transfer: Handle<'a>,
@@ -405,8 +357,6 @@ impl<'a> Slots<'a> {
         begun
     }
 
-    /// The beginning itself, for chunks of `C` bytes, in a frame of its own: the wipe that follows
-    /// starts where this frame starts.
     #[inline(never)]
     pub(super) fn begin_receive_block_in<const C: usize>(
         &self,
@@ -440,36 +390,22 @@ impl<'a> Slots<'a> {
         })
     }
 
-    /// Gives the carried block `receipt` begins a set for data to be written under, from its
-    /// first chunk, bound to `context`, from 1 to 255 bytes, which names the place the block is
-    /// kept, and writes the header of the block written into `header`, as [`Slots::begin_seal`]
-    /// does. With `set` empty the set is a new one, of one key from `entropy`, hedged with the key
-    /// of this epoch, in the first free slot; otherwise `set` is to refer to a set that came in this
-    /// transfer, before its end. Such a set is neither wrapped, exported nor changed, and opens and
-    /// writes no other block, until [`Slots::end_receive`] receives the end of the export: blocks
-    /// of an export that does not end are lost with it. The chunks follow with
-    /// [`Slots::receive_chunk`] and [`Slots::receive_last`].
+    /// Gives the block `receipt` begins a set for `context`, new if `set` is empty, and writes its
+    /// header into `header`. Until [`Slots::end_receive`] that set opens no block and is not
+    /// wrapped, exported or changed.
     ///
-    /// Needs 13 KiB of stack, or 77 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: each hedge, the load, the derivation and the whole call are
-    /// each followed by a wipe of 8 KiB, or 64 KiB, below them, whether it succeeded or not. A
-    /// build that optimises this crate but not the hash code it calls has to set that flag.
+    /// Needs 13 KiB of stack, or 77 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if a handle does not refer to a set held here now, or another record
-    /// or block has gone under the key for transfers, [`Error::WrongPurpose`] if `set` does not
-    /// serve [`Purpose::Data`], [`Error::NotReceived`] if it did not come in this transfer,
-    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::NoFreeSlot`] if a new set finds no
-    /// free slot, [`Error::DerivationFailed`] if the salt, a key, its identifier or the check
-    /// cannot be derived, and [`Error::DuplicateKey`] if these slots hold the new key already. No
-    /// other slot changes then, a new set is released, and `header` is left as it was.
+    /// [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::NotReceived`], [`Error::EntropyFailed`], [`Error::NoFreeSlot`],
+    /// [`Error::DerivationFailed`] or [`Error::DuplicateKey`]. A new set is then released, no other
+    /// slot changes and `header` stays as it was.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through, no slot changes, and `header` is left as
-    /// it was.
+    /// Only if `entropy` panics; no slot then changes and `header` is left as it was.
     pub fn receive_into(
         &mut self,
         receipt: Receipt<'a>,
@@ -484,8 +420,6 @@ impl<'a> Slots<'a> {
         begun
     }
 
-    /// The beginning of the block written itself, in a frame of its own: the wipe that follows
-    /// starts where this frame starts.
     #[inline(never)]
     pub(super) fn receive_into_in(
         &mut self,
@@ -545,8 +479,6 @@ impl<'a> Slots<'a> {
         }
     }
 
-    /// Writes into `header` the salt `salt` and the check of the primary key of the set in slot
-    /// `index`, when the check is derived, and gives the position of that key.
     fn header_of_received(
         &self,
         index: Index,
@@ -568,27 +500,17 @@ impl<'a> Slots<'a> {
         Ok(at)
     }
 
-    /// Receives `chunk`, the next chunk of the carried block `receiving` receives and not its
-    /// last, in place: it opens under the key for transfers if `tag` is its tag, is sealed under
-    /// the set for data, and its new tag goes into `out`.
+    /// Reseals `chunk`, the next but not last chunk of `receiving`, in place from the transfer key
+    /// to the data key. Its tag is `tag`; the new one goes into `out`.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::WrongChunk`] if the last chunk is due, [`Error::StaleHandle`] if either set is not
-    /// held here now, the set for data no longer waits for the end of this transfer, or another
-    /// record or block has gone under the key for transfers, [`Error::Unfinished`] if the key
-    /// writes an export, [`Error::DerivationFailed`] if a key that encrypts the chunks cannot be
-    /// derived,
-    /// [`Error::RecordRejected`] if the chunk does not open as the next of the block, and
-    /// [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or fails, or the
-    /// chunk does not open and seal again to the same tag and ciphertext. `chunk` is then wiped if
-    /// the cipher ran, and left as it was if not, `out` is left as it was, and the block goes on
-    /// as before the call: the caller keeps its own copy of the chunk until the call succeeds.
+    /// [`Error::WrongChunk`], [`Error::StaleHandle`], [`Error::Unfinished`],
+    /// [`Error::DerivationFailed`], [`Error::RecordRejected`] or [`Error::CipherFailed`]. `chunk`
+    /// may be wiped, `out` stays as it was and the block goes on as before.
     pub fn receive_chunk(
         &mut self,
         receiving: &mut Receiving<'a>,
@@ -603,7 +525,6 @@ impl<'a> Slots<'a> {
         carried
     }
 
-    /// A chunk received that is not the last.
     pub(super) fn receive_next_in(
         &mut self,
         receiving: &mut Receiving<'a>,
@@ -622,20 +543,16 @@ impl<'a> Slots<'a> {
         self.receive_chunk_on_stack(receiving, chunk, false, tags, open_with, seal_with)
     }
 
-    /// Receives `chunk`, the last chunk of the carried block `receiving` receives, in place, as
-    /// [`Slots::receive_chunk`] does, and ends the block: the receipt of the export goes on after
-    /// it.
+    /// Reseals `chunk`, the last chunk of `receiving`, as [`Slots::receive_chunk`] does, and ends
+    /// the block. The receipt of the export goes on after it.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::WrongChunk`] if more chunks are due before the last, or `chunk` is not as long as
-    /// [`Receipt::last_len`] says, and the errors of [`Slots::receive_chunk`]. The block is then
-    /// not received.
+    /// The errors of [`Slots::receive_chunk`], or [`Error::WrongChunk`] if more chunks are due or
+    /// `chunk` is not as long as [`Receipt::last_len`]. The block is then not received.
     pub fn receive_last(
         &mut self,
         mut receiving: Receiving<'a>,
@@ -650,7 +567,6 @@ impl<'a> Slots<'a> {
         carried
     }
 
-    /// The last chunk received.
     pub(super) fn receive_last_in(
         &mut self,
         receiving: &mut Receiving<'a>,
@@ -667,8 +583,7 @@ impl<'a> Slots<'a> {
         self.receive_chunk_on_stack(receiving, chunk, true, tags, open_with, seal_with)
     }
 
-    /// The receipt of a chunk itself, in a frame of its own: the wipe that follows starts where
-    /// this frame starts. Every check and both derivations come before the cipher.
+    /// Every check and both derivations come before the cipher.
     #[inline(never)]
     pub(super) fn receive_chunk_on_stack(
         &mut self,
@@ -748,8 +663,6 @@ mod tests {
     use crate::slots::{Handle, Slot, Slots};
     use crate::timing::timed;
 
-    /// The chunks of `block`, each with its tag, past the header, for a block of `chunks` chunks
-    /// whose last holds `last` bytes.
     fn chunks_of(block: &[u8], chunks: u64, last: u64) -> Vec<(Vec<u8>, [u8; CHUNK_TAG_LEN])> {
         let mut at = BLOCK_HEADER_LEN;
         (0..chunks)
@@ -769,8 +682,6 @@ mod tests {
             .collect()
     }
 
-    /// Carries `block`, read under `set` for `context`, under `transfer` for the export's
-    /// `export`: the carried block.
     fn export_block<'a>(
         slots: &mut Slots<'a>,
         (set, context): (Handle<'a>, &[u8]),
@@ -804,8 +715,6 @@ mod tests {
         unreachable!("the last chunk returns")
     }
 
-    /// Receives the carried block `carried` under `transfer` for the export's `export`, into
-    /// `set` or a new set, as a block for `context`: the block and the handle of its set.
     fn receive_block<'a>(
         slots: &mut Slots<'a>,
         (transfer, export): (Handle<'a>, &[u8]),
@@ -842,8 +751,8 @@ mod tests {
     const LENGTHS: [usize; 5] = [0, 1, 33, CHUNK_LEN, CHUNK_LEN + 1];
 
     /// Blocks carried out in turn as one export, computed by an implementation independent of this
-    /// library: the length of the data and of the carried block, and the block, or its SHA-256 when
-    /// long.
+    /// library. Each holds the lengths of the data and of the carried block, and the block or its
+    /// SHA-256.
     const KNOWN_CARRIED: [(usize, usize, &str); 5] = [
         (
             0,
@@ -891,8 +800,6 @@ mod tests {
             .collect()
     }
 
-    /// Slots of one device with a recorded set for data and a key for transfers, and of another
-    /// with the same key for transfers.
     fn devices<'a>(
         (memory, epoch): (&'a mut [Slot], &'a mut Epoch),
         (other_memory, other_epoch): (&'a mut [Slot], &'a mut Epoch),
@@ -946,8 +853,6 @@ mod tests {
         }
     }
 
-    /// Blocks of every length carried out, received into one new set and opened once the end of
-    /// the export is received: before the end the set opens and writes no block.
     #[test]
     fn carried_blocks_open_to_their_data_once_the_export_ends() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
@@ -1014,9 +919,6 @@ mod tests {
         }
     }
 
-    /// A carried block opens only in its place in the export: one out of order, one given twice
-    /// and one of another context are refused, and the end does not open after a block left out.
-    /// A carried block is no local block and a local one no carried block.
     #[test]
     fn carried_blocks_open_only_in_order_and_as_what_they_are() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
@@ -1054,7 +956,6 @@ mod tests {
         from.end_export(out, b"move", &mut Fixed(&NONCE), &mut end)
             .unwrap();
         let entropy = &mut Fixed(&pattern::<16>(3, 7));
-        // The local block is no carried block, and the carried block no local one.
         let header: [u8; BLOCK_HEADER_LEN] = blocks[0][..BLOCK_HEADER_LEN].try_into().unwrap();
         let length = u64::try_from(blocks[0].len()).unwrap();
         assert_eq!(
@@ -1065,7 +966,6 @@ mod tests {
             open_block(&from, set, b"chat 7", &carried[0]),
             Err(Error::RecordRejected)
         );
-        // Out of order, and in another context.
         let new = None;
         assert_eq!(
             receive_block(&mut to, (into, b"move"), &carried[1], (new, b"x"), entropy).err(),
@@ -1123,8 +1023,6 @@ mod tests {
         to.end_receive(into, b"move", &end).unwrap();
     }
 
-    /// The last chunk is carried out and received only in its place and at its length; the
-    /// refusals give no tag and leave the export as it was.
     #[test]
     fn carried_chunks_go_in_the_order_and_lengths_of_their_block() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
@@ -1209,8 +1107,6 @@ mod tests {
         assert_eq!(open_block(&to, new, b"chat 9", &received).unwrap(), data);
     }
 
-    /// A block carried between records of the export takes its place among them, a record between
-    /// two of its chunks breaks it, and a set that did not come in the transfer takes no block.
     #[test]
     fn a_carried_block_is_an_element_of_its_export() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 5], Epoch::empty());
@@ -1326,7 +1222,6 @@ mod tests {
         assert_eq!(std::format!("{receiving:?}"), "Receiving { .. }");
     }
 
-    /// A chunk refused by the cipher is wiped, on the way out and in, and its block goes on from it.
     #[test]
     fn a_chunk_that_does_not_open_is_wiped() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
@@ -1391,9 +1286,6 @@ mod tests {
             .unwrap();
     }
 
-    /// A receipt stops at another element of the export between two of its chunks, and at an end
-    /// of another export received under the same key, which lets its set go: a block begun as the
-    /// first element of one export does not go on into another.
     #[test]
     fn a_receipt_stops_at_another_element_or_end() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
@@ -1411,12 +1303,10 @@ mod tests {
             &pattern_of(CHUNK_LEN + 3),
         )
         .unwrap();
-        // The first export: the long block alone, ended.
         let carried =
             export_block(&mut from, (set, b"chat 7"), &long, (out, b"move"), entropy).unwrap();
         let mut end = [0; END_RECORD_LEN];
         from.end_export(out, b"move", entropy, &mut end).unwrap();
-        // The second export: one record, ended.
         let external = from
             .import32(Purpose::ExternalData, &mut pattern(19, 4))
             .unwrap();
@@ -1460,8 +1350,6 @@ mod tests {
         let _ = end;
     }
 
-    /// Every call on a carried block derives and runs the cipher with data-independent timing on,
-    /// where it is offered.
     #[test]
     fn every_call_on_a_carried_block_holds_data_independent_timing() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
@@ -1519,17 +1407,12 @@ mod tests {
         });
     }
 
-    /// A source of the next bytes of `random`.
     fn random_source(random: &mut Random) -> Fixed<'static> {
         Fixed(std::boxed::Box::leak(std::boxed::Box::new(
             random.bytes::<64>(),
         )))
     }
 
-    /// Exports of one to four elements, each a set for external data or a block of a random length
-    /// and context, carried out and received in order into one new set, with their end. One random
-    /// element with one bit changed is refused in its place, and the export goes on with it whole;
-    /// once the end is received, every block opens to its data.
     #[expect(
         clippy::too_many_lines,
         reason = "one round builds an export, changes it and receives it"
@@ -1651,8 +1534,6 @@ mod tests {
         random_exports(8, 1);
     }
 
-    /// The same over as many rounds and from the seed `LETHEWIS_RANDOM_ROUNDS` and
-    /// `LETHEWIS_RANDOM_SEED` give.
     #[test]
     #[ignore = "long; the rounds and the seed come from the environment"]
     fn many_random_exports_open_to_their_data_and_refuse_a_changed_bit() {
@@ -1662,8 +1543,6 @@ mod tests {
         );
     }
 
-    /// Every changed bit of a carried block is refused, at its header or at its chunk, and the block
-    /// unchanged is received after them.
     #[test]
     fn every_bit_of_a_carried_block_is_bound() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
@@ -1743,13 +1622,11 @@ mod stack {
     use crate::{Epoch, Handle, KeyLength, Position, Purpose, RECORD_LEN, Slot, Slots, seal};
 
     /// The stack each beginning needs, in KiB, in an optimised build and in one without
-    /// optimisation: a beginning of a receipt reads as a beginning of a block does, one of an
-    /// export also hedges, and one of the block received also loads a key.
+    /// optimisation. An export also hedges, and the block received also loads a key.
     const EXPORT_NEEDS: [usize; 2] = [12, 74];
     const RECEIPT_NEEDS: [usize; 2] = [11, 70];
     const INTO_NEEDS: [usize; 2] = [13, 77];
 
-    /// The documentation of the public call `name` in this file, its lines joined.
     fn documentation(name: &str) -> String {
         let source = include_str!("carry.rs");
         let at = source.find(&format!("    pub fn {name}(")).unwrap();
@@ -1763,8 +1640,6 @@ mod stack {
         lines.join(" ")
     }
 
-    /// The documentation of each call on a carried block states the stack it needs and the depth
-    /// of the wipe after it: a beginning derives, a chunk derives and runs the cipher.
     #[test]
     fn the_documentation_states_the_stack_calls_need() {
         for (call, needs, wipes) in [
@@ -1786,7 +1661,6 @@ mod stack {
         }
     }
 
-    /// The data of the first chunk, which `flip` changes, varied in every piece.
     fn first_data(flip: u8) -> std::boxed::Box<[u8; CHUNK_LEN]> {
         let mut data: std::boxed::Box<[u8; CHUNK_LEN]> = std::vec![0; CHUNK_LEN]
             .into_boxed_slice()
@@ -1798,12 +1672,10 @@ mod stack {
         data
     }
 
-    /// The data of the last chunk.
     fn last_data(flip: u8) -> [u8; 33] {
         core::array::from_fn(|at| u8::try_from(at).unwrap().wrapping_mul(53).wrapping_add(7) ^ flip)
     }
 
-    /// The key for transfers both devices hold, which `flip` changes.
     fn transfer_key(flip: u8) -> [u8; 32] {
         let mut key = pattern::<32>(41, 3);
         key[0] ^= flip;
@@ -1842,8 +1714,6 @@ mod stack {
         block
     }
 
-    /// Slots of a device whose epoch key `flip` changes, with a key for data that a record of this
-    /// epoch holds and a key for transfers, and a block of two chunks sealed under the key for data.
     fn device<'a>(
         memory: &'a mut [Slot],
         epoch: &'a mut Epoch,
@@ -1877,7 +1747,6 @@ mod stack {
         (slots, set, transfer, block)
     }
 
-    /// The beginning of the carriage of `block` out of `slots`.
     fn begin_export_block<'a>(
         slots: &mut Slots<'a>,
         (set, transfer): (Handle<'a>, Handle<'a>),
@@ -1892,7 +1761,6 @@ mod stack {
             .unwrap()
     }
 
-    /// The beginning of the receipt of `carried` into a new set of `slots`.
     fn begin_receipt<'a>(
         slots: &mut Slots<'a>,
         transfer: Handle<'a>,
@@ -1909,12 +1777,8 @@ mod stack {
             .unwrap()
     }
 
-    /// A block of `memory` whose epoch key `flip` changes, carried out of it and received into a
-    /// new set of the slots over `other`, and the secrets the calls handle on both: the keys for
-    /// data and for transfers, the keys of the chunks of the three blocks, the cipher's keys and
-    /// keystream for each pass, the derivations of those keys and the checks, the hedges of the
-    /// salts and the new key, and the data; and the three headers, which are public: a call copies
-    /// the salt of each.
+    /// The secrets the calls handle, and apart from them the three headers, which are public. A
+    /// call copies the salt of each.
     #[expect(clippy::too_many_lines, reason = "both devices are gathered at once")]
     fn carried(
         memory: &mut [Slot],
@@ -1958,8 +1822,8 @@ mod stack {
             first_data(flip).to_vec(),
             last_data(flip).to_vec(),
         ];
-        // The hedges of the carried salt, the fifth draw of its device, and of the salt and the key
-        // of the new set, the first two of the other.
+        // The hedges of the carried salt, the fifth draw of its device. Then those of the salt and
+        // key of the new set, the other's first two draws.
         for (key, drawn, count, branch) in [
             (&epoch_key, 16, 4_u64, Branch::HedgeSalt),
             (&other_epoch_key, 16, 0, Branch::HedgeSalt),
@@ -2032,7 +1896,6 @@ mod stack {
         )
     }
 
-    /// The slots over `other` with the key for transfers `flip` gives.
     fn receiver<'a>(
         (memory, epoch): (&'a mut [Slot], &'a mut Epoch),
         flip: u8,
@@ -2044,9 +1907,8 @@ mod stack {
         (slots, transfer)
     }
 
-    /// Carrying a chunk out and receiving it without the wipe after them leave on the stack some
-    /// of what they handle, so that the test below can tell the wipe from its absence: each seals
-    /// last, and a seal leaves its keystream.
+    /// Lets the test below tell the wipe from its absence: each call seals last, and a seal leaves
+    /// its keystream.
     #[test]
     fn the_calls_on_a_carried_chunk_without_the_wipe_leave_residue() {
         let (mut other_memory, mut other_epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
@@ -2113,8 +1975,6 @@ mod stack {
         assert!(residue(range, &pieces) > 0, "a chunk received");
     }
 
-    /// Carrying a block out and receiving it leave on the stack none of the secrets [`carried`]
-    /// names, and none of the data.
     #[test]
     fn the_calls_on_a_carried_block_leave_no_key_on_the_stack() {
         let (mut other_memory, mut other_epoch) = ([const { Slot::empty() }; 4], Epoch::empty());
@@ -2196,8 +2056,6 @@ mod stack {
         });
     }
 
-    /// The wipes that follow each call reach as deep as they are meant to, and no call reaches
-    /// deeper than its documentation says it needs.
     #[test]
     #[expect(clippy::too_many_lines, reason = "each call is measured in turn")]
     fn the_calls_on_a_carried_block_wipe_and_need_the_stack_documented() {
