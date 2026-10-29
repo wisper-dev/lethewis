@@ -397,8 +397,9 @@ jobs:
           LETHEWIS_RANDOM_SEED: ${{ github.run_id }}
         run: |
           cargo test -p lethewis-core --lib --locked --release -- --ignored --exact \
-            words::tests::many_random_words_are_read_as_the_list_says | tee random-words.txt
-          grep -q '^test result: ok. 1 passed' random-words.txt
+            words::tests::many_random_words_are_read_as_the_list_says \
+            shares::words::tests::many_random_changes_of_symbols_are_refused | tee random-words.txt
+          grep -q '^test result: ok. 2 passed' random-words.txt
 
       - name: Ten thousand random records of the archive
         # X-Wing runs in every round, so the rounds are fewer.

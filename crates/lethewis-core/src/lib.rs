@@ -67,7 +67,10 @@ pub use record::{
     ARCHIVE_KEY_RECORD_LEN, ARCHIVE_RECORD_LEN, END_RECORD_LEN, LOCK_RECORD_LEN, Purpose,
     RECORD_LEN,
 };
-pub use shares::{SHARE_COUNT, SHARE_LEN, Share, Shares};
+pub use shares::{
+    SHARE_COUNT, SHARE_LEN, SHARE_WORD_COUNT, Share, ShareWords, Shares, share_from_words,
+    share_to_words, wrong_share_word,
+};
 pub use slots::{
     ArchivePublic, Exporting, Handle, Opening, Receipt, Receiving, Sealing, Slot, Slots,
 };

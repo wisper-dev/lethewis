@@ -79,6 +79,8 @@ password and the hardware secret at each unlock, and neither alone is enough.
 - Twelve words are as safe as the place they are kept: whoever reads them derives the key. Keeping
   them off screenshots, the clipboard and backups is the caller's.
 - About one changed word in sixteen passes the checksum; the key it gives opens no record.
+- A share with four or more wrong words may pass its check of three words. The check of the secret
+  still refuses it, but for one time in 2^32.
 - Any two holders of shares open what the shares protect, agreeing, forced or deceived. One alone
   learns nothing.
 - A changed share is refused, not named. A 4-byte check split with the secret catches a change,

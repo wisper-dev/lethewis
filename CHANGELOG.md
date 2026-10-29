@@ -300,5 +300,11 @@ Nothing is published while the version is below 0.1.0.
   fails it.
 - Kani 0.68.0 proves the field, the split, one share against every secret, the check, and reading
   and loading shares. Tests against an independent implementation, and of the stack.
+- `share_to_words` writes a share as 21 words of BIP 39 (`ShareWords`), the last three a
+  Reed-Solomon check over GF(2^11).
+- `share_from_words` reads a share back and wipes its words; `wrong_share_word` names a single
+  wrong word.
+- Kani 0.68.0 proves the field, reading back, and that up to three changed words are refused and
+  one is found. Tests against an independent implementation, and of the stack.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

@@ -2134,6 +2134,10 @@ mod tests {
         let mut shares = [[0; crate::shares::SHARE_LEN]; crate::shares::SHARE_COUNT];
         let set = timed(|| slots.generate_shares(&mut Counting, &mut shares).unwrap());
         slots.release(set).unwrap();
+        let mut written = [[0; 8]; crate::shares::SHARE_WORD_COUNT];
+        timed(|| crate::shares::share_to_words(&shares[0], &mut written).unwrap());
+        timed(|| assert_eq!(crate::shares::wrong_share_word(&written), None));
+        timed(|| crate::shares::share_from_words(&mut written, &mut shares[0]).unwrap());
         let [first, _, third] = &mut shares;
         let set = timed(|| slots.derive_from_shares(third, first).unwrap());
         slots.release(set).unwrap();

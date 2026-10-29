@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Checks that `KeyId::is`, both `same_check`, `first_match`, `find_step`, `select_step` and
-`product` run straight through on every target. No branch, call or program counter write is
-allowed; the timing itself is not checked.
+"""Checks that `KeyId::is`, both `same_check`, `first_match`, `find_step`, `select_step`, both
+`product`, `locate_step` and `named` run straight through on every target. No branch, call or
+program counter write is allowed; the timing itself is not checked.
 """
 
 import re
@@ -24,6 +24,12 @@ FUNCTIONS = {
         r"^(_RNv\S*13lethewis_core5words11select_step):\s*$"),
     "a product in the field of shares": re.compile(
         r"^(_RNv\S*13lethewis_core6shares7product):\s*$"),
+    "a product in the field of share words": re.compile(
+        r"^(_RNv\S*13lethewis_core6shares5words7product):\s*$"),
+    "a step of the search for a wrong share word": re.compile(
+        r"^(_RNv\S*13lethewis_core6shares5words11locate_step):\s*$"),
+    "the choice of the wrong share word named": re.compile(
+        r"^(_RNv\S*13lethewis_core6shares5words5named):\s*$"),
     "the comparison of the checks of shares": re.compile(
         r"^(_RNv\S*13lethewis_core6shares10same_check):\s*$"),
 }

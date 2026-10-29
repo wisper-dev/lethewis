@@ -21,6 +21,13 @@
 3 281 shares::proofs::every_byte_but_zero_has_its_inverse
 100 929 shares::proofs::shares_are_read_exactly_when_they_fit_together
 5 284 shares::proofs::the_product_is_that_of_the_field
+33 1695 shares::words::proofs::a_place_is_named_only_for_one_change_there
+69 2048 shares::words::proofs::a_share_is_read_back_from_its_symbols
+30 1345 shares::words::proofs::one_change_is_found
+130 3972 shares::words::proofs::symbols_are_read_exactly_when_those_of_a_share
+3 286 shares::words::proofs::the_product_is_that_of_the_field
+73 2495 shares::words::proofs::the_syndromes_add
+47 713 shares::words::proofs::up_to_three_changes_are_seen
 70 1758 slots::proofs::a_block_begins_under_the_primary_of_a_recorded_set
 142 2225 slots::proofs::a_block_is_carried_out_after_the_chain_of_its_export
 148 3250 slots::proofs::a_block_opens_only_under_the_key_its_header_names
