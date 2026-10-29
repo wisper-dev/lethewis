@@ -55,6 +55,7 @@ mod record;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod residue;
 mod seal;
+mod shares;
 mod slots;
 mod timing;
 mod words;
@@ -71,6 +72,7 @@ pub use record::{
     ARCHIVE_KEY_RECORD_LEN, ARCHIVE_RECORD_LEN, END_RECORD_LEN, LOCK_RECORD_LEN, Purpose,
     RECORD_LEN,
 };
+pub use shares::{SHARE_COUNT, SHARE_LEN, Share, Shares};
 pub use slots::{
     ArchivePublic, Exporting, Handle, Opening, Receipt, Receiving, Sealing, Slot, Slots,
 };

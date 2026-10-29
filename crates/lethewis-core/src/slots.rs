@@ -5,9 +5,9 @@ use core::{fmt, marker::PhantomData};
 
 use crate::{
     derive::{
-        Branch, DerivationFailed, Hedged, KeyId, derive_archive_key, derive_challenge,
-        derive_combined, derive_export_key, derive_key_id, derive_layer_key, derive_lock_key,
-        derive_wrap_key, wipe_cipher_stack, wipe_stack,
+        Branch, DerivationFailed, Hedged, KeyId, SECRET_LEN, derive_archive_key, derive_challenge,
+        derive_combined, derive_export_key, derive_from_secret, derive_key_id, derive_layer_key,
+        derive_lock_key, derive_wrap_key, wipe_cipher_stack, wipe_stack,
     },
     entropy::{Entropy, EntropyError},
     epoch::{Epoch, Erasure, Root, RootFailed},
@@ -594,6 +594,30 @@ impl<'a> Slots<'a> {
             first
                 .fill(length, source)
                 .map_err(|EntropyError| Error::EntropyFailed)
+        })
+    }
+
+    /// Loads the key for `purpose` that `secret`, the bytes twelve words or two shares stand for,
+    /// derives under the label of `branch` into a free slot: a key from such a secret is loaded as
+    /// a generated one is.
+    pub(crate) fn derive_into(
+        &mut self,
+        secret: &[u8; SECRET_LEN],
+        purpose: Purpose,
+        branch: Branch,
+    ) -> Result<Handle<'a>, Error> {
+        self.load_derived(
+            purpose,
+            KeyLength::Bytes32,
+            &mut FromSecret {
+                secret,
+                purpose,
+                branch,
+            },
+        )
+        .map_err(|error| match error {
+            Error::EntropyFailed => Error::DerivationFailed,
+            other => other,
         })
     }
 
@@ -2150,6 +2174,20 @@ fn hedged_fill(
     })
 }
 
+/// The derivation from the bytes of words or of shares as the source of a key's bytes.
+struct FromSecret<'b> {
+    secret: &'b [u8; SECRET_LEN],
+    purpose: Purpose,
+    branch: Branch,
+}
+
+impl Entropy for FromSecret<'_> {
+    fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
+        derive_from_secret(self.secret, Some(self.purpose), self.branch, dest)
+            .map_err(|_| EntropyError)
+    }
+}
+
 /// Fills `dest` from `entropy`, the platform's source, hedged with `epoch` under `branch` and the
 /// next count of `drawn`. A failed hedge is `DerivationFailed`, a failed source `EntropyFailed`.
 fn hedged_draw(
@@ -2398,6 +2436,12 @@ mod tests {
         let mut kept = words;
         slots.release(set).unwrap();
         timed(|| slots.derive_from_words(&mut words).unwrap());
+        let mut shares = [[0; crate::shares::SHARE_LEN]; crate::shares::SHARE_COUNT];
+        let set = timed(|| slots.generate_shares(&mut Counting, &mut shares).unwrap());
+        slots.release(set).unwrap();
+        let [first, _, third] = &mut shares;
+        let set = timed(|| slots.derive_from_shares(third, first).unwrap());
+        slots.release(set).unwrap();
         let secret = timed(|| slots.import32(Purpose::Wrap, &mut [6; 32]).unwrap());
         let stored = timed(|| {
             slots
@@ -5349,11 +5393,11 @@ mod tests {
         assert_eq!(slots.epoch.drawn, 3);
     }
 
-    /// A source that gives the same bytes every time still gives different keys, words and nonces:
-    /// each draw is hedged with its own count.
+    /// A source that gives the same bytes every time still gives different keys, words, shares and
+    /// nonces: each draw is hedged with its own count.
     #[test]
     fn a_source_that_repeats_itself_gives_different_bytes() {
-        let mut memory = [const { Slot::empty() }; 4];
+        let mut memory = [const { Slot::empty() }; 6];
         let mut epoch_memory = Epoch::empty();
         let mut slots = Slots::new(&mut memory, &mut epoch_memory, EPOCH, &mut epoch_key());
         let first = slots
@@ -5378,6 +5422,13 @@ mod tests {
         slots.generate_words(&mut Counting, &mut words).unwrap();
         slots.generate_words(&mut Counting, &mut more).unwrap();
         assert_ne!(words, more);
+        let mut shares = [[0; crate::shares::SHARE_LEN]; crate::shares::SHARE_COUNT];
+        let mut others = shares;
+        slots.generate_shares(&mut Counting, &mut shares).unwrap();
+        slots.generate_shares(&mut Counting, &mut others).unwrap();
+        for (share, other) in shares.iter().zip(&others) {
+            assert_ne!(share[1..], other[1..]);
+        }
     }
 
     #[test]

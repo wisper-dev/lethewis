@@ -19,8 +19,8 @@ use crate::derive::{
         expected_archive_layer_key, expected_archive_randomness, expected_archive_seal_key,
         expected_carry_check, expected_carry_chunk, expected_challenge, expected_combined,
         expected_data_check, expected_data_chunk, expected_export_key, expected_hedge,
-        expected_key_id, expected_layer_key, expected_lock_key, expected_words_key,
-        expected_wrap_key,
+        expected_key_id, expected_layer_key, expected_lock_key, expected_secret_key,
+        expected_share_check, expected_wrap_key,
     },
 };
 use crate::keyset::proofs::{allowed, any_purpose, any_whole_stages};
@@ -29,6 +29,10 @@ use crate::record::{
     ARCHIVE_KEY_RECORD_LEN, ARCHIVE_LAYER_LEN, ARCHIVE_RECORD_LEN, ARCHIVED_LEN, ID_LEN,
 };
 use crate::seal;
+use crate::shares::{
+    SHARE_LEN, Share, Shares,
+    proofs::{expected_secret_and_check, expected_shares},
+};
 use crate::words::{
     Words, bits_of,
     proofs::{any_list, expected_words},
@@ -1147,13 +1151,17 @@ fn a_derivation_from_a_password_past_a_retired_slot() {
     kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
 }
 
-/// A derivation from any bytes that twelve words stand for, from `memory`, of a key from a
-/// secret or a key for transfers: a failure of a derivation is `DerivationFailed`, and nothing
-/// else is, never the failure of a platform source; a failed derivation changes no slot, and
-/// one that succeeds loads the first free slot with the 32-byte key for that purpose derived
-/// from the bytes and the identifier derived from it. The rest is
-/// the load of a generation, proven above for a source that writes any bytes and may fail.
-fn derivation_from_words(mut memory: [Slot; 2]) -> Result<Handle<'static>, Error> {
+/// A derivation from any 16 bytes that twelve words or two shares stand for, from `memory`, of a
+/// key from a secret or a key for transfers, under the label of `branch`: a failure of a
+/// derivation is `DerivationFailed`, and nothing else is, never the failure of a platform source;
+/// a failed derivation changes no slot, and one that succeeds loads the first free slot with the
+/// 32-byte key for that purpose derived from the bytes under that label and the identifier derived
+/// from it. The rest is the load of a generation, proven above for a source that writes any bytes
+/// and may fail.
+fn derivation_from_a_secret(
+    mut memory: [Slot; 2],
+    branch: Branch,
+) -> Result<Handle<'static>, Error> {
     let mut epoch = any_epoch(false);
     let mut slots = Slots {
         memory: Table::new(&mut memory),
@@ -1166,14 +1174,14 @@ fn derivation_from_words(mut memory: [Slot; 2]) -> Result<Handle<'static>, Error
     } else {
         Purpose::Transfer
     };
-    let result = slots.derive_into(&bytes, purpose);
+    let result = slots.derive_into(&bytes, purpose, branch);
     kani::assert(
         (result == Err(Error::DerivationFailed)) == any_failed(),
         "a failure of a derivation is DerivationFailed, and nothing else is",
     );
     if let Ok(handle) = result {
         let now = snapshot(slot_at(&slots, handle.index.number()));
-        let key = expected_words_key(&bytes, purpose);
+        let key = expected_secret_key(&bytes, purpose, branch);
         kani::assert(
             first_free(&before) == Some(handle.index.number())
                 && now.occupancy == Occupancy::Loaded
@@ -1199,10 +1207,10 @@ fn derivation_from_words(mut memory: [Slot; 2]) -> Result<Handle<'static>, Error
             "a failed derivation changes no slot",
         );
     }
-    kani::cover!(result.is_ok(), "a key is derived from words");
+    kani::cover!(result.is_ok(), "a key is derived from a secret");
     kani::cover!(
         result.is_ok() && purpose == Purpose::Transfer,
-        "a key for transfers is derived from words"
+        "a key for transfers is derived from a secret"
     );
     kani::cover!(
         result == Err(Error::DerivationFailed),
@@ -1211,18 +1219,28 @@ fn derivation_from_words(mut memory: [Slot; 2]) -> Result<Handle<'static>, Error
     result.map(widen)
 }
 
-/// A derivation from words with the first slot free.
+/// A derivation from a secret with the first slot free, under the label of words or of shares.
 #[kani::proof]
 #[kani::unwind(65)]
-fn a_derivation_from_words_into_the_first_slot() {
-    let _ = into_the_first(derivation_from_words);
+fn a_derivation_from_a_secret_into_the_first_slot() {
+    let shares: bool = kani::any();
+    let branch = if shares {
+        Branch::FromShares
+    } else {
+        Branch::FromWords
+    };
+    let result = into_the_first(|memory| derivation_from_a_secret(memory, branch));
+    kani::cover!(result.is_ok() && shares, "a key is derived from shares");
+    kani::cover!(result.is_ok() && !shares, "a key is derived from words");
 }
 
-/// A derivation from words with the first slot loaded.
+/// A derivation from words with the first slot loaded: past a free slot, a load reads no label.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_derivation_from_words_past_a_loaded_slot() {
-    let result = past_a(Occupancy::Loaded, derivation_from_words);
+    let result = past_a(Occupancy::Loaded, |memory| {
+        derivation_from_a_secret(memory, Branch::FromWords)
+    });
     kani::cover!(
         result == Err(Error::DuplicateKey),
         "a derivation finds its key held"
@@ -1234,7 +1252,9 @@ fn a_derivation_from_words_past_a_loaded_slot() {
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_derivation_from_words_past_a_retired_slot() {
-    let result = past_a(Occupancy::Retired, derivation_from_words);
+    let result = past_a(Occupancy::Retired, |memory| {
+        derivation_from_a_secret(memory, Branch::FromWords)
+    });
     kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
 }
 
@@ -1297,7 +1317,8 @@ fn words_are_wiped_exactly_when_their_key_is_derived() {
             });
             let (read, _) = bits_of(&numbers);
             kani::assert(
-                snapshot(&slots.memory[0]).keys.0[..32] == expected_words_key(&read, purpose),
+                snapshot(&slots.memory[0]).keys.0[..32]
+                    == expected_secret_key(&read, purpose, Branch::FromWords),
                 "the key in the slot is the one the bytes the words stand for derive",
             );
         } else {
@@ -1371,7 +1392,7 @@ fn words_are_written_exactly_when_their_key_is_generated() {
         if result.is_ok() {
             let now = snapshot(&slots.memory[0]);
             kani::assert(
-                now.keys.0[..32] == expected_words_key(&bytes, Purpose::Wrap)
+                now.keys.0[..32] == expected_secret_key(&bytes, Purpose::Wrap, Branch::FromWords)
                     && now.unlocks
                     && !now.recorded,
                 "the key in the slot is the one the hedged bytes derive, a key from a secret \
@@ -1434,6 +1455,212 @@ fn no_words_are_generated_without_a_free_slot() {
         1 => generation_without_a_free_slot([any_slot_in(loaded), any_slot_in(retired)]),
         2 => generation_without_a_free_slot([any_slot_in(retired), any_slot_in(loaded)]),
         _ => generation_without_a_free_slot([any_slot_in(retired), any_slot_in(retired)]),
+    }
+    kani::cover!(layout == 3, "both slots retired");
+}
+
+/// Whether two shares are the same, compared byte by byte.
+fn same_share(a: &Share, b: &Share) -> bool {
+    a.iter().zip(b).all(|(x, y)| x == y)
+}
+
+/// Whether two sets of shares are the same, compared share by share.
+fn same_shares(a: &Shares, b: &Shares) -> bool {
+    a.iter().zip(b).all(|(x, y)| same_share(x, y))
+}
+
+/// Any two shares, with the first slot free: shares that do not fit together derive nothing; shares
+/// are refused for their check exactly when the secret they give fails it, and a key is derived
+/// only from a secret with its check; the shares are wiped exactly when the derivation succeeds; a
+/// failure of the platform source is never reported; a failed derivation changes no slot. Where
+/// the key goes, the derivations from a secret above prove.
+#[kani::proof]
+#[kani::unwind(65)]
+fn shares_are_wiped_exactly_when_their_key_is_derived() {
+    into_the_first(|mut memory| {
+        let mut epoch = any_epoch(false);
+        let mut slots = Slots {
+            memory: Table::new(&mut memory),
+            epoch: &mut epoch,
+        };
+        let before = snapshots(&slots);
+        let (mut first, mut second): (Share, Share) = (kani::any(), kani::any());
+        let (given_first, given_second) = (first, second);
+        let result = slots.derive_from_shares(&mut first, &mut second);
+        let refused = matches!(
+            result,
+            Err(Error::InvalidShare | Error::MixedShares | Error::SameShare)
+        );
+        kani::assert(!refused || !any_failed(), "refused shares derive nothing");
+        let read = expected_secret_and_check(&given_first, &given_second);
+        if let Err(error) = read {
+            kani::assert(
+                result == Err(error),
+                "shares that do not fit together are refused as reading them refuses them",
+            );
+        }
+        let fails_check = read.is_ok_and(|(secret, check)| expected_share_check(&secret) != check);
+        kani::assert(
+            (result == Err(Error::ChangedShare)) == (fails_check && !any_failed()),
+            "shares are refused for their check exactly when the secret they give fails it",
+        );
+        kani::assert(
+            result != Err(Error::EntropyFailed),
+            "no platform source is asked",
+        );
+        let (kept_first, kept_second) = if result.is_ok() {
+            ([0; SHARE_LEN], [0; SHARE_LEN])
+        } else {
+            (given_first, given_second)
+        };
+        kani::assert(
+            same_share(&first, &kept_first) && same_share(&second, &kept_second),
+            "the shares are wiped exactly when the derivation succeeds",
+        );
+        if result.is_ok() {
+            kani::assert(
+                read.is_ok_and(|(secret, check)| {
+                    expected_share_check(&secret) == check
+                        && snapshot(&slots.memory[0]).keys.0[..32]
+                            == expected_secret_key(&secret, Purpose::Wrap, Branch::FromShares)
+                }),
+                "the key in the slot is the one the secret of the shares derives, with its check",
+            );
+        } else {
+            kani::assert(
+                unchanged_except(&slots, &before, 2),
+                "a failed derivation changes no slot",
+            );
+        }
+        kani::cover!(result.is_ok(), "a key is derived from shares");
+        kani::cover!(result == Err(Error::InvalidShare), "a share of no number");
+        kani::cover!(result == Err(Error::MixedShares), "shares of two splits");
+        kani::cover!(result == Err(Error::SameShare), "one share twice");
+        kani::cover!(
+            result == Err(Error::ChangedShare),
+            "shares whose check fails"
+        );
+        kani::cover!(
+            result == Err(Error::DuplicateKey),
+            "shares whose key is held"
+        );
+        kani::cover!(
+            result == Err(Error::DerivationFailed),
+            "shares whose derivation fails"
+        );
+    });
+}
+
+/// Generation of shares, with the first slot free: the source is asked once for 64 bytes, its
+/// failure is `EntropyFailed`, the count of draws grows exactly when it answers, and the shares of
+/// its bytes hedged with the key of this epoch are written exactly when the key of the secret they
+/// begin with is derived; a failed generation changes neither the shares nor any slot. During a
+/// change of epoch or not.
+#[kani::proof]
+#[kani::unwind(65)]
+fn shares_are_written_exactly_when_their_key_is_generated() {
+    into_the_first(|mut memory| {
+        let mut epoch = any_epoch(kani::any());
+        let mut slots = Slots {
+            memory: Table::new(&mut memory),
+            epoch: &mut epoch,
+        };
+        let before = snapshots(&slots);
+        let mut source = AnyEntropy::new();
+        let (epoch_key, count) = (first_half(&slots.epoch.key), slots.epoch.drawn);
+        let mut shares: Shares = kani::any();
+        let original = shares;
+        let result = slots.generate_shares(&mut source, &mut shares);
+        kani::assert(
+            source.calls == 1 && source.requested == 64,
+            "the source is asked once for 64 bytes",
+        );
+        kani::assert(
+            source.failed == (result == Err(Error::EntropyFailed)),
+            "a failure of the source is EntropyFailed, and nothing else is",
+        );
+        kani::assert(
+            slots.epoch.drawn == count.wrapping_add(u64::from(!source.failed)),
+            "the count of draws grows by one exactly when the source answers",
+        );
+        let hedged = expected_hedge(&epoch_key, count, Branch::HedgeShares, &source.written);
+        let expected = if result.is_ok() {
+            expected_shares(&hedged)
+        } else {
+            original
+        };
+        kani::assert(
+            same_shares(&shares, &expected),
+            "the shares of the hedged bytes are written exactly when the key is derived",
+        );
+        if result.is_ok() {
+            let mut secret = [0; 16];
+            secret.copy_from_slice(&hedged[..16]);
+            let now = snapshot(&slots.memory[0]);
+            kani::assert(
+                now.keys.0[..32] == expected_secret_key(&secret, Purpose::Wrap, Branch::FromShares)
+                    && now.unlocks
+                    && !now.recorded,
+                "the key in the slot is the one the secret the hedged bytes begin with derives, a \
+                 key from a secret held by no record",
+            );
+        } else {
+            kani::assert(
+                unchanged_except(&slots, &before, 2),
+                "a failed generation changes no slot",
+            );
+        }
+        kani::cover!(result.is_ok(), "shares are generated");
+        kani::cover!(
+            result.is_ok() && slots.epoch.changing,
+            "shares are generated during a change of epoch"
+        );
+        kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
+        kani::cover!(
+            result == Err(Error::DuplicateKey),
+            "the key generated is held"
+        );
+        kani::cover!(
+            result == Err(Error::DerivationFailed),
+            "the derivation fails"
+        );
+    });
+}
+
+/// Without a free slot, from `memory`, a generation of shares asks nothing of the source and
+/// changes neither the shares nor any slot.
+fn shares_without_a_free_slot(mut memory: [Slot; 2]) {
+    let mut epoch = any_epoch(kani::any());
+    let mut slots = Slots {
+        memory: Table::new(&mut memory),
+        epoch: &mut epoch,
+    };
+    let before = snapshots(&slots);
+    let mut source = AnyEntropy::new();
+    let mut shares: Shares = kani::any();
+    let original = shares;
+    let result = slots.generate_shares(&mut source, &mut shares);
+    kani::assert(
+        result == Err(Error::NoFreeSlot) && source.calls == 0,
+        "without a free slot nothing is asked",
+    );
+    kani::assert(
+        same_shares(&shares, &original) && unchanged_except(&slots, &before, 2),
+        "nothing changes",
+    );
+}
+
+/// The same in each of the four ways two slots can be taken.
+#[kani::proof]
+#[kani::unwind(65)]
+fn no_shares_are_generated_without_a_free_slot() {
+    let (loaded, retired) = (Occupancy::Loaded, Occupancy::Retired);
+    let layout = kani::any::<u8>() % 4;
+    match layout {
+        0 => shares_without_a_free_slot([any_slot_in(loaded), any_slot_in(loaded)]),
+        1 => shares_without_a_free_slot([any_slot_in(loaded), any_slot_in(retired)]),
+        2 => shares_without_a_free_slot([any_slot_in(retired), any_slot_in(loaded)]),
+        _ => shares_without_a_free_slot([any_slot_in(retired), any_slot_in(retired)]),
     }
     kani::cover!(layout == 3, "both slots retired");
 }

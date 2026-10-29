@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use crate::derive::{Branch, WORDS_ENTROPY_LEN, derive_from_words, wipe_stack};
-use crate::entropy::{Entropy, EntropyError};
+use crate::derive::{Branch, SECRET_LEN, wipe_stack};
+use crate::entropy::Entropy;
 use crate::error::Error;
-use crate::key::{KeyLength, wipe};
+use crate::key::wipe;
 use crate::record::Purpose;
 use crate::slots::{Handle, Slots};
 
@@ -80,7 +80,7 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// [`Error::NoFreeSlot`] if no slot is free, [`Error::EntropyFailed`] if `entropy` fails,
-    /// [`Error::DerivationFailed`] if the key or its identifier cannot be derived, and
+    /// [`Error::DerivationFailed`] if the hedge, the key or its identifier cannot be derived, and
     /// [`Error::DuplicateKey`] if these slots hold the key already. `words` is then left as it
     /// was, and no slot changes.
     ///
@@ -163,9 +163,9 @@ impl<'a> Slots<'a> {
         entropy: &mut (impl Entropy + ?Sized),
         words: &mut Words,
     ) -> Result<Handle<'a>, Error> {
-        let mut bytes = [0; WORDS_ENTROPY_LEN];
+        let mut bytes = [0; SECRET_LEN];
         let generated = crate::timing::with(|| self.draw(entropy, Branch::HedgeWords, &mut bytes))
-            .and_then(|()| self.derive_into(&bytes, Purpose::Wrap));
+            .and_then(|()| self.derive_into(&bytes, Purpose::Wrap, Branch::FromWords));
         if generated.is_ok() {
             crate::timing::with(|| encode(list, &bytes, words));
         }
@@ -197,44 +197,14 @@ impl<'a> Slots<'a> {
         purpose: Purpose,
         words: &Words,
     ) -> Result<Handle<'a>, Error> {
-        let mut bytes = [0; WORDS_ENTROPY_LEN];
+        let mut bytes = [0; SECRET_LEN];
         crate::timing::with(|| decode(list, words, &mut bytes))
-            .and_then(|()| self.derive_into(&bytes, purpose))
-    }
-
-    /// Loads the key for `purpose` that `bytes`, which twelve words stand for, derive into a free
-    /// slot: a key from words is loaded as a generated one is.
-    pub(crate) fn derive_into(
-        &mut self,
-        bytes: &[u8; WORDS_ENTROPY_LEN],
-        purpose: Purpose,
-    ) -> Result<Handle<'a>, Error> {
-        self.load_derived(
-            purpose,
-            KeyLength::Bytes32,
-            &mut FromWords { bytes, purpose },
-        )
-        .map_err(|error| match error {
-            Error::EntropyFailed => Error::DerivationFailed,
-            other => other,
-        })
-    }
-}
-
-/// The derivation from words as the source of a key's bytes.
-struct FromWords<'b> {
-    bytes: &'b [u8; WORDS_ENTROPY_LEN],
-    purpose: Purpose,
-}
-
-impl Entropy for FromWords<'_> {
-    fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
-        derive_from_words(self.bytes, self.purpose, dest).map_err(|_| EntropyError)
+            .and_then(|()| self.derive_into(&bytes, purpose, Branch::FromWords))
     }
 }
 
 /// Writes the twelve words of `bytes`, from `list`, into `words`.
-fn encode<const N: usize>(list: &[u64; N], bytes: &[u8; WORDS_ENTROPY_LEN], words: &mut Words) {
+fn encode<const N: usize>(list: &[u64; N], bytes: &[u8; SECRET_LEN], words: &mut Words) {
     #[cfg(test)]
     crate::timing::note();
     for (word, &number) in words.iter_mut().zip(&numbers(bytes)) {
@@ -247,7 +217,7 @@ fn encode<const N: usize>(list: &[u64; N], bytes: &[u8; WORDS_ENTROPY_LEN], word
 fn decode<const N: usize>(
     list: &[u64; N],
     words: &Words,
-    bytes: &mut [u8; WORDS_ENTROPY_LEN],
+    bytes: &mut [u8; SECRET_LEN],
 ) -> Result<(), Error> {
     #[cfg(test)]
     crate::timing::note();
@@ -274,7 +244,7 @@ fn decode<const N: usize>(
 
 /// The numbers of the twelve words of `bytes`: their 128 bits and the 4 bits of their checksum,
 /// 11 bits to a word, from the first bit.
-fn numbers(bytes: &[u8; WORDS_ENTROPY_LEN]) -> [u16; WORD_COUNT] {
+fn numbers(bytes: &[u8; SECRET_LEN]) -> [u16; WORD_COUNT] {
     let bits = u128::from_be_bytes(*bytes);
     let mut numbers = [0; WORD_COUNT];
     if let Some((last, first)) = numbers.split_last_mut() {
@@ -287,7 +257,7 @@ fn numbers(bytes: &[u8; WORDS_ENTROPY_LEN]) -> [u16; WORD_COUNT] {
 }
 
 /// The 128 bits that `numbers` stand for, and the checksum they carry.
-pub(crate) fn bits_of(numbers: &[u16; WORD_COUNT]) -> ([u8; WORDS_ENTROPY_LEN], u16) {
+pub(crate) fn bits_of(numbers: &[u16; WORD_COUNT]) -> ([u8; SECRET_LEN], u16) {
     let mut bits = 0_u128;
     let mut carried = 0;
     if let Some((&last, first)) = numbers.split_last() {
@@ -308,7 +278,7 @@ fn low_bits(bits: u128) -> u16 {
 
 /// The first 4 bits of SHA-256 of `bytes`: the checksum BIP 39 appends to 128 bits.
 #[cfg(not(kani))]
-fn checksum(bytes: &[u8; WORDS_ENTROPY_LEN]) -> u16 {
+fn checksum(bytes: &[u8; SECRET_LEN]) -> u16 {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes)
         .first()
@@ -390,7 +360,7 @@ use model::checksum;
 /// What stands in under Kani for SHA-256, and for the comparisons that end in inline assembly.
 #[cfg(kani)]
 pub(crate) mod model {
-    use super::{CHECKSUM_BITS, WORDS_ENTROPY_LEN};
+    use super::{CHECKSUM_BITS, SECRET_LEN};
 
     pub(crate) fn same_checksum(a: u16, b: u16) -> bool {
         a == b
@@ -411,7 +381,7 @@ pub(crate) mod model {
     /// SHA-256 is beyond Kani. 4 bits that equal bytes give alike, the low 4 bits of every byte
     /// folded together, so that the few numbers of a short list still change them; that the
     /// checksum is SHA-256's, the unit tests check.
-    pub(crate) fn checksum(bytes: &[u8; WORDS_ENTROPY_LEN]) -> u16 {
+    pub(crate) fn checksum(bytes: &[u8; SECRET_LEN]) -> u16 {
         u16::from(bytes.iter().fold(0, |sum, &byte| sum ^ byte)) & CHECKSUM_BITS
     }
 }
@@ -897,7 +867,7 @@ mod stack {
         block_forms, epoch_bytes, hash_forms, secrets, secrets_for, secrets_of, state_after,
         state_forms,
     };
-    use crate::derive::{Branch, SALT, STACK_WIPE, derive_from_words};
+    use crate::derive::{Branch, SALT, STACK_WIPE, derive_from_secret};
     use crate::entropy::{Entropy, EntropyError};
     use crate::epoch::Epoch;
     use crate::error::Error;
@@ -973,7 +943,7 @@ mod stack {
         found.extend(checksum_secrets(bytes));
         found.extend(secrets_for(bytes, SALT, Branch::FromWords, Some(purpose)));
         let mut key = [0; 64];
-        derive_from_words(bytes, purpose, &mut key[..32]).unwrap();
+        derive_from_secret(bytes, Some(purpose), Branch::FromWords, &mut key[..32]).unwrap();
         found.extend(secrets(&key, SALT, KeyLength::Bytes32, Branch::KeyId));
         found
     }
@@ -1228,13 +1198,13 @@ mod stack {
 #[coverage(on)]
 pub(crate) mod proofs {
     use super::{
-        LIST_LEN, WORD_COUNT, WORDS_ENTROPY_LEN, Words, bits_of, checksum, decode, encode, find_in,
+        LIST_LEN, SECRET_LEN, WORD_COUNT, Words, bits_of, checksum, decode, encode, find_in,
         numbers, select_in,
     };
     use crate::error::Error;
 
     /// The words `list` writes for `bytes`.
-    pub(crate) fn expected_words(list: &[u64; 3], bytes: &[u8; WORDS_ENTROPY_LEN]) -> Words {
+    pub(crate) fn expected_words(list: &[u64; 3], bytes: &[u8; SECRET_LEN]) -> Words {
         let mut words = [[0; 8]; WORD_COUNT];
         encode(list, bytes, &mut words);
         words
@@ -1289,7 +1259,7 @@ pub(crate) mod proofs {
     /// checksum.
     #[kani::proof]
     fn bytes_are_read_back_from_their_numbers() {
-        let bytes: [u8; WORDS_ENTROPY_LEN] = kani::any();
+        let bytes: [u8; SECRET_LEN] = kani::any();
         let numbers = numbers(&bytes);
         kani::assert(
             numbers.iter().all(|&number| usize::from(number) < LIST_LEN),
@@ -1299,7 +1269,7 @@ pub(crate) mod proofs {
             bits_of(&numbers) == (bytes, checksum(&bytes)),
             "the numbers stand for the bytes and carry their checksum",
         );
-        kani::cover!(bytes == [0xff; WORDS_ENTROPY_LEN], "every bit set");
+        kani::cover!(bytes == [0xff; SECRET_LEN], "every bit set");
     }
 
     /// Twelve numbers of the list are the numbers of the bytes they stand for exactly when the
@@ -1324,7 +1294,7 @@ pub(crate) mod proofs {
     fn words_are_read_exactly_when_listed_with_their_checksum() {
         let list = any_list();
         let words: Words = kani::any();
-        let mut bytes: [u8; WORDS_ENTROPY_LEN] = kani::any();
+        let mut bytes: [u8; SECRET_LEN] = kani::any();
         let result = decode(&list, &words, &mut bytes);
         let listed = words
             .iter()
@@ -1362,7 +1332,7 @@ pub(crate) mod proofs {
             kani::assert(written == words, "words read are the words of their bytes");
         } else {
             kani::assert(
-                bytes == [0; WORDS_ENTROPY_LEN],
+                bytes == [0; SECRET_LEN],
                 "the bytes are wiped when the words are refused",
             );
         }

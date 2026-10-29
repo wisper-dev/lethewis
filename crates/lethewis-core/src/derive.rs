@@ -47,10 +47,13 @@ const DATA_CHUNK: &[u8; 10] = b"data chunk";
 const HEDGE_SALT: &[u8; 10] = b"hedge salt";
 const CARRY_CHECK: &[u8; 11] = b"carry check";
 const CARRY_CHUNK: &[u8; 11] = b"carry chunk";
+const HEDGE_SHARES: &[u8; 12] = b"hedge shares";
+const FROM_SHARES: &[u8; 11] = b"from shares";
+const SHARE_CHECK: &[u8; 11] = b"share check";
 /// The count of a draw, after the bytes the source gave, in the material a hedge extracts.
 const COUNT_LEN: usize = 8;
-/// How many bytes twelve words stand for.
-pub(crate) const WORDS_ENTROPY_LEN: usize = 16;
+/// How many bytes twelve words, or two shares, stand for.
+pub(crate) const SECRET_LEN: usize = 16;
 /// How many bytes of stack a derivation is followed by a wipe of: at least twice what it uses, as a
 /// test measures in each build and with each SHA-256 back end. Without optimisation it uses far
 /// more.
@@ -124,6 +127,12 @@ pub(crate) enum Branch {
     /// The key that encrypts the chunks of a block carried under a key for transfers, from that key
     /// and the block's salt.
     CarryChunk,
+    /// The bytes a split into shares takes, hedged.
+    HedgeShares,
+    /// A key from the bytes two shares stand for.
+    FromShares,
+    /// The check of the bytes two shares stand for, split with them.
+    ShareCheck,
 }
 
 /// The purpose each branch is derived for.
@@ -132,6 +141,7 @@ pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
     match branch {
         Branch::WrapKey
         | Branch::FromWords
+        | Branch::FromShares
         | Branch::LockKey
         | Branch::EpochLayer
         | Branch::Combined
@@ -147,6 +157,8 @@ pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
         | Branch::HedgeNonce
         | Branch::HedgeEncaps
         | Branch::HedgeSalt
+        | Branch::HedgeShares
+        | Branch::ShareCheck
         | Branch::Challenge => None,
     }
 }
@@ -444,39 +456,43 @@ pub(crate) fn derive_carry_chunk(
     derive(key, salt, Some(Purpose::Transfer), Branch::CarryChunk, out)
 }
 
-/// Fills `out` with the key for `purpose` that the bytes twelve words stand for, `entropy`, derive:
-/// HKDF-Extract with the salt of identifiers, then HKDF-Expand with a label of its own, which names
-/// the purpose. Then the stack the derivation used is wiped, whether it succeeded or not.
-pub(crate) fn derive_from_words(
-    entropy: &[u8; WORDS_ENTROPY_LEN],
-    purpose: Purpose,
+/// Fills `out` with the value of `branch` that `secret`, the bytes twelve words or two shares stand
+/// for, derives for `purpose`, or for none: HKDF-Extract with the salt of identifiers, then
+/// HKDF-Expand with the label of `branch`, [`Branch::FromWords`], [`Branch::FromShares`] or
+/// [`Branch::ShareCheck`]. Then the stack the derivation used is wiped, whether it succeeded or
+/// not.
+pub(crate) fn derive_from_secret(
+    secret: &[u8; SECRET_LEN],
+    purpose: Option<Purpose>,
+    branch: Branch,
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
     #[cfg(test)]
     crate::timing::note();
     #[cfg(kani)]
     crate::entropy::model::step();
-    let derived = words_on_stack(entropy, purpose, out);
+    let derived = secret_on_stack(secret, purpose, branch, out);
     wipe_stack();
     derived
 }
 
-/// The derivation from words itself, in a frame of its own.
+/// The derivation from a secret itself, in a frame of its own.
 #[inline(never)]
-fn words_on_stack(
-    entropy: &[u8; WORDS_ENTROPY_LEN],
-    purpose: Purpose,
+fn secret_on_stack(
+    secret: &[u8; SECRET_LEN],
+    purpose: Option<Purpose>,
+    branch: Branch,
     out: &mut [u8],
 ) -> Result<(), DerivationFailed> {
-    let length = u8::try_from(WORDS_ENTROPY_LEN).map_err(|_| DerivationFailed)?;
-    let (label, used) = label(Some(purpose), length, Branch::FromWords, out.len())?;
+    let length = u8::try_from(SECRET_LEN).map_err(|_| DerivationFailed)?;
+    let (label, used) = label(purpose, length, branch, out.len())?;
     let info = label.get(..used).ok_or(DerivationFailed)?;
     // The model of HKDF fills a 32-byte output from the first 32 bytes of the key.
     #[cfg(kani)]
-    let twice = model::twice(entropy);
+    let twice = model::twice(secret);
     #[cfg(kani)]
-    let entropy = &twice;
-    hkdf(SALT, entropy, info, out)
+    let secret = &twice;
+    hkdf(SALT, secret, info, out)
 }
 
 /// Fills `out` with the value of `branch` derived from `key` for `purpose`, or for none. The key
@@ -516,7 +532,7 @@ pub(crate) fn hedge(
     #[cfg(kani)]
     if matches!(
         branch,
-        Branch::HedgeKey | Branch::HedgeWords | Branch::HedgeEncaps
+        Branch::HedgeKey | Branch::HedgeWords | Branch::HedgeEncaps | Branch::HedgeShares
     ) {
         crate::entropy::model::step();
     }
@@ -898,10 +914,14 @@ pub(crate) mod stack {
         let out_len = match branch {
             Branch::KeyId | Branch::HedgeWords | Branch::ArchiveCheck => 16,
             Branch::HedgeNonce => 12,
-            Branch::HedgeKey | Branch::HedgeEncaps | Branch::HedgeSalt => key.len() - 8,
+            Branch::ShareCheck => 4,
+            Branch::HedgeKey | Branch::HedgeEncaps | Branch::HedgeSalt | Branch::HedgeShares => {
+                key.len() - 8
+            }
             Branch::ArchiveEncaps => 64,
             Branch::WrapKey
             | Branch::FromWords
+            | Branch::FromShares
             | Branch::LockKey
             | Branch::EpochLayer
             | Branch::Combined
@@ -1272,7 +1292,7 @@ use model::hkdf;
 pub(crate) mod model {
     use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-    use super::{DerivationFailed, KeyId, WORDS_ENTROPY_LEN};
+    use super::{DerivationFailed, KeyId, SECRET_LEN};
     use crate::record::ID_LEN;
 
     /// Whether the last derivation failed, so a proof can tell a failure of the derivation from one
@@ -1313,13 +1333,13 @@ pub(crate) mod model {
         Ok(())
     }
 
-    /// The 16 bytes twelve words stand for, given twice: the derivation from words passes them so
-    /// to the model, so that both halves of a 32-byte output take every byte.
-    pub(crate) fn twice(entropy: &[u8; WORDS_ENTROPY_LEN]) -> [u8; 32] {
+    /// The 16 bytes twelve words or two shares stand for, given twice: the derivation from a
+    /// secret passes them so to the model, so that both halves of a 32-byte output take every byte.
+    pub(crate) fn twice(secret: &[u8; SECRET_LEN]) -> [u8; 32] {
         let mut both = [0; 32];
-        if let Some((first, second)) = both.split_first_chunk_mut::<WORDS_ENTROPY_LEN>() {
-            *first = *entropy;
-            second.copy_from_slice(entropy);
+        if let Some((first, second)) = both.split_first_chunk_mut::<SECRET_LEN>() {
+            *first = *secret;
+            second.copy_from_slice(secret);
         }
         both
     }
@@ -1400,6 +1420,13 @@ pub(crate) mod model {
             for (to, lane) in out.as_chunks_mut::<16>().0.iter_mut().zip(folded) {
                 *to = lane.to_ne_bytes();
             }
+        } else if let Ok(out) = <&mut [u8; 4]>::try_from(&mut *out) {
+            // The first 16 bytes of the key, folded down to 4.
+            let key = material.first_chunk::<16>().map_or(0, head);
+            let folded = key ^ low ^ high ^ salt_low;
+            let folded = folded ^ folded.wrapping_shr(64);
+            let [a, b, c, d, ..] = (folded ^ folded.wrapping_shr(32)).to_ne_bytes();
+            *out = [a, b, c, d];
         } else if let Ok(out) = <&mut [u8; 12]>::try_from(&mut *out) {
             let mut key = [0; 16];
             if let (Some(to), Some(drawn)) = (key.first_chunk_mut::<12>(), material.first_chunk()) {
@@ -1504,6 +1531,9 @@ fn label(
         Branch::HedgeSalt => joined(head, HEDGE_SALT),
         Branch::CarryCheck => joined(head, CARRY_CHECK),
         Branch::CarryChunk => joined(head, CARRY_CHUNK),
+        Branch::HedgeShares => joined(head, HEDGE_SHARES),
+        Branch::FromShares => joined(head, FROM_SHARES),
+        Branch::ShareCheck => joined(head, SHARE_CHECK),
     }
 }
 
@@ -1537,9 +1567,10 @@ mod tests {
     use super::{
         ARCHIVE_BATCH, ARCHIVE_CHECK, ARCHIVE_ENCAPS, ARCHIVE_KEY, ARCHIVE_LAYER, ARCHIVE_SEAL,
         ARCHIVE_SEED, Branch, CARRY_CHECK, CARRY_CHUNK, CHALLENGE, COMBINED, DATA_CHECK,
-        DATA_CHUNK, DerivationFailed, EPOCH_LAYER, EXPORT_KEY, FROM_WORDS, HEDGE_ENCAPS, HEDGE_KEY,
-        HEDGE_NONCE, HEDGE_SALT, HEDGE_WORDS, Hedged, KEY_ID, KeyId, LOCK_KEY, SALT, WRAP_KEY,
-        derive, derive_from_words, derive_key_id, hedge, label, purpose_of,
+        DATA_CHUNK, DerivationFailed, EPOCH_LAYER, EXPORT_KEY, FROM_SHARES, FROM_WORDS,
+        HEDGE_ENCAPS, HEDGE_KEY, HEDGE_NONCE, HEDGE_SALT, HEDGE_SHARES, HEDGE_WORDS, Hedged,
+        KEY_ID, KeyId, LOCK_KEY, SALT, SHARE_CHECK, WRAP_KEY, derive, derive_from_secret,
+        derive_key_id, hedge, label, purpose_of,
     };
     use crate::entropy::{Entropy, EntropyError};
     use crate::key::{Key, KeyLength};
@@ -1617,6 +1648,12 @@ mod tests {
         expected.extend_from_slice(&[1, 1, 16, 32, 0, 10]);
         expected.extend_from_slice(b"from words");
         assert_eq!(&bytes[..used], &expected[..]);
+
+        let (bytes, used) = label(Some(Purpose::Wrap), 16, Branch::FromShares, 32).unwrap();
+        let mut expected = b"lethewis".to_vec();
+        expected.extend_from_slice(&[1, 1, 16, 32, 0, 11]);
+        expected.extend_from_slice(b"from shares");
+        assert_eq!(&bytes[..used], &expected[..]);
     }
 
     /// Keys of both lengths whose bytes are all different: 0, 1, 2, ...
@@ -1652,23 +1689,40 @@ mod tests {
         }
     }
 
-    /// The derivation from words against HKDF called directly with the salt and the label written
-    /// out by hand: all 16 bytes go in, and the label states their length.
+    /// The derivation from a secret, of words or of shares, and of the check of shares, against HKDF
+    /// called directly with the salt and the label written out by hand: all 16 bytes go in, and the
+    /// label states their length.
     #[test]
-    fn a_derivation_from_words_is_hkdf_with_the_salt_and_its_label() {
-        let entropy: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).unwrap());
-        for purpose in [Purpose::Wrap, Purpose::Transfer] {
-            let mut ours = [0; 32];
-            derive_from_words(&entropy, purpose, &mut ours).unwrap();
-            let mut info = b"lethewis".to_vec();
-            info.extend_from_slice(&[1, purpose as u8, 16, 32, 0, 10]);
-            info.extend_from_slice(b"from words");
-            let mut direct = [0; 32];
-            Hkdf::<Sha256>::new(Some(b"lethewis derivation salt v1"), &entropy)
-                .expand(&info, &mut direct)
-                .unwrap();
-            assert_eq!(ours, direct, "{purpose:?}");
+    fn a_derivation_from_a_secret_is_hkdf_with_the_salt_and_its_label() {
+        let secret: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).unwrap());
+        for (branch, name) in [
+            (Branch::FromWords, &b"from words"[..]),
+            (Branch::FromShares, &b"from shares"[..]),
+        ] {
+            for purpose in [Purpose::Wrap, Purpose::Transfer] {
+                let mut ours = [0; 32];
+                derive_from_secret(&secret, Some(purpose), branch, &mut ours).unwrap();
+                let mut info = b"lethewis".to_vec();
+                info.extend_from_slice(&[1, purpose as u8, 16, 32, 0]);
+                info.push(u8::try_from(name.len()).unwrap());
+                info.extend_from_slice(name);
+                let mut direct = [0; 32];
+                Hkdf::<Sha256>::new(Some(b"lethewis derivation salt v1"), &secret)
+                    .expand(&info, &mut direct)
+                    .unwrap();
+                assert_eq!(ours, direct, "{branch:?} {purpose:?}");
+            }
         }
+        let mut ours = [0; 4];
+        derive_from_secret(&secret, None, Branch::ShareCheck, &mut ours).unwrap();
+        let mut info = b"lethewis".to_vec();
+        info.extend_from_slice(&[1, 0, 16, 4, 0, 11]);
+        info.extend_from_slice(b"share check");
+        let mut direct = [0; 4];
+        Hkdf::<Sha256>::new(Some(b"lethewis derivation salt v1"), &secret)
+            .expand(&info, &mut direct)
+            .unwrap();
+        assert_eq!(ours, direct, "the check of shares");
     }
 
     /// Outputs computed by an independent implementation of HKDF-SHA-256 from the documented salt
@@ -1935,6 +1989,9 @@ mod tests {
             Branch::HedgeSalt,
             Branch::CarryCheck,
             Branch::CarryChunk,
+            Branch::HedgeShares,
+            Branch::FromShares,
+            Branch::ShareCheck,
         ] {
             let (_, used) = label(purpose_of(branch), 64, branch, 32).unwrap();
             let name = match branch {
@@ -1962,6 +2019,9 @@ mod tests {
                 Branch::HedgeSalt => HEDGE_SALT.len(),
                 Branch::CarryCheck => CARRY_CHECK.len(),
                 Branch::CarryChunk => CARRY_CHUNK.len(),
+                Branch::HedgeShares => HEDGE_SHARES.len(),
+                Branch::FromShares => FROM_SHARES.len(),
+                Branch::ShareCheck => SHARE_CHECK.len(),
             };
             assert_eq!(used, 14 + name);
         }
@@ -1998,11 +2058,12 @@ mod tests {
 #[coverage(on)]
 pub(crate) mod proofs {
     use super::{
-        Branch, CHECK_LEN, CIPHER_KEY_LEN, SALT, SALT_LEN, WORDS_ENTROPY_LEN, label,
+        Branch, CHECK_LEN, CIPHER_KEY_LEN, SALT, SALT_LEN, SECRET_LEN, label,
         model::{fold, twice},
     };
     use crate::key::KeyLength;
     use crate::record::{ID_LEN, Purpose, length_to_byte};
+    use crate::shares::CHECK_LEN as SHARE_CHECK_LEN;
 
     /// The identifier the model of HKDF gives for the first `length` bytes of `key`, worked out
     /// from the label alone, without a `Key` and without `derive`: the same for every purpose.
@@ -2240,15 +2301,27 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The key for `purpose` the model of HKDF gives from the bytes twelve words stand for, worked
-    /// out in the same way.
-    pub(crate) fn expected_words_key(
-        bytes: &[u8; WORDS_ENTROPY_LEN],
+    /// The key for `purpose` the model of HKDF gives from the bytes twelve words or two shares stand
+    /// for, under the label of `branch`, worked out in the same way.
+    pub(crate) fn expected_secret_key(
+        bytes: &[u8; SECRET_LEN],
         purpose: Purpose,
+        branch: Branch,
     ) -> [u8; 32] {
         let mut out = [0; 32];
-        let length = WORDS_ENTROPY_LEN as u8;
-        let _ = label(Some(purpose), length, Branch::FromWords, 32).map(|(label, used)| {
+        let length = SECRET_LEN as u8;
+        let _ = label(Some(purpose), length, branch, 32).map(|(label, used)| {
+            fold(SALT, &twice(bytes), &label[..used], &mut out);
+        });
+        out
+    }
+
+    /// The check the model of HKDF gives from the bytes two shares stand for, worked out in the same
+    /// way.
+    pub(crate) fn expected_share_check(bytes: &[u8; SECRET_LEN]) -> [u8; SHARE_CHECK_LEN] {
+        let mut out = [0; SHARE_CHECK_LEN];
+        let length = SECRET_LEN as u8;
+        let _ = label(None, length, Branch::ShareCheck, SHARE_CHECK_LEN).map(|(label, used)| {
             fold(SALT, &twice(bytes), &label[..used], &mut out);
         });
         out
@@ -2279,7 +2352,10 @@ pub(crate) mod proofs {
             20 => Branch::DataChunk,
             21 => Branch::HedgeSalt,
             22 => Branch::CarryCheck,
-            _ => Branch::CarryChunk,
+            23 => Branch::CarryChunk,
+            24 => Branch::HedgeShares,
+            25 => Branch::FromShares,
+            _ => Branch::ShareCheck,
         }
     }
 

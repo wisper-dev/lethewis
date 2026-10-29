@@ -99,6 +99,15 @@ pub enum Error {
     /// The set for data did not come in the transfer under way, so a received block is not written
     /// under it.
     NotReceived,
+    /// A share is numbered other than 1, 2 or 3.
+    InvalidShare,
+    /// The shares carry the marks of different splits.
+    MixedShares,
+    /// Both shares carry the same number.
+    SameShare,
+    /// The secret the shares give fails the check they carry: a share was changed, or the shares
+    /// come from two splits with one mark.
+    ChangedShare,
 }
 
 impl From<crate::keyset::Refused> for Error {
@@ -150,6 +159,10 @@ impl fmt::Display for Error {
             Self::KeyDisabled => "key disabled",
             Self::WrongChunk => "wrong chunk",
             Self::NotReceived => "set not received",
+            Self::InvalidShare => "invalid share",
+            Self::MixedShares => "shares of different splits",
+            Self::SameShare => "same share twice",
+            Self::ChangedShare => "changed share",
         })
     }
 }
@@ -203,5 +216,9 @@ mod tests {
         assert_eq!(Error::KeyDisabled.to_string(), "key disabled");
         assert_eq!(Error::WrongChunk.to_string(), "wrong chunk");
         assert_eq!(Error::NotReceived.to_string(), "set not received");
+        assert_eq!(Error::InvalidShare.to_string(), "invalid share");
+        assert_eq!(Error::MixedShares.to_string(), "shares of different splits");
+        assert_eq!(Error::SameShare.to_string(), "same share twice");
+        assert_eq!(Error::ChangedShare.to_string(), "changed share");
     }
 }
