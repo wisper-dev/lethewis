@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 # SPDX-License-Identifier: AGPL-3.0-only
 
-# Prints only=true when HEAD differs only in Markdown from the newest earlier commit of BASE..HEAD
-# on which every check below passed, if that commit holds BASE, and only=false otherwise. Markdown
-# that a source file or a script names is not counted as text. Fails on any error of git or of the
-# API. Needs REPO, BASE, HEAD and a token for gh.
+# Prints only=true if HEAD differs only in Markdown no code names from a commit of BASE..HEAD. That
+# commit is the newest earlier one that passed every check below and holds BASE; otherwise
+# only=false.
+#
+# Needs REPO, BASE, HEAD and a token for gh; fails on any error of git or the API.
 set -euo pipefail
 
 checks=("Tests" "Tests on aarch64 Linux" "Tests on macOS" "Every mutant is caught" "Proofs hold"

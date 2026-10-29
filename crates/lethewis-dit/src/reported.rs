@@ -3,7 +3,6 @@
 
 //! What an answer of `sysctlbyname` about a feature says.
 
-/// Present only when the call succeeded and wrote a four-byte value that is not zero.
 pub(crate) fn present(status: i32, size: usize, value: u32) -> bool {
     status == 0 && size == size_of::<u32>() && value != 0
 }

@@ -4,12 +4,8 @@
 
 """What cargo-vet and Cargo allow but this repository does not.
 
-Only what is listed here may appear in the store: a review of our own is the only thing that counts,
-never an exemption, an imported review or a trusted publisher; every crate of the workspace asks for
-a reading in full, and every locked version of a crate that handles secrets has a record of one.
-Nothing in the tree changes where dependencies or the compiler come from, or where cargo-vet looks
-for its store. Every crate of the workspace inherits its lints, but the one crate allowed unsafe
-code, whose own lints differ from them only there.
+Only our own reviews count; workspace and secret-handling crates are read in full; nothing
+redirects dependencies, compiler or reviews.
 """
 
 import json

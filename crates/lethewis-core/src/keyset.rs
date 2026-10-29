@@ -6,16 +6,13 @@ use crate::record::{
     ID_LEN, Malformed, PLAINTEXT_LEN, Purpose, Status, VERSION, length_from_byte, length_to_byte,
 };
 
-/// The most keys a set holds: the primary, one on its way out, and one added before it becomes the
-/// primary.
+/// The most keys a set holds: the primary, one on its way out, and one added before it is primary.
 pub(crate) const MEMBERS: usize = 3;
-/// A position of a set: the stage, the length and the key, zero past its length; all zero when the
-/// position is empty.
+/// A set position: the stage, length and key, zero past the length; all zero when empty.
 const MEMBER_LEN: usize = 2 + CAPACITY;
 
 const _: () = assert!(3 + ID_LEN + 8 + 8 + MEMBERS * MEMBER_LEN == PLAINTEXT_LEN);
 
-/// What a set's record holds besides its keys and their stages.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(any(test, kani), derive(PartialEq, Eq))]
 pub(crate) struct Header {
@@ -25,12 +22,9 @@ pub(crate) struct Header {
     pub(crate) epoch: u64,
 }
 
-/// The stage of every position of a set, which position holds the primary key, and how many
-/// transitions the set has gone through.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(any(test, kani), derive(PartialEq, Eq))]
 pub(crate) struct Stages {
-    /// `None` for an empty position.
     members: [Option<Status>; MEMBERS],
     primary: usize,
     revision: u64,
@@ -69,7 +63,6 @@ impl Position {
 /// Why a transition was refused. Nothing has changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refused {
-    /// Every position holds a key.
     Full,
     /// The transition does not apply to the primary key.
     Primary,
@@ -80,7 +73,6 @@ pub(crate) enum Refused {
 }
 
 impl Stages {
-    /// A set of one enabled key, which is the primary.
     pub(crate) const fn one() -> Self {
         Self {
             members: [Some(Status::Enabled), None, None],
@@ -89,35 +81,29 @@ impl Stages {
         }
     }
 
-    /// Whether this is a set of one enabled key, which is the primary, that has never changed.
     pub(crate) fn is_one(&self) -> bool {
         matches!(self.members, [Some(Status::Enabled), None, None])
             && self.primary == 0
             && self.revision == 0
     }
 
-    /// Whether the primary position holds an enabled key.
     pub(crate) fn is_whole(&self) -> bool {
         self.members.get(self.primary) == Some(&Some(Status::Enabled))
     }
 
-    /// The stage of the key at `at`, or `None` where the position is empty.
     pub(crate) fn stage(&self, at: usize) -> Option<Status> {
         self.members.get(at).copied().flatten()
     }
 
-    /// The position of the primary key.
     #[cfg(any(test, kani))]
     pub(crate) const fn primary(&self) -> usize {
         self.primary
     }
 
-    /// The position of the primary key, named.
     pub(crate) const fn primary_position(&self) -> Option<Position> {
         Position::at(self.primary)
     }
 
-    /// How many transitions the set has gone through.
     pub(crate) const fn revision(&self) -> u64 {
         self.revision
     }
@@ -138,7 +124,6 @@ impl Stages {
 }
 
 impl Stages {
-    /// Adds an enabled key in the first empty position, which is returned. It is not the primary.
     pub(crate) fn add(&mut self) -> Result<usize, Refused> {
         let at = self
             .members
@@ -149,7 +134,7 @@ impl Stages {
         Ok(at)
     }
 
-    /// Makes the enabled key at `at` the primary. The former primary stays enabled.
+    /// The former primary stays enabled.
     pub(crate) fn promote(&mut self, at: usize) -> Result<(), Refused> {
         self.require(at, Status::Enabled)?;
         self.revision = self.next()?;
@@ -157,25 +142,21 @@ impl Stages {
         Ok(())
     }
 
-    /// Disables the enabled key at `at`, which is not the primary.
     pub(crate) fn disable(&mut self, at: usize) -> Result<(), Refused> {
         self.require(at, Status::Enabled)?;
         self.set(at, Some(Status::Disabled))
     }
 
-    /// Enables the disabled key at `at` again.
     pub(crate) fn enable(&mut self, at: usize) -> Result<(), Refused> {
         self.require(at, Status::Disabled)?;
         self.set(at, Some(Status::Enabled))
     }
 
-    /// Empties the position of the disabled key at `at`.
     pub(crate) fn destroy(&mut self, at: usize) -> Result<(), Refused> {
         self.require(at, Status::Disabled)?;
         self.set(at, None)
     }
 
-    /// Refuses unless `at` is not the primary and holds a key in `stage`.
     fn require(&self, at: usize, stage: Status) -> Result<(), Refused> {
         if at == self.primary {
             return Err(Refused::Primary);
@@ -199,8 +180,7 @@ impl Stages {
     }
 }
 
-/// Writes the plaintext of a set. The key of a position the stages leave empty is not written;
-/// every byte of `out` is.
+/// The key of a position the stages leave empty is not written; every byte of `out` is.
 pub(crate) fn build(
     header: &Header,
     stages: &Stages,
@@ -267,13 +247,10 @@ pub(crate) fn parent_of(bytes: &[u8; PLAINTEXT_LEN]) -> &[u8; ID_LEN] {
         .map_or(&[0; ID_LEN], |(parent, _)| parent)
 }
 
-/// What parsing a set's plaintext gives: its header, its stages, and the bytes of each key, `None`
-/// where the position is empty.
 pub(crate) type Parsed<'a> = (Header, Stages, [Option<KeyBytes<'a>>; MEMBERS]);
 
-/// Reads the plaintext of a set. Anything [`build`] cannot write is refused, and so is a set whose
-/// primary position does not hold an enabled key, or that holds a key of a length its purpose does
-/// not take.
+/// Anything [`build`] cannot write is refused. So is a set whose primary is not enabled, or with a
+/// key length its purpose does not take.
 pub(crate) fn parse(bytes: &[u8; PLAINTEXT_LEN]) -> Result<Parsed<'_>, Malformed> {
     let Some((&[version, purpose, primary], rest)) = bytes.split_first_chunk::<3>() else {
         return Err(Malformed);
@@ -318,8 +295,7 @@ pub(crate) fn parse(bytes: &[u8; PLAINTEXT_LEN]) -> Result<Parsed<'_>, Malformed
     Ok((header, stages, [first_key, second_key, third_key]))
 }
 
-/// The stage and the key of one position of a set for `purpose`. An empty position is zero
-/// throughout; reading it has no early exit.
+/// An empty position is zero throughout; reading it has no early exit.
 fn parse_member(
     bytes: &[u8; MEMBER_LEN],
     purpose: Purpose,
@@ -374,7 +350,6 @@ mod tests {
         pieces.concat().try_into().unwrap()
     }
 
-    /// A set of one 32-byte key.
     fn one() -> [u8; PLAINTEXT_LEN] {
         laid_out(&[
             &[0x01, 0x01, 0x00], // version, purpose, primary position
@@ -389,8 +364,7 @@ mod tests {
         ])
     }
 
-    /// A full set: a disabled 64-byte key, an enabled 32-byte key, and the primary, a 64-byte key
-    /// in the third position.
+    /// A full set: a disabled 64-byte key, an enabled 32-byte key, and a 64-byte primary third.
     fn full() -> [u8; PLAINTEXT_LEN] {
         laid_out(&[
             &[0x01, 0x01, 0x02],
@@ -407,8 +381,7 @@ mod tests {
         ])
     }
 
-    /// The primary in the first position and a disabled 32-byte key in the third, with the second
-    /// position empty between them.
+    /// The primary first and a disabled 32-byte key third, with the second position empty between.
     fn gap() -> [u8; PLAINTEXT_LEN] {
         laid_out(&[
             &[0x01, 0x01, 0x00],
@@ -514,7 +487,6 @@ mod tests {
 
     type Read = (Header, Stages, [Option<(KeyLength, Vec<u8>)>; MEMBERS]);
 
-    /// The header, the stages and each key as its length and bytes, or the error.
     fn read(bytes: &[u8; PLAINTEXT_LEN]) -> Result<Read, Malformed> {
         parse(bytes).map(|(header, stages, keys)| {
             let keys = keys.map(|key| {
@@ -556,8 +528,8 @@ mod tests {
         }
     }
 
-    /// The version is 1; the purpose is one of the seven, and a set of any purpose but wrapping
-    /// holds only 32-byte keys, as [`gap`] does and [`full`] does not.
+    /// A set of any purpose but wrapping holds only 32-byte keys, as [`gap`] does and [`full`]
+    /// does not.
     #[test]
     fn the_version_is_one_and_the_purpose_takes_its_lengths() {
         for (position, bytes, accepted) in [
@@ -593,8 +565,8 @@ mod tests {
         }
     }
 
-    /// The offsets of the stage of each position, and which values each accepts in [`full`]: the
-    /// primary in the third position may not be disabled, and no key may be marked empty.
+    /// In [`full`] the primary in the third position may not be disabled, and no key may be marked
+    /// empty.
     #[test]
     fn each_stage_accepts_only_its_values() {
         for (offset, accepted) in [(35, &[1, 2][..]), (101, &[1, 2]), (167, &[1])] {
@@ -685,8 +657,7 @@ mod tests {
         }
     }
 
-    /// Bytes past a short key that would cancel out if the tail were checked by anything but whether
-    /// every byte is zero.
+    /// Bytes past a short key that would cancel out unless the tail were checked as all zero.
     #[test]
     fn a_short_key_with_a_tail_that_cancels_out_is_refused() {
         let mut bytes = full();
@@ -831,7 +802,6 @@ pub(crate) mod proofs {
     /// Offsets of the positions, written from the layout.
     const POSITIONS: [usize; MEMBERS] = [35, 101, 167];
 
-    /// Whether every byte of `bytes` from `start` to `end` is zero.
     fn zero(bytes: &[u8; PLAINTEXT_LEN], start: usize, end: usize) -> bool {
         let mut seen = 0;
         let mut at = start;
@@ -842,8 +812,6 @@ pub(crate) mod proofs {
         seen == 0
     }
 
-    /// Whether the position starting at `at` is one `build` can write for the purpose `purpose`:
-    /// keys of 32 or 64 bytes for 1, of 32 for 2 to 7.
     fn writable_position(bytes: &[u8; PLAINTEXT_LEN], at: usize, purpose: u8) -> bool {
         let stage = bytes[at];
         let length = bytes[at + 1];
@@ -870,14 +838,12 @@ pub(crate) mod proofs {
                 || (primary == 2 && bytes[POSITIONS[2]] == 1))
     }
 
-    /// Whether `bytes` would be writable with the byte at `offset` set to `value`.
     fn with(bytes: &[u8; PLAINTEXT_LEN], offset: usize, value: u8) -> bool {
         let mut changed = *bytes;
         changed[offset] = value;
         writable(&changed)
     }
 
-    /// For any 233 bytes, parsing succeeds exactly when the layout allows them, and never panics.
     #[kani::proof]
     #[kani::unwind(67)]
     fn parsing_a_set_accepts_exactly_what_building_can_write() {
@@ -973,7 +939,6 @@ pub(crate) mod proofs {
         stages
     }
 
-    /// Any purpose.
     pub(crate) fn any_purpose() -> Purpose {
         match kani::any::<u8>() % 7 {
             0 => Purpose::Wrap,
@@ -996,23 +961,19 @@ pub(crate) mod proofs {
         key
     }
 
-    /// Whether `purpose` takes a key of `length`, as the documentation of `Purpose` states it: any
-    /// length for wrapping, 32 bytes for every other purpose. Written apart from the code.
+    /// As the documentation of `Purpose` states it, written apart from the code.
     pub(crate) fn allowed(purpose: Purpose, length: KeyLength) -> bool {
         purpose == Purpose::Wrap || length == KeyLength::Bytes32
     }
 
-    /// Any key of a length `purpose` takes.
     fn any_key_for(purpose: Purpose) -> Key {
         let key = any_key();
         kani::assume(allowed(purpose, key.length()));
         key
     }
 
-    /// For any header of any purpose, any whole stages and any keys of a length the purpose
-    /// takes, building puts every field where the layout says, empty positions zero, and parsing
-    /// gives back the same header, stages and keys. The offsets and values are written from the
-    /// layout, independently of the builder and the parser.
+    /// The offsets and values are written from the layout, independently of the builder and the
+    /// parser.
     #[kani::proof]
     #[kani::unwind(67)]
     fn building_then_parsing_gives_back_the_set() {
@@ -1128,8 +1089,6 @@ pub(crate) mod proofs {
         );
     }
 
-    /// For any 233 bytes that parse, loading the keys and building again gives the same bytes: a
-    /// set has exactly one way to be written.
     #[kani::proof]
     #[kani::unwind(234)]
     fn a_parsed_set_builds_back_to_the_same_bytes() {
@@ -1155,11 +1114,8 @@ pub(crate) mod proofs {
         );
     }
 
-    /// From any whole stages, every transition at any position succeeds exactly when its starting
-    /// stage holds and the revision has room, and then leaves exactly the stages written out below,
-    /// one revision later; otherwise it is refused for the reason written out below and changes
-    /// nothing. Either way the stages stay whole; a set of one is whole, so by induction every
-    /// sequence of transitions from it keeps the set whole.
+    /// A set of one is whole, so by induction every sequence of transitions from it keeps the set
+    /// whole.
     #[kani::proof]
     #[kani::unwind(4)]
     fn a_transition_keeps_the_set_whole() {

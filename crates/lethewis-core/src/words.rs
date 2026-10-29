@@ -13,13 +13,13 @@ pub const WORD_COUNT: usize = 12;
 /// The length of the longest word of the list, in bytes.
 pub const WORD_LEN: usize = 8;
 
-/// Twelve words of the English list of BIP 39, each in lowercase ASCII and followed by zeros up to
+/// Twelve words of BIP 39's English list, each in lowercase ASCII followed by zeros up to
 /// [`WORD_LEN`] bytes.
 pub type Words = [[u8; WORD_LEN]; WORD_COUNT];
 
 const LIST_LEN: usize = 2048;
-/// Where the number of each of the first eleven words sits in the 128 bits: 11 bits each, from the
-/// most significant. The twelfth holds the last 7 bits and the 4 of the checksum.
+/// Where each of the first eleven word numbers sits in the 128 bits: 11 bits each, from the top.
+/// The twelfth holds the last 7 bits and the 4 checksum bits.
 const SHIFTS: [u32; WORD_COUNT - 1] = [117, 106, 95, 84, 73, 62, 51, 40, 29, 18, 7];
 const NUMBER_BITS: u16 = 0x7ff;
 const CHECKSUM_BITS: u16 = 0xf;
@@ -30,8 +30,7 @@ const LIST_TEXT: &[u8] = include_bytes!("words/english.txt");
 /// The list, each word as a number: its bytes and the zeros after them, in little-endian order.
 static LIST: [u64; LIST_LEN] = numbers_of(LIST_TEXT);
 
-/// The words of `text` as numbers. Read at compile time: a text that is not 2048 words of 3 to 8
-/// lowercase letters, each followed by a line feed, fails the build.
+/// Read at compile time: anything but 2048 lines of 3 to 8 lowercase letters fails the build.
 #[expect(
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
@@ -65,29 +64,21 @@ const fn numbers_of(text: &[u8]) -> [u64; LIST_LEN] {
 }
 
 impl<'a> Slots<'a> {
-    /// Creates a 32-byte wrapping key from 16 random bytes from `entropy`, hedged with the key of
-    /// the epoch, in a free slot, as a set of one whose key is the primary, and writes the twelve
-    /// words of the hedged bytes into `words`, as BIP 39 has them. [`Self::derive_from_words`]
-    /// derives the same key from the words; nothing else gives them again. `entropy` is asked once,
-    /// and only when a slot is free.
+    /// Creates a 32-byte wrapping key from 16 hedged bytes of `entropy`, and writes its twelve BIP
+    /// 39 words into `words`. Nothing else gives the words again; [`Self::derive_from_words`]
+    /// derives the same key from them.
     ///
-    /// Needs 10 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the hedge, the derivation of the key, the derivation of its
-    /// identifier, the whole load and the whole call are each followed by a wipe of 8 KiB, or 64
-    /// KiB, below them. A build that optimises this crate but not the hash code it calls has to set
-    /// that flag.
+    /// Needs 10 KiB of stack, or 72 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::NoFreeSlot`] if no slot is free, [`Error::EntropyFailed`] if `entropy` fails,
-    /// [`Error::DerivationFailed`] if the hedge, the key or its identifier cannot be derived, and
-    /// [`Error::DuplicateKey`] if these slots hold the key already. `words` is then left as it
-    /// was, and no slot changes.
+    /// [`Error::NoFreeSlot`] before `entropy` is asked, [`Error::EntropyFailed`],
+    /// [`Error::DerivationFailed`] or [`Error::DuplicateKey`], with `words` and the slots
+    /// unchanged.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through after the random bytes are wiped, and no
-    /// slot changes.
+    /// Only if `entropy` panics; the random bytes are then wiped and no slot changes.
     pub fn generate_words(
         &mut self,
         entropy: &mut (impl Entropy + ?Sized),
@@ -96,46 +87,31 @@ impl<'a> Slots<'a> {
         self.generate_words_from(&LIST, entropy, words)
     }
 
-    /// Derives the key [`Self::generate_words`] created with `words` into a free slot, as a set of
-    /// one whose key is the primary, and wipes `words`. Each word is compared with every word of
-    /// the list, in steps with no branch on the words, before any word is judged.
+    /// Derives the key [`Self::generate_words`] created with `words` into a free slot, and wipes
+    /// `words`. The words are read in constant time, as lowercase ASCII bytes followed by zeros.
     ///
-    /// `words` are taken as the bytes they are: lowercase ASCII, each followed by zeros. Text is
-    /// to be brought to that form first.
-    ///
-    /// Needs 10 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation of the key, the derivation of its identifier,
-    /// the whole load and the whole call are each followed by a wipe of 8 KiB, or 64 KiB, below
-    /// them. A build that optimises this crate but not the hash code it calls has to set that flag.
+    /// Needs 10 KiB of stack, or 72 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::UnknownWord`] if a word is not one of the list, [`Error::InvalidChecksum`] if the
-    /// words are of the list but their checksum does not hold, [`Error::NoFreeSlot`] if no slot is
-    /// free, [`Error::DerivationFailed`] if the key or its identifier cannot be derived, and
-    /// [`Error::DuplicateKey`] if these slots hold the key already. `words` is then left as it
-    /// was, and no slot changes.
+    /// [`Error::UnknownWord`], [`Error::InvalidChecksum`], [`Error::NoFreeSlot`],
+    /// [`Error::DerivationFailed`] or [`Error::DuplicateKey`], with `words` and the slots
+    /// unchanged.
     pub fn derive_from_words(&mut self, words: &mut Words) -> Result<Handle<'a>, Error> {
         self.derive_from_words_in(&LIST, Purpose::Wrap, words)
     }
 
-    /// Derives from `words` a key for transfers into a free slot, as a set of one whose key is the
-    /// primary, and wipes `words`: the key of a backup, which opens with the words alone. It is
-    /// another key than the one [`Self::derive_from_words`] derives from the same words, and the
-    /// words are read as there.
+    /// Derives from `words` the transfer key of a backup, which opens with the words alone, and
+    /// wipes `words`. It differs from the key [`Self::derive_from_words`] derives from the same
+    /// words.
     ///
-    /// Needs 10 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation of the key, the derivation of its identifier,
-    /// the whole load and the whole call are each followed by a wipe of 8 KiB, or 64 KiB, below
-    /// them. A build that optimises this crate but not the hash code it calls has to set that flag.
+    /// Needs 10 KiB of stack, or 72 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::UnknownWord`] if a word is not one of the list, [`Error::InvalidChecksum`] if the
-    /// words are of the list but their checksum does not hold, [`Error::NoFreeSlot`] if no slot is
-    /// free, [`Error::DerivationFailed`] if the key or its identifier cannot be derived, and
-    /// [`Error::DuplicateKey`] if these slots hold the key already. `words` is then left as it
-    /// was, and no slot changes.
+    /// [`Error::UnknownWord`], [`Error::InvalidChecksum`], [`Error::NoFreeSlot`],
+    /// [`Error::DerivationFailed`] or [`Error::DuplicateKey`], with `words` and the slots
+    /// unchanged.
     pub fn transfer_from_words(&mut self, words: &mut Words) -> Result<Handle<'a>, Error> {
         self.derive_from_words_in(&LIST, Purpose::Transfer, words)
     }
@@ -154,8 +130,6 @@ impl<'a> Slots<'a> {
         generated
     }
 
-    /// The generation itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     fn generate_words_on_stack<const N: usize>(
         &mut self,
@@ -188,8 +162,6 @@ impl<'a> Slots<'a> {
         derived
     }
 
-    /// The derivation itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     fn derive_from_words_on_stack<const N: usize>(
         &mut self,
@@ -203,7 +175,6 @@ impl<'a> Slots<'a> {
     }
 }
 
-/// Writes the twelve words of `bytes`, from `list`, into `words`.
 fn encode<const N: usize>(list: &[u64; N], bytes: &[u8; SECRET_LEN], words: &mut Words) {
     #[cfg(test)]
     crate::timing::note();
@@ -212,8 +183,8 @@ fn encode<const N: usize>(list: &[u64; N], bytes: &[u8; SECRET_LEN], words: &mut
     }
 }
 
-/// Reads the bytes `words`, from `list`, stand for into `bytes`. Every word is looked up and the
-/// checksum computed before either is judged; `bytes` is wiped if they fail.
+/// Every word is looked up and the checksum computed before either is judged; `bytes` is wiped if
+/// they fail.
 fn decode<const N: usize>(
     list: &[u64; N],
     words: &Words,
@@ -242,8 +213,6 @@ fn decode<const N: usize>(
     Ok(())
 }
 
-/// The numbers of the twelve words of `bytes`: their 128 bits and the 4 bits of their checksum,
-/// 11 bits to a word, from the first bit.
 fn numbers(bytes: &[u8; SECRET_LEN]) -> [u16; WORD_COUNT] {
     let bits = u128::from_be_bytes(*bytes);
     let mut numbers = [0; WORD_COUNT];
@@ -256,7 +225,6 @@ fn numbers(bytes: &[u8; SECRET_LEN]) -> [u16; WORD_COUNT] {
     numbers
 }
 
-/// The 128 bits that `numbers` stand for, and the checksum they carry.
 pub(crate) fn bits_of(numbers: &[u16; WORD_COUNT]) -> ([u8; SECRET_LEN], u16) {
     let mut bits = 0_u128;
     let mut carried = 0;
@@ -270,7 +238,6 @@ pub(crate) fn bits_of(numbers: &[u16; WORD_COUNT]) -> ([u8; SECRET_LEN], u16) {
     (bits.to_be_bytes(), carried)
 }
 
-/// The low 11 bits of `bits`.
 fn low_bits(bits: u128) -> u16 {
     let [low, high, ..] = bits.to_le_bytes();
     u16::from_le_bytes([low, high]) & NUMBER_BITS
@@ -307,7 +274,7 @@ fn find_in<const N: usize>(list: &[u64; N], word: u64) -> (u16, u8) {
     found
 }
 
-/// The entry of `list` numbered `number`. Every entry is read, in constant time.
+/// Every entry is read, in constant time.
 fn select_in<const N: usize>(list: &[u64; N], number: u16) -> u64 {
     let mut word = 0;
     for (at, &entry) in (0..).zip(list) {
@@ -316,9 +283,7 @@ fn select_in<const N: usize>(list: &[u64; N], number: u16) -> u64 {
     word
 }
 
-/// `found` with `number` in place of its number and its mark set where `word` is `entry`, and
-/// `found` as it was otherwise, in constant time. Kept out of line, so that the check of its
-/// machine code finds it.
+/// Kept out of line, so that the check of its machine code finds it.
 #[inline(never)]
 fn find_step(word: u64, entry: u64, number: u16, found: (u16, u8)) -> (u16, u8) {
     #[cfg(not(kani))]
@@ -337,8 +302,7 @@ fn find_step(word: u64, entry: u64, number: u16, found: (u16, u8)) -> (u16, u8) 
     }
 }
 
-/// `entry` where `at` is `wanted`, and `word` otherwise, in constant time. Kept out of line, so
-/// that the check of its machine code finds it.
+/// Kept out of line, so that the check of its machine code finds it.
 #[inline(never)]
 fn select_step(at: u16, wanted: u16, entry: u64, word: u64) -> u64 {
     #[cfg(not(kani))]
@@ -378,9 +342,8 @@ pub(crate) mod model {
         if at == wanted { entry } else { word }
     }
 
-    /// SHA-256 is beyond Kani. 4 bits that equal bytes give alike, the low 4 bits of every byte
-    /// folded together, so that the few numbers of a short list still change them; that the
-    /// checksum is SHA-256's, the unit tests check.
+    /// SHA-256 is beyond Kani: folding in every byte lets the few numbers of a short list change
+    /// the checksum. Unit tests check that it is SHA-256's.
     pub(crate) fn checksum(bytes: &[u8; SECRET_LEN]) -> u16 {
         u16::from(bytes.iter().fold(0, |sum, &byte| sum ^ byte)) & CHECKSUM_BITS
     }
@@ -443,8 +406,8 @@ pub(crate) mod tests {
         ),
     ];
 
-    /// Keys from words, computed by an independent implementation of HKDF-SHA-256 from the
-    /// documented salt and label: they fix the derivation for every set of words already written.
+    /// Keys from words, computed by an independent HKDF-SHA-256 from the documented salt and label.
+    /// They fix the derivation for all words already written.
     const KEYS: [(&str, &str); 4] = [
         (
             "00000000000000000000000000000000",
@@ -464,8 +427,8 @@ pub(crate) mod tests {
         ),
     ];
 
-    /// Keys for transfers from the same words, computed in the same way: the purpose in the label
-    /// is that of transfers.
+    /// Keys for transfers from the same words, computed the same way, with the purpose of transfers
+    /// in the label.
     const TRANSFER_KEYS: [(&str, &str); 4] = [
         (
             "00000000000000000000000000000000",
@@ -502,12 +465,10 @@ pub(crate) mod tests {
         })
     }
 
-    /// The lines of the list as published.
     fn lines() -> Vec<&'static str> {
         core::str::from_utf8(LIST_TEXT).unwrap().lines().collect()
     }
 
-    /// `sentence` as twelve words, each followed by zeros.
     pub(crate) fn words_of(sentence: &str) -> Words {
         let given: Vec<&str> = sentence.split(' ').collect();
         assert_eq!(given.len(), WORD_COUNT);
@@ -532,8 +493,7 @@ pub(crate) mod tests {
         words
     }
 
-    /// What `words` stand for, read apart from the code: each word's line in the list, 11 bits to
-    /// a word from the most significant, and the first 4 bits of SHA-256 as the checksum.
+    /// What `words` stand for, read apart from the code.
     fn reading(words: &Words) -> Result<[u8; 16], Error> {
         let lines = lines();
         let mut stream = Vec::new();
@@ -626,8 +586,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Twelve words from `random`: the words of random bytes, random words of the list, words of
-    /// random bytes with one word or one byte changed, or random bytes.
     fn random_words(random: &mut Random) -> Words {
         let entry = |random: &mut Random| LIST[random.below(LIST_LEN)].to_le_bytes();
         let mut words = words_for(&random.bytes());
@@ -647,9 +605,6 @@ pub(crate) mod tests {
         words
     }
 
-    /// Random words through the real code: each is read exactly as the reading apart from the code
-    /// says, with the error it says, the bytes wiped when refused, and words read are the words of
-    /// the bytes read.
     fn read_random_words(rounds: u64, seed: u64) {
         let mut random = Random(seed);
         for round in 0..rounds {
@@ -674,8 +629,6 @@ pub(crate) mod tests {
         read_random_words(300, 1);
     }
 
-    /// The same over as many rounds and from the seed `LETHEWIS_RANDOM_ROUNDS` and
-    /// `LETHEWIS_RANDOM_SEED` give.
     #[test]
     #[ignore = "long; the rounds and the seed come from the environment"]
     fn many_random_words_are_read_as_the_list_says() {
@@ -701,8 +654,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// The key for transfers from words is that of another implementation, a key for transfers,
-    /// beside the key from a secret from the same words, and refused like it.
     #[test]
     fn a_key_for_transfers_from_words_matches_another_implementation() {
         for ((bytes, transfer), (_, secret)) in TRANSFER_KEYS.into_iter().zip(KEYS) {
@@ -850,8 +801,7 @@ pub(crate) mod tests {
 #[cfg(test)]
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod stack {
-    //! What a derivation from words and a generation of words leave on the stack, read back from
-    //! the memory of this process.
+    //! What a derivation from words and a generation of words leave on the stack.
 
     extern crate std;
 
@@ -876,13 +826,13 @@ mod stack {
     use crate::residue::{assert_clean, below_pad, depth_changed, key_dependent, residue};
     use crate::slots::{Slot, Slots};
 
-    /// The stack, in KiB, that a derivation from words and a generation of words need, and the
-    /// depth of the wipe after them, in an optimised build and in one without optimisation.
+    /// The stack in KiB that deriving and generating words need, and the depth of the wipe after
+    /// them. For an optimised build and for one without optimisation.
     const NEEDS: [usize; 2] = [10, 72];
     const WIPES: [usize; 2] = [8, 64];
 
-    /// Bytes whose values appear nowhere else, in static memory, so that no copy of them is made
-    /// on the stack but the ones looked for.
+    /// Bytes whose values appear nowhere else, kept static so that only the copies looked for reach
+    /// the stack.
     static BYTES: [u8; 16] = [
         13, 84, 155, 226, 41, 112, 183, 254, 69, 140, 211, 26, 97, 168, 239, 54,
     ];
@@ -895,7 +845,6 @@ mod stack {
         bytes().map(|byte| byte ^ 0xff)
     }
 
-    /// Writes [`BYTES`].
     struct Fixed;
 
     impl Entropy for Fixed {
@@ -905,14 +854,11 @@ mod stack {
         }
     }
 
-    /// The bytes `words` stand for, whether their checksum holds or not.
     fn read(words: &Words) -> [u8; 16] {
         let numbers = words.map(|word| find_in(&LIST, u64::from_le_bytes(word)).0);
         bits_of(&numbers).0
     }
 
-    /// The secrets of the checksum of `bytes`: the block SHA-256 compresses, its message schedule,
-    /// the state after it and the hash.
     fn checksum_secrets(bytes: &[u8; 16]) -> Vec<Vec<u8>> {
         let mut block = [0; 64];
         block[..16].copy_from_slice(bytes);
@@ -934,9 +880,6 @@ mod stack {
         std::vec![bytes.to_vec(), reversed, numbers]
     }
 
-    /// The secrets a derivation from the words of `bytes` of a key for `purpose` handles: the bytes
-    /// and the numbers of the words; the words laid out together; those of their checksum; those
-    /// of HKDF from the bytes; and those of the identifier of the key.
     fn derivation_secrets(bytes: &[u8; 16], purpose: Purpose) -> Vec<Vec<u8>> {
         let mut found = bytes_and_numbers(bytes);
         found.push(words_for(bytes).concat());
@@ -963,7 +906,6 @@ mod stack {
         Slots::new(memory, epoch, 1, &mut epoch_bytes(0))
     }
 
-    /// The test can see residue: reading words without a wipe leaves some.
     #[test]
     fn reading_words_without_a_wipe_leaves_residue() {
         let words = words_for(&bytes());
@@ -975,7 +917,6 @@ mod stack {
         assert!(residue(range, &pieces()) > 0);
     }
 
-    /// The same for writing words.
     #[test]
     fn writing_words_without_a_wipe_leaves_residue() {
         let range = below_pad(false, || {
@@ -1065,8 +1006,6 @@ mod stack {
                 .try_into()
                 .unwrap()
         };
-        // What the source gave, what the words stand for once it is hedged, and the hedge itself,
-        // the key of the epoch among its secrets.
         let found = |bytes: &[u8; 16], epoch: &[u8; 32]| {
             let mut material = bytes.to_vec();
             material.extend_from_slice(&0_u64.to_le_bytes());
@@ -1090,7 +1029,6 @@ mod stack {
         assert_eq!(words, words_for(&hedged(&bytes(), &epoch_bytes(0))));
     }
 
-    /// Writes [`BYTES`], then panics.
     struct Panicking;
 
     impl Entropy for Panicking {
@@ -1100,9 +1038,8 @@ mod stack {
         }
     }
 
-    /// A source that panics after writing leaves neither its bytes nor a key: the panic unwinds
-    /// past a wipe of the bytes, and the slot stays free. With optimisation the unwinding itself
-    /// overwrites where the bytes were, so only a build without it can tell.
+    /// With optimisation the unwinding itself overwrites where the bytes were, so only a build
+    /// without it can tell.
     #[test]
     fn a_panicking_source_leaves_no_bytes() {
         let pieces = key_dependent(&[bytes().to_vec()], &[other_bytes().to_vec()]);
@@ -1120,9 +1057,6 @@ mod stack {
         slots.generate_words(&mut Fixed, &mut words).unwrap();
     }
 
-    /// The wipe that follows a derivation from words and a generation of words reaches as deep as
-    /// it is meant to, also when the derivation fails after the key is derived, and no deeper than
-    /// the documentation says.
     #[test]
     fn the_wipe_reaches_its_depth() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -1146,7 +1080,7 @@ mod stack {
         }
     }
 
-    /// The wipe covers more than reading and writing words use; the load has wipes of its own.
+    /// The load has wipes of its own.
     #[test]
     fn the_wipe_is_deeper_than_reading_and_writing_words() {
         let words = words_for(&bytes());
@@ -1167,8 +1101,6 @@ mod stack {
         }
     }
 
-    /// The documentation of every call states the stack it needs and the depth of the wipe after
-    /// them, and that depth is the library's.
     #[test]
     fn the_documentation_states_the_stack_the_calls_need() {
         let build = usize::from(cfg!(lethewis_unoptimised));
@@ -1203,23 +1135,20 @@ pub(crate) mod proofs {
     };
     use crate::error::Error;
 
-    /// The words `list` writes for `bytes`.
     pub(crate) fn expected_words(list: &[u64; 3], bytes: &[u8; SECRET_LEN]) -> Words {
         let mut words = [[0; 8]; WORD_COUNT];
         encode(list, bytes, &mut words);
         words
     }
 
-    /// A list of three different words, any at all: the code reads every list alike, and the
-    /// list of 2048 is checked word by word by the unit tests.
+    /// The code reads every list alike, and the list of 2048 is checked word by word by the unit
+    /// tests.
     pub(crate) fn any_list() -> [u64; 3] {
         let list: [u64; 3] = kani::any();
         kani::assume(list[0] != list[1] && list[0] != list[2] && list[1] != list[2]);
         list
     }
 
-    /// Any word, whether of the list or not, is found exactly when an entry is that word, and then
-    /// with that entry's number.
     #[kani::proof]
     fn a_word_is_found_exactly_where_it_is_listed() {
         let list = any_list();
@@ -1241,7 +1170,6 @@ pub(crate) mod proofs {
         kani::cover!(listed == 0, "a word not of the list");
     }
 
-    /// The entry of any number of the list is read, and a number past the list reads nothing.
     #[kani::proof]
     fn the_entry_of_a_number_is_read() {
         let list = any_list();
@@ -1255,8 +1183,6 @@ pub(crate) mod proofs {
         kani::cover!(number == 3, "past the list");
     }
 
-    /// Any bytes give twelve numbers of the list, which stand for those bytes and carry their
-    /// checksum.
     #[kani::proof]
     fn bytes_are_read_back_from_their_numbers() {
         let bytes: [u8; SECRET_LEN] = kani::any();
@@ -1272,8 +1198,6 @@ pub(crate) mod proofs {
         kani::cover!(bytes == [0xff; SECRET_LEN], "every bit set");
     }
 
-    /// Twelve numbers of the list are the numbers of the bytes they stand for exactly when the
-    /// checksum they carry is the checksum of those bytes: one set of words to a set of bytes.
     #[kani::proof]
     fn numbers_stand_for_one_set_of_bytes() {
         let given: [u16; WORD_COUNT] = kani::any();
@@ -1287,9 +1211,6 @@ pub(crate) mod proofs {
         kani::cover!(carried != checksum(&bytes), "the checksum does not hold");
     }
 
-    /// Any twelve words are read exactly when each is of the list and their checksum holds; an
-    /// unknown word is refused before a checksum that does not hold, and the bytes are then wiped.
-    /// Words read are the words of the bytes read.
     #[kani::proof]
     fn words_are_read_exactly_when_listed_with_their_checksum() {
         let list = any_list();

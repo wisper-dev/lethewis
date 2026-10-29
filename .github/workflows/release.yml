@@ -1,9 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 # SPDX-License-Identifier: AGPL-3.0-only
 
-# Publishing happens here and nowhere else, never from a personal machine: no long-lived publishing
-# credential exists. Triggered by a signed tag on a commit already in main, so the content has been
-# through the pull-request gate. Tag rules forbid moving or deleting that tag.
+# Publishing happens only here: no long-lived publishing credential exists. It needs a signed tag
+# on a commit already in main, and tag rules forbid moving or deleting that tag.
 
 name: Release
 
@@ -14,14 +13,13 @@ on:
 
 permissions: {}
 
-# An in-flight release is never cancelled: cargo publish is not atomic, and a published version
-# cannot be deleted, only yanked.
 # Without this, GitHub runs each step as `bash -e`, where a failing command in a pipeline is
 # reported as success. `shell: bash` means `bash --noprofile --norc -eo pipefail`.
 defaults:
   run:
     shell: bash
 
+# cargo publish is not atomic, and a published version cannot be deleted, only yanked.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -45,8 +43,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          # Every crate shares one version, and that is verified rather than assumed: taking the
-          # first package's version would silently accept a workspace that had drifted apart.
+          # Taking the first package's version would accept crates that had drifted apart.
           versions=$(cargo metadata --no-deps --format-version 1 --locked |
             jq -r '.packages[].version' | sort -u)
           if [ "$(printf '%s\n' "$versions" | wc -l)" -ne 1 ]; then
@@ -82,9 +79,7 @@ jobs:
 
       - name: Every crate is actually publishable
         run: |
-          # cargo publish exits 0 when every package has publishing disabled, printing only a
-          # warning. Without this check the whole release would succeed (attestation, GitHub
-          # release, changelog) while nothing reached the registry.
+          # cargo publish succeeds, with only a warning, when every package has publishing disabled.
           blocked=$(cargo metadata --no-deps --format-version 1 --locked |
             jq -r '.packages[] | select(.publish == []) | .name' | tr '\n' ' ')
           if [ -n "${blocked// /}" ]; then
@@ -116,9 +111,8 @@ jobs:
 
       - name: Software bill of materials
         run: |
-          # Built here, in a job without id-token, rather than in the publishing job: installing a
-          # tool runs its build scripts, and in the publishing job that code could obtain a
-          # registry token. Pinned to an exact version for the same reason.
+          # Here, not in the publishing job: a tool's build scripts there could obtain a registry
+          # token. Pinned exactly for the same reason.
           cargo install cargo-cyclonedx --locked --version 0.5.9
           cargo cyclonedx --all --format json
           mkdir -p sbom
@@ -134,9 +128,8 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          # A linter, not a proof: it misses changes to field types, generics and lifetimes, and
-          # says nothing about a raised minimum compiler version. The version is pinned because an
-          # older release cannot read the rustdoc format of a current compiler.
+          # It misses changes to field types, generics, lifetimes and the minimum compiler version.
+          # Pinned because an older release cannot read a current compiler's rustdoc format.
           cargo install cargo-semver-checks --locked --version 0.50.0
           # Nothing to compare against until something has been published.
           if cargo semver-checks --workspace 2>&1 | tee semver.log; then
@@ -155,7 +148,7 @@ jobs:
     environment: release
     permissions:
       contents: write # writes the GitHub release and attaches the crate and its bill of materials
-      id-token: write # exchanges GitHub's identity for a 30-minute crates.io token; the whole point
+      id-token: write # exchanges GitHub's identity for a 30-minute crates.io token
       attestations: write # records provenance, so anyone can check what built these files
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -196,8 +189,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           # The attestation above describes the archive built by `cargo package`. `cargo publish`
-          # builds its own, so the two are compared afterwards: if they differ, the provenance
-          # describes a file nobody received.
+          # builds its own: if they differ, the provenance describes a file nobody received.
           before=$(cd dist && sha256sum ./*.crate | sort)
           cargo publish --workspace --locked
           after=$(cd target/package && sha256sum ./*.crate | sort)
@@ -213,9 +205,8 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           version=${TAG#v}
-          # The section for this version only: from its heading to the next one.
-          # Stops at the link definitions too: for the oldest section, which is the first release,
-          # awk otherwise ran to the end of the file and pulled them into the release text.
+          # This version's section only: from its heading to the next, or to the link definitions
+          # after the oldest.
           notes=$(awk -v v="## [$version]" '
             index($0, v) == 1 { on = 1; next }
             on && (/^## \[/ || /^\[/) { exit }

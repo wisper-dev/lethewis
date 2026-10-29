@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The records of an archive: a ciphertext of X-Wing to an archive key under the key of a chat for
-//! its archive, and the bodies of their batches, sealed under a key derived from its shared secret.
+//! The records of an archive and the bodies of their batches.
 
 use super::archive::{open_archive_layer, seed_of, split_body, wipe_archive_stack};
 use core::marker::PhantomData;
@@ -27,9 +26,8 @@ use crate::{
     xwing::{self, CIPHERTEXT_LEN, KNOWN, Known, PUBLIC_LEN, RANDOMNESS_LEN, SHARED_LEN},
 };
 
-/// The identifier and the public key of an archive key, as the record of the key holds them under
-/// the profile's stored key for wrapping, for the set of slots and the epoch it was read in. Only
-/// [`Slots::archive_public_key`] makes one.
+/// The identifier and the public key of an archive key, from [`Slots::archive_public_key`]. It
+/// serves only the set of slots and the epoch it was read in.
 pub struct ArchivePublic<'a> {
     pub(super) id: [u8; ID_LEN],
     pub(super) public: [u8; PUBLIC_LEN],
@@ -45,25 +43,18 @@ impl core::fmt::Debug for ArchivePublic<'_> {
 }
 
 impl<'a> Slots<'a> {
-    /// Reads the identifier and the public key of the archive key whose record is `record`, for the
-    /// `context` it was written for, under the stored key for wrapping that `profile` refers to and
-    /// the key of this epoch; the stored key of the archive is not needed. It serves these slots in
-    /// this epoch only. Whether the public key is the one the seed gives is known only once
-    /// [`Slots::load_archive_key`] loads the key, or [`Slots::open_archive`] opens a batch.
+    /// Reads the archive key's identifier and public key in `record` for `context`, under `profile`
+    /// alone. Whether the public key matches the seed is known only at [`Slots::load_archive_key`]
+    /// or [`Slots::open_archive`].
     ///
-    /// Needs 100 KiB of stack, or 232 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 96 KiB, or 224 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the code it calls has
-    /// to set that flag.
+    /// Needs 100 KiB of stack, or 232 KiB when unoptimised, and wipes 96 KiB, or 224 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if `profile` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Wrap`],
-    /// [`Error::WrongLevel`] if it is a key from a secret, [`Error::DerivationFailed`] if the key
-    /// of the layer cannot be derived, and [`Error::StaleRecord`] if the record does not open with
-    /// that stored key, this context and the key of this epoch, or names another epoch.
+    /// [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::WrongLevel`], [`Error::DerivationFailed`], or [`Error::StaleRecord`] if the record
+    /// does not open under that key, context and epoch.
     pub fn archive_public_key(
         &self,
         profile: Handle<'a>,
@@ -77,8 +68,6 @@ impl<'a> Slots<'a> {
         read
     }
 
-    /// The reading itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     pub(super) fn archive_public_key_on_stack(
         &self,
@@ -114,41 +103,23 @@ impl<'a> Slots<'a> {
         clippy::too_many_arguments,
         reason = "a batch takes its data, its record and its body"
     )]
-    /// Archives `data`, a batch of a chat: encapsulates to the archive key `public` names, writes
-    /// into `record` the identifier of the archive key, the ciphertext and a check of the shared
-    /// secret, and into `body`, [`batch_len`](crate::batch_len) bytes long, the data in chunks
-    /// sealed under a key derived from the shared secret, which never leaves the library. The
-    /// record is under the key of the chat for its archive that `seal` refers to, bound to
-    /// `context`, from 1 to 255 bytes, in no epoch, and the body is bound to the same context;
-    /// only that key and the archive key open them, with [`Slots::open_archive`]. The context names the place of the
-    /// batch: a record and body of another batch of the same context open in its place. The
-    /// randomness of the encapsulation and the nonce come from `entropy`, hedged with the key of
-    /// this epoch, the randomness also with the key of the chat. X-Wing gives a known answer
-    /// first, once in a process. The data are sealed in a buffer of the library, and only their
-    /// ciphertext goes into `body`.
+    /// Archives `data` to the archive key `public` names: the record into `record` under `seal`,
+    /// the sealed data into `body`. Only both keys open them, through [`Slots::open_archive`] with
+    /// the same `context`; `body` is [`batch_len`](crate::batch_len) bytes.
     ///
-    /// Needs 164 KiB of stack, or 232 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 160 KiB, or 224 KiB,
-    /// deep, whether it succeeded or not. A build that optimises this crate but not the code it
-    /// calls has to set that flag.
+    /// Needs 164 KiB of stack, or 232 KiB when unoptimised, and wipes 160 KiB, or 224 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if `seal` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::ArchiveSeal`],
-    /// [`Error::StaleRecord`] if `public` was read from other slots or in another epoch,
-    /// [`Error::WrongLength`] if `body` is not as long as the chunks of `data` take,
-    /// [`Error::CipherFailed`] if X-Wing gives a known input a wrong answer,
-    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if a value cannot
-    /// be derived from a key, [`Error::RecordRejected`] if X-Wing refuses the public key, and
-    /// [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or fails. `record`
-    /// is then left as it was, and `body` is wiped.
+    /// [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::StaleRecord`], [`Error::WrongLength`], [`Error::EntropyFailed`],
+    /// [`Error::DerivationFailed`], [`Error::RecordRejected`] or [`Error::CipherFailed`]. `record`
+    /// then stays as it was, and `body` is wiped.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through, and `record` and `body` are left as they
-    /// were.
+    /// Only if `entropy` panics; `record` and `body` are then left as they were.
     pub fn archive(
         &mut self,
         seal: Handle<'a>,
@@ -174,8 +145,7 @@ impl<'a> Slots<'a> {
         archived
     }
 
-    /// The archiving itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts. X-Wing has to give `known` first.
+    /// X-Wing has to give `known` first.
     #[inline(never)]
     #[expect(
         clippy::too_many_arguments,
@@ -269,35 +239,18 @@ impl<'a> Slots<'a> {
         written
     }
 
-    /// Opens into `data` the batch whose record of the archive is `record` and whose body is `body`,
-    /// for the `context` it was written for: the record opens with the key of the chat for its
-    /// archive that `seal` refers to, the key of the body is derived from the shared secret the
-    /// archive key that `archive` refers to gives its ciphertext, if the record's check of that
-    /// secret holds, and the body opens under it. `data` is
-    /// [`batch_data_len`](crate::batch_data_len) bytes long. Each chunk opens in a buffer of the
-    /// library and goes into `data` only once it has opened; if one does not, `data` is wiped, so
-    /// it is to be memory of this process, not a mapped file. X-Wing gives a known answer first,
-    /// once in a process.
+    /// Opens the batch of `record` and `body` for `context` into `data`, under `archive` and the
+    /// chat key `seal`. `data`, [`batch_data_len`](crate::batch_data_len) bytes, takes only opened
+    /// chunks and is wiped on failure, so it must be process memory.
     ///
-    /// Needs 164 KiB of stack, or 232 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 160 KiB, or 224 KiB,
-    /// deep, whether it succeeded or not. A build that optimises this crate but not the code it
-    /// calls has to set that flag.
+    /// Needs 164 KiB of stack, or 232 KiB when unoptimised, and wipes 160 KiB, or 224 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set `archive` refers to does not serve [`Purpose::Archive`]
-    /// or the one `seal` refers to [`Purpose::ArchiveSeal`], [`Error::RecordRejected`] if no body
-    /// of a batch is as long as `body`, [`Error::WrongLength`] if `data` is not as long as the body
-    /// holds or the set `archive` refers to holds no key of 32 bytes, [`Error::CipherFailed`] if
-    /// X-Wing gives a known input a wrong answer, [`Error::DerivationFailed`] if a value cannot be
-    /// derived from a key, [`Error::RecordRejected`] if the record does not open with that key of
-    /// the chat and this context, [`Error::WrongArchiveKey`] if it was written to another archive
-    /// key, [`Error::PublicKeyMismatch`] if the check of the shared secret fails: the batch was
-    /// archived to another public key, or its ciphertext or check changed, and
-    /// [`Error::RecordRejected`] if a chunk of the body does not open as the next of this batch.
+    /// [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::WrongLength`], [`Error::CipherFailed`], [`Error::DerivationFailed`],
+    /// [`Error::RecordRejected`], [`Error::WrongArchiveKey`] or [`Error::PublicKeyMismatch`];
     /// `data` is then wiped.
     pub fn open_archive(
         &self,
@@ -321,8 +274,7 @@ impl<'a> Slots<'a> {
         opened
     }
 
-    /// The opening itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts. X-Wing has to give `known` first.
+    /// X-Wing has to give `known` first.
     #[inline(never)]
     pub(super) fn open_archive_on_stack(
         &self,
@@ -395,31 +347,21 @@ impl<'a> Slots<'a> {
         opened
     }
 
-    /// Moves the record of an archive `record` from the key of a chat for its archive that `from`
-    /// refers to, to the one `to` refers to, which may be the same, and writes it into `out`, for
-    /// the same `context`: the archive key and the body are not needed, and the identifier, the
-    /// ciphertext and the check stay the same, so the moved record opens the same body. The nonce
-    /// comes from `entropy`, hedged with the key of this epoch.
+    /// Moves `record` from the chat key `from` to the chat key `to`, into `out`, for the same
+    /// `context`. It needs neither the archive key nor the body, and opens the same body.
     ///
-    /// Needs 100 KiB of stack, or 232 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 96 KiB, or 224 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the code it calls has
-    /// to set that flag.
+    /// Needs 100 KiB of stack, or 232 KiB when unoptimised, and wipes 96 KiB, or 224 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if either set does not serve [`Purpose::ArchiveSeal`],
-    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if the nonce
-    /// cannot be hedged or a key that encrypts a record cannot be derived,
-    /// [`Error::RecordRejected`] if `record` does not open with the first key and this context,
-    /// and [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or fails.
-    /// `out` is then left as it was.
+    /// [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::EntropyFailed`], [`Error::DerivationFailed`], [`Error::RecordRejected`] or
+    /// [`Error::CipherFailed`]; `out` is then left as it was.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through, and `out` is left as it was.
+    /// Only if `entropy` panics; `out` is then left as it was.
     pub fn reseal_archive(
         &mut self,
         from: Handle<'a>,
@@ -443,8 +385,6 @@ impl<'a> Slots<'a> {
         resealed
     }
 
-    /// The move itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     pub(super) fn reseal_archive_on_stack(
         &mut self,
@@ -484,8 +424,6 @@ impl<'a> Slots<'a> {
     }
 }
 
-/// Writes into `batch` the key of the body of a batch, and into `check` the check a record keeps,
-/// derived from the shared secret `shared` and the ciphertext it came with.
 fn batch_keys(
     shared: &[u8; SHARED_LEN],
     ciphertext: &[u8; CIPHERTEXT_LEN],
@@ -500,9 +438,7 @@ fn batch_keys(
     derived.map_err(|_| Error::DerivationFailed)
 }
 
-/// Seals the identifier `id` of an archive key, the ciphertext to it and the check of its shared
-/// secret with `seal_with` under the key derived from the key of a chat for its archive `chat`,
-/// under `nonce` into `out`. `out` is written only when this succeeds.
+/// `out` is written only when this succeeds.
 fn seal_archived(
     chat: &Key,
     nonce: &[u8; NONCE_LEN],
@@ -537,9 +473,7 @@ fn seal_archived(
     Ok(())
 }
 
-/// Opens the record of an archive `record` under the key derived from the key of a chat for its
-/// archive `chat` and keeps what it holds in `sealed`; otherwise `RecordRejected`, and `sealed` is
-/// left as it was.
+/// `sealed` is left as it was when the record does not open.
 fn open_archived(
     chat: &Key,
     aad: &[u8],
@@ -567,8 +501,6 @@ fn open_archived(
     Ok(())
 }
 
-/// The identifier of the archive key, the ciphertext and the check that a record of an archive
-/// holds.
 fn split_archived(
     sealed: &[u8; ARCHIVED_LEN],
 ) -> ([u8; ID_LEN], [u8; CIPHERTEXT_LEN], [u8; ID_LEN]) {
@@ -617,8 +549,6 @@ mod tests {
         }
     }
 
-    /// A stored key for wrapping, a stored key of the archive, two keys of chats for their archives
-    /// and the public key of an archive key created under the first two, with its record.
     fn archive<'a>(
         slots: &mut Slots<'a>,
     ) -> (
@@ -648,13 +578,10 @@ mod tests {
         (keys, public, record)
     }
 
-    /// How long the body of data of `len` bytes is.
     fn body_len(len: usize) -> usize {
         usize::try_from(batch_len(u64::try_from(len).unwrap()).unwrap()).unwrap()
     }
 
-    /// `data` archived under the key of a chat `chat` to the archive key `public` names, for
-    /// `context`: the record and the body.
     fn archive_batch<'a>(
         slots: &mut Slots<'a>,
         chat: Handle<'a>,
@@ -677,8 +604,6 @@ mod tests {
         (record, body)
     }
 
-    /// What opening the batch of `record` and `body` gives, into data as long as the body holds,
-    /// or five bytes for a body no batch has, that start as 7s.
     fn open_batch<'a>(
         slots: &Slots<'a>,
         (archive, chat): (Handle<'a>, Handle<'a>),
@@ -697,8 +622,6 @@ mod tests {
         bytes.iter().all(|&byte| byte == 0)
     }
 
-    /// A batch opens only with the archive key it was archived to, the key of its chat and its
-    /// context, and its own body; a refusal wipes the data.
     #[test]
     fn a_batch_opens_with_its_archive_key_and_its_chat_only() {
         let mut memory = [const { Slot::empty() }; 8];
@@ -742,8 +665,6 @@ mod tests {
         );
     }
 
-    /// The context names the place of a batch: the record and body of another batch of the same
-    /// context open in its place, those of another context do not.
     #[test]
     fn the_context_is_the_place_of_a_batch() {
         let mut memory = [const { Slot::empty() }; 8];
@@ -777,9 +698,6 @@ mod tests {
         );
     }
 
-    /// A body changed in any chunk or tag, cut by a chunk, grown by one, with its chunks swapped,
-    /// or of a length no body has, does not open, and the data are wiped; data of another length
-    /// than the body holds are refused as `WrongLength`.
     #[test]
     fn a_changed_body_is_refused() {
         let mut memory = [const { Slot::empty() }; 8];
@@ -827,8 +745,6 @@ mod tests {
         );
     }
 
-    /// Every call on a batch of an archive derives and runs the cipher and X-Wing inside the switch
-    /// of data-independent timing, and with the mode on where it is offered.
     #[test]
     fn every_call_on_a_record_of_an_archive_holds_data_independent_timing() {
         let mut memory = [const { Slot::empty() }; 8];
@@ -879,8 +795,6 @@ mod tests {
         });
     }
 
-    /// A public key serves only the slots and the epoch it was read in, and shows nothing of
-    /// itself.
     #[test]
     fn a_public_key_serves_its_slots_and_epoch_only() {
         let mut memory = [const { Slot::empty() }; 8];
@@ -962,8 +876,6 @@ mod tests {
         );
     }
 
-    /// A batch archived to a public key other than its archive key's, or whose ciphertext was
-    /// changed under the key of its chat, does not open: the check of the shared secret fails.
     #[test]
     fn a_batch_of_another_public_key_is_refused() {
         let mut memory = [const { Slot::empty() }; 8];
@@ -1019,7 +931,6 @@ mod tests {
         );
     }
 
-    /// A record of an archive written to one archive key does not open with another.
     #[test]
     fn a_record_of_another_archive_key_is_refused() {
         let mut memory = [const { Slot::empty() }; 8];
@@ -1039,8 +950,6 @@ mod tests {
         assert!(wiped(&held));
     }
 
-    /// A record moves to another key of the chat for its archive without the archive key; the
-    /// moved record opens with that key only, and opens the same body.
     #[test]
     fn a_record_of_an_archive_is_resealed_without_its_archive_key() {
         let mut memory = [const { Slot::empty() }; 8];
@@ -1087,8 +996,6 @@ mod tests {
         );
     }
 
-    /// The public key comes only from a record that opens with the profile's stored key, its
-    /// context and the key of this epoch.
     #[test]
     fn the_public_key_is_read_from_its_record_only() {
         let mut memory = [const { Slot::empty() }; 8];
@@ -1119,9 +1026,6 @@ mod tests {
         assert_eq!(public.id, id.bytes());
     }
 
-    /// A public key X-Wing refuses, a wrong answer of X-Wing, a failed source, a body of another
-    /// length and a failed seal of the body archive nothing: the record is left as it was, and
-    /// the body is wiped. An opening that fails wipes the data.
     #[test]
     #[expect(clippy::too_many_lines, reason = "one test goes through every failure")]
     fn an_archive_that_fails_writes_no_record_and_wipes_its_body() {
@@ -1237,9 +1141,8 @@ mod tests {
         assert_eq!(opened, [0; 3]);
     }
 
-    /// Every changed bit of a record of an archive is refused by the move, which opens it as the
-    /// opening does and writes nothing, without optimisation, where the cipher is slow, one bit of
-    /// every byte; and a changed byte in each part of it by the opening.
+    /// The move opens a record as the opening does. Without optimisation, where the cipher is slow,
+    /// only one bit of every byte is changed.
     #[test]
     #[expect(clippy::integer_division, reason = "a test picks bits of a record")]
     fn every_changed_bit_of_a_record_of_an_archive_is_refused() {
@@ -1296,8 +1199,7 @@ mod tests {
         );
     }
 
-    /// `id`, `ciphertext` and `check` sealed under the key of the chat `chat` for its archive,
-    /// bound to `context`, with `nonce`, laid out without the library's code for it.
+    /// A record laid out without the library's code for it.
     fn seal_parts(
         chat: &Key,
         context: &[u8],
@@ -1319,8 +1221,7 @@ mod tests {
         record
     }
 
-    /// What a record of an archive under the key of the chat `chat` for its archive holds, bound to
-    /// `context`, read without the library's code for it.
+    /// A record read without the library's code for it.
     fn opened_parts(
         chat: &Key,
         context: &[u8],
@@ -1335,17 +1236,14 @@ mod tests {
         seal::open(&cipher_key, &nonce, associated.bytes(), &mut sealed, &tag).map(|()| sealed)
     }
 
-    /// What a round of random records of an archive gets wrong.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Fault {
         Nothing,
         /// A context of no bytes or of more than 255.
         Context,
-        /// A context other than the record's.
         OtherContext,
         /// A changed bit of the record.
         Record,
-        /// The record under the key of another chat.
         OtherChat,
         /// The record under a key no slot holds.
         Outsider,
@@ -1353,7 +1251,6 @@ mod tests {
         Id,
         /// A changed bit of the ciphertext.
         Ciphertext,
-        /// A ciphertext of random bytes.
         RandomCiphertext,
         /// A changed bit of the check, in each byte in turn.
         Check,
@@ -1361,7 +1258,6 @@ mod tests {
         Body,
     }
 
-    /// Each fault in turn; one round in four gets a second, at random.
     const FAULTS: [Fault; 14] = [
         Fault::Nothing,
         Fault::Nothing,
@@ -1379,13 +1275,8 @@ mod tests {
         Fault::Body,
     ];
 
-    /// Records of an archive sealed through the real derivation and cipher and laid out by hand,
-    /// from real encapsulations to the archive key, with bodies of random data sealed under the key
-    /// the encapsulation gives, with every fault of [`FAULTS`] in turn and at times a second: a
-    /// context, the key of the chat, the identifier, the ciphertext, the check or the body wrong.
-    /// The opening and the move never panic, refuse exactly what they should, with the error they
-    /// should; the opening gives the data or wipes them, and the move writes the same parts under
-    /// the other key or nothing.
+    /// Archive records sealed through the real derivation and cipher, laid out by hand, from real
+    /// encapsulations to the key.
     #[expect(clippy::too_many_lines, reason = "one round builds and reads a record")]
     fn open_random_archive_records(rounds: u64, seed: u64) {
         let mut random = Random(seed);
@@ -1526,8 +1417,6 @@ mod tests {
         open_random_archive_records(100, 1);
     }
 
-    /// The same over as many rounds and from the seed `LETHEWIS_RANDOM_ROUNDS` and
-    /// `LETHEWIS_RANDOM_SEED` give.
     #[test]
     #[ignore = "long; the rounds and the seed come from the environment"]
     fn many_random_records_of_an_archive_open_as_their_parts_say() {
@@ -1572,8 +1461,7 @@ mod stack {
         ARCHIVE_KEY_RECORD_LEN, Epoch, Error, Handle, KeyLength, Purpose, Slot, Slots, seal, xwing,
     };
 
-    /// The data of a batch: 48 bytes that depend on `flip`, so that they tell one run from the
-    /// other on the stack.
+    /// Data that depend on `flip`, so that they tell one run from the other on the stack.
     fn data_of(flip: u8) -> [u8; 48] {
         let mut shake = Shake256::default();
         shake.update(&[flip, 0x2b]);
@@ -1582,18 +1470,15 @@ mod stack {
         data
     }
 
-    /// The body of those data.
     type Body = [u8; 64];
 
-    /// The stack each call needs, and the depth of the wipe after it, in KiB, in an optimised build
-    /// and in one without optimisation; archiving and opening, with a chunk of the body in a buffer
-    /// of its own, need more.
+    /// The stack each call needs, and the depth of the wipe after it, in KiB. For an optimised
+    /// build and for one without optimisation.
     const NEEDS: [usize; 2] = [100, 232];
     const WIPES: [usize; 2] = [96, 224];
     const ARCHIVE_NEEDS: [usize; 2] = [164, 232];
     const ARCHIVE_WIPES: [usize; 2] = [160, 224];
 
-    /// The documentation of the public call `name` in this file, its lines joined.
     fn documentation(name: &str) -> String {
         let source = include_str!("archived.rs");
         let at = source.find(&format!("    pub fn {name}(")).unwrap();
@@ -1607,8 +1492,6 @@ mod stack {
         lines.join(" ")
     }
 
-    /// The documentation of each call on a record of an archive states the stack it needs and the
-    /// depth of the wipe after it, and those depths are the library's.
     #[test]
     fn the_documentation_states_the_stack_calls_need() {
         let build = usize::from(cfg!(lethewis_unoptimised));
@@ -1630,12 +1513,9 @@ mod stack {
         }
     }
 
-    /// The handles of a set of slots over `memory` in an epoch whose key `flip` changes: a stored
-    /// key for wrapping, two keys of chats for their archives and a loaded archive key.
+    /// A stored key for wrapping, two keys of chats for their archives and a loaded archive key.
     type Keys<'a> = [Handle<'a>; 4];
 
-    /// Those slots and keys, the record of the archive key and its public key, the record and body
-    /// of a batch, and the secrets.
     type Archived<'a> = (
         Slots<'a>,
         Keys<'a>,
@@ -1644,12 +1524,6 @@ mod stack {
         Vec<Vec<u8>>,
     );
 
-    /// Those slots, with the record of the archive key, the public key it holds, the record and
-    /// body of a batch of [`data_of`] archived to it under the first key of a chat, and what the
-    /// calls on it handle: the keys, the seed and what X-Wing makes of it, the randomness of the
-    /// encapsulation and what X-Wing makes of that, the shared secret, the key of the body, the
-    /// data, what the ciphers of the record and the body and the derivation of the key of the
-    /// record handle, and the key of the epoch and the hedges of both draws under it.
     #[expect(
         clippy::too_many_lines,
         reason = "the secrets of every call are gathered at once"
@@ -1784,9 +1658,6 @@ mod stack {
         )
     }
 
-    /// What moving the record of a batch from the slots [`archived`] makes with `flip` to the second
-    /// key of a chat handles to seal it: the cipher of the moved record, the derivation of its key
-    /// and the hedge of its nonce.
     fn moved_secrets(flip: u8) -> Vec<Vec<u8>> {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
         let (mut slots, [_, chat, other_chat, _], _, (record, _), _) =
@@ -1825,8 +1696,7 @@ mod stack {
         secrets
     }
 
-    /// Fresh slots over `memory` in the state [`archived`] archives its batch in, with both keys of
-    /// a chat and the public key of its archive key.
+    /// Fresh slots in the state [`archived`] archives its batch in.
     fn before_archiving<'a>(
         memory: &'a mut [Slot],
         epoch: &'a mut Epoch,
@@ -1850,10 +1720,8 @@ mod stack {
         (slots, chats, public)
     }
 
-    /// Reading a public key, archiving, opening and moving a record without the wipe after them
-    /// leave on the stack some of what they handle, so that the test below can tell the wipe from
-    /// its absence. Archiving runs from the state [`archived`] archives in, so it handles the same
-    /// values.
+    /// Lets the test below tell the wipe from its absence. Archiving runs from the state
+    /// [`archived`] archives in, so it handles the same values.
     #[test]
     fn the_calls_on_records_of_an_archive_without_the_wipe_leave_residue() {
         let (mut memory, mut other) = ([const { Slot::empty() }; 6], [const { Slot::empty() }; 6]);
@@ -1930,9 +1798,7 @@ mod stack {
         assert!(residue(range, &pieces) > 0, "an archiving");
     }
 
-    /// Reading a public key, archiving, opening and moving a record leave none of the keys, the
-    /// expanded seed, the shared secret, the key of the body or the data on the stack: archiving
-    /// runs again from the same state, so it makes the same record and body.
+    /// Archiving runs again from the same state, so it makes the same record and body.
     #[test]
     fn the_calls_on_records_of_an_archive_leave_no_key_on_the_stack() {
         let (mut memory, mut other) = ([const { Slot::empty() }; 6], [const { Slot::empty() }; 6]);
@@ -1998,9 +1864,8 @@ mod stack {
         assert_eq!(written, (record, body));
     }
 
-    /// A source that panics on any of its calls leaves none of what archiving or a move handles on
-    /// the stack, at the panic or after it, and writes nothing. Each runs from the state
-    /// [`archived`] runs it from, so it handles the same values until the panic.
+    /// Each call runs from the state [`archived`] runs it from, so it handles the same values until
+    /// the panic.
     #[test]
     fn a_panicking_source_leaves_no_secret_of_archiving_or_a_move() {
         let (mut memory, mut other) = ([const { Slot::empty() }; 6], [const { Slot::empty() }; 6]);
@@ -2067,8 +1932,7 @@ mod stack {
         }
     }
 
-    /// The wipes cover more than the calls use, with the self-test of X-Wing asked for the first
-    /// time, and not needlessly more.
+    /// The self-test of X-Wing is asked for the first time.
     #[test]
     fn the_wipes_are_deeper_than_the_calls_on_records_of_an_archive() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
@@ -2135,8 +1999,6 @@ mod stack {
         }
     }
 
-    /// The wipes that follow each call reach as deep as they are meant to, also when the call
-    /// fails, and no call reaches deeper than its documentation says it needs.
     #[test]
     fn the_calls_on_records_of_an_archive_wipe_and_need_the_stack_documented() {
         let build = usize::from(cfg!(lethewis_unoptimised));

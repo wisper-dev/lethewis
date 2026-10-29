@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Tells the library whether it is built without optimisation: the hash and the cipher then use
-//! several times more stack, and the wipes after them have to reach deeper. A build that optimises
-//! this crate but not the hash and cipher code it calls sets `--cfg lethewis_unoptimised` itself.
+//! Sets `lethewis_unoptimised` without optimisation, where the hash and the cipher use several
+//! times more stack and the wipes reach deeper. A build that optimises this crate but not the hash
+//! and the cipher sets it itself.
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");

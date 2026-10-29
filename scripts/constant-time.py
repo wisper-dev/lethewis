@@ -2,22 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""The comparison of key identifiers and of the checks of blocks and of shares, the choice of the
-key a block is under, each step of the lookup of a word in the list and of the choice of a word by
-its number, and a product in the field of shares, run straight through on every target below: no
-branch, no call and no write of the program counter.
-
-The core is compiled to assembly as a library, optimised, before any link-time optimisation, for
-each target, and the bodies of `KeyId::is`, both `same_check`, `first_match`, `find_step`,
-`select_step` and `product` are read out of it.
-Every instruction in each body has to be one of a set known not to move control, and on every
-target but WebAssembly, whose functions end without one, the last has to be an unconditional
-return. An instruction outside that set fails the
-check, whatever it does, as do a directive other than those that only describe the code and a body
-that cannot be found or holds no instruction. Before that, the rules are run on known instructions.
-This shows how this compiler laid out the code; it says nothing about how long each instruction
-takes on a given processor, nor, for WebAssembly, about the code a runtime makes of it. It reads
-instructions, not the data they move, so a return to an address the body itself changed passes.
+"""Checks that `KeyId::is`, both `same_check`, `first_match`, `find_step`, `select_step` and
+`product` run straight through on every target. No branch, call or program counter write is
+allowed; the timing itself is not checked.
 """
 
 import re
@@ -51,13 +38,11 @@ WASM = "wasm32-unknown-unknown"
 TARGETS = (X86, AARCH64, THUMB, WASM)
 
 COMMENTS = {X86: "#", AARCH64: "//", THUMB: "@", WASM: "#"}
-# Directives that describe the code, for unwinding or as the signature and locals of a WebAssembly
-# function, and emit none of it.
+# Directives that describe the code and emit none of it.
 ANNOTATIONS = re.compile(r"^\.(cfi_[a-z_]+|fnstart|fnend|cantunwind|save|vsave|pad|setfp|functype"
                          r"|local)$")
 CONDITIONS = "eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le|al"
-# Mnemonics that never move control. A Thumb instruction from this set can still write the program
-# counter, which is checked apart.
+# Mnemonics that never move control. Thumb writes to the program counter are checked apart.
 STRAIGHT = {
     X86: re.compile(
         r"^(v?mov[a-z0-9]*|cmov[a-z]+|set[a-z]+|lea[a-z]?|(xor|or|and|andn|not|neg|add|adc|sub"

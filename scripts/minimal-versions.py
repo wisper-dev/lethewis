@@ -2,13 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""The lower bounds in the manifests hold.
-
-On top of the committed lockfile, every direct dependency is set to the lowest version its manifest
-allows and nothing else moves; then the review rules must hold and every version in the graph must
-have a review record, and only then do the tests build and run. Works on a copy of the files git
-tracks or would track, so the committed lockfile is left as it is. Needs the network to fetch the
-lower versions.
+"""The manifests' lower bounds hold: with each direct dependency at its lowest allowed version,
+cargo vet and tests pass. Works on a copy and needs the network.
 """
 
 import json
@@ -37,8 +32,7 @@ def main() -> int:
             target = repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(root / name, target, follow_symlinks=False)
-        # A cargo home of its own, so the lower versions are downloaded here rather than into the
-        # shared cache.
+        # Its own cargo home keeps the lower versions out of the shared cache.
         os.environ["CARGO_HOME"] = str(Path(work) / "cargo-home")
 
         metadata = json.loads(

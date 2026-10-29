@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Blocks of the caller's data, encrypted in the library under a set for data: a header of a salt
-//! and a check that names the key, then chunks, each sealed with AES-256-GCM-SIV under a key
-//! derived from that key and the salt.
+//! Blocks of the caller's data, encrypted in the library under a set for data.
 
 use super::{Handle, Slots, hedged_draw};
 use crate::{
@@ -21,9 +19,8 @@ use crate::{
     seal::{self, KEY_LEN as CIPHER_KEY_LEN, NONCE_LEN, Rejected, SealFailed, TAG_LEN},
 };
 
-/// A block being written under the primary key of a set for data, from [`Slots::begin_seal`]: it
-/// names the set, the key and the salt, and holds no key. It cannot be copied or cloned, and it
-/// stops working once the set changes.
+/// A block being written under the primary key of a set for data, from [`Slots::begin_seal`]. It
+/// holds no key, cannot be copied or cloned, and stops working once the set changes.
 pub struct Sealing<'a> {
     pub(super) set: Handle<'a>,
     pub(super) at: Position,
@@ -34,9 +31,8 @@ pub struct Sealing<'a> {
 }
 
 /// A block being read under the key of a set for data its header names, from
-/// [`Slots::begin_open`]: it names the set, the key and the salt, knows how many chunks the block
-/// holds, and holds no key. It cannot be copied or cloned, and it stops working once the set
-/// changes.
+/// [`Slots::begin_open`]. It holds no key, cannot be copied or cloned, and stops working once the
+/// set changes.
 pub struct Opening<'a> {
     pub(super) set: Handle<'a>,
     pub(super) at: Position,
@@ -75,8 +71,7 @@ impl core::fmt::Debug for Opening<'_> {
     }
 }
 
-/// What seals a chunk of any length: AES-256-GCM-SIV, which is all a build outside the proofs and
-/// the tests has, or a model of it in them.
+/// What seals a chunk of any length: AES-256-GCM-SIV, or a model of it in the proofs and tests.
 pub(super) trait SealChunk {
     fn seal(
         &mut self,
@@ -120,7 +115,6 @@ where
     }
 }
 
-/// What opens a chunk of any length.
 pub(super) trait OpenChunk {
     fn open(
         &mut self,
@@ -169,35 +163,21 @@ where
 }
 
 impl<'a> Slots<'a> {
-    /// Begins a block of data under the primary key of the set for data that `set` refers to, bound
-    /// to `context`, from 1 to 255 bytes, which names the place the block is kept, and writes its
-    /// header into `header`: a salt from `entropy`, hedged with the key of this epoch, and a check
-    /// derived from the key and the salt, which tells that key from any other and is random to
-    /// whoever lacks it. The chunks follow with [`Slots::seal_chunk`] and [`Slots::seal_last`].
-    /// A block is written once: a change to its data is a new block.
+    /// Begins a block of data under the primary key of `set`, bound to `context`, and writes its
+    /// header into `header`. The chunks follow with [`Slots::seal_chunk`] and [`Slots::seal_last`];
+    /// changed data is a new block.
     ///
-    /// The set is to be held by a record of this epoch as it is now, so that the key outlives the
-    /// slots. Whether that record is kept, and the records of the keys above it, the library
-    /// cannot see.
-    ///
-    /// Needs 11 KiB of stack, or 69 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the hedge, the derivation and the whole call are each followed
-    /// by a wipe of 8 KiB, or 64 KiB, below them, whether it succeeded or not. A build that
-    /// optimises this crate but not the hash code it calls has to set that flag.
+    /// Needs 11 KiB of stack, or 69 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Data`], [`Error::Unfinished`]
-    /// if it came in a transfer whose end has not been received, [`Error::Unsaved`] if no record of
-    /// this epoch holds it as it is now, [`Error::EntropyFailed`] if `entropy` fails,
-    /// and [`Error::DerivationFailed`] if the salt cannot be hedged or the check cannot be derived.
-    /// `header` is then left as it was.
+    /// [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::Unfinished`], [`Error::Unsaved`], [`Error::EntropyFailed`] or
+    /// [`Error::DerivationFailed`], with `header` left as it was.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through, and `header` is left as it was.
+    /// Only if `entropy` panics; `header` is then left as it was.
     pub fn begin_seal(
         &mut self,
         set: Handle<'a>,
@@ -210,8 +190,6 @@ impl<'a> Slots<'a> {
         begun
     }
 
-    /// The beginning itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     pub(super) fn begin_seal_in(
         &mut self,
@@ -254,26 +232,18 @@ impl<'a> Slots<'a> {
         })
     }
 
-    /// Seals `chunk`, the next chunk of the block `sealing` writes and not its last, in place, and
-    /// writes its tag into `tag`. The chunk is then opened and sealed again to the same tag and
-    /// ciphertext, so that a fault of the cipher in one of these passes fails the seal while the
-    /// caller still holds its own copy of the data.
+    /// Seals `chunk`, the next but not last chunk of `sealing`, in place and writes its tag into
+    /// `tag`. It is then opened and sealed again, so a cipher fault fails the seal while the caller
+    /// holds the data.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if the set is not held here now or has changed since the block began,
-    /// [`Error::Unsaved`] if no record of this epoch holds it as it is now, [`Error::WrongChunk`]
-    /// if the block holds as many chunks as a number of 64 bits counts, [`Error::DerivationFailed`]
-    /// if the key that encrypts the chunks cannot be derived, and [`Error::CipherFailed`] if the
-    /// cipher gives a known input a wrong answer or fails, or the chunk does not open and seal
-    /// again to the same tag and ciphertext. `chunk` is then wiped if the cipher ran,
-    /// and left as it was if not; `tag` is left as it was, and the block goes on as before the
-    /// call.
+    /// [`Error::StaleHandle`], [`Error::Unsaved`], [`Error::WrongChunk`],
+    /// [`Error::DerivationFailed`] or [`Error::CipherFailed`], with `tag` and the block unchanged
+    /// and `chunk` wiped if the cipher ran.
     pub fn seal_chunk(
         &self,
         sealing: &mut Sealing<'a>,
@@ -286,20 +256,17 @@ impl<'a> Slots<'a> {
         sealed
     }
 
-    /// Seals `chunk`, the last chunk of the block `sealing` writes, in place, writes its tag into
-    /// `tag`, and ends the block. The last chunk holds from 1 to [`CHUNK_LEN`] bytes, or none if it
-    /// is the only one and the data are empty.
+    /// Seals `chunk`, the last chunk of `sealing`, in place, writes its tag into `tag`, and ends
+    /// the block. The last chunk holds from 1 to [`CHUNK_LEN`] bytes, or none if the data are
+    /// empty.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::WrongChunk`] if `chunk` is longer than [`CHUNK_LEN`], or empty after other chunks,
-    /// and the errors of [`Slots::seal_chunk`]. `tag` is then left as it was, and the block is not
-    /// written.
+    /// [`Error::WrongChunk`] if `chunk` is too long or empty after other chunks, or an error of
+    /// [`Slots::seal_chunk`]. `tag` then stays as it was, and the block is not written.
     pub fn seal_last(
         &self,
         mut sealing: Sealing<'a>,
@@ -313,7 +280,6 @@ impl<'a> Slots<'a> {
         sealed
     }
 
-    /// The last chunk, of up to `C` bytes.
     pub(super) fn seal_last_in<const C: usize>(
         &self,
         sealing: &mut Sealing<'a>,
@@ -327,8 +293,6 @@ impl<'a> Slots<'a> {
         self.seal_chunk_on_stack(sealing, chunk, true, tag, seal_with)
     }
 
-    /// The seal of a chunk itself, in a frame of its own: the wipe that follows starts where this
-    /// frame starts.
     #[inline(never)]
     pub(super) fn seal_chunk_on_stack(
         &self,
@@ -360,26 +324,17 @@ impl<'a> Slots<'a> {
         Ok(())
     }
 
-    /// Begins to read the block of `block` bytes whose header is `header`, under the set for data
-    /// that `set` refers to and the `context` it was written for: the check of each key of the set
-    /// is derived from the salt and compared with the header's, all of them, with no early exit,
-    /// and the block is read under the key whose check it holds. The chunks follow with
-    /// [`Slots::open_chunk`] and [`Slots::open_last`]; only the last tells that the block is whole.
+    /// Begins to read the block of `block` bytes with `header`, under the data set `set` and its
+    /// `context`. The chunks follow with [`Slots::open_chunk`] and [`Slots::open_last`]; only the
+    /// last shows the block is whole.
     ///
-    /// Needs 11 KiB of stack, or 69 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: each derivation, and the whole call, are each followed by a
-    /// wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate but not the hash
-    /// code it calls has to set that flag.
+    /// Needs 11 KiB of stack, or 69 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Data`], [`Error::Unfinished`]
-    /// if it came in a transfer whose end has not been received,
-    /// [`Error::RecordRejected`] if no block is `block` bytes long, [`Error::DerivationFailed`] if a
-    /// check cannot be derived, [`Error::RecordRejected`] if the header names no key of the set,
-    /// and [`Error::KeyDisabled`] if it names a disabled one.
+    /// [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::Unfinished`], [`Error::RecordRejected`], [`Error::DerivationFailed`] or
+    /// [`Error::KeyDisabled`].
     pub fn begin_open(
         &self,
         set: Handle<'a>,
@@ -393,8 +348,6 @@ impl<'a> Slots<'a> {
         begun
     }
 
-    /// The beginning itself, for chunks of `C` bytes, in a frame of its own: the wipe that follows
-    /// starts where this frame starts.
     #[inline(never)]
     pub(super) fn begin_open_in<const C: usize>(
         &self,
@@ -449,21 +402,15 @@ impl<'a> Slots<'a> {
         })
     }
 
-    /// Opens `chunk`, the next chunk of the block `opening` reads and not its last, in place, if
-    /// `tag` is its tag.
+    /// Opens `chunk`, the next chunk of `opening` and not its last, in place, if `tag` is its tag.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::WrongChunk`] if the last chunk is due, [`Error::StaleHandle`] if the set is not held
-    /// here now or has changed since the block began to be read, [`Error::DerivationFailed`] if
-    /// the key that encrypts the chunks cannot be derived, and [`Error::RecordRejected`] if the
-    /// chunk does not open as the next of this block, for its context. `chunk` is then wiped if
-    /// the cipher ran, and left as it was if not, and the block goes on as before the call.
+    /// [`Error::WrongChunk`], [`Error::StaleHandle`], [`Error::DerivationFailed`] or
+    /// [`Error::RecordRejected`], with the block unchanged and `chunk` wiped if the cipher ran.
     pub fn open_chunk(
         &self,
         opening: &mut Opening<'a>,
@@ -475,7 +422,6 @@ impl<'a> Slots<'a> {
         opened
     }
 
-    /// A chunk that is not the last.
     pub(super) fn open_next_in(
         &self,
         opening: &mut Opening<'a>,
@@ -493,18 +439,16 @@ impl<'a> Slots<'a> {
         self.open_chunk_on_stack(opening, chunk, false, tag, open_with)
     }
 
-    /// Opens `chunk`, the last chunk of the block `opening` reads, in place, if `tag` is its tag,
-    /// and ends the block: the whole block has then opened, in order.
+    /// Opens `chunk`, the last chunk of `opening`, in place, if `tag` is its tag, and ends the
+    /// block. Success means the whole block opened, in order.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::WrongChunk`] if more chunks are due before the last, or `chunk` is not as long as
-    /// [`Opening::last_len`] says, and the errors of [`Slots::open_chunk`].
+    /// [`Error::WrongChunk`] if more chunks are due or `chunk` is not [`Opening::last_len`] bytes
+    /// long, or an error of [`Slots::open_chunk`].
     pub fn open_last(
         &self,
         mut opening: Opening<'a>,
@@ -516,7 +460,6 @@ impl<'a> Slots<'a> {
         opened
     }
 
-    /// The last chunk.
     pub(super) fn open_last_in(
         &self,
         opening: &mut Opening<'a>,
@@ -531,8 +474,6 @@ impl<'a> Slots<'a> {
         self.open_chunk_on_stack(opening, chunk, true, tag, open_with)
     }
 
-    /// The opening of a chunk itself, in a frame of its own: the wipe that follows starts where
-    /// this frame starts.
     #[inline(never)]
     pub(super) fn open_chunk_on_stack(
         &self,
@@ -561,7 +502,6 @@ impl<'a> Slots<'a> {
     }
 }
 
-/// The salt and the check of a block's header.
 pub(super) fn split_header(header: &[u8; BLOCK_HEADER_LEN]) -> ([u8; SALT_LEN], [u8; CHECK_LEN]) {
     let mut salt = [0; SALT_LEN];
     let mut check = [0; CHECK_LEN];
@@ -601,7 +541,6 @@ pub(super) mod tests {
     use crate::slots::{Erasure, Handle, Slot, Slots};
     use crate::timing::timed;
 
-    /// Writes the bytes it was made with, over and over.
     pub(in crate::slots) struct Fixed<'b>(pub(in crate::slots) &'b [u8]);
 
     impl Entropy for Fixed<'_> {
@@ -617,8 +556,6 @@ pub(super) mod tests {
         0x05, 0x16, 0x27, 0x38, 0x49, 0x5a, 0x6b, 0x7c, 0x8d, 0x9e, 0xaf, 0xc0,
     ];
 
-    /// Writes `data` as one block under the set `set` refers to, for `context`: the header, then
-    /// each chunk followed by its tag.
     pub(in crate::slots) fn seal_block<'a>(
         slots: &mut Slots<'a>,
         set: Handle<'a>,
@@ -654,7 +591,6 @@ pub(super) mod tests {
         unreachable!("the last chunk returns")
     }
 
-    /// Reads `block` under the set `set` refers to, for `context`.
     pub(in crate::slots) fn open_block<'a>(
         slots: &Slots<'a>,
         set: Handle<'a>,
@@ -683,8 +619,7 @@ pub(super) mod tests {
         Ok(data)
     }
 
-    /// A key for data from `pattern(59, 201)` as the first draw of `slots`, wrapped under a stored
-    /// key as the second, so that a record of this epoch holds it.
+    /// A key for data wrapped under a stored key, so that a record of this epoch holds it.
     pub(in crate::slots) fn recorded_set<'a>(slots: &mut Slots<'a>) -> (Handle<'a>, Handle<'a>) {
         let data = slots
             .generate(
@@ -720,8 +655,8 @@ pub(super) mod tests {
             .collect()
     }
 
-    /// Blocks computed by an implementation independent of this library: the length of the
-    /// context, of the data and of the block, and the block, or its SHA-256 when long.
+    /// Blocks computed by an implementation independent of this library. Each holds the lengths of
+    /// the context, data and block, and the block, or its SHA-256 when long.
     const KNOWN_BLOCKS: [(usize, usize, usize, &str); 5] = [
         (
             6,
@@ -802,7 +737,6 @@ pub(super) mod tests {
         }
     }
 
-    /// A set unwrapped from a record of this epoch is held by that record, so it begins a block.
     #[test]
     fn a_set_unwrapped_from_a_record_of_this_epoch_begins_a_block() {
         let mut memory = [const { Slot::empty() }; 2];
@@ -831,8 +765,6 @@ pub(super) mod tests {
         );
     }
 
-    /// A chunk the cipher fails to seal is refused as `CipherFailed`, and one it refuses to open as
-    /// `RecordRejected`; neither writes a tag or moves its block on.
     #[test]
     fn a_failing_cipher_fails_the_chunk() {
         let mut memory = [const { Slot::empty() }; 2];
@@ -958,7 +890,6 @@ pub(super) mod tests {
             Err(Error::RecordRejected)
         );
         assert!(chunk.iter().all(|&byte| byte == 0));
-        // The block goes on from the same chunk.
         tag[3] ^= 0x10;
         chunk.copy_from_slice(&block[BLOCK_HEADER_LEN..BLOCK_HEADER_LEN + CHUNK_LEN]);
         slots.open_chunk(&mut opening, &mut chunk, &tag).unwrap();
@@ -1004,7 +935,6 @@ pub(super) mod tests {
                 Err(Error::RecordRejected)
             );
         }
-        // The two full chunks swapped.
         let mut swapped = block.clone();
         swapped[first.clone()].copy_from_slice(&block[second.clone()]);
         swapped[second.clone()].copy_from_slice(&block[first.clone()]);
@@ -1012,21 +942,18 @@ pub(super) mod tests {
             open_block(&slots, set, b"file", &swapped),
             Err(Error::RecordRejected)
         );
-        // A chunk of the other block, of the same key, context and place.
         let mut mixed = block.clone();
         mixed[second.clone()].copy_from_slice(&other[second.clone()]);
         assert_eq!(
             open_block(&slots, set, b"file", &mixed),
             Err(Error::RecordRejected)
         );
-        // The other block's header on this block's chunks.
         let mut mixed = block.clone();
         mixed[..header].copy_from_slice(&other[..header]);
         assert_eq!(
             open_block(&slots, set, b"file", &mixed),
             Err(Error::RecordRejected)
         );
-        // Another context, shorter or of the same length.
         for context in [&b"fil"[..], b"filf"] {
             assert_eq!(
                 open_block(&slots, set, context, &block),
@@ -1144,7 +1071,6 @@ pub(super) mod tests {
         let mut sealing = slots
             .begin_seal(set, b"chat 7", &mut Fixed(&NONCE), &mut header)
             .unwrap();
-        // A change between two chunks: the block stops, and no new one begins before a record.
         slots
             .add_generated(set, KeyLength::Bytes32, &mut Fixed(&[5; 32]))
             .unwrap();
@@ -1174,7 +1100,6 @@ pub(super) mod tests {
                 .begin_seal(set, b"chat 7", &mut Fixed(&NONCE), &mut header)
                 .is_ok()
         );
-        // So does a change of stage.
         slots.promote(set, Position::Second).unwrap();
         assert_eq!(
             slots
@@ -1302,7 +1227,6 @@ pub(super) mod tests {
         let length = u64::try_from(block.len()).unwrap();
         let opening = slots.begin_open(set, b"chat 7", header, length).unwrap();
         assert_eq!((opening.chunks(), opening.last_len()), (2, 3));
-        // The last before the others.
         assert_eq!(
             slots.open_last(opening, &mut [0; 3], &[0; CHUNK_TAG_LEN]),
             Err(Error::WrongChunk)
@@ -1316,7 +1240,6 @@ pub(super) mod tests {
             .try_into()
             .unwrap();
         slots.open_chunk(&mut opening, &mut chunk, &tag).unwrap();
-        // Another full chunk where the last is due, and a last one of another length.
         assert_eq!(
             slots.open_chunk(&mut opening, &mut [0; CHUNK_LEN], &tag),
             Err(Error::WrongChunk)
@@ -1406,8 +1329,6 @@ pub(super) mod tests {
         random_blocks(20, 1);
     }
 
-    /// The same over as many rounds and from the seed `LETHEWIS_RANDOM_ROUNDS` and
-    /// `LETHEWIS_RANDOM_SEED` give.
     #[test]
     #[ignore = "long; the rounds and the seed come from the environment"]
     fn many_random_blocks_open_to_their_data_and_refuse_a_changed_bit() {
@@ -1417,7 +1338,6 @@ pub(super) mod tests {
         );
     }
 
-    /// A source of the next bytes of `random`.
     fn random_source(random: &mut Random) -> Fixed<'static> {
         Fixed(std::boxed::Box::leak(std::boxed::Box::new(
             random.bytes::<64>(),
@@ -1445,11 +1365,10 @@ mod stack {
     use crate::slots::tests::{EPOCH, WRAP_NEEDS, flipped_epoch_key};
     use crate::{Epoch, Error, Handle, KeyLength, Purpose, RECORD_LEN, Slot, Slots, seal};
 
-    /// The stack a beginning needs, in KiB, in an optimised build and in one without optimisation:
-    /// a little more than a load, for the block it returns.
+    /// The stack a beginning needs, in KiB, in an optimised build and in one without optimisation.
+    /// It is a little more than a load, for the block it returns.
     const BEGIN_NEEDS: [usize; 2] = [11, 69];
 
-    /// The documentation of the public call `name` in this file, its lines joined.
     fn documentation(name: &str) -> String {
         let source = include_str!("data.rs");
         let at = source.find(&format!("    pub fn {name}(")).unwrap();
@@ -1463,8 +1382,6 @@ mod stack {
         lines.join(" ")
     }
 
-    /// The documentation of each call on a block states the stack it needs and the depth of the
-    /// wipe after it: a beginning derives, a chunk derives and runs the cipher.
     #[test]
     fn the_documentation_states_the_stack_calls_need() {
         for (call, needs, wipes) in [
@@ -1485,8 +1402,8 @@ mod stack {
         }
     }
 
-    /// Slots over `memory` whose epoch key `flip` changes, with a key for data that a record of this
-    /// epoch holds, in the state [`blocked`] begins its block in.
+    /// Slots over `memory` whose epoch key `flip` changes, holding a data key that a record of this
+    /// epoch holds. They are in the state [`blocked`] begins its block in.
     fn before_sealing<'a>(
         memory: &'a mut [Slot],
         epoch: &'a mut Epoch,
@@ -1506,10 +1423,8 @@ mod stack {
         (slots, set)
     }
 
-    /// A block of two chunks under a key for data in slots over `memory` whose epoch key `flip`
-    /// changes, the handle of its set, and the secrets the calls on it handle: the key, the key of
-    /// the epoch and the hedge of the salt, the key of its chunks, the cipher's keys and keystream
-    /// for each chunk, and the derivations of the check and of the key of the chunks.
+    /// A block of two chunks under a data key in slots whose epoch key `flip` changes. Also the
+    /// handle of its set, and the secrets the calls on it handle.
     fn blocked<'a>(
         memory: &'a mut [Slot],
         epoch: &'a mut Epoch,
@@ -1572,12 +1487,10 @@ mod stack {
         data
     }
 
-    /// The data of the last chunk [`blocked`] seals.
     fn last_data(flip: u8) -> [u8; 33] {
         core::array::from_fn(|at| u8::try_from(at).unwrap().wrapping_mul(57).wrapping_add(3) ^ flip)
     }
 
-    /// The header, the first chunk and its tag, and the last chunk and its tag of `block`.
     #[expect(clippy::type_complexity, reason = "the parts of a block of two chunks")]
     fn parts(
         block: &[u8],
@@ -1603,11 +1516,8 @@ mod stack {
         u64::try_from(block.len()).unwrap()
     }
 
-    /// Sealing and opening a chunk without the wipe after them leave on the stack some of what they
-    /// handle, so that the test below can tell the wipe from its absence; an opening in the portable
-    /// code built without optimisation leaves nothing even so. The block is sealed again from the
-    /// same state, so it handles the same values. A beginning keeps nothing secret in its own frame:
-    /// the hedge and the derivations it runs wipe after themselves.
+    /// Lets the test below tell the wipe from its absence. A beginning keeps nothing secret in its
+    /// own frame: the hedge and the derivations it runs wipe after themselves.
     #[test]
     fn the_calls_on_a_chunk_without_the_wipe_leave_residue() {
         let (mut memory, mut other) = ([const { Slot::empty() }; 2], [const { Slot::empty() }; 2]);
@@ -1667,8 +1577,6 @@ mod stack {
         );
     }
 
-    /// Beginning, sealing and opening a block leave on the stack none of the secrets [`blocked`]
-    /// names, and none of the data of its chunks.
     #[test]
     fn the_calls_on_a_block_leave_no_key_on_the_stack() {
         let (mut memory, mut other) = ([const { Slot::empty() }; 2], [const { Slot::empty() }; 2]);
@@ -1731,9 +1639,8 @@ mod stack {
         );
     }
 
-    /// The wipe after a chunk covers more than the cipher uses on a chunk, full or short; the
-    /// derivations a beginning and a chunk run are measured with the derivation, and wiped after it
-    /// besides.
+    /// The derivations a beginning and a chunk run are measured with the derivation, and wiped
+    /// after it besides.
     #[test]
     fn the_wipe_is_deeper_than_the_cipher_on_a_chunk() {
         let (key, nonce) = ([7; 32], chunk_nonce(3, false));
@@ -1773,8 +1680,6 @@ mod stack {
         }
     }
 
-    /// The wipes that follow each call reach as deep as they are meant to, also when the call
-    /// fails, and no call reaches deeper than its documentation says it needs.
     #[test]
     fn the_calls_on_a_block_wipe_and_need_the_stack_documented() {
         let build = usize::from(cfg!(lethewis_unoptimised));

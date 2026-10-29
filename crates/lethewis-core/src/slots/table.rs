@@ -1,14 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The memory of a set of slots: the only code that reaches a slot by its number or goes over all
-//! of them. A test or a change it applies is `Fn` and `Sync`, so it can count the slots only in an
-//! atomic.
+//! The only code that reaches a slot by its number or goes over all of them.
 
 use super::Slot;
 
-/// The number of a slot. Only the table makes one, for a slot it finds; a handle, and a set that
-/// came in a transfer, carry it as the table gave it.
+/// Only the table makes one, for a slot it finds. A handle, and a set from a transfer, carry it as
+/// given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Index(usize);
 
@@ -34,7 +32,6 @@ impl Index {
     }
 }
 
-/// The slots of a set of slots, in the memory the caller provides.
 pub(super) struct Table<'a> {
     memory: &'a mut [Slot],
 }
@@ -44,7 +41,6 @@ impl<'a> Table<'a> {
         Self { memory }
     }
 
-    /// The address of the memory.
     pub(super) fn id(&self) -> usize {
         self.memory.as_ptr().addr()
     }
@@ -57,17 +53,14 @@ impl<'a> Table<'a> {
         self.memory.get_mut(at.0)
     }
 
-    /// The first slot that passes `test`.
     pub(super) fn find(&self, test: impl Fn(&Slot) -> bool + Sync) -> Option<Index> {
         self.memory.iter().position(test).map(Index)
     }
 
-    /// Whether any slot passes `test`.
     pub(super) fn any(&self, test: impl Fn(&Slot) -> bool + Sync) -> bool {
         self.find(test).is_some()
     }
 
-    /// Applies `change` to every slot, once each.
     pub(super) fn each(&mut self, change: impl Fn(&mut Slot) + Sync) {
         self.memory.iter_mut().for_each(change);
     }
@@ -96,8 +89,7 @@ mod proofs {
 
     const SLOTS: usize = 8;
 
-    /// Slots with any marks and generations: the table reads nothing of a slot, so these stand for
-    /// slots in any state.
+    /// The table reads nothing of a slot, so these stand for slots in any state.
     fn any_slots() -> [Slot; SLOTS] {
         let any = || {
             let mut slot = Slot::empty();
@@ -114,8 +106,6 @@ mod proofs {
         number
     }
 
-    /// For eight slots, whichever of them pass a test, the table finds the first that passes, and
-    /// none only when none does.
     #[kani::proof]
     #[kani::unwind(9)]
     fn the_table_finds_the_first_slot_that_passes() {
@@ -139,8 +129,7 @@ mod proofs {
         kani::cover!(found.is_none(), "no slot passes");
     }
 
-    /// For eight slots, a change over all of them reaches each slot once: the loop bound leaves no
-    /// room for a count that wraps around to one.
+    /// The loop bound leaves no room for a count that wraps around to one.
     #[kani::proof]
     #[kani::unwind(9)]
     fn the_table_changes_every_slot_once() {
@@ -156,8 +145,6 @@ mod proofs {
         kani::cover!(before[at] == u64::MAX, "a generation that wraps");
     }
 
-    /// For eight slots, a slot is reached by its number alone, and a change through it changes
-    /// no other slot.
     #[kani::proof]
     #[kani::unwind(9)]
     fn the_table_reaches_a_slot_by_its_number() {

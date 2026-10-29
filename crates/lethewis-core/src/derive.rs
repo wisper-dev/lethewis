@@ -13,15 +13,12 @@ use crate::record::{ID_LEN, Purpose, length_to_byte};
 use crate::seal::KEY_LEN as CIPHER_KEY_LEN;
 use crate::xwing::{CIPHERTEXT_LEN, RANDOMNESS_LEN};
 
-/// The salt of the derivation of an identifier, and of a key from words.
 pub(crate) const SALT: &[u8] = b"lethewis derivation salt v1";
-/// The first bytes of every label.
 const PREFIX: &[u8; 8] = b"lethewis";
 const VERSION: u8 = 1;
 /// Prefix (8), version, purpose, key length, output length (2), name length, and a name of up to
 /// 16 bytes.
 const LABEL_CAPACITY: usize = 30;
-/// The part of a label before the name.
 const HEAD_LEN: usize = 14;
 const KEY_ID: &[u8; 6] = b"key id";
 const WRAP_KEY: &[u8; 8] = b"wrap key";
@@ -50,38 +47,28 @@ const CARRY_CHUNK: &[u8; 11] = b"carry chunk";
 const HEDGE_SHARES: &[u8; 12] = b"hedge shares";
 const FROM_SHARES: &[u8; 11] = b"from shares";
 const SHARE_CHECK: &[u8; 11] = b"share check";
-/// The count of a draw, after the bytes the source gave, in the material a hedge extracts.
 const COUNT_LEN: usize = 8;
 /// How many bytes twelve words, or two shares, stand for.
 pub(crate) const SECRET_LEN: usize = 16;
-/// How many bytes of stack a derivation is followed by a wipe of: at least twice what it uses, as a
-/// test measures in each build and with each SHA-256 back end. Without optimisation it uses far
-/// more.
+/// At least twice the stack a derivation uses, as a test measures in each build and SHA-256 back
+/// end.
 #[cfg(all(not(kani), not(lethewis_unoptimised)))]
 pub(crate) const STACK_WIPE: usize = 8192;
 #[cfg(all(not(kani), lethewis_unoptimised))]
 pub(crate) const STACK_WIPE: usize = 65_536;
-/// How many bytes of stack a wrap or an unwrap is followed by a wipe of: at least twice what the
-/// cipher uses at any level of optimisation, as a test measures in the same way.
+/// At least twice the stack the cipher uses at any level of optimisation, as a test measures.
 #[cfg(all(not(kani), not(lethewis_unoptimised)))]
 pub(crate) const CIPHER_STACK_WIPE: usize = 24_576;
 #[cfg(all(not(kani), lethewis_unoptimised))]
 pub(crate) const CIPHER_STACK_WIPE: usize = 65_536;
 
-/// What a derived value is for. Each branch has a name of its own in the label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Branch {
-    /// The identifier of a key.
     KeyId,
-    /// The key that encrypts the records a wrapping key wraps.
     WrapKey,
-    /// A key from the bytes twelve words stand for.
     FromWords,
-    /// The bytes of a new key, hedged.
     HedgeKey,
-    /// The bytes that new words stand for, hedged.
     HedgeWords,
-    /// The nonce of a record, hedged.
     HedgeNonce,
     /// The key that encrypts the records a key from a secret locks, whatever the epoch.
     LockKey,
@@ -97,15 +84,13 @@ pub(crate) enum Branch {
     /// The key that encrypts the seed of an archive key under a stored key of the archive, whatever
     /// the epoch.
     ArchiveKey,
-    /// The key that encrypts the outer layer of the record of an archive key, under a stored key for
-    /// wrapping, in an epoch.
+    /// The key of the outer layer of an archive key's record, under a stored wrapping key, in an
+    /// epoch.
     ArchiveLayer,
     /// The seed of an archive key, from hedged bytes and a stored key of the archive.
     ArchiveSeed,
-    /// The key that encrypts the records of an archive under a key of a chat for its archive,
-    /// whatever the epoch.
+    /// The key of the records of an archive under a key of a chat for its archive, in any epoch.
     ArchiveSeal,
-    /// The randomness of an encapsulation of X-Wing, hedged.
     HedgeEncaps,
     /// The randomness of an encapsulation, from hedged bytes and a key of a chat for its archive.
     ArchiveEncaps,
@@ -113,29 +98,20 @@ pub(crate) enum Branch {
     ArchiveBatch,
     /// The check of a shared secret of X-Wing that a record of an archive holds.
     ArchiveCheck,
-    /// The check in the header of a block of data, which names the key of a set the block is
-    /// under, from that key and the block's salt.
+    /// The check in a block's header, which names the key of a set the block is under.
     DataCheck,
-    /// The key that encrypts the chunks of a block of data, from the key of a set and the block's
-    /// salt.
     DataChunk,
-    /// The salt of a block of data, hedged.
     HedgeSalt,
-    /// The check in the header of a block carried under a key for transfers, which names that key,
-    /// from it and the block's salt.
+    /// The check in the header of a block carried under a key for transfers, which names that key.
     CarryCheck,
-    /// The key that encrypts the chunks of a block carried under a key for transfers, from that key
-    /// and the block's salt.
+    /// The key that encrypts the chunks of a block carried under a key for transfers.
     CarryChunk,
-    /// The bytes a split into shares takes, hedged.
     HedgeShares,
-    /// A key from the bytes two shares stand for.
     FromShares,
     /// The check of the bytes two shares stand for, split with them.
     ShareCheck,
 }
 
-/// The purpose each branch is derived for.
 #[cfg(test)]
 pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
     match branch {
@@ -163,7 +139,6 @@ pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
     }
 }
 
-/// Hedges worked out apart from [`hedge`], for the tests.
 #[cfg(test)]
 pub(crate) mod direct {
     extern crate std;
@@ -173,7 +148,6 @@ pub(crate) mod direct {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
-    /// What a hedge makes of `drawn` under the epoch key `epoch` at `count`, for the use `name`:
     /// HKDF-SHA-256 called directly, with the label written out by hand.
     pub(crate) fn hedged_directly(
         epoch: &[u8; 32],
@@ -202,7 +176,6 @@ pub(crate) mod direct {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DerivationFailed;
 
-/// The identifier of a key, derived from the key itself. It is wiped when dropped.
 #[cfg_attr(any(test, kani), derive(Debug, PartialEq, Eq))]
 pub(crate) struct KeyId([u8; ID_LEN]);
 
@@ -215,7 +188,6 @@ impl KeyId {
         wipe(&mut self.0);
     }
 
-    /// Takes the identifier out of `source` and wipes `source`.
     pub(crate) fn take(&mut self, source: &mut Self) {
         self.0 = source.0;
         source.wipe();
@@ -225,13 +197,11 @@ impl KeyId {
         self.0
     }
 
-    /// Whether both are the identifier of one key, compared in constant time.
     pub(crate) fn same(&self, other: &Self) -> bool {
         self.is(&other.0)
     }
 
-    /// Whether the identifier is `bytes`, compared in constant time. Kept out of line, so that the
-    /// check of its machine code finds it.
+    /// Compares in constant time; kept out of line so that the check of its machine code finds it.
     #[inline(never)]
     pub(crate) fn is(&self, bytes: &[u8; ID_LEN]) -> bool {
         #[cfg(not(kani))]
@@ -253,14 +223,11 @@ impl Drop for KeyId {
     }
 }
 
-/// Derives the identifier of `key` straight into `id`. The purpose is not part of it: the same
-/// bytes have one identifier whatever they serve.
+/// The purpose is not part of it: the same bytes have one identifier whatever they serve.
 pub(crate) fn derive_key_id(key: &Key, id: &mut KeyId) -> Result<(), DerivationFailed> {
     derive(key, SALT, None, Branch::KeyId, &mut id.0)
 }
 
-/// Derives the key that encrypts the records the wrapping key `key` wraps in the epoch whose key is
-/// `epoch`.
 pub(crate) fn derive_wrap_key(
     key: &Key,
     epoch: &Key,
@@ -270,7 +237,6 @@ pub(crate) fn derive_wrap_key(
     derive(key, salt, Some(Purpose::Wrap), Branch::WrapKey, out)
 }
 
-/// Derives the key that encrypts the records the key from a secret `key` locks, in any epoch.
 pub(crate) fn derive_lock_key(
     key: &Key,
     out: &mut [u8; CIPHER_KEY_LEN],
@@ -278,8 +244,6 @@ pub(crate) fn derive_lock_key(
     derive(key, SALT, Some(Purpose::Wrap), Branch::LockKey, out)
 }
 
-/// Derives into `out` the key from a secret that the key from a secret `key` and the key `salt`, as
-/// the salt, make together.
 pub(crate) fn derive_combined(
     key: &Key,
     salt: &Key,
@@ -289,13 +253,10 @@ pub(crate) fn derive_combined(
     derive(key, salt, Some(Purpose::Wrap), Branch::Combined, out)
 }
 
-/// Derives into `out` the challenge to a chip from the key from a secret `key`.
 pub(crate) fn derive_challenge(key: &Key, out: &mut [u8; 32]) -> Result<(), DerivationFailed> {
     derive(key, SALT, None, Branch::Challenge, out)
 }
 
-/// Derives the key that encrypts the records of an export, and the record that ends one, under the
-/// key for transfers `key`, in any epoch.
 pub(crate) fn derive_export_key(
     key: &Key,
     out: &mut [u8; CIPHER_KEY_LEN],
@@ -303,8 +264,6 @@ pub(crate) fn derive_export_key(
     derive(key, SALT, Some(Purpose::Transfer), Branch::ExportKey, out)
 }
 
-/// Derives the key that encrypts the outer layer of the lock records of the epoch whose key is
-/// `epoch`.
 pub(crate) fn derive_layer_key(
     epoch: &Key,
     out: &mut [u8; CIPHER_KEY_LEN],
@@ -312,7 +271,6 @@ pub(crate) fn derive_layer_key(
     derive(epoch, SALT, Some(Purpose::Wrap), Branch::EpochLayer, out)
 }
 
-/// Derives the key that encrypts the seeds the stored key of the archive `key` wraps, in any epoch.
 pub(crate) fn derive_archive_key(
     key: &Key,
     out: &mut [u8; CIPHER_KEY_LEN],
@@ -326,8 +284,6 @@ pub(crate) fn derive_archive_key(
     )
 }
 
-/// Derives the key that encrypts the outer layer of the records of archive keys under the stored
-/// key for wrapping `key` in the epoch whose key is `epoch`.
 pub(crate) fn derive_archive_layer_key(
     key: &Key,
     epoch: &Key,
@@ -337,8 +293,6 @@ pub(crate) fn derive_archive_layer_key(
     derive(key, salt, Some(Purpose::Wrap), Branch::ArchiveLayer, out)
 }
 
-/// Derives the seed of an archive key from `hedged`, bytes of the platform's source hedged with the
-/// key of the epoch, as the salt and the stored key of the archive `key`.
 pub(crate) fn derive_archive_seed(
     key: &Key,
     hedged: &[u8; 32],
@@ -353,8 +307,6 @@ pub(crate) fn derive_archive_seed(
     )
 }
 
-/// Derives the key that encrypts the records of an archive under the key of a chat for its archive
-/// `key`, in any epoch.
 pub(crate) fn derive_archive_seal_key(
     key: &Key,
     out: &mut [u8; CIPHER_KEY_LEN],
@@ -368,8 +320,6 @@ pub(crate) fn derive_archive_seal_key(
     )
 }
 
-/// Derives the randomness of an encapsulation from `hedged`, bytes of the platform's source hedged
-/// with the key of the epoch, as the salt and the key of a chat for its archive `key`.
 pub(crate) fn derive_archive_randomness(
     key: &Key,
     hedged: &[u8; RANDOMNESS_LEN],
@@ -384,8 +334,6 @@ pub(crate) fn derive_archive_randomness(
     )
 }
 
-/// Derives the key that seals the chunks of the body of a batch from the shared secret of X-Wing
-/// `shared`, with the ciphertext it came with as the salt.
 pub(crate) fn derive_archive_batch(
     shared: &Key,
     ciphertext: &[u8; CIPHERTEXT_LEN],
@@ -400,8 +348,6 @@ pub(crate) fn derive_archive_batch(
     )
 }
 
-/// Derives into `check` the check of the shared secret of X-Wing `shared` that a record of an
-/// archive holds, with the ciphertext it came with as the salt.
 pub(crate) fn derive_archive_check(
     shared: &Key,
     ciphertext: &[u8; CIPHERTEXT_LEN],
@@ -416,8 +362,6 @@ pub(crate) fn derive_archive_check(
     )
 }
 
-/// Derives into `out` the check in the header of a block of data under the key for data `key`,
-/// with the block's salt `salt` as the salt.
 pub(crate) fn derive_data_check(
     key: &Key,
     salt: &[u8; SALT_LEN],
@@ -426,8 +370,6 @@ pub(crate) fn derive_data_check(
     derive(key, salt, Some(Purpose::Data), Branch::DataCheck, out)
 }
 
-/// Derives the key that encrypts the chunks of a block of data under the key for data `key`, with
-/// the block's salt `salt` as the salt.
 pub(crate) fn derive_data_chunk(
     key: &Key,
     salt: &[u8; SALT_LEN],
@@ -436,8 +378,6 @@ pub(crate) fn derive_data_chunk(
     derive(key, salt, Some(Purpose::Data), Branch::DataChunk, out)
 }
 
-/// Derives into `out` the check in the header of a block carried under the key for transfers `key`,
-/// with the block's salt `salt` as the salt.
 pub(crate) fn derive_carry_check(
     key: &Key,
     salt: &[u8; SALT_LEN],
@@ -446,8 +386,6 @@ pub(crate) fn derive_carry_check(
     derive(key, salt, Some(Purpose::Transfer), Branch::CarryCheck, out)
 }
 
-/// Derives the key that encrypts the chunks of a block carried under the key for transfers `key`,
-/// with the block's salt `salt` as the salt.
 pub(crate) fn derive_carry_chunk(
     key: &Key,
     salt: &[u8; SALT_LEN],
@@ -456,11 +394,7 @@ pub(crate) fn derive_carry_chunk(
     derive(key, salt, Some(Purpose::Transfer), Branch::CarryChunk, out)
 }
 
-/// Fills `out` with the value of `branch` that `secret`, the bytes twelve words or two shares stand
-/// for, derives for `purpose`, or for none: HKDF-Extract with the salt of identifiers, then
-/// HKDF-Expand with the label of `branch`, [`Branch::FromWords`], [`Branch::FromShares`] or
-/// [`Branch::ShareCheck`]. Then the stack the derivation used is wiped, whether it succeeded or
-/// not.
+/// `branch` is [`Branch::FromWords`], [`Branch::FromShares`] or [`Branch::ShareCheck`].
 pub(crate) fn derive_from_secret(
     secret: &[u8; SECRET_LEN],
     purpose: Option<Purpose>,
@@ -476,7 +410,6 @@ pub(crate) fn derive_from_secret(
     derived
 }
 
-/// The derivation from a secret itself, in a frame of its own.
 #[inline(never)]
 fn secret_on_stack(
     secret: &[u8; SECRET_LEN],
@@ -495,9 +428,6 @@ fn secret_on_stack(
     hkdf(SALT, secret, info, out)
 }
 
-/// Fills `out` with the value of `branch` derived from `key` for `purpose`, or for none. The key
-/// goes through HKDF-Extract with `salt`, and HKDF-Expand takes the label. Then the stack the
-/// derivation used is wiped, whether it succeeded or not.
 pub(crate) fn derive(
     key: &Key,
     salt: &[u8],
@@ -514,12 +444,8 @@ pub(crate) fn derive(
     derived
 }
 
-/// Fills `out` from the bytes the platform's source gave, `drawn`, hedged with the key of the epoch
-/// as RFC 8937 has it: HKDF-Extract, with that key as the salt, takes the bytes and then `count`,
-/// least significant byte first, and HKDF-Expand takes the label of `branch`. While that key is
-/// secret, the output cannot be told from random bytes unless the bytes drawn and the count repeat
-/// together, which they do not within one set of slots. Then the stack the hedge used is wiped,
-/// whether it succeeded or not.
+/// RFC 8937: while the epoch key is secret, the output looks random unless `drawn` and `count`
+/// repeat together. Within one set of slots they never do.
 pub(crate) fn hedge(
     epoch: &Key,
     count: u64,
@@ -541,7 +467,6 @@ pub(crate) fn hedge(
     hedged
 }
 
-/// The hedge itself, in a frame of its own.
 #[inline(never)]
 fn hedge_on_stack(
     epoch: &Key,
@@ -553,7 +478,7 @@ fn hedge_on_stack(
     let salt = epoch.material().ok_or(DerivationFailed)?;
     let count = count.to_le_bytes();
     let mut material = [0; CAPACITY + COUNT_LEN];
-    // Copies of a length fixed at each arm: under the proofs a copy of a length known only at run
+    // Copies of a length fixed at each arm. Under the proofs a copy of a length known only at run
     // time reads stale bytes.
     let placed = match drawn.len() {
         12 => place::<12>(&mut material, drawn, count),
@@ -573,8 +498,6 @@ fn hedge_on_stack(
     hedged
 }
 
-/// Puts the `N` bytes drawn and then the count at the start of `material`, and returns how many
-/// bytes that is.
 fn place<const N: usize>(
     material: &mut [u8; CAPACITY + COUNT_LEN],
     drawn: &[u8],
@@ -588,9 +511,7 @@ fn place<const N: usize>(
     N.checked_add(COUNT_LEN)
 }
 
-/// The platform's source hedged with the key of the epoch: what the source writes goes through
-/// [`hedge`] before it reaches the buffer given, under the next count of draws. It remembers
-/// whether the hedge failed, so that the failure is told from the source's.
+/// Remembers whether the hedge failed, so that the failure is told from the source's.
 pub(crate) struct Hedged<'h, E: ?Sized> {
     pub(crate) source: &'h mut E,
     pub(crate) epoch: &'h Key,
@@ -628,21 +549,19 @@ impl Drop for WipeOnDrop {
     }
 }
 
-/// Wipes the stack below the caller's frame, as deep as a derivation reaches.
+/// Wipes the stack below the caller. The work it has to reach runs first in an `#[inline(never)]`
+/// function, so that its frame lies below the caller's.
 pub(crate) fn wipe_stack() {
     // The wipe ends in inline assembly, which Kani cannot model.
     #[cfg(not(kani))]
     zeroize::zeroize_stack::<STACK_WIPE>();
 }
 
-/// Wipes the stack below the caller's frame, as deep as the cipher reaches.
 pub(crate) fn wipe_cipher_stack() {
     #[cfg(not(kani))]
     zeroize::zeroize_stack::<CIPHER_STACK_WIPE>();
 }
 
-/// The derivation itself, in a frame of its own: the wipe that follows starts where this frame
-/// starts.
 #[inline(never)]
 fn derive_on_stack(
     key: &Key,
@@ -780,14 +699,12 @@ pub(crate) mod stack {
         0xc671_78f2,
     ];
 
-    /// An HMAC key block: `key` padded with zeros to 64 bytes, each byte combined with `pad` by
-    /// exclusive or.
     fn key_block(key: &[u8], pad: u8) -> [u8; 64] {
         core::array::from_fn(|i| key.get(i).copied().unwrap_or(0) ^ pad)
     }
 
     /// The last block SHA-256 compresses for a message of one 64-byte block and then `tail`,
-    /// shorter than 56 bytes: the tail, the end mark and the length in bits.
+    /// shorter than 56 bytes.
     fn final_block(tail: &[u8]) -> [u8; 64] {
         let mut block = [0; 64];
         block[..tail.len()].copy_from_slice(tail);
@@ -797,7 +714,6 @@ pub(crate) mod stack {
         block
     }
 
-    /// The SHA-256 state after `blocks`, from the initial state.
     pub(crate) fn state_after(blocks: &[[u8; 64]]) -> [u32; 8] {
         let mut state = IV;
         compress256(&mut state, blocks);
@@ -822,7 +738,6 @@ pub(crate) mod stack {
         w
     }
 
-    /// Words as they sit in memory on either byte order.
     fn words_forms(words: &[u32]) -> [Vec<u8>; 2] {
         [
             words.iter().flat_map(|word| word.to_le_bytes()).collect(),
@@ -830,8 +745,8 @@ pub(crate) mod stack {
         ]
     }
 
-    /// A state as it sits in memory: as eight words, and as the halves the SHA instructions of
-    /// x86-64 keep it in on the way in, during the rounds and on the way out.
+    /// A state as it sits in memory: as eight words, and as the halves x86-64's SHA instructions
+    /// keep it in. That is on the way in, during the rounds and on the way out.
     pub(crate) fn state_forms(state: [u32; 8]) -> Vec<Vec<u8>> {
         let mut forms = Vec::from(words_forms(&state));
         for half in [
@@ -847,7 +762,6 @@ pub(crate) mod stack {
         forms
     }
 
-    /// A hash output as bytes and as the words of the state it came from.
     pub(crate) fn hash_forms(hash: &[u8]) -> Vec<Vec<u8>> {
         let words: Vec<u32> = hash
             .chunks(4)
@@ -858,8 +772,6 @@ pub(crate) mod stack {
         forms
     }
 
-    /// A block a hash compresses, with its message schedule and the schedule plus the round
-    /// constants, as they sit in memory.
     pub(crate) fn block_forms(block: &[u8; 64]) -> Vec<Vec<u8>> {
         let w = schedule(block);
         let with_constants: Vec<u32> = w.iter().zip(K).map(|(w, k)| w.wrapping_add(k)).collect();
@@ -869,12 +781,8 @@ pub(crate) mod stack {
         forms
     }
 
-    /// The secrets a derivation of `branch` from the first `length` bytes of `key` handles: the
-    /// key; in Extract, the state after the key and the inner hash; the extracted key, the HMAC key
-    /// blocks made from it and the states after each, from which any value could be derived; in
-    /// Expand, the inner hash; the message schedules of every secret block; and the first output
-    /// block. Of an identifier, which the caller asks for, the plain bytes past its first byte only
-    /// are counted, so that the identifier itself is not.
+    /// Of an identifier, which the caller asks for, only the plain bytes past the first are
+    /// counted. The identifier itself is not.
     pub(crate) fn secrets(
         key: &[u8],
         salt: &[u8],
@@ -884,14 +792,10 @@ pub(crate) mod stack {
         secrets_of(&key[..length.bytes()], salt, branch)
     }
 
-    /// The same for a derivation of `branch` from the whole of `key`: a key of 16, 32 or 64 bytes,
-    /// or the material of a hedge.
     pub(crate) fn secrets_of(key: &[u8], salt: &[u8], branch: Branch) -> Vec<Vec<u8>> {
         secrets_for(key, salt, branch, purpose_of(branch))
     }
 
-    /// The secrets a hedge of `drawn` for `branch` at `count`, under the key of the epoch `epoch`,
-    /// handles.
     pub(crate) fn hedge_secrets(
         epoch: &[u8],
         count: u64,
@@ -903,7 +807,6 @@ pub(crate) mod stack {
         secrets_of(&material, epoch, branch)
     }
 
-    /// The same for a derivation for `purpose`, or for none.
     pub(crate) fn secrets_for(
         key: &[u8],
         salt: &[u8],
@@ -963,8 +866,7 @@ pub(crate) mod stack {
             .finalize();
 
         let mut secrets = std::vec![key.to_vec(), output[1..].to_vec()];
-        // The salt of a wrap key and of a hedge is the key of an epoch, and that of a combined key a
-        // key as well.
+        // An epoch key salts a wrap key and a hedge, and a key salts a combined key too.
         if matches!(
             branch,
             Branch::WrapKey
@@ -1005,8 +907,6 @@ pub(crate) mod stack {
         secrets
     }
 
-    /// What HMAC keyed with `salt` works with: the salt, its blocks padded for the inner and the
-    /// outer hash, and the state after each.
     pub(crate) fn salt_secrets(salt: &[u8]) -> Vec<Vec<u8>> {
         let mut secrets = std::vec![salt.to_vec()];
         for block in [key_block(salt, 0x36), key_block(salt, 0x5c)] {
@@ -1016,8 +916,6 @@ pub(crate) mod stack {
         secrets
     }
 
-    /// The pieces of the secrets of a derivation from the first `length` bytes of `key` that depend
-    /// on the key.
     fn pieces(key: &[u8], length: KeyLength) -> Vec<Vec<u8>> {
         let other: [u8; 64] = core::array::from_fn(|i| key[i] ^ 0xff);
         key_dependent(
@@ -1032,7 +930,6 @@ pub(crate) mod stack {
         key
     }
 
-    /// The test can see residue: the derivation without the wipe leaves some.
     #[test]
     fn a_derivation_without_the_wipe_leaves_residue() {
         let pieces = pieces(&key_bytes(), KeyLength::Bytes64);
@@ -1055,8 +952,7 @@ pub(crate) mod stack {
         });
     }
 
-    /// The key of the epoch these tests run under, with every bit of `flip` flipped in each byte;
-    /// its bytes vary, so that the tests look for it.
+    /// The key of the epoch these tests run under; its bytes vary, so that the tests look for it.
     pub(crate) fn epoch_bytes(flip: u8) -> [u8; 32] {
         core::array::from_fn(|at| {
             u8::try_from(at)
@@ -1073,8 +969,6 @@ pub(crate) mod stack {
         key
     }
 
-    /// The pieces of what a hedge of 32 bytes at count 3 works with that depend on those bytes:
-    /// the bytes themselves and the secrets of their derivation.
     fn hedge_pieces() -> Vec<Vec<u8>> {
         let material = |drawn: &[u8]| {
             let mut material = drawn.to_vec();
@@ -1090,7 +984,6 @@ pub(crate) mod stack {
         key_dependent(&secrets, &others)
     }
 
-    /// The test can see residue: a hedge without the wipe leaves some.
     #[test]
     fn a_hedge_without_the_wipe_leaves_residue() {
         let (epoch, drawn) = (hedge_epoch(), key_bytes());
@@ -1113,8 +1006,8 @@ pub(crate) mod stack {
         });
     }
 
-    /// The bytes a panicking source writes, from a static, so that the source keeps no copy of them
-    /// on the stack.
+    /// The bytes a panicking source writes, from a static, so the source keeps no copy on the
+    /// stack.
     static PANICKED: [u8; 32] = [
         0x8c, 0x31, 0xe7, 0x05, 0x6a, 0xd2, 0x49, 0xb0, 0x17, 0xfe, 0x63, 0x9a, 0x2d, 0xc4, 0x58,
         0x0b, 0x76, 0xe1, 0x3f, 0xa8, 0x92, 0x14, 0xcd, 0x60, 0xbb, 0x27, 0xf5, 0x4e, 0x81, 0x3a,
@@ -1130,9 +1023,8 @@ pub(crate) mod stack {
         }
     }
 
-    /// A source that panics after writing leaves none of its bytes in the hedge's buffer: the panic
-    /// unwinds past a wipe of it. With optimisation the unwinding itself overwrites that place, so
-    /// only a build without it can tell.
+    /// With optimisation the unwinding itself overwrites the hedge's buffer, so only a build
+    /// without optimisation can tell.
     #[test]
     fn a_panicking_source_leaves_no_bytes_in_the_hedge() {
         let other: Vec<u8> = PANICKED.iter().map(|byte| byte ^ 0xff).collect();
@@ -1217,9 +1109,6 @@ pub(crate) mod stack {
         }
     }
 
-    /// What a generation from `drawn`, the bytes the source gave, at `count` under the epoch key
-    /// `epoch` works with: those bytes, the key their hedge gives and the secrets of its
-    /// identifier, and the secrets of the hedge itself, the key of the epoch among them.
     fn generation_secrets(drawn: &[u8], count: u64, epoch: &[u8; 32]) -> Vec<Vec<u8>> {
         let key = super::direct::hedged_directly(epoch, count, b"hedge key", drawn, drawn.len());
         let mut found = secrets_of(&key, SALT, Branch::KeyId);
@@ -1230,8 +1119,6 @@ pub(crate) mod stack {
         found
     }
 
-    /// The pieces of a generation by [`Counting`] under the epoch key of these tests that depend on
-    /// the source and on that key.
     fn generation_pieces(count: u64, length: KeyLength) -> Vec<Vec<u8>> {
         let drawn = &counted::<64>()[..length.bytes()];
         let other: Vec<u8> = drawn.iter().map(|byte| byte ^ 0xff).collect();
@@ -1255,7 +1142,6 @@ pub(crate) mod stack {
         }
     }
 
-    /// The wipe that follows a derivation reaches as deep as it is meant to.
     #[test]
     fn the_wipe_reaches_its_depth() {
         let key = loaded_key();
@@ -1267,7 +1153,6 @@ pub(crate) mod stack {
         assert!(wiped >= STACK_WIPE, "{wiped} bytes wiped");
     }
 
-    /// The wipe covers more than the derivation uses.
     #[test]
     fn the_wipe_is_deeper_than_the_derivation() {
         let key = loaded_key();
@@ -1295,20 +1180,17 @@ pub(crate) mod model {
     use super::{DerivationFailed, KeyId, SECRET_LEN};
     use crate::record::ID_LEN;
 
-    /// Whether the last derivation failed, so a proof can tell a failure of the derivation from one
-    /// the code makes up.
+    /// Whether the last derivation failed, so a proof can tell its failure from one the code makes
+    /// up.
     static FAILED: AtomicBool = AtomicBool::new(false);
     /// How many derivations have failed, so a proof can tell whether any of several did.
     static FAILURES: AtomicU8 = AtomicU8::new(0);
     /// How many derivations have run, so a proof can tell that a search stopped at none early.
     static RUNS: AtomicU8 = AtomicU8::new(0);
 
-    /// HKDF-SHA-256 is beyond Kani. The model fails at will, after writing into `out`, and records
-    /// whether it failed; otherwise `out` takes the first bytes of the key, or zeros for a key
-    /// shorter than `out`, with the key's length, the label and the first bytes of the salt folded
-    /// in, so equal inputs give equal outputs, and the output depends on those bytes, that length,
-    /// the label and the salt. Folding every byte of the key would be too slow for the solver; that
-    /// HKDF uses the whole key and the output length, the unit tests check.
+    /// Fails at will after writing into `out`; else folds in the key length, label, and starts of
+    /// key and salt. Folding every byte is too slow for the solver; unit tests check that HKDF
+    /// takes the whole key and length.
     pub(super) fn hkdf(
         salt: &[u8],
         material: &[u8],
@@ -1333,8 +1215,8 @@ pub(crate) mod model {
         Ok(())
     }
 
-    /// The 16 bytes twelve words or two shares stand for, given twice: the derivation from a
-    /// secret passes them so to the model, so that both halves of a 32-byte output take every byte.
+    /// The secret given twice, so that both halves of a 32-byte output of the model take every
+    /// byte.
     pub(crate) fn twice(secret: &[u8; SECRET_LEN]) -> [u8; 32] {
         let mut both = [0; 32];
         if let Some((first, second)) = both.split_first_chunk_mut::<SECRET_LEN>() {
@@ -1344,24 +1226,20 @@ pub(crate) mod model {
         both
     }
 
-    /// Whether the last derivation failed.
     pub(crate) fn failed() -> bool {
         FAILED.load(Ordering::Relaxed)
     }
 
-    /// Whether any derivation has failed.
     pub(crate) fn any_failed() -> bool {
         FAILURES.load(Ordering::Relaxed) != 0
     }
 
-    /// How many derivations have run.
     pub(crate) fn runs() -> u8 {
         RUNS.load(Ordering::Relaxed)
     }
 
-    // Never indexing: a path that never derives would leave a check unreached. Copies have lengths
-    // known at each call: Kani 0.68.0 reads stale bytes in a slice copy of unknown length. The
-    // lengths derived are folded as numbers: byte by byte costs the proofs many times more.
+    // Copies have lengths known at each call: Kani 0.68.0 reads stale bytes in a slice copy of
+    // unknown length. Output lengths are folded as numbers: byte by byte costs the proofs far more.
     pub(crate) fn fold(salt: &[u8], material: &[u8], info: &[u8], out: &mut [u8]) {
         let mut label = [0; 32];
         if let Some(to) = label.get_mut(..info.len()) {
@@ -1396,9 +1274,9 @@ pub(crate) mod model {
                 to_second.copy_from_slice(&(second ^ high ^ salt_high).to_ne_bytes());
             }
         } else if let Ok(out) = <&mut [u8; 64]>::try_from(&mut *out) {
-            // Taken apart rather than indexed: a bounds check on a path a proof never takes would be
-            // a check it never reaches.
-            // A 32-byte key fills the first two lanes, so that it reaches a 64-byte output too.
+            // Taken apart rather than indexed: a bounds check on a path no proof takes would never
+            // be reached. A 32-byte key fills the first two lanes, so it reaches a 64-byte output
+            // too.
             let [first, second, third, fourth] = material.first_chunk::<64>().map_or_else(
                 || {
                     material.first_chunk::<32>().map_or([0; 4], |key| {
@@ -1421,7 +1299,6 @@ pub(crate) mod model {
                 *to = lane.to_ne_bytes();
             }
         } else if let Ok(out) = <&mut [u8; 4]>::try_from(&mut *out) {
-            // The first 16 bytes of the key, folded down to 4.
             let key = material.first_chunk::<16>().map_or(0, head);
             let folded = key ^ low ^ high ^ salt_low;
             let folded = folded ^ folded.wrapping_shr(64);
@@ -1455,9 +1332,8 @@ pub(crate) mod model {
         }
     }
 
-    /// What stands in for the constant-time comparison of identifiers. As two numbers: comparing the
-    /// arrays whole reads bytes from before the latest write in Kani 0.68.0, and byte by byte costs
-    /// many times more.
+    /// As two numbers: comparing the arrays whole reads stale bytes in Kani 0.68.0, and byte by
+    /// byte costs far more.
     pub(crate) fn same_id(a: &[u8; ID_LEN], b: &[u8; ID_LEN]) -> bool {
         u128::from_ne_bytes(*a) == u128::from_ne_bytes(*b)
     }
@@ -1471,10 +1347,8 @@ pub(crate) mod model {
     }
 }
 
-/// The label of one derivation from `length` bytes, and how many of its bytes are used. Every
-/// field but the name has a fixed width, and the name, which comes last, is preceded by its length,
-/// so two different derivations never share a label. A derivation for no purpose has zero there,
-/// which no purpose is.
+/// Every field but the last, the name, has a fixed width, and the name follows its length. So two
+/// different derivations never share a label; a zero purpose means none.
 fn label(
     purpose: Option<Purpose>,
     length: u8,
@@ -1537,9 +1411,8 @@ fn label(
     }
 }
 
-/// A label of `head` and `name`, and how many of its bytes are used.
-// Placed at fixed offsets rather than appended piece by piece: under the proofs a piece of a length
-// known only at run time costs many times its bytes.
+// Placed at fixed offsets, not appended piece by piece. Under the proofs a piece of a length known
+// only at run time costs many times its bytes.
 fn joined<const N: usize>(
     head: impl FnOnce(u8) -> [u8; HEAD_LEN],
     name: &[u8; N],
@@ -1656,7 +1529,6 @@ mod tests {
         assert_eq!(&bytes[..used], &expected[..]);
     }
 
-    /// Keys of both lengths whose bytes are all different: 0, 1, 2, ...
     fn counted_key(length: KeyLength) -> Key {
         let mut key = Key::empty();
         if length == KeyLength::Bytes32 {
@@ -1667,8 +1539,6 @@ mod tests {
         key
     }
 
-    /// The wrapper against HKDF called directly with the salt and the label written out by hand,
-    /// for both key lengths: the whole key goes in, and the label states its length.
     #[test]
     fn derivation_is_hkdf_with_the_salt_and_the_label() {
         for (length, length_byte) in [(KeyLength::Bytes32, 32_u8), (KeyLength::Bytes64, 64)] {
@@ -1689,9 +1559,6 @@ mod tests {
         }
     }
 
-    /// The derivation from a secret, of words or of shares, and of the check of shares, against HKDF
-    /// called directly with the salt and the label written out by hand: all 16 bytes go in, and the
-    /// label states their length.
     #[test]
     fn a_derivation_from_a_secret_is_hkdf_with_the_salt_and_its_label() {
         let secret: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).unwrap());
@@ -1725,8 +1592,8 @@ mod tests {
         assert_eq!(ours, direct, "the check of shares");
     }
 
-    /// Outputs computed by an independent implementation of HKDF-SHA-256 from the documented salt
-    /// and label: they fix the derivation for every key already written.
+    /// Outputs computed by an independent HKDF-SHA-256 from the documented salt and label. They fix
+    /// the derivation for every key already written.
     #[test]
     fn derivations_match_known_answers() {
         let cases = [
@@ -1784,8 +1651,7 @@ mod tests {
         }
     }
 
-    /// A combined key against an independent implementation of HKDF-SHA-256: the key from a
-    /// secret, of either length, goes in, with the 32 bytes of the other key as the salt.
+    /// A combined key against an independent implementation of HKDF-SHA-256.
     #[test]
     fn a_combined_key_matches_known_answers() {
         let mut salt = Key::empty();
@@ -1806,8 +1672,6 @@ mod tests {
         }
     }
 
-    /// A length no hedge takes fails as a hedge, before the source is asked and with no draw
-    /// counted.
     #[test]
     fn a_length_no_hedge_takes_asks_nothing_of_the_source() {
         struct Asked(bool);
@@ -1835,7 +1699,6 @@ mod tests {
         }
     }
 
-    /// The key of an epoch whose bytes are 0x40, 0x41, ... 0x5f.
     fn hedge_epoch() -> Key {
         let mut key = Key::empty();
         key.load32(&mut core::array::from_fn(|i| {
@@ -1844,8 +1707,8 @@ mod tests {
         key
     }
 
-    /// Hedges computed by an independent implementation of HKDF-SHA-256 from the documented salt,
-    /// material and label, for each use and length the library draws.
+    /// Hedges computed by an independent implementation of HKDF-SHA-256, for each use and length
+    /// the library draws.
     #[test]
     fn hedges_match_known_answers() {
         let cases = [
@@ -1885,9 +1748,6 @@ mod tests {
         }
     }
 
-    /// A hedge is HKDF with the key of the epoch as the salt, the bytes drawn followed by the count
-    /// as the material, and the label written out by hand; another count, use or epoch key gives
-    /// another value.
     #[test]
     fn a_hedge_is_hkdf_of_the_bytes_and_the_count_under_the_key_of_the_epoch() {
         let drawn = [7; 32];
@@ -1930,9 +1790,8 @@ mod tests {
         assert_ne!(id[..16], short);
     }
 
-    /// The label states the key length, and Extract takes the key as a message rather than as an
-    /// HMAC key, which would pad a short key with zeros: either keeps a key and its zero-padded
-    /// long form apart.
+    /// The label states the key length, and Extract takes the key as a message, not as a
+    /// zero-padded HMAC key. Either keeps the two apart.
     #[test]
     fn a_short_key_and_its_zero_padded_long_form_differ() {
         let mut short = Key::empty();
@@ -2065,8 +1924,8 @@ pub(crate) mod proofs {
     use crate::record::{ID_LEN, Purpose, length_to_byte};
     use crate::shares::CHECK_LEN as SHARE_CHECK_LEN;
 
-    /// The identifier the model of HKDF gives for the first `length` bytes of `key`, worked out
-    /// from the label alone, without a `Key` and without `derive`: the same for every purpose.
+    /// Worked out from the label alone, without a `Key` and without `derive`, as are the others
+    /// below.
     pub(crate) fn expected_key_id(key: &[u8; 64], length: KeyLength) -> [u8; ID_LEN] {
         let mut id = [0; ID_LEN];
         let _ = label(None, length_to_byte(length), Branch::KeyId, ID_LEN).map(|(label, used)| {
@@ -2075,9 +1934,6 @@ pub(crate) mod proofs {
         id
     }
 
-    /// The key the model of HKDF gives the outer layer of the record of an archive key from the
-    /// first `length` bytes of the stored key for wrapping `key` in the epoch whose key is `epoch`,
-    /// worked out in the same way.
     pub(crate) fn expected_archive_layer_key(
         key: &[u8; 64],
         length: KeyLength,
@@ -2097,8 +1953,6 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The key the model of HKDF gives a record's cipher from the first `length` bytes of the
-    /// wrapping key `key` in the epoch whose key is `epoch`, worked out in the same way.
     pub(crate) fn expected_wrap_key(
         key: &[u8; 64],
         length: KeyLength,
@@ -2118,8 +1972,6 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The key the model of HKDF gives the records the key from a secret `key`, of `length`, locks,
-    /// worked out in the same way.
     pub(crate) fn expected_lock_key(key: &[u8; 64], length: KeyLength) -> [u8; CIPHER_KEY_LEN] {
         let mut out = [0; CIPHER_KEY_LEN];
         let length_byte = length_to_byte(length);
@@ -2135,8 +1987,6 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The key from a secret the model of HKDF gives from the first `length` bytes of `key` and the
-    /// 32 bytes of `salt`, worked out in the same way.
     pub(crate) fn expected_combined(
         key: &[u8; 64],
         length: KeyLength,
@@ -2155,8 +2005,6 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The challenge the model of HKDF gives from the first `length` bytes of `key`, worked out in
-    /// the same way.
     pub(crate) fn expected_challenge(key: &[u8; 64], length: KeyLength) -> [u8; 32] {
         let mut out = [0; 32];
         let _ = label(None, length_to_byte(length), Branch::Challenge, 32).map(|(label, used)| {
@@ -2165,8 +2013,6 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The key the model of HKDF gives the outer layer of lock records in the epoch whose key is
-    /// `epoch`, worked out in the same way.
     pub(crate) fn expected_layer_key(epoch: &[u8; 32]) -> [u8; CIPHER_KEY_LEN] {
         let mut out = [0; CIPHER_KEY_LEN];
         let _ = label(Some(Purpose::Wrap), 32, Branch::EpochLayer, CIPHER_KEY_LEN).map(
@@ -2177,8 +2023,6 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The key the model of HKDF gives the inner layer of the record of an archive key from the
-    /// stored key of the archive `key`, worked out in the same way.
     pub(crate) fn expected_archive_key(key: &[u8; 32]) -> [u8; CIPHER_KEY_LEN] {
         let mut out = [0; CIPHER_KEY_LEN];
         let _ = label(
@@ -2193,8 +2037,6 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The key the model of HKDF gives the records of an archive under the key of a chat for its
-    /// archive `key`, worked out in the same way.
     pub(crate) fn expected_archive_seal_key(key: &[u8; 32]) -> [u8; CIPHER_KEY_LEN] {
         let mut out = [0; CIPHER_KEY_LEN];
         let _ = label(
@@ -2209,8 +2051,6 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The randomness of an encapsulation the model of HKDF gives from `hedged` and the key of a
-    /// chat for its archive `key`, worked out in the same way.
     pub(crate) fn expected_archive_randomness(key: &[u8; 32], hedged: &[u8; 64]) -> [u8; 64] {
         let mut out = [0; 64];
         let _ = label(Some(Purpose::ArchiveSeal), 32, Branch::ArchiveEncaps, 64).map(
@@ -2221,8 +2061,7 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The check of a shared secret the model of HKDF gives from `shared` and a ciphertext that
-    /// begins with `ciphertext`, as far as the model reads it, worked out in the same way.
+    /// `ciphertext` is the start of the ciphertext, as far as the model reads it.
     pub(crate) fn expected_archive_check(shared: &[u8; 32], ciphertext: &[u8; 32]) -> [u8; ID_LEN] {
         let mut out = [0; ID_LEN];
         let _ =
@@ -2232,8 +2071,7 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The check in the header of a block the model of HKDF gives from the key for data `key`, its
-    /// first 32 bytes, and the block's salt `salt`, worked out in the same way.
+    /// `key` is the first 32 bytes of the key for data.
     pub(crate) fn expected_data_check(key: &[u8; 32], salt: &[u8; SALT_LEN]) -> [u8; CHECK_LEN] {
         let mut out = [0; CHECK_LEN];
         let _ =
@@ -2243,8 +2081,6 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The key of the chunks of a block the model of HKDF gives from the key for data `key` and
-    /// the block's salt `salt`, worked out in the same way.
     pub(crate) fn expected_data_chunk(key: &[u8; 32], salt: &[u8; SALT_LEN]) -> [u8; 32] {
         let mut out = [0; 32];
         let _ = label(Some(Purpose::Data), 32, Branch::DataChunk, 32).map(|(label, used)| {
@@ -2253,8 +2089,7 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The check in the header of a carried block the model of HKDF gives from the key for transfers
-    /// `key`, its first 32 bytes, and the block's salt `salt`, worked out in the same way.
+    /// `key` is the first 32 bytes of the key for transfers.
     pub(crate) fn expected_carry_check(key: &[u8; 32], salt: &[u8; SALT_LEN]) -> [u8; CHECK_LEN] {
         let mut out = [0; CHECK_LEN];
         let _ = label(Some(Purpose::Transfer), 32, Branch::CarryCheck, CHECK_LEN).map(
@@ -2265,8 +2100,6 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The key of the chunks of a carried block the model of HKDF gives from the key for transfers
-    /// `key` and the block's salt `salt`, worked out in the same way.
     pub(crate) fn expected_carry_chunk(key: &[u8; 32], salt: &[u8; SALT_LEN]) -> [u8; 32] {
         let mut out = [0; 32];
         let _ = label(Some(Purpose::Transfer), 32, Branch::CarryChunk, 32).map(|(label, used)| {
@@ -2275,8 +2108,7 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The key of a body the model of HKDF gives from the shared secret `shared` and a ciphertext
-    /// that begins with `ciphertext`, as far as the model reads it, worked out in the same way.
+    /// `ciphertext` is the start of the ciphertext, as far as the model reads it.
     pub(crate) fn expected_archive_batch(shared: &[u8; 32], ciphertext: &[u8; 32]) -> [u8; 32] {
         let mut out = [0; 32];
         let _ = label(Some(Purpose::Archive), 32, Branch::ArchiveBatch, 32).map(|(label, used)| {
@@ -2285,8 +2117,6 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The key the model of HKDF gives the records of an export, and the record that ends one,
-    /// from the key for transfers `key`, worked out in the same way.
     pub(crate) fn expected_export_key(key: &[u8; 32]) -> [u8; CIPHER_KEY_LEN] {
         let mut out = [0; CIPHER_KEY_LEN];
         let _ = label(
@@ -2301,8 +2131,6 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The key for `purpose` the model of HKDF gives from the bytes twelve words or two shares stand
-    /// for, under the label of `branch`, worked out in the same way.
     pub(crate) fn expected_secret_key(
         bytes: &[u8; SECRET_LEN],
         purpose: Purpose,
@@ -2316,8 +2144,6 @@ pub(crate) mod proofs {
         out
     }
 
-    /// The check the model of HKDF gives from the bytes two shares stand for, worked out in the same
-    /// way.
     pub(crate) fn expected_share_check(bytes: &[u8; SECRET_LEN]) -> [u8; SHARE_CHECK_LEN] {
         let mut out = [0; SHARE_CHECK_LEN];
         let length = SECRET_LEN as u8;
@@ -2359,9 +2185,6 @@ pub(crate) mod proofs {
         }
     }
 
-    /// What the model of HKDF gives a hedge of the `N` bytes `drawn` under the epoch key `epoch` at
-    /// `count`, for `branch`: the bytes and then the count, eight bytes, least significant first,
-    /// as the material, worked out in the same way.
     pub(crate) fn expected_hedge<const N: usize>(
         epoch: &[u8; 32],
         count: u64,
@@ -2378,7 +2201,6 @@ pub(crate) mod proofs {
         out
     }
 
-    /// Any purpose, or none.
     fn any_purpose() -> Option<Purpose> {
         match kani::any::<u8>() {
             0 => None,
@@ -2392,7 +2214,6 @@ pub(crate) mod proofs {
         }
     }
 
-    /// Two derivations that differ in anything the label states never share a label.
     #[kani::proof]
     #[kani::unwind(32)]
     fn different_derivations_have_different_labels() {

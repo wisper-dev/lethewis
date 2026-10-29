@@ -35,8 +35,8 @@ const EXPANDED_LEN: usize = 96;
 #[cfg(not(kani))]
 const LABEL: &[u8; 6] = b"\\.//^\\";
 
-/// How many bytes of stack an operation with X-Wing or on an archive key is followed by a wipe of: at
-/// least twice what it uses, as tests measure in each build.
+/// At least twice the stack an X-Wing or archive key operation uses, as tests measure in each
+/// build.
 #[cfg(all(not(kani), not(lethewis_unoptimised)))]
 pub(crate) const STACK_WIPE: usize = 98_304;
 #[cfg(all(not(kani), lethewis_unoptimised))]
@@ -46,7 +46,6 @@ pub(crate) const STACK_WIPE: usize = 229_376;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InvalidPublicKey;
 
-/// Writes the public key of `seed`.
 #[cfg(not(kani))]
 pub(crate) fn public_key(seed: &[u8; SEED_LEN], public: &mut [u8; PUBLIC_LEN]) {
     #[cfg(test)]
@@ -65,8 +64,7 @@ pub(crate) fn public_key(seed: &[u8; SEED_LEN], public: &mut [u8; PUBLIC_LEN]) {
     wipe(&mut expanded);
 }
 
-/// Encapsulates to `public` with `randomness` and writes the ciphertext and the shared secret.
-/// Fails, writing neither, if the ML-KEM-768 part of `public` is not a valid key.
+/// Fails, writing neither output, if the ML-KEM-768 part of `public` is not a valid key.
 #[cfg(not(kani))]
 pub(crate) fn encapsulate(
     public: &[u8; PUBLIC_LEN],
@@ -103,8 +101,8 @@ pub(crate) fn encapsulate(
     Ok(())
 }
 
-/// Writes the shared secret of `ciphertext` under `seed`. A ciphertext not made for this key gives
-/// no error but a pseudorandom secret of the key and the ciphertext: ML-KEM rejects it implicitly.
+/// A ciphertext not made for this key gives a pseudorandom secret, not an error: ML-KEM's implicit
+/// rejection.
 #[cfg(not(kani))]
 pub(crate) fn decapsulate(
     seed: &[u8; SEED_LEN],
@@ -138,7 +136,6 @@ pub(crate) fn decapsulate(
     wipe(&mut expanded);
 }
 
-/// SHAKE256 of the seed, 96 bytes.
 #[cfg(not(kani))]
 fn expand(seed: &[u8; SEED_LEN], expanded: &mut [u8; EXPANDED_LEN]) {
     use shake::{ExtendableOutput, Shake256, Update, XofReader};
@@ -148,7 +145,6 @@ fn expand(seed: &[u8; SEED_LEN], expanded: &mut [u8; EXPANDED_LEN]) {
     shake.finalize_xof().read(expanded);
 }
 
-/// SHA3-256 of the two shared secrets, the ciphertext and public key of X25519, and the label.
 #[cfg(not(kani))]
 fn combine(
     shared: &mut [u8; SHARED_LEN],
@@ -167,7 +163,6 @@ fn combine(
     *shared = hash.finalize().into();
 }
 
-/// The first `A` bytes and the `B` after them.
 #[cfg(not(kani))]
 fn split<const N: usize, const A: usize, const B: usize>(
     bytes: &[u8; N],
@@ -177,7 +172,6 @@ fn split<const N: usize, const A: usize, const B: usize>(
     Some((first, rest.first_chunk::<B>()?))
 }
 
-/// Writes `first` and then `second` at the start of `out`.
 #[cfg(not(kani))]
 fn join<const N: usize, const A: usize, const B: usize>(
     out: &mut [u8; N],
@@ -193,7 +187,6 @@ fn join<const N: usize, const A: usize, const B: usize>(
     }
 }
 
-/// A seed and randomness, and what X-Wing makes of them.
 #[cfg(not(kani))]
 pub(crate) struct Answer {
     seed: [u8; SEED_LEN],
@@ -203,7 +196,6 @@ pub(crate) struct Answer {
     shared: [u8; SHARED_LEN],
 }
 
-/// An answer X-Wing has to give, and whether it has given it in this process.
 #[cfg(not(kani))]
 pub(crate) struct Known {
     answer: &'static Answer,
@@ -450,19 +442,16 @@ const ANSWER: Answer = Answer {
 #[cfg(test)]
 extern crate std;
 
-/// [`KNOWN`] as X-Wing has not given it yet.
 #[cfg(test)]
 pub(crate) fn unanswered() -> Known {
     Known::of(&ANSWER)
 }
 
-/// `answer`, which X-Wing has not given yet.
 #[cfg(test)]
 pub(crate) fn known(answer: Answer) -> Known {
     Known::of(std::boxed::Box::leak(std::boxed::Box::new(answer)))
 }
 
-/// [`KNOWN`] with its shared secret changed, which X-Wing does not give.
 #[cfg(test)]
 pub(crate) fn wrong_known() -> Known {
     let mut wrong = ANSWER;
@@ -472,9 +461,7 @@ pub(crate) fn wrong_known() -> Known {
     known(wrong)
 }
 
-/// Whether X-Wing gives `known`, which is [`KNOWN`] but in tests: the public key of its seed, the
-/// ciphertext and shared secret of its randomness, and the shared secret of that ciphertext. Once it
-/// has, `known` keeps that, and X-Wing is not asked for it again.
+/// Whether X-Wing gives `known`. Once it has, `known` keeps that, and X-Wing is not asked again.
 #[cfg(not(kani))]
 pub(crate) fn answers(known: &Known) -> bool {
     if known.given.load(Ordering::Relaxed) {
@@ -503,9 +490,8 @@ pub(crate) fn answers(known: &Known) -> bool {
     answered
 }
 
-/// Whether the key pair of `seed` agrees with itself: an encapsulation to `public` and the
-/// decapsulation of its ciphertext with `seed` give one shared secret. A pair that does not makes
-/// X-Wing untrusted, and `known` is asked for again.
+/// Whether the key pair of `seed` agrees with itself. A pair that does not makes X-Wing untrusted,
+/// and `known` is asked for again.
 #[cfg(not(kani))]
 pub(crate) fn agrees(known: &Known, seed: &[u8; SEED_LEN], public: &[u8; PUBLIC_LEN]) -> bool {
     let (mut ciphertext, mut shared, mut opened) =
@@ -529,7 +515,6 @@ pub(crate) fn agrees(known: &Known, seed: &[u8; SEED_LEN], public: &[u8; PUBLIC_
 #[cfg(kani)]
 pub(crate) use model::{KNOWN, Known, agrees, answers, decapsulate, encapsulate, public_key};
 
-/// What stands in for X-Wing under Kani.
 #[cfg(kani)]
 pub(crate) mod model {
     use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -538,35 +523,30 @@ pub(crate) mod model {
         CIPHERTEXT_LEN, InvalidPublicKey, PUBLIC_LEN, RANDOMNESS_LEN, SEED_LEN, SHARED_LEN,
     };
 
-    /// What the last encapsulation or decapsulation was given and gave, so that a proof can follow
-    /// it: the randomness or the seed, the first bytes of the public key and of the ciphertext,
-    /// which the model of HKDF reads only so far, and the shared secret.
+    /// What the last encapsulation or decapsulation was given and gave, for the proofs.
+    /// The model of HKDF reads only the first bytes of the public key and of the ciphertext.
     static RANDOMNESS: [AtomicU8; RANDOMNESS_LEN] = [const { AtomicU8::new(0) }; RANDOMNESS_LEN];
     static SEED: [AtomicU8; SEED_LEN] = [const { AtomicU8::new(0) }; SEED_LEN];
     static PUBLIC: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
     static CIPHERTEXT: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
     static SHARED: [AtomicU8; SHARED_LEN] = [const { AtomicU8::new(0) }; SHARED_LEN];
-    /// Whether the last encapsulation refused its public key, and whether any decapsulation ran.
     static REFUSED: AtomicBool = AtomicBool::new(false);
     static DECAPSULATED: AtomicBool = AtomicBool::new(false);
 
-    /// Whether the last self-test was given the known answer, so that a proof can tell a refusal
-    /// of X-Wing from one the code makes up.
+    /// Whether the last self-test got the known answer, so a proof tells X-Wing's refusal from one
+    /// the code invents.
     static ANSWERED: AtomicBool = AtomicBool::new(false);
-    /// Whether a key pair was checked, whether it agreed with itself, and the seed and the first
-    /// bytes of the public key it was.
     static PAIRED: AtomicBool = AtomicBool::new(false);
     static AGREED: AtomicBool = AtomicBool::new(false);
     static PAIR_SEED: [AtomicU8; SEED_LEN] = [const { AtomicU8::new(0) }; SEED_LEN];
     static PAIR_PUBLIC: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
 
-    /// The known answer, which the model does not read.
     pub(crate) struct Known;
 
     pub(crate) const KNOWN: Known = Known;
 
-    /// X-Wing is beyond Kani. The public key of a seed is the seed and then zeros: one seed gives
-    /// one public key, and two seeds two.
+    /// X-Wing is beyond Kani. A seed's public key is the seed and then zeros, so seeds and public
+    /// keys match one to one.
     pub(crate) fn public_key(seed: &[u8; SEED_LEN], public: &mut [u8; PUBLIC_LEN]) {
         crate::entropy::model::step();
         *public = [0; PUBLIC_LEN];
@@ -575,19 +555,16 @@ pub(crate) mod model {
         }
     }
 
-    /// The known answer is given or not, at will, and the model records which.
     pub(crate) fn answers(_: &Known) -> bool {
         let answered = kani::any();
         ANSWERED.store(answered, Ordering::Relaxed);
         answered
     }
 
-    /// Whether the last self-test was given the known answer.
     pub(crate) fn answered() -> bool {
         ANSWERED.load(Ordering::Relaxed)
     }
 
-    /// A key pair agrees with itself or not, at will, and the model records which, and the pair.
     pub(crate) fn agrees(_: &Known, seed: &[u8; SEED_LEN], public: &[u8; PUBLIC_LEN]) -> bool {
         crate::entropy::model::step();
         keep(&PAIR_SEED, seed);
@@ -600,22 +577,18 @@ pub(crate) mod model {
         agreed
     }
 
-    /// Whether a key pair was checked.
     pub(crate) fn paired() -> bool {
         PAIRED.load(Ordering::Relaxed)
     }
 
-    /// Whether the last key pair checked agreed with itself.
     pub(crate) fn agreed() -> bool {
         AGREED.load(Ordering::Relaxed)
     }
 
-    /// The seed and the first bytes of the public key of the last key pair checked.
     pub(crate) fn pair() -> ([u8; SEED_LEN], [u8; 32]) {
         (kept(&PAIR_SEED), kept(&PAIR_PUBLIC))
     }
 
-    /// Any ciphertext and shared secret, or a refusal of the public key at will, writing neither.
     pub(crate) fn encapsulate(
         public: &[u8; PUBLIC_LEN],
         randomness: &[u8; RANDOMNESS_LEN],
@@ -639,7 +612,6 @@ pub(crate) mod model {
         Ok(())
     }
 
-    /// Any shared secret.
     pub(crate) fn decapsulate(
         seed: &[u8; SEED_LEN],
         ciphertext: &[u8; CIPHERTEXT_LEN],
@@ -653,8 +625,8 @@ pub(crate) mod model {
         keep(&SHARED, shared);
     }
 
-    /// Keeps `bytes` in `kept`. They are copied out first: a loop over bytes behind a pointer the
-    /// proof does not pin down unwinds as far as the proof allows.
+    /// Copied out first: a loop over bytes behind a pointer the proof leaves free unwinds to its
+    /// bound.
     fn keep<const N: usize>(kept: &[AtomicU8; N], bytes: &[u8; N]) {
         let bytes = *bytes;
         for (to, byte) in kept.iter().zip(bytes) {
@@ -662,14 +634,12 @@ pub(crate) mod model {
         }
     }
 
-    /// Keeps the first bytes of `ciphertext`.
     fn keep_ciphertext(ciphertext: &[u8; CIPHERTEXT_LEN]) {
         if let Some(head) = ciphertext.first_chunk() {
             keep(&CIPHERTEXT, head);
         }
     }
 
-    /// The bytes kept in `kept`.
     fn kept<const N: usize>(kept: &[AtomicU8; N]) -> [u8; N] {
         let mut bytes = [0; N];
         for (to, from) in bytes.iter_mut().zip(kept) {
@@ -678,37 +648,30 @@ pub(crate) mod model {
         bytes
     }
 
-    /// Whether the last encapsulation refused its public key.
     pub(crate) fn refused() -> bool {
         REFUSED.load(Ordering::Relaxed)
     }
 
-    /// Whether any decapsulation ran.
     pub(crate) fn decapsulated() -> bool {
         DECAPSULATED.load(Ordering::Relaxed)
     }
 
-    /// The randomness the last encapsulation was given.
     pub(crate) fn randomness() -> [u8; RANDOMNESS_LEN] {
         kept(&RANDOMNESS)
     }
 
-    /// The seed the last decapsulation was given.
     pub(crate) fn seed() -> [u8; SEED_LEN] {
         kept(&SEED)
     }
 
-    /// The first bytes of the public key the last encapsulation was given.
     pub(crate) fn public_head() -> [u8; 32] {
         kept(&PUBLIC)
     }
 
-    /// The first bytes of the ciphertext of the last encapsulation, or of the last one decapsulated.
     pub(crate) fn ciphertext_head() -> [u8; 32] {
         kept(&CIPHERTEXT)
     }
 
-    /// The shared secret the last encapsulation or decapsulation gave.
     pub(crate) fn shared() -> [u8; SHARED_LEN] {
         kept(&SHARED)
     }
@@ -930,9 +893,8 @@ mod tests {
         }
     }
 
-    /// Every changed bit of the ciphertext gives another shared secret. A change to a low bit of a
-    /// value of ML-KEM leaves the decrypted message as it was, so only the comparison of the whole
-    /// ciphertext with its encryption again tells it apart.
+    /// A change to a low bit of an ML-KEM value leaves the decrypted message as it was. Only
+    /// comparing the whole ciphertext with its re-encryption tells it apart.
     #[test]
     #[cfg_attr(
         debug_assertions,
@@ -950,8 +912,8 @@ mod tests {
         }
     }
 
-    /// The first bit of the ciphertext changed: ML-KEM gives J(z, c) of FIPS 203, the hash of z and
-    /// the ciphertext, as an independent implementation computes it with X25519 and the combiner.
+    /// ML-KEM gives J(z, c) of FIPS 203, the hash of z and the ciphertext. An independent
+    /// implementation computes it with X25519 and the combiner.
     #[test]
     fn a_changed_ciphertext_gives_the_secret_of_implicit_rejection() {
         let mut ciphertext = ANSWER.ciphertext;
@@ -964,8 +926,7 @@ mod tests {
         );
     }
 
-    /// The first value of the ML-KEM-768 key at q, then at 4095, and the last at 4095: refused, and
-    /// neither output is touched.
+    /// The first value of the ML-KEM-768 key at q, then at 4095, and the last at 4095.
     #[test]
     fn a_public_key_with_an_unreduced_value_is_refused() {
         for (at, low, high) in [(0, 0x01, 0x0d), (0, 0xff, 0x0f), (1150, 0, 0)] {
@@ -1011,7 +972,6 @@ mod tests {
         }
     }
 
-    /// A known answer once given is not asked for again; a wrong one is asked for each time.
     #[test]
     fn a_known_answer_is_asked_for_until_it_is_given() {
         let known = unanswered();
@@ -1023,8 +983,6 @@ mod tests {
         assert!(!answers(&wrong));
     }
 
-    /// A seed agrees with its own public key only, and a pair that does not makes the known
-    /// answer asked for again.
     #[test]
     fn a_key_pair_agrees_with_itself_only() {
         let known = unanswered();
@@ -1064,8 +1022,8 @@ pub(crate) mod stack {
     };
     use crate::residue::depth_changed;
 
-    /// What X-Wing handles with `seed` besides the seed: its expansion, the noise seed of ML-KEM,
-    /// sigma of FIPS 203, and the private key of X25519 as the curve takes it.
+    /// What X-Wing handles with `seed` besides the seed: its expansion and ML-KEM's noise seed,
+    /// sigma of FIPS 203. Also the X25519 private key as the curve takes it.
     pub(crate) fn seed_secrets(seed: &[u8; 32]) -> Vec<Vec<u8>> {
         let mut expanded = [0; 96];
         super::expand(seed, &mut expanded);
@@ -1080,9 +1038,9 @@ pub(crate) mod stack {
         ]
     }
 
-    /// What an encapsulation to `public` with `randomness` handles besides the randomness: the
-    /// ephemeral key of X25519 as the curve takes it, the shared secret of X25519, and the shared
-    /// secret and the randomness r of ML-KEM, FIPS 203, algorithm 17.
+    /// Besides `randomness`, an encapsulation to `public` handles the X25519 ephemeral key, as the
+    /// curve takes it, and shared secret. Also ML-KEM's shared secret and randomness r, FIPS 203,
+    /// algorithm 17.
     pub(crate) fn encapsulation_secrets(
         public: &[u8; 1216],
         randomness: &[u8; 64],
@@ -1105,8 +1063,6 @@ pub(crate) mod stack {
         key
     }
 
-    /// The wipe covers more than any operation uses, the self-test asked for the first time
-    /// included, and not needlessly more.
     #[test]
     fn the_wipe_is_deeper_than_x_wing() {
         let known = unanswered();

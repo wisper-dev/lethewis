@@ -34,11 +34,9 @@ pub use archived::ArchivePublic;
 pub use carry::{Exporting, Receipt, Receiving};
 pub use data::{Opening, Sealing};
 
-/// Memory for one key set, provided by the caller: up to three keys, the stage of each, and which
-/// of them is the primary.
+/// Memory for one key set of up to three keys, provided by the caller.
 ///
-/// A slot cannot be copied, cloned or compared. It holds keys only while a [`Slots`] over it is
-/// alive, so moving the memory afterwards copies no key.
+/// It holds keys only while a [`Slots`] over it is alive, so moving it afterwards copies no key.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "the kind of a set and its marks for the epoch are independent"
@@ -48,8 +46,7 @@ pub struct Slot {
     ids: [KeyId; MEMBERS],
     stages: Stages,
     purpose: Purpose,
-    /// The set is a key from a secret the caller holds: it is never wrapped, and wraps only stored
-    /// keys, for wrapping or of the archive.
+    /// A key from a secret the caller holds: it is never wrapped, and wraps only stored keys.
     unlocks: bool,
     generation: u64,
     occupancy: Occupancy,
@@ -57,17 +54,15 @@ pub struct Slot {
     changed: bool,
     /// The set is wrapped in the next epoch, and has not changed since.
     sealed: bool,
-    /// The set came from a record of this epoch, or has been wrapped into one since it last
-    /// changed: what a key of it encrypts outlives the slots, while that record is kept.
+    /// The set came from a record of this epoch, or was wrapped into one since it last changed.
+    /// What its keys encrypt then outlives the slots while that record is kept.
     recorded: bool,
-    /// The slot and generation of the key for transfers the set came under, until the end of that
-    /// transfer is received.
+    /// The slot and generation of the key for transfers the set came under, until that transfer
+    /// ends.
     pending: Option<(Index, u64)>,
-    /// For a key for transfers: the tag of the last record or block of the export it writes or
-    /// receives, or
-    /// zero before the first.
+    /// For a key for transfers: the tag of the last element of its export, or zero before the
+    /// first.
     chain: [u8; TAG_LEN],
-    /// For a key for transfers: whether it writes an export or receives one, until its end.
     direction: Direction,
 }
 
@@ -108,8 +103,8 @@ impl Slot {
         }
     }
 
-    // Here and below each position is named rather than iterated, or reached through an array of
-    // references: under the proofs either costs many times a field access.
+    // Each position is named, not iterated or reached through an array of references. Under the
+    // proofs either costs many times a field access.
     fn wipe_keys(&mut self) {
         let [first, second, third] = &mut self.keys;
         first.wipe();
@@ -138,7 +133,6 @@ impl Slot {
         }
     }
 
-    /// Whether the slot holds a key with the identifier `id`.
     fn holds(&self, id: &KeyId) -> bool {
         let [first, second, third] = &self.ids;
         let at =
@@ -165,7 +159,6 @@ impl Slot {
         }
     }
 
-    /// Refuses a key for transfers that carries an export the other way than `way`.
     fn may_go(&self, way: Direction) -> Result<(), Error> {
         if self.direction == Direction::Idle || self.direction == way {
             Ok(())
@@ -174,7 +167,6 @@ impl Slot {
         }
     }
 
-    /// Refuses the end of an export `way` that the key for transfers does not carry.
     fn may_end(&self, way: Direction) -> Result<(), Error> {
         if self.direction == way {
             Ok(())
@@ -185,8 +177,7 @@ impl Slot {
         }
     }
 
-    /// The key of a set for wrapping, which holds it alone at the first position, and its
-    /// identifier.
+    /// A set for wrapping holds its key alone at the first position.
     fn wrapping_key(&self) -> (&Key, &KeyId) {
         let [first, ..] = &self.keys;
         let [first_id, ..] = &self.ids;
@@ -200,10 +191,8 @@ impl fmt::Debug for Slot {
     }
 }
 
-/// Refers to a key set held in [`Slots`].
-///
-/// A handle works only with the `Slots` that issued it, stops working when its set is released,
-/// and cannot outlive the memory of its slots and epoch. It may outlive the `Slots` itself:
+/// Refers to a key set held in the [`Slots`] that issued it, until the set is released. It may
+/// outlive that `Slots`, but not its memory; the second example does not compile.
 ///
 /// ```
 /// use lethewis_core::{Epoch, Purpose, Slot, Slots};
@@ -218,8 +207,6 @@ impl fmt::Debug for Slot {
 /// let _ = handle;
 /// # Ok::<(), lethewis_core::Error>(())
 /// ```
-///
-/// The same code with the memory gone before the handle does not compile:
 ///
 /// ```compile_fail
 /// use lethewis_core::{Epoch, Purpose, Slot, Slots};
@@ -248,19 +235,9 @@ impl fmt::Debug for Handle<'_> {
     }
 }
 
-/// Key sets held in slots provided by the caller.
-///
-/// A key goes in, and only a handle to its set comes out: no call returns a key itself except
-/// [`Slots::reveal32`], and only a key for external data. A key is held in one place only,
-/// whatever its purpose: a load that would hold a key these slots already hold is
-/// refused. Each profile needs an epoch and a root of its own: a change of epoch carries only the
-/// records it is made with, and the other records of an epoch open no more once it is committed and
-/// the old root erased.
-/// Creating and dropping `Slots` wipes every key in its slots and its epoch, and dropping it
-/// discards every change no epoch has saved; a change of epoch under way is to be abandoned first,
-/// so that its root is erased. A `Slots` leaked instead of dropped, for example through
-/// [`core::mem::forget`], [`core::mem::ManuallyDrop`] or `Box::leak`, skips that wipe, and its keys
-/// stay in memory until the next `Slots` over the same memory.
+/// Key sets in slots provided by the caller, reached only through handles; only
+/// [`Slots::reveal32`] gives a key out. Dropping it wipes every key and discards unsaved changes,
+/// so abandon an epoch change first; leaking it skips the wipe.
 ///
 /// ```
 /// use lethewis_core::{Epoch, Purpose, Slot, Slots};
@@ -281,8 +258,7 @@ pub struct Slots<'a> {
     epoch: &'a mut Epoch,
 }
 
-/// What opens a sealed plaintext of `N` bytes: AES-256-GCM-SIV, which is all a build outside the
-/// proofs and the tests has, or a model of it in them.
+/// Opens a sealed plaintext of `N` bytes: AES-256-GCM-SIV, or a model of it in proofs and tests.
 trait Open<const N: usize> {
     fn open(
         &mut self,
@@ -330,8 +306,7 @@ where
     }
 }
 
-/// What seals a plaintext of `N` bytes: AES-256-GCM-SIV, which is all a build outside the proofs
-/// and the tests has, or a model of it in them.
+/// Seals a plaintext of `N` bytes: AES-256-GCM-SIV, or a model of it in proofs and tests.
 trait Seal<const N: usize> {
     fn seal(
         &mut self,
@@ -375,7 +350,6 @@ where
     }
 }
 
-/// `open`, as the stand-in for the cipher it is in the proofs and the tests.
 #[cfg(any(test, kani))]
 fn opening<F, const N: usize>(open: F) -> F
 where
@@ -390,8 +364,6 @@ where
     open
 }
 
-/// Where a wrap writes: the record of a set under a stored key for wrapping, the lock record of a
-/// stored key, or a record of an export.
 enum Out<'r> {
     Record(&'r mut [u8; RECORD_LEN]),
     Lock(&'r mut [u8; LOCK_RECORD_LEN]),
@@ -408,9 +380,8 @@ impl Out<'_> {
     }
 }
 
-/// What a record is: of a set under a stored key for wrapping, in an epoch; the inner record of a
-/// lock record, under a key from a secret; of an export, under a key for transfers; or the inner
-/// record of the record of an archive key, under a stored key of the archive.
+/// `Lock` and `ArchiveKey` are the inner records of a lock record and of the record of an archive
+/// key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Record,
@@ -420,7 +391,6 @@ enum Kind {
 }
 
 impl Kind {
-    /// Whether a record of this kind may hold a set for `purpose`.
     const fn holds(self, purpose: Purpose) -> bool {
         match self {
             Self::Record => matches!(
@@ -433,7 +403,6 @@ impl Kind {
         }
     }
 
-    /// The purpose of the key a record of this kind is wrapped under.
     const fn parent_purpose(self) -> Purpose {
         match self {
             Self::Record | Self::Lock => Purpose::Wrap,
@@ -444,8 +413,9 @@ impl Kind {
 }
 
 impl<'a> Slots<'a> {
-    /// Keeps key sets in `slots`, in the epoch numbered `number`, whose key it takes from `key`
-    /// into `epoch` and then wipes. A key left in `slots` or `epoch` earlier is wiped first.
+    /// Keeps key sets in `slots`, in the epoch numbered `number`, whose key it takes from `key` and
+    /// wipes. Any key left in `slots` or `epoch` is wiped first; each profile needs an epoch of its
+    /// own.
     #[must_use]
     pub fn new(
         slots: &'a mut [Slot],
@@ -465,21 +435,15 @@ impl<'a> Slots<'a> {
         this
     }
 
-    /// Takes a 32-byte key for `purpose` from `source` into a free slot, as a set of one whose key
-    /// is the primary, and wipes `source`.
+    /// Takes a 32-byte key for `purpose` from `source` into a free slot as a set of one, and wipes
+    /// `source`. Keys of the archive and for data are refused: only the library creates them.
     ///
-    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole load, are
-    /// each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate
-    /// but not the hash code it calls has to set that flag.
+    /// Needs 9 KiB of stack, or 68 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::WrongPurpose`] if `purpose` is [`Purpose::Archive`], [`Purpose::ArchiveWrap`],
-    /// [`Purpose::ArchiveSeal`] or [`Purpose::Data`], whose keys only the library creates,
-    /// [`Error::NoFreeSlot`] if no slot is free, [`Error::DerivationFailed`] if the identifier of
-    /// the key cannot be derived, and [`Error::DuplicateKey`] if these slots hold the key already.
-    /// `source` is then left as it was, and no slot changes.
+    /// Fails with [`Error::WrongPurpose`], [`Error::NoFreeSlot`], [`Error::DerivationFailed`] or
+    /// [`Error::DuplicateKey`], and then leaves `source` and the slots as they were.
     pub fn import32(
         &mut self,
         purpose: Purpose,
@@ -497,22 +461,16 @@ impl<'a> Slots<'a> {
         Ok(handle)
     }
 
-    /// Takes a 64-byte key for `purpose` from `source` into a free slot, as a set of one whose key
-    /// is the primary, and wipes `source`.
+    /// Takes a 64-byte key for `purpose` from `source` into a free slot as a set of one, and wipes
+    /// `source`. Keys of the archive and for data are refused: only the library creates them.
     ///
-    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole load, are
-    /// each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate
-    /// but not the hash code it calls has to set that flag.
+    /// Needs 9 KiB of stack, or 68 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::WrongPurpose`] if `purpose` is [`Purpose::Archive`], [`Purpose::ArchiveWrap`],
-    /// [`Purpose::ArchiveSeal`] or [`Purpose::Data`], whose keys only the library creates,
-    /// [`Error::WrongLength`] if `purpose` takes no 64-byte key, [`Error::NoFreeSlot`] if no slot
-    /// is free, [`Error::DerivationFailed`] if the identifier of the key cannot be derived, and
-    /// [`Error::DuplicateKey`] if these slots hold the key already. `source` is then left as it
-    /// was, and no slot changes.
+    /// Fails with [`Error::WrongPurpose`], [`Error::WrongLength`], [`Error::NoFreeSlot`],
+    /// [`Error::DerivationFailed`] or [`Error::DuplicateKey`], and then leaves `source` and the
+    /// slots as they were.
     pub fn import64(
         &mut self,
         purpose: Purpose,
@@ -530,29 +488,21 @@ impl<'a> Slots<'a> {
         Ok(handle)
     }
 
-    /// Creates a key for `purpose` of `length` random bytes from `entropy` in a free slot, as a set
-    /// of one whose key is the primary. The bytes are hedged with the key of the epoch, as RFC 8937
-    /// has it, and the key derived from them is written straight into the slot; the bytes `entropy`
-    /// gave are wiped, and so is the stack the derivations used. `entropy` is asked once, and only
-    /// when `purpose` is generated, takes `length` and a slot is free.
+    /// Creates a key for `purpose` of `length` bytes in a free slot, from `entropy` hedged with the
+    /// epoch key. `entropy` is asked once, after the purpose, the length and a free slot are
+    /// checked.
     ///
-    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the hedge, the derivation of the key's identifier, and the
-    /// whole load, are each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that
-    /// optimises this crate but not the hash code it calls has to set that flag.
+    /// Needs 9 KiB of stack, or 68 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::WrongPurpose`] if `purpose` is [`Purpose::Transfer`], whose key the other device
-    /// has to share, or [`Purpose::Archive`], whose seed only the record of an archive key
-    /// creates, [`Error::WrongLength`] if `purpose` takes no key of `length`,
-    /// [`Error::NoFreeSlot`] if no slot is free, [`Error::EntropyFailed`] if `entropy` fails,
-    /// [`Error::DerivationFailed`] if the key or its identifier cannot be derived, and
-    /// [`Error::DuplicateKey`] if these slots hold the key already. No slot changes then.
+    /// Fails with [`Error::WrongPurpose`], [`Error::WrongLength`], [`Error::NoFreeSlot`],
+    /// [`Error::EntropyFailed`], [`Error::DerivationFailed`] or [`Error::DuplicateKey`], and then
+    /// changes no slot.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through, and the slot stays free and wiped.
+    /// Only if `entropy` panics; the slot then stays free and wiped.
     pub fn generate(
         &mut self,
         purpose: Purpose,
@@ -567,8 +517,6 @@ impl<'a> Slots<'a> {
         })
     }
 
-    /// Fills `dest` from `entropy`, the platform's source, hedged with the key of this epoch under
-    /// `branch`.
     pub(crate) fn draw(
         &mut self,
         entropy: &mut (impl Entropy + ?Sized),
@@ -579,8 +527,7 @@ impl<'a> Slots<'a> {
         hedged_draw(entropy, key, drawn, branch, dest)
     }
 
-    /// Loads a key of `length` for `purpose` whose bytes `source` derives, from a password or from
-    /// words, as a set of one: not hedged, so that the same input gives the same key.
+    /// Not hedged, so that the same password or words give the same key.
     pub(crate) fn load_derived(
         &mut self,
         purpose: Purpose,
@@ -597,9 +544,7 @@ impl<'a> Slots<'a> {
         })
     }
 
-    /// Loads the key for `purpose` that `secret`, the bytes twelve words or two shares stand for,
-    /// derives under the label of `branch` into a free slot: a key from such a secret is loaded as
-    /// a generated one is.
+    /// `secret` holds the bytes that twelve words or two shares stand for.
     pub(crate) fn derive_into(
         &mut self,
         secret: &[u8; SECRET_LEN],
@@ -621,22 +566,16 @@ impl<'a> Slots<'a> {
         })
     }
 
-    /// Writes the enabled key at `at` of the set that `set` refers to into `out`, if the set serves
-    /// `purpose` and keys of `purpose` leave the library: only [`Purpose::ExternalData`] does. The
-    /// copy in `out` is the caller's to wipe. The set is to be wrapped and its record stored before
-    /// an engine uses the key; otherwise the key is lost with the slots.
+    /// Copies the enabled key at `at` of `set` into `out`, if both the set and `purpose` are
+    /// [`Purpose::ExternalData`]. The copy is the caller's to wipe; wrap and store the set first,
+    /// or the key dies with the slots.
     ///
-    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the call is followed by a wipe of 8 KiB, or 64 KiB, below it,
-    /// whether it succeeded or not.
+    /// Needs 9 KiB of stack, or 68 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set serves another purpose than `purpose` or keys of
-    /// `purpose` never leave the library, [`Error::Unfinished`] if the set came in an export whose
-    /// end has not been received, and [`Error::WrongStage`] if `at` does not hold an enabled key.
-    /// `out` is then left as it was.
+    /// Fails with [`Error::StaleHandle`], [`Error::WrongPurpose`], [`Error::Unfinished`] or
+    /// [`Error::WrongStage`], and then leaves `out` as it was.
     pub fn reveal32(
         &self,
         set: Handle<'a>,
@@ -649,8 +588,6 @@ impl<'a> Slots<'a> {
         revealed
     }
 
-    /// The reveal itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     fn reveal_on_stack(
         &self,
@@ -681,33 +618,23 @@ impl<'a> Slots<'a> {
         Ok(())
     }
 
-    /// Combines the keys from a secret that `key` and `salt` refer to into a new key from a secret
-    /// of 32 bytes in a free slot, and releases both: HKDF-Extract with the key of `salt`, 32
-    /// bytes, as the salt and the key of `key` as the input, then HKDF-Expand with a label of its
-    /// own. With the key from a password as `key` and the chip's answer to its
-    /// [`Slots::challenge`], imported for wrapping, as `salt`, the new key needs both.
+    /// Combines the keys from a secret `key` and `salt` by HKDF, the 32-byte `salt` as the salt,
+    /// and releases both. With a password key and the chip's answer to its [`Slots::challenge`],
+    /// the new key needs both.
     ///
-    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation, the load, and the whole combination, are each
-    /// followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises this crate but
-    /// not the hash code it calls has to set that flag.
+    /// Needs 9 KiB of stack, or 68 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
-    /// [`Error::SameKey`] if both refer to the same set, [`Error::WrongPurpose`] if either set does
-    /// not serve [`Purpose::Wrap`], [`Error::WrongLevel`] if either is not a key from a secret,
-    /// [`Error::WrongLength`] if the key of `salt` is not of 32 bytes, [`Error::NoFreeSlot`] if no
-    /// slot is free, [`Error::DerivationFailed`] if the key or its identifier cannot be derived,
-    /// and [`Error::DuplicateKey`] if these slots hold the new key already. No slot changes then.
+    /// Fails with [`Error::StaleHandle`], [`Error::SameKey`], [`Error::WrongPurpose`],
+    /// [`Error::WrongLevel`], [`Error::WrongLength`], [`Error::NoFreeSlot`],
+    /// [`Error::DerivationFailed`] or [`Error::DuplicateKey`], and then changes no slot.
     pub fn combine(&mut self, key: Handle<'a>, salt: Handle<'a>) -> Result<Handle<'a>, Error> {
         let combined = crate::timing::with(|| self.combine_on_stack(key, salt));
         wipe_stack();
         combined
     }
 
-    /// The combination itself, in a frame of its own: the wipe that follows starts where this
-    /// frame starts.
     #[inline(never)]
     fn combine_on_stack(&mut self, key: Handle<'a>, salt: Handle<'a>) -> Result<Handle<'a>, Error> {
         let (first, second) = self.combinable(key, salt)?;
@@ -734,8 +661,6 @@ impl<'a> Slots<'a> {
         Ok(handle)
     }
 
-    /// The slots of the sets `key` and `salt` refer to, if they are two keys from a secret, the
-    /// second of 32 bytes, and a slot is free.
     fn combinable(&self, key: Handle<'a>, salt: Handle<'a>) -> Result<(Index, Index), Error> {
         let (first, second) = (self.loaded(key)?, self.loaded(salt)?);
         if first == second {
@@ -759,32 +684,22 @@ impl<'a> Slots<'a> {
         Ok((first, second))
     }
 
-    /// Writes into `out` the challenge to the platform's chip from the key from a secret that `set`
-    /// refers to: HKDF-Extract with the salt of identifiers, then HKDF-Expand with a label of its
-    /// own. The chip answers it under a key that never
-    /// leaves the chip; the answer, imported for wrapping and given to [`Slots::combine`] as the
-    /// salt of this key, makes a key that needs both. Whoever reads a challenge can test guesses at
-    /// the secret without the chip, as with a hash of a password: it is the caller's to wipe, and
-    /// to give to the chip alone.
+    /// Writes into `out` the chip's challenge from the key from a secret `set`; the answer is
+    /// [`Slots::combine`]'s salt. It lets guesses at the secret be tested without the chip: wipe
+    /// it, and give it to the chip alone.
     ///
-    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the call is followed by a wipe of 8 KiB, or 64 KiB, below it,
-    /// whether it succeeded or not.
+    /// Needs 9 KiB of stack, or 68 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set does not serve [`Purpose::Wrap`], [`Error::WrongLevel`]
-    /// if it is not a key from a secret, and [`Error::DerivationFailed`] if the challenge cannot be
-    /// derived. `out` is then left as it was.
+    /// Fails with [`Error::StaleHandle`], [`Error::WrongPurpose`], [`Error::WrongLevel`] or
+    /// [`Error::DerivationFailed`], and then leaves `out` as it was.
     pub fn challenge(&self, set: Handle<'a>, out: &mut [u8; 32]) -> Result<(), Error> {
         let challenged = crate::timing::with(|| self.challenge_on_stack(set, out));
         wipe_stack();
         challenged
     }
 
-    /// The challenge itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     fn challenge_on_stack(&self, set: Handle<'a>, out: &mut [u8; 32]) -> Result<(), Error> {
         let slot = self
@@ -806,37 +721,23 @@ impl<'a> Slots<'a> {
         challenged.map_err(|_| Error::DerivationFailed)
     }
 
-    /// Wraps the set for external data or for data, the key for transfers or the key of a chat for
-    /// its archive that `set` refers to under the stored key for wrapping that `parent` refers to
-    /// and writes the record into `record`, in this epoch, or in the next while a change to it is
-    /// under way. A record of this epoch holds the set as it is now, so a block of data may be
-    /// begun under it. The record holds every key of the set, its stage and which key is the
-    /// primary, and opens only with that key and the same `context`, which names the place the
-    /// record is kept, from 1 to 255 bytes. The nonce comes from `entropy`, hedged with the key of
-    /// the epoch the record is wrapped in.
+    /// Wraps `set` under the stored wrapping key `parent` into `record`, in this epoch or, during a
+    /// change, the next. The record opens only with that key and the same `context` of 1 to 255
+    /// bytes.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
-    /// [`Error::SameKey`] if both refer to the same set, [`Error::WrongPurpose`] if the set
-    /// `parent` refers to does not serve [`Purpose::Wrap`], [`Error::WrongLevel`] if the set `set`
-    /// refers to is of another purpose, or `parent` refers to a key from a secret,
-    /// [`Error::Unfinished`] if the
-    /// set `set` refers to came in a transfer whose end has not been received, [`Error::Unsaved`]
-    /// if it has changed in this epoch and no change to the next is under way,
-    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if the nonce cannot
-    /// be hedged or the key that encrypts the record cannot be derived, and [`Error::CipherFailed`]
-    /// if the cipher gives a known input a wrong answer or fails. `record` is then left as it was.
+    /// Fails with [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::SameKey`],
+    /// [`Error::WrongPurpose`], [`Error::WrongLevel`], [`Error::Unfinished`], [`Error::Unsaved`],
+    /// [`Error::EntropyFailed`], [`Error::DerivationFailed`] or [`Error::CipherFailed`], and then
+    /// leaves `record` as it was.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through, and `record` is left as it was.
+    /// Only if `entropy` panics; `record` is then left as it was.
     pub fn wrap(
         &mut self,
         set: Handle<'a>,
@@ -852,34 +753,22 @@ impl<'a> Slots<'a> {
         wrapped
     }
 
-    /// Locks the stored key, for wrapping or of the archive, that `set` refers to under the key from
-    /// a secret that
-    /// `parent` refers to, and writes the lock record into `record`, in this epoch, or in the next
-    /// while a change to it is under way. The record has two layers, both bound to `context`, from
-    /// 1 to 255 bytes, for good. The inner one opens only with the key from a secret, whatever the
-    /// epoch; the outer one only with the key of the epoch, which [`Slots::carry`] moves on to the
-    /// next without the key from a secret. The nonces come from `entropy`, hedged with the key of
-    /// the epoch the record is written in.
+    /// Locks the stored key `set` under the key from a secret `parent` into `record`, for this
+    /// epoch or the next. It opens with that key, the same `context` and the epoch key;
+    /// [`Slots::carry`] moves it on without the secret.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
-    /// [`Error::SameKey`] if both refer to the same set, [`Error::WrongPurpose`] if the set
-    /// `parent` refers to does not serve [`Purpose::Wrap`], [`Error::WrongLevel`] if `set` does not
-    /// refer to a stored key, for wrapping or of the archive, or `parent` to a key from a secret,
-    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if a nonce cannot
-    /// be hedged or a key that encrypts a layer cannot be derived, and [`Error::CipherFailed`] if
-    /// the cipher gives a known input a wrong answer or fails. `record` is then left as it was.
+    /// Fails with [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::SameKey`],
+    /// [`Error::WrongPurpose`], [`Error::WrongLevel`], [`Error::EntropyFailed`],
+    /// [`Error::DerivationFailed`] or [`Error::CipherFailed`], and then leaves `record` as it was.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through, and `record` is left as it was.
+    /// Only if `entropy` panics; `record` is then left as it was.
     pub fn lock(
         &mut self,
         set: Handle<'a>,
@@ -895,8 +784,6 @@ impl<'a> Slots<'a> {
         locked
     }
 
-    /// Refuses a record of `kind` of the set in slot `index` under the set in slot `parent`, for
-    /// the first reason that applies once both handles are live.
     fn wrappable(&self, index: Index, parent: Index, kind: Kind) -> Result<(), Error> {
         if index == parent {
             return Err(Error::SameKey);
@@ -927,37 +814,23 @@ impl<'a> Slots<'a> {
         Ok(())
     }
 
-    /// Exports the set for external data that `set` refers to under the key for transfers that
-    /// `transfer` refers to, and writes the record into `record`: the next record of the export, in
-    /// the order of the calls, until [`Slots::end_export`] ends it. The key carries this one export
-    /// until then: it receives none, and releasing it abandons the export. The record holds every
-    /// key of the set, disabled ones too, its stage and which key is the primary, and opens only
-    /// with that key, the same `context`, from 1 to 255 bytes, and the records and blocks before
-    /// it, in any epoch: neither a change of epoch nor a destruction afterwards reaches it. The
-    /// nonce comes from `entropy`, hedged with the key of this epoch.
+    /// Writes `set`, for external data, into `record` as the next record of the export under
+    /// `transfer`. It opens in any epoch with that key, the same `context` and all before it; early
+    /// release abandons it.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if either handle does not refer to a set held here now,
-    /// [`Error::SameKey`] if both refer to the same set, [`Error::WrongPurpose`] if the set
-    /// `transfer` refers to does not serve [`Purpose::Transfer`], [`Error::WrongLevel`] if the set
-    /// `set` refers to does not serve [`Purpose::ExternalData`], [`Error::Unfinished`] if it came
-    /// in an export whose end has not been received or the key for transfers receives one,
-    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if the nonce cannot
-    /// be hedged or the key that encrypts the record cannot be derived, and [`Error::CipherFailed`]
-    /// if the cipher gives a known input a wrong answer or fails. `record` is then left as it was,
-    /// and the export goes on as before the call.
+    /// Fails with [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::SameKey`],
+    /// [`Error::WrongPurpose`], [`Error::WrongLevel`], [`Error::Unfinished`],
+    /// [`Error::EntropyFailed`], [`Error::DerivationFailed`] or [`Error::CipherFailed`]. `record`
+    /// and the export then stay as they were.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through, `record` is left as it was, and the
-    /// export goes on as before the call.
+    /// Only if `entropy` panics; `record` and the export are then left as they were.
     pub fn export(
         &mut self,
         set: Handle<'a>,
@@ -973,32 +846,22 @@ impl<'a> Slots<'a> {
         exported
     }
 
-    /// Ends the export under the key for transfers that `transfer` refers to and writes its end
-    /// into `end`: it opens only after every record and block of the export, in order, with the
-    /// same `context`. The next record or block exported under the key begins a new export. The nonce comes from
-    /// `entropy`, hedged with the key of this epoch.
+    /// Ends the export under `transfer`, writing into `end` what opens only after its elements, in
+    /// order, for the same `context`. The next record or block under the key begins a new export.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if `transfer` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Transfer`],
-    /// [`Error::NoTransfer`] if the key carries no export: it has written or received no record or
-    /// block since its load or its last end, [`Error::Unfinished`] if it receives one,
-    /// [`Error::EntropyFailed`] if `entropy` fails,
-    /// [`Error::DerivationFailed`] if the nonce cannot be hedged or the key that encrypts the end
-    /// cannot be derived, and [`Error::CipherFailed`] if the cipher gives a known input a wrong
-    /// answer or fails. `end` is then left as it was, and the export goes on as before the call.
+    /// Fails with [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::NoTransfer`], [`Error::Unfinished`], [`Error::EntropyFailed`],
+    /// [`Error::DerivationFailed`] or [`Error::CipherFailed`]. `end` and the export then stay as
+    /// they were.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through, `end` is left as it was, and the export
-    /// goes on as before the call.
+    /// Only if `entropy` panics; `end` and the export are then left as they were.
     pub fn end_export(
         &mut self,
         transfer: Handle<'a>,
@@ -1012,8 +875,6 @@ impl<'a> Slots<'a> {
         ended
     }
 
-    /// The end of an export itself, in a frame of its own: the wipe that follows starts where this
-    /// frame starts.
     #[inline(never)]
     fn end_export_on_stack(
         &mut self,
@@ -1049,8 +910,6 @@ impl<'a> Slots<'a> {
         Ok(())
     }
 
-    /// The wrap, the lock or the export itself, in a frame of its own: the wipe that follows starts
-    /// where this frame starts.
     #[inline(never)]
     fn wrap_on_stack(
         &mut self,
@@ -1143,30 +1002,17 @@ impl<'a> Slots<'a> {
         Ok(())
     }
 
-    /// Unwraps `record` with the stored key for wrapping that `parent` refers to and the `context`
-    /// it was wrapped for, into a free slot. The set, of external data, a key for transfers or a
-    /// key of a chat for its archive, comes out with the purpose, keys, stages and primary the
-    /// record holds.
+    /// Unwraps `record` with the stored wrapping key `parent` and its `context` into a free slot.
+    /// The set comes out with the purpose, keys, stages and primary the record holds.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if `parent` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Wrap`], [`Error::WrongLevel`]
-    /// if it is a key from a secret, [`Error::NoFreeSlot`] if no slot is free,
-    /// [`Error::DerivationFailed`] if a value cannot be derived from a key,
-    /// [`Error::RecordRejected`] if the record does not open with the key of the parent, this
-    /// context and the key of this epoch, names a key other than the one that opens it or another
-    /// epoch, or holds a set of another purpose, a set neither for external data nor for data
-    /// other than one key that has never changed, or a plaintext this version of the library
-    /// cannot read,
-    /// and [`Error::DuplicateKey`] if these slots hold a key of the set already or the set holds
-    /// one key twice. No slot changes then.
+    /// Fails with [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::WrongLevel`], [`Error::NoFreeSlot`], [`Error::DerivationFailed`],
+    /// [`Error::RecordRejected`] or [`Error::DuplicateKey`], and then changes no slot.
     pub fn unwrap(
         &mut self,
         parent: Handle<'a>,
@@ -1179,8 +1025,6 @@ impl<'a> Slots<'a> {
         unwrapped
     }
 
-    /// The unwrap itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     fn unwrap_on_stack(
         &mut self,
@@ -1194,32 +1038,19 @@ impl<'a> Slots<'a> {
         self.take(index, associated.bytes(), record, Kind::Record, &mut open)
     }
 
-    /// Receives `record`, the next record of an export under the key for transfers that `transfer`
-    /// refers to, for the `context` it was exported for, into a free slot: it opens only after the
-    /// records and blocks received under that key before it, in the order they were exported. The set comes
-    /// out with the keys, stages and primary the record holds, and is neither revealed, wrapped,
-    /// exported nor changed until [`Slots::end_receive`] receives the end of the export; it may be
-    /// released. The key carries this one export until then: it exports none, a receipt goes on
-    /// from the record it stopped at, and releasing the key abandons the export, whose sets are
-    /// then to be released before it is received again from its first record.
+    /// Receives `record`, the next record of the export under `transfer`, for its `context` into a
+    /// free slot. The set is not revealed, wrapped, exported or changed until
+    /// [`Slots::end_receive`]; releasing the key first abandons the export.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if `transfer` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Transfer`],
-    /// [`Error::NoFreeSlot`] if no slot is free, [`Error::Unfinished`] if the key writes an export,
-    /// [`Error::DerivationFailed`] if a value cannot be derived from a key,
-    /// [`Error::RecordRejected`] if the record does not open with that key, this context and the
-    /// records and blocks received before it, names a key other than the one that opens it or an epoch, or
-    /// holds a set not for external data or a plaintext this version of the library cannot read,
-    /// and [`Error::DuplicateKey`] if these slots hold a key of the set already or the set holds
-    /// one key twice. No slot changes then, and the export goes on as before the call.
+    /// Fails with [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::NoFreeSlot`], [`Error::Unfinished`], [`Error::DerivationFailed`],
+    /// [`Error::RecordRejected`] or [`Error::DuplicateKey`]. No slot then changes, and the export
+    /// stays as it was.
     pub fn receive(
         &mut self,
         transfer: Handle<'a>,
@@ -1232,8 +1063,6 @@ impl<'a> Slots<'a> {
         received
     }
 
-    /// The receipt itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     fn receive_on_stack(
         &mut self,
@@ -1262,27 +1091,18 @@ impl<'a> Slots<'a> {
         Ok(handle)
     }
 
-    /// Receives `end`, the end of the export under the key for transfers that `transfer` refers to,
-    /// for the `context` it was exported for: it opens only after every record and block of the
-    /// export, in order. The sets received under that key are then revealed, wrapped, exported and
-    /// changed as any other, and the next record or block received under it begins a new export.
+    /// Receives `end`, the end of the export under `transfer`, for its `context`, after all its
+    /// elements. The sets it brought are then free to use, and the next element begins a new
+    /// export.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if `transfer` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Transfer`],
-    /// [`Error::NoTransfer`] if the key carries no export: it has written or received no record or
-    /// block since its load or its last end, [`Error::Unfinished`] if it writes one,
-    /// [`Error::DerivationFailed`] if the key that encrypts the end cannot be derived, and
-    /// [`Error::RecordRejected`] if the end does not open with that key, this context and the
-    /// records and blocks received: one is missing or another end was given. No slot changes then, and
-    /// the export goes on as before the call.
+    /// Fails with [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::NoTransfer`], [`Error::Unfinished`], [`Error::DerivationFailed`] or
+    /// [`Error::RecordRejected`]. No slot then changes, and the export stays as it was.
     pub fn end_receive(
         &mut self,
         transfer: Handle<'a>,
@@ -1295,8 +1115,6 @@ impl<'a> Slots<'a> {
         ended
     }
 
-    /// The receipt of the end itself, in a frame of its own: the wipe that follows starts where
-    /// this frame starts.
     #[inline(never)]
     fn end_receive_on_stack(
         &mut self,
@@ -1341,27 +1159,18 @@ impl<'a> Slots<'a> {
         Ok(())
     }
 
-    /// Unlocks the lock record `record` with the key from a secret that `parent` refers to and the
-    /// `context` it was locked for, into a free slot: the stored key, for wrapping or of the
-    /// archive, it holds comes out as a set of one.
+    /// Unlocks the lock record `record` with the key from a secret `parent` and its `context`. Its
+    /// stored key comes out in a free slot as a set of one.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::StaleHandle`] if `parent` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if that set does not serve [`Purpose::Wrap`], [`Error::WrongLevel`]
-    /// if it is not a key from a secret, [`Error::NoFreeSlot`] if no slot is free,
-    /// [`Error::DerivationFailed`] if a value cannot be derived from a key,
-    /// [`Error::StaleRecord`] if the record does not open in this epoch for this context: it was
-    /// not locked or carried into this epoch, or it was changed, [`Error::RecordRejected`] if it
-    /// does not open with the key of the parent, names a key other than the one that opens it, or
-    /// holds a plaintext this version of the library cannot read, and [`Error::DuplicateKey`] if
-    /// these slots hold its key already. No slot changes then.
+    /// Fails with [`Error::InvalidContext`], [`Error::StaleHandle`], [`Error::WrongPurpose`],
+    /// [`Error::WrongLevel`], [`Error::NoFreeSlot`], [`Error::DerivationFailed`],
+    /// [`Error::StaleRecord`], [`Error::RecordRejected`] or [`Error::DuplicateKey`], and then
+    /// changes no slot.
     pub fn unlock(
         &mut self,
         parent: Handle<'a>,
@@ -1375,8 +1184,6 @@ impl<'a> Slots<'a> {
         unlocked
     }
 
-    /// The unlock itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     fn unlock_on_stack(
         &mut self,
@@ -1401,7 +1208,6 @@ impl<'a> Slots<'a> {
         unlocked
     }
 
-    /// The slot of the set `handle` refers to, if it serves `purpose`.
     fn serving(&self, handle: Handle<'a>, purpose: Purpose) -> Result<Index, Error> {
         let index = self.loaded(handle)?;
         let set = self.memory.get(index).ok_or(Error::StaleHandle)?;
@@ -1411,8 +1217,6 @@ impl<'a> Slots<'a> {
         Ok(index)
     }
 
-    /// The slot of the set `parent` refers to, if it is the key records of `kind` are wrapped
-    /// under, of the level they take, and a slot is free.
     fn parent(&self, parent: Handle<'a>, kind: Kind) -> Result<Index, Error> {
         let index = self.serving(parent, kind.parent_purpose())?;
         let set = self.memory.get(index).ok_or(Error::StaleHandle)?;
@@ -1425,8 +1229,6 @@ impl<'a> Slots<'a> {
         Ok(index)
     }
 
-    /// Opens `record`, of `kind`, under the key of the set in slot `parent`, and loads the set it
-    /// holds.
     fn take(
         &mut self,
         parent: Index,
@@ -1443,8 +1245,6 @@ impl<'a> Slots<'a> {
         admitted
     }
 
-    /// Opens `record`, of `kind`, under the key of the set in slot `parent`, and keeps the
-    /// plaintext in `found` if it names that key's identifier as the parent's.
     fn open_under(
         &self,
         parent: Index,
@@ -1482,12 +1282,6 @@ impl<'a> Slots<'a> {
         }
     }
 
-    /// Loads the key set a record's plaintext holds into a free slot, if one is and the plaintext
-    /// parses and its purpose is one that `kind` holds: from a record of this epoch, a set of
-    /// external data or of data, a key for transfers or a key of a chat for its archive, held by
-    /// that record; from a lock record, a stored key, for wrapping or of the archive; from a record
-    /// of an export, a set of external data. A set of any other purpose is a set of one that has
-    /// never changed.
     fn admit(&mut self, plaintext: &[u8; PLAINTEXT_LEN], kind: Kind) -> Result<Handle<'a>, Error> {
         if !self.has_free() {
             return Err(Error::NoFreeSlot);
@@ -1524,31 +1318,21 @@ impl<'a> Slots<'a> {
         )
     }
 
-    /// Carries the lock record `from` into the next epoch while a change to it is under way, and
-    /// writes it into `to`: the same stored key for wrapping under the same key from a secret, for
-    /// the same `context`, without that key. The nonce comes from `entropy`, hedged with the key
-    /// of the next epoch. A lock record not carried opens no more once the change is committed, so
-    /// a change that leaves one behind revokes that way in; until the commit, and while the
-    /// platform keeps the old root, a copy of it still opens.
+    /// Carries the lock record `from` into the next epoch during a change, without its key from a
+    /// secret, into `to`. A lock record not carried opens no more once the change is committed.
     ///
-    /// Needs 25 KiB of stack, or 72 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the stack it used is wiped after it, 24 KiB, or 64 KiB, deep,
-    /// whether it succeeded or not. A build that optimises this crate but not the hash and cipher
-    /// code it calls has to set that flag.
+    /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidContext`] if `context` is empty or longer than 255 bytes,
-    /// [`Error::NoEpochChange`] if no change to the next epoch is under way,
-    /// [`Error::EpochExhausted`] if it is the last, [`Error::EntropyFailed`] if `entropy` fails,
-    /// [`Error::DerivationFailed`] if the nonce cannot be hedged or a key that encrypts a layer
-    /// cannot be derived, [`Error::StaleRecord`] if `from` does not open in this epoch for this
-    /// context, and [`Error::CipherFailed`] if the cipher gives a known input a wrong answer or
-    /// fails. `to` is then left as it was.
+    /// Fails with [`Error::InvalidContext`], [`Error::NoEpochChange`],
+    /// [`Error::EpochExhausted`], [`Error::EntropyFailed`], [`Error::DerivationFailed`],
+    /// [`Error::StaleRecord`] or [`Error::CipherFailed`], and then leaves `to` as it was.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through, and `to` is left as it was.
+    /// Only if `entropy` panics; `to` is then left as it was.
     pub fn carry(
         &mut self,
         context: &[u8],
@@ -1562,8 +1346,6 @@ impl<'a> Slots<'a> {
         carried
     }
 
-    /// The carry itself, in a frame of its own: the wipe that follows starts where this frame
-    /// starts.
     #[inline(never)]
     fn carry_on_stack(
         &mut self,
@@ -1604,7 +1386,6 @@ impl<'a> Slots<'a> {
         self.memory.any(|slot| slot.occupancy == Occupancy::Free)
     }
 
-    /// The index of the slot `handle` refers to, if it is loaded with the handle's generation.
     fn loaded(&self, handle: Handle<'a>) -> Result<Index, Error> {
         if handle.slots != self.id() {
             return Err(Error::StaleHandle);
@@ -1618,9 +1399,6 @@ impl<'a> Slots<'a> {
             .ok_or(Error::StaleHandle)
     }
 
-    /// Puts one key of `length` for `purpose` into the first free slot with `fill`, as a set of one
-    /// whose key is the primary, a key from a secret if `secret` says so, if `purpose` takes
-    /// `length`.
     fn load_new(
         &mut self,
         purpose: Purpose,
@@ -1640,11 +1418,7 @@ impl<'a> Slots<'a> {
         )
     }
 
-    /// Puts the keys of a set for `purpose` with `stages` into the first free slot with `fill`, a
-    /// key from a secret if `secret` says so and held by a record of this epoch if `recorded`
-    /// does, derives their identifiers, and issues a handle if that succeeds, no key is held
-    /// already and none twice, with data-independent timing on. On failure the slot is left free
-    /// and wiped. The stack the load used is wiped after it.
+    /// On failure the slot is left free and wiped.
     fn load(
         &mut self,
         purpose: Purpose,
@@ -1706,10 +1480,8 @@ impl<'a> Slots<'a> {
         })
     }
 
-    /// The identifiers of the keys `stages` places in the free slot `index`. A key that a loaded
-    /// slot holds, for any purpose, or that the set holds twice, is refused.
-    // Derived into local buffers and copied in at once: the derivation writes byte by byte, and
-    // each write through a reference to a slot chosen at run time multiplies the proofs' work.
+    // Derived into local buffers and copied in at once: the derivation writes byte by byte. Each
+    // write through a reference to a slot chosen at run time multiplies the proofs' work.
     fn identify(&self, index: Index, stages: &Stages) -> Result<[KeyId; MEMBERS], Error> {
         let slot = self.memory.get(index).ok_or(Error::NoFreeSlot)?;
         let derive = |position: usize, key: &Key, id: &mut KeyId| -> Result<(), Error> {
@@ -1739,25 +1511,18 @@ impl<'a> Slots<'a> {
         Ok(ids)
     }
 
-    /// Takes a 32-byte key from `source` into the first empty position of the set that `set` refers
-    /// to, enabled and not the primary, and wipes `source`. Returns the position.
+    /// Takes a 32-byte key from `source` as an enabled key into the first empty position of `set`,
+    /// and wipes `source`. Returns the position; only a set for external data takes a key the
+    /// caller gives.
     ///
-    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the derivation of the key's identifier, and the whole
-    /// addition, are each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that optimises
-    /// this crate but not the hash code it calls has to set that flag.
+    /// Needs 9 KiB of stack, or 68 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set does not serve [`Purpose::ExternalData`]: no other set
-    /// takes a key the caller gives, [`Error::EpochChanging`] if a change to the next epoch is
-    /// under way, [`Error::Unfinished`] if the set came in a transfer whose end has not been
-    /// received, [`Error::Unsaved`] if the set has changed in this epoch, [`Error::SetFull`] if
-    /// every position holds a key, [`Error::SetExhausted`] if the set has changed as many times as
-    /// its counter holds, [`Error::DerivationFailed`] if the identifier of the key cannot be
-    /// derived, and [`Error::DuplicateKey`] if these slots hold the key already. `source` is then
-    /// left as it was, and nothing changes.
+    /// Fails with [`Error::StaleHandle`], [`Error::WrongPurpose`], [`Error::EpochChanging`],
+    /// [`Error::Unfinished`], [`Error::Unsaved`], [`Error::SetFull`], [`Error::SetExhausted`],
+    /// [`Error::DerivationFailed`] or [`Error::DuplicateKey`]. `source` and the slots then stay as
+    /// they were.
     pub fn add32(&mut self, set: Handle<'a>, source: &mut [u8; 32]) -> Result<Position, Error> {
         let at = self.add(set, KeyLength::Bytes32, true, |key, _| {
             key.copy32(source);
@@ -1767,34 +1532,22 @@ impl<'a> Slots<'a> {
         Ok(at)
     }
 
-    /// Creates a key of `length` random bytes from `entropy` in the first empty position of the set
-    /// that `set` refers to, enabled and not the primary, and returns the position. The bytes are
-    /// hedged with the key of the epoch, as RFC 8937 has it, and the key derived from them is
-    /// written straight into the slot. `entropy` is asked once, and only when the set's purpose
-    /// takes `length` and a position is empty.
+    /// Creates an enabled key of `length` bytes from hedged `entropy` in the first empty position
+    /// of `set`. Returns the position; `entropy` is asked once, after the purpose, the length and
+    /// an empty position are checked.
     ///
-    /// Needs 9 KiB of stack, or 68 KiB when this crate is built without optimisation or with
-    /// `--cfg lethewis_unoptimised`: the hedge, the derivation of the key's identifier, and the
-    /// whole addition, are each followed by a wipe of 8 KiB, or 64 KiB, below them. A build that
-    /// optimises this crate but not the hash code it calls has to set that flag.
+    /// Needs 9 KiB of stack, or 68 KiB when unoptimised, and wipes 8 KiB, or 64 KiB, below itself.
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set serves neither [`Purpose::ExternalData`] nor
-    /// [`Purpose::Data`]: no other set changes, [`Error::EpochChanging`] if a change to the next
-    /// epoch is under way,
-    /// [`Error::Unfinished`] if the set came in a transfer whose end has not been received,
-    /// [`Error::Unsaved`] if the set has changed in this epoch, [`Error::WrongLength`] if its
-    /// purpose takes no key of `length`, [`Error::SetFull`] if every position holds a key,
-    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds,
-    /// [`Error::EntropyFailed`] if `entropy` fails, [`Error::DerivationFailed`] if the key or its
-    /// identifier cannot be derived, and [`Error::DuplicateKey`] if these slots hold the key
-    /// already. No slot changes then.
+    /// Fails with [`Error::StaleHandle`], [`Error::WrongPurpose`], [`Error::EpochChanging`],
+    /// [`Error::Unfinished`], [`Error::Unsaved`], [`Error::WrongLength`], [`Error::SetFull`],
+    /// [`Error::SetExhausted`], [`Error::EntropyFailed`], [`Error::DerivationFailed`] or
+    /// [`Error::DuplicateKey`], and then changes no slot.
     ///
     /// # Panics
     ///
-    /// Only if `entropy` panics. The panic passes through, and the position stays empty and wiped.
+    /// Only if `entropy` panics; the position then stays empty and wiped.
     pub fn add_generated(
         &mut self,
         set: Handle<'a>,
@@ -1806,75 +1559,50 @@ impl<'a> Slots<'a> {
         })
     }
 
-    /// Makes the enabled key at `at` the primary of the set that `set` refers to. The former primary
-    /// stays enabled.
+    /// Makes the enabled key at `at` the primary of the set `set` refers to; the former primary
+    /// stays enabled. Only sets for external data and for data change.
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set serves neither [`Purpose::ExternalData`] nor
-    /// [`Purpose::Data`]: no other set changes, [`Error::EpochChanging`] if a change to the next
-    /// epoch is under way,
-    /// [`Error::Unfinished`] if the set came in a transfer whose end has not been received,
-    /// [`Error::Unsaved`] if the set has changed in this epoch, [`Error::PrimaryKey`] if the key at
-    /// `at` is the primary already, [`Error::WrongStage`] if `at` does not hold an enabled key, and
-    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds. Nothing
-    /// changes then.
+    /// Fails with [`Error::StaleHandle`], [`Error::WrongPurpose`], [`Error::EpochChanging`],
+    /// [`Error::Unfinished`], [`Error::Unsaved`], [`Error::PrimaryKey`], [`Error::WrongStage`] or
+    /// [`Error::SetExhausted`], and then changes nothing.
     pub fn promote(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
         self.change(set, at, Stages::promote).map(|_| ())
     }
 
-    /// Disables the enabled key at `at` of the set that `set` refers to: it is not revealed until it
-    /// is enabled again.
+    /// Disables the enabled key at `at` of `set`, which is then not revealed until it is enabled
+    /// again. Only sets for external data and for data change.
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set serves neither [`Purpose::ExternalData`] nor
-    /// [`Purpose::Data`]: no other set changes, [`Error::EpochChanging`] if a change to the next
-    /// epoch is under way,
-    /// [`Error::Unfinished`] if the set came in a transfer whose end has not been received,
-    /// [`Error::Unsaved`] if the set has changed in this epoch, [`Error::PrimaryKey`] if the key at
-    /// `at` is the primary, [`Error::WrongStage`] if `at` does not hold an enabled key, and
-    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds. Nothing
-    /// changes then.
+    /// Fails with [`Error::StaleHandle`], [`Error::WrongPurpose`], [`Error::EpochChanging`],
+    /// [`Error::Unfinished`], [`Error::Unsaved`], [`Error::PrimaryKey`], [`Error::WrongStage`] or
+    /// [`Error::SetExhausted`], and then changes nothing.
     pub fn disable(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
         self.change(set, at, Stages::disable).map(|_| ())
     }
 
-    /// Enables the disabled key at `at` of the set that `set` refers to again.
+    /// Enables the disabled key at `at` of the set `set` refers to again. Only sets for external
+    /// data and for data change.
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set serves neither [`Purpose::ExternalData`] nor
-    /// [`Purpose::Data`]: no other set changes, [`Error::EpochChanging`] if a change to the next
-    /// epoch is under way,
-    /// [`Error::Unfinished`] if the set came in a transfer whose end has not been received,
-    /// [`Error::Unsaved`] if the set has changed in this epoch, [`Error::PrimaryKey`] if `at` is
-    /// the primary position, [`Error::WrongStage`] if `at` does not hold a disabled key, and
-    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds. Nothing
-    /// changes then.
+    /// Fails with [`Error::StaleHandle`], [`Error::WrongPurpose`], [`Error::EpochChanging`],
+    /// [`Error::Unfinished`], [`Error::Unsaved`], [`Error::PrimaryKey`], [`Error::WrongStage`] or
+    /// [`Error::SetExhausted`], and then changes nothing.
     pub fn enable(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
         self.change(set, at, Stages::enable).map(|_| ())
     }
 
-    /// Wipes the disabled key at `at` of the set that `set` refers to, with its identifier, and
-    /// empties the position. A record of the set wrapped afterwards does not hold the key. The
-    /// destruction is saved only by the commit of the next epoch, and a record wrapped before stays
-    /// readable until then; dropping these slots first discards it.
+    /// Wipes the disabled key at `at` of `set` and empties the position. Until the next epoch is
+    /// committed, a record wrapped before still opens, and dropping the slots undoes it.
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `set` does not refer to a set held here now,
-    /// [`Error::WrongPurpose`] if the set serves neither [`Purpose::ExternalData`] nor
-    /// [`Purpose::Data`]: no other set changes, [`Error::EpochChanging`] if a change to the next
-    /// epoch is under way,
-    /// [`Error::Unfinished`] if the set came in a transfer whose end has not been received,
-    /// [`Error::Unsaved`] if the set has changed in this epoch, [`Error::PrimaryKey`] if `at` is
-    /// the primary position, [`Error::WrongStage`] if `at` does not hold a disabled key, and
-    /// [`Error::SetExhausted`] if the set has changed as many times as its counter holds. Nothing
-    /// changes then.
+    /// Fails with [`Error::StaleHandle`], [`Error::WrongPurpose`], [`Error::EpochChanging`],
+    /// [`Error::Unfinished`], [`Error::Unsaved`], [`Error::PrimaryKey`], [`Error::WrongStage`] or
+    /// [`Error::SetExhausted`], and then changes nothing.
     pub fn destroy(&mut self, set: Handle<'a>, at: Position) -> Result<(), Error> {
         let (key, id) = self.change(set, at, Stages::destroy)?.member(at);
         key.wipe();
@@ -1882,8 +1610,6 @@ impl<'a> Slots<'a> {
         Ok(())
     }
 
-    /// Applies `transition` at `at` to the stages of the set that `set` refers to, and returns its
-    /// slot if it applies.
     fn change(
         &mut self,
         set: Handle<'a>,
@@ -1917,10 +1643,7 @@ impl<'a> Slots<'a> {
         Ok(slot)
     }
 
-    /// Puts a key of `length` into the first empty position of the set that `set` refers to with
-    /// `fill`, derives its identifier, and keeps the key enabled if the set's purpose takes
-    /// `length` and these slots do not hold the key already, with data-independent timing on. On
-    /// failure the position is left empty and wiped. The stack the addition used is wiped after it.
+    /// On failure the position is left empty and wiped.
     fn add(
         &mut self,
         set: Handle<'a>,
@@ -1984,15 +1707,13 @@ impl<'a> Slots<'a> {
         Ok(at)
     }
 
-    /// Begins the change to the next epoch, whose key it takes from `key` and then wipes. Until the
-    /// change is committed or abandoned, records are wrapped in the next epoch and unwrapped in
-    /// this one. `key` comes from the platform with the root of the next epoch, and is never used
-    /// again.
+    /// Begins the change to the next epoch, taking its key from `key` and wiping it. Until the
+    /// change ends, records are wrapped in the next epoch and unwrapped in this one.
     ///
     /// # Errors
     ///
-    /// [`Error::EpochChanging`] if a change has begun already, and [`Error::EpochExhausted`] if
-    /// this is the last epoch the counter holds. `key` is then left as it was.
+    /// Fails with [`Error::EpochChanging`] or [`Error::EpochExhausted`], and then leaves `key` as
+    /// it was.
     pub fn begin_epoch(&mut self, key: &mut [u8; 32]) -> Result<(), Error> {
         if self.epoch.changing {
             return Err(Error::EpochChanging);
@@ -2006,13 +1727,13 @@ impl<'a> Slots<'a> {
         Ok(())
     }
 
-    /// Abandons the change to the next epoch: wipes its key, and has `root` erase the root made for
-    /// it, so that no record wrapped for it opens. Returns how surely that root is gone. A set that
-    /// has changed in this epoch stays unsaved.
+    /// Abandons the epoch change: wipes the next key, and `root` erases its root so its records
+    /// open no more. Returns how surely that root is gone; a set changed in this epoch stays
+    /// unsaved.
     ///
     /// # Errors
     ///
-    /// [`Error::NoEpochChange`] if no change has begun. Nothing changes then.
+    /// Fails with [`Error::NoEpochChange`], and then changes nothing.
     pub fn abandon_epoch(&mut self, root: &mut (impl Root + ?Sized)) -> Result<Erasure, Error> {
         if !self.epoch.changing {
             return Err(Error::NoEpochChange);
@@ -2028,19 +1749,13 @@ impl<'a> Slots<'a> {
         Ok(root.erase(next))
     }
 
-    /// Commits the change to the next epoch: `root` makes the root of the next epoch the current
-    /// one, the key of this epoch is wiped, and `root` erases its root. Returns how surely the root
-    /// is gone. Only then are the keys destroyed in this epoch out of reach of the records wrapped
-    /// before. Before the commit, every record of the next epoch is to be stored, and the records
-    /// of this epoch kept until it returns: a record of the next epoch opens only after it, and a
-    /// record of this epoch not wrapped or carried again opens no more. Should the platform stop between
-    /// switching the root and erasing the old one, it erases the old one at its next start.
+    /// Commits the change to the next epoch and returns how surely `root` erased the old root.
+    /// Store the next epoch's records before the call, and keep this epoch's until it returns.
     ///
     /// # Errors
     ///
-    /// [`Error::NoEpochChange`] if no change has begun, [`Error::Unsaved`] if a set that has
-    /// changed in this epoch has not been wrapped in the next since, and [`Error::RootFailed`] if
-    /// `root` does not switch the root. Nothing changes then.
+    /// Fails with [`Error::NoEpochChange`], [`Error::Unsaved`] or [`Error::RootFailed`], and then
+    /// changes nothing.
     pub fn commit_epoch(&mut self, root: &mut (impl Root + ?Sized)) -> Result<Erasure, Error> {
         if !self.epoch.changing {
             return Err(Error::NoEpochChange);
@@ -2076,12 +1791,11 @@ impl<'a> Slots<'a> {
         Ok(root.erase(old))
     }
 
-    /// Wipes every key of the set that `handle` refers to and frees its slot.
+    /// Wipes every key of the set `handle` refers to and frees its slot.
     ///
     /// # Errors
     ///
-    /// [`Error::StaleHandle`] if `handle` does not refer to a set held here now, and
-    /// [`Error::Unsaved`] if the set has changed in this epoch. Nothing changes then.
+    /// Fails with [`Error::StaleHandle`] or [`Error::Unsaved`], and then changes nothing.
     pub fn release(&mut self, handle: Handle<'a>) -> Result<(), Error> {
         let index = self.loaded(handle)?;
         let slot = self.memory.get_mut(index).ok_or(Error::StaleHandle)?;
@@ -2092,7 +1806,7 @@ impl<'a> Slots<'a> {
         Ok(())
     }
 
-    /// Marks every set saved, as a new epoch would: for tests of the stages alone.
+    /// Marks every set saved, as a new epoch would, for tests of the stages alone.
     #[cfg(test)]
     pub(crate) fn settle(&mut self) {
         for slot in self.memory.iter_mut() {
@@ -2100,8 +1814,8 @@ impl<'a> Slots<'a> {
         }
     }
 
-    /// Makes the key for wrapping `handle` refers to a stored one, as an unlock gives it: for tests
-    /// of what a stored key does, without a lock record.
+    /// Makes a key for wrapping a stored one, as an unlock gives it, for tests without a lock
+    /// record.
     #[cfg(test)]
     pub(crate) fn store(&mut self, handle: Handle<'a>) -> Handle<'a> {
         if let Some(slot) = self.memory.get_mut(handle.index) {
@@ -2110,14 +1824,12 @@ impl<'a> Slots<'a> {
         handle
     }
 
-    /// Tells apart two `Slots` alive at once: their memory does not overlap, so neither do the
-    /// addresses. Empty ones may share an address, but they issue no handles. A handle keeps its
-    /// memory borrowed, so no other `Slots` can take that memory over while the handle exists.
+    /// Two `Slots` alive at once never share memory, and a handle keeps its memory borrowed. Empty
+    /// ones may share an address, but issue no handles.
     fn id(&self) -> usize {
         self.memory.id()
     }
 
-    /// Wipes every key and identifier in every slot, loaded or not, and frees the loaded ones.
     fn unload_all(&mut self) {
         self.memory.each(|slot| {
             if slot.occupancy == Occupancy::Loaded {
@@ -2129,8 +1841,6 @@ impl<'a> Slots<'a> {
     }
 }
 
-/// Derives the key that encrypts a record of `kind` under the key `parent`, in the epoch whose key
-/// is `epoch` for a plain record.
 fn derive_record_key(
     kind: Kind,
     parent: &Key,
@@ -2145,8 +1855,6 @@ fn derive_record_key(
     }
 }
 
-/// Fills `key` with `length` bytes from `entropy`, the platform's source, hedged with the key of
-/// `epoch`. A failed hedge is `DerivationFailed`, a failed source `EntropyFailed`.
 fn hedged_fill(
     key: &mut Key,
     length: KeyLength,
@@ -2174,7 +1882,6 @@ fn hedged_fill(
     })
 }
 
-/// The derivation from the bytes of words or of shares as the source of a key's bytes.
 struct FromSecret<'b> {
     secret: &'b [u8; SECRET_LEN],
     purpose: Purpose,
@@ -2188,8 +1895,6 @@ impl Entropy for FromSecret<'_> {
     }
 }
 
-/// Fills `dest` from `entropy`, the platform's source, hedged with `epoch` under `branch` and the
-/// next count of `drawn`. A failed hedge is `DerivationFailed`, a failed source `EntropyFailed`.
 fn hedged_draw(
     entropy: &mut (impl Entropy + ?Sized),
     epoch: &Key,
@@ -2213,9 +1918,7 @@ fn hedged_draw(
     })
 }
 
-/// Seals `inner`, the record of a stored key for wrapping, with the number of an epoch under that
-/// epoch's key, given in `epoch`, under `nonce` into the lock record `out`. `out` is written only
-/// when this succeeds.
+/// `out` is written only when this succeeds.
 fn seal_layer(
     (epoch_key, number): (&Key, u64),
     nonce: &[u8; NONCE_LEN],
@@ -2248,9 +1951,7 @@ fn seal_layer(
     Ok(())
 }
 
-/// Opens the lock record `record` under the key of an epoch, given in `epoch` with its number, and
-/// keeps the record it holds in `inner` if it names that number; otherwise `StaleRecord`, and
-/// `inner` is left as it was.
+/// `inner` is written only when the layer opens and names the epoch `number`.
 fn open_layer(
     (epoch_key, number): (&Key, u64),
     aad: &[u8],
@@ -2290,7 +1991,6 @@ fn open_layer(
     }
 }
 
-/// The nonce, the encrypted plaintext and the tag of a record.
 fn split_record(
     record: &[u8; RECORD_LEN],
 ) -> ([u8; NONCE_LEN], [u8; PLAINTEXT_LEN], [u8; TAG_LEN]) {
@@ -2368,8 +2068,7 @@ mod tests {
         flipped_epoch_key(0)
     }
 
-    /// The key of the test epoch with every bit of `flip` flipped in each byte; its bytes vary, so
-    /// that the tests of residue look for it.
+    /// Its bytes vary, so that the tests of residue look for it.
     pub(super) fn flipped_epoch_key(flip: u8) -> [u8; 32] {
         core::array::from_fn(|at| {
             u8::try_from(at)
@@ -2393,10 +2092,6 @@ mod tests {
     assert_not_impl!(Slot: Clone, PartialEq, Default);
     assert_not_impl!(Epoch: Clone, PartialEq, Default);
 
-    /// Every import, generation, wrap, unwrap, lock, unlock, challenge, combination, carry, export
-    /// and receipt derives and runs the cipher, and every call on words reads and writes them,
-    /// inside the switch of data-independent timing, and with the mode on where the processor and
-    /// the operating system offer it.
     #[test]
     fn every_call_that_derives_holds_data_independent_timing() {
         use crate::timing::timed;
@@ -2489,14 +2184,12 @@ mod tests {
         timed(|| slots.transfer_from_words(&mut kept).unwrap());
     }
 
-    /// The stack, in KiB, that a load and that a wrap or an unwrap need, and the depth of the wipes
-    /// that follow them, in an optimised build and in one without optimisation.
+    /// In KiB, for an optimised build and for one without optimisation.
     pub(super) const LOAD_NEEDS: [usize; 2] = [9, 68];
     pub(super) const WRAP_NEEDS: [usize; 2] = [25, 72];
     const LOAD_WIPES: [usize; 2] = [8, 64];
     const WRAP_WIPES: [usize; 2] = [24, 64];
 
-    /// The documentation of the public call `name` in this file, its lines joined.
     fn documentation(name: &str) -> String {
         let source = include_str!("slots.rs");
         let at = source.find(&format!("    pub fn {name}(")).unwrap();
@@ -2510,9 +2203,6 @@ mod tests {
         lines.join(" ")
     }
 
-    /// The documentation of each import, generation, addition, reveal, wrap, unwrap, lock, unlock,
-    /// carry, combination, challenge, export and receipt states the stack it needs and the depth of
-    /// the wipe after it, and those depths are the library's.
     #[test]
     fn the_documentation_states_the_stack_calls_need() {
         let build = usize::from(cfg!(lethewis_unoptimised));
@@ -2580,8 +2270,6 @@ mod tests {
         assert_eq!(more, [6; 32]);
     }
 
-    /// A generated key is the hedge of the source's bytes, in its position: the source writes into a
-    /// buffer of the library's, not into the slot.
     #[test]
     fn a_generated_key_is_the_hedge_of_the_source_in_its_position() {
         let mut memory = [const { Slot::empty() }; 1];
@@ -2779,8 +2467,6 @@ mod tests {
         assert_eq!(slots.memory[0].occupancy, Occupancy::Free);
     }
 
-    /// A set for wrapping holds its one key and never changes: every change of stage and every
-    /// addition is refused before anything else, the source is not asked, and nothing changes.
     #[test]
     fn a_wrapping_set_takes_no_changes() {
         let mut memory = [const { Slot::empty() }; 1];
@@ -2806,14 +2492,12 @@ mod tests {
         assert!(!slots.memory[0].changed);
     }
 
-    /// A key whose bytes are 0, 1, 2 and so on, and one whose bytes count from `first`: the inputs of
-    /// the known answers of the derivations.
+    /// The inputs of the known answers of the derivations.
     fn counted_from(first: u8) -> [u8; 32] {
         core::array::from_fn(|i| first + u8::try_from(i).unwrap())
     }
 
-    /// Two keys from a secret combine into one, the key an independent implementation of HKDF gives,
-    /// as a key from a secret, for a first key of either length; both are released.
+    /// The expected keys come from an independent implementation of HKDF.
     #[test]
     fn two_keys_from_a_secret_combine_into_one_and_go() {
         for (long, expected) in [
@@ -2856,8 +2540,6 @@ mod tests {
         core::array::from_fn(|at| u8::from_str_radix(&text[2 * at..2 * at + 2], 16).unwrap())
     }
 
-    /// A combination takes two keys from a secret, the second of 32 bytes, and a free slot, and
-    /// refuses anything else in order, changing nothing.
     #[test]
     fn a_combination_takes_only_two_keys_from_a_secret() {
         let mut memory = [const { Slot::empty() }; 7];
@@ -2902,8 +2584,7 @@ mod tests {
         assert_eq!(slots.combine(password, answer), Err(Error::StaleHandle));
     }
 
-    /// A key from a secret gives the challenge an independent implementation of HKDF gives; no
-    /// other key gives one, and a refusal writes nothing.
+    /// The expected challenges come from an independent implementation of HKDF.
     #[test]
     fn a_challenge_comes_only_from_a_key_from_a_secret() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -2940,7 +2621,6 @@ mod tests {
         assert_eq!(out, [0x55; 32]);
     }
 
-    /// A platform that records what it is asked, and switches the root unless told to fail.
     #[derive(Default)]
     pub(super) struct Platform {
         switched: Vec<u64>,
@@ -2963,8 +2643,6 @@ mod tests {
         }
     }
 
-    /// Saves the change of `set` by a new epoch whose key is all `byte`: wraps `set` under `root`
-    /// into `record`.
     fn save<'a>(
         slots: &mut Slots<'a>,
         platform: &mut Platform,
@@ -2979,9 +2657,6 @@ mod tests {
         assert_eq!(slots.commit_epoch(platform), Ok(Erasure::Guaranteed));
     }
 
-    /// A key goes from added to destroyed, each change saved by a new epoch. The copy of the set
-    /// that holds the destroyed key does not reach the last epoch, and no copy of an epoch past
-    /// opens.
     #[test]
     fn keys_rotate_from_added_to_destroyed() {
         use Position::{First, Second};
@@ -3030,9 +2705,6 @@ mod tests {
         }
     }
 
-    /// A set changes once in an epoch, and is neither released nor wrapped in it after the
-    /// change; the change is saved by committing a new epoch the set is wrapped in. Calls out of
-    /// order are refused and change nothing.
     #[test]
     fn an_epoch_changes_only_in_order() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -3085,8 +2757,6 @@ mod tests {
         );
     }
 
-    /// An abandoned change leaves the epoch as it was: a record wrapped for the next epoch does not
-    /// open, and a change stays unsaved until a later epoch the set is wrapped in.
     #[test]
     fn an_abandoned_epoch_change_leaves_the_epoch_as_it_was() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -3138,8 +2808,8 @@ mod tests {
         assert!(!epoch_memory.changing);
     }
 
-    /// No set changes while a change of epoch is under way: a set wrapped for the next epoch could
-    /// otherwise change after, and leave that record of the next epoch holding a destroyed key.
+    /// Otherwise a set wrapped for the next epoch could change after, and leave that record
+    /// holding a destroyed key.
     #[test]
     fn a_set_does_not_change_during_an_epoch_change() {
         let mut memory = [const { Slot::empty() }; 2];
@@ -3180,8 +2850,6 @@ mod tests {
         );
     }
 
-    /// A record opens only in the epoch it was wrapped in: with another key of the epoch it does
-    /// not open, and with the same key under another number it is refused.
     #[test]
     fn a_record_opens_only_in_its_epoch() {
         let wrapped = |epoch, key: [u8; 32]| {
@@ -3227,7 +2895,6 @@ mod tests {
         assert_eq!(key, [5; 32]);
     }
 
-    /// Fails the test if it is ever asked for bytes.
     struct Untouched;
 
     impl Entropy for Untouched {
@@ -3588,7 +3255,6 @@ mod tests {
         );
     }
 
-    /// Writes the bytes it was made with.
     struct Fixed(&'static [u8]);
 
     impl Entropy for Fixed {
@@ -3611,9 +3277,8 @@ mod tests {
         })
     }
 
-    /// What the slots make of `drawn`, the bytes a source gave, at `count` draws since they were
-    /// created, for the use `name`: HKDF-SHA-256 called directly, with the key of the test epoch as
-    /// the salt and the label written out by hand.
+    /// The hedge of `drawn` at `count` draws for the use `name`, by HKDF-SHA-256 with the label
+    /// written by hand.
     pub(super) fn hedged(count: u64, name: &[u8], drawn: &[u8], length: usize) -> Vec<u8> {
         crate::derive::direct::hedged_directly(&epoch_key(), count, name, drawn, length)
     }
@@ -3622,12 +3287,8 @@ mod tests {
         core::array::from_fn(|at| u8::from_str_radix(&text[2 * at..2 * at + 2], 16).unwrap())
     }
 
-    /// Records computed by an implementation independent of this library, in epoch `EPOCH` with the
-    /// key `epoch_key()`, of sets for external data: under a 32-byte parent, a set of one key in
-    /// "chat 7"; under a 64-byte parent, a set of one key in "chat 8"; and under the 32-byte parent,
-    /// in "archive", a full set at revision 9: a disabled key, an enabled key, and the primary, an
-    /// enabled key. They are wrapped in this order in one set of slots, the nonce `NONCE` the
-    /// source gave each hedged as the next draw.
+    /// Computed by an independent implementation, in the order the test wraps them. Each nonce is
+    /// `NONCE` hedged as the next draw.
     const KNOWN_RECORDS: [&str; 3] = [
         concat!(
             "c7a1550603080bf1aa1c51924a6d5d642a6be55972bad74c1f1853ffffd3f2b6",
@@ -3677,9 +3338,6 @@ mod tests {
     /// A parent's bytes, a context, the members of a set and its primary.
     type Case<'b> = (&'b [u8], &'b [u8], [Member<'b>; MEMBERS], usize);
 
-    /// Asserts that the set `handle` refers to holds `members` at their positions, each with its
-    /// stage and the identifier derived from it, with `primary` as the primary, and nothing at an
-    /// empty position, for external data.
     fn assert_holds(
         slots: &Slots<'_>,
         handle: Handle<'_>,
@@ -3689,7 +3347,6 @@ mod tests {
         assert_holds_for(slots, handle, members, primary, Purpose::ExternalData);
     }
 
-    /// The same, for `purpose`.
     fn assert_holds_for(
         slots: &Slots<'_>,
         handle: Handle<'_>,
@@ -3819,7 +3476,6 @@ mod tests {
         }
     }
 
-    /// Two slots holding a parent and a key, and the record of the key under the parent.
     fn wrapped<'a>(
         memory: &'a mut [Slot],
         epoch: &'a mut Epoch,
@@ -3876,7 +3532,6 @@ mod tests {
         assert!(slots.unwrap(parent, b"chat 7", &record).is_ok());
     }
 
-    /// `plaintext` sealed under the key derived from `sealer` for `context`, with `nonce`.
     fn seal_plaintext(
         sealer: &Key,
         plaintext: &[u8; PLAINTEXT_LEN],
@@ -3893,8 +3548,6 @@ mod tests {
         record
     }
 
-    /// The plaintext of the set `members` for external data with `primary`, naming `named` as its
-    /// parent, built without `wrap`.
     fn set_plaintext(
         members: [Member<'_>; MEMBERS],
         primary: usize,
@@ -3903,7 +3556,6 @@ mod tests {
         set_plaintext_for(members, primary, named, Purpose::ExternalData)
     }
 
-    /// The same, for `purpose`.
     fn set_plaintext_for(
         members: [Member<'_>; MEMBERS],
         primary: usize,
@@ -3932,8 +3584,6 @@ mod tests {
         plaintext
     }
 
-    /// The record of the set `members` with `primary`, sealed under the key of the set `parent`
-    /// refers to and naming that key, for `context`.
     fn sealed_under(
         slots: &Slots<'_>,
         parent: Handle<'_>,
@@ -3946,8 +3596,6 @@ mod tests {
         seal_plaintext(&slot.keys[0], &plaintext, context, &NONCE)
     }
 
-    /// A record opens with one trial, under the key of its parent; naming that parent but sealed under
-    /// another key, it is refused, and nothing is loaded.
     #[test]
     fn a_record_opens_under_the_key_of_its_parent_alone() {
         let mut memory = [const { Slot::empty() }; 2];
@@ -3983,10 +3631,6 @@ mod tests {
         }
     }
 
-    /// `plaintext`, the record of a stored key for wrapping, locked under the key from a secret
-    /// `sealer` and then, with the number of the epoch `epoch` names, under the key of that epoch,
-    /// for `context`: the inner layer with the first nonce, the outer with the second. Built
-    /// without `lock`.
     fn lock_plaintext(
         sealer: &Key,
         plaintext: &[u8; PLAINTEXT_LEN],
@@ -4020,8 +3664,6 @@ mod tests {
         plaintext
     }
 
-    /// The plaintext of the set `members` for wrapping, naming `named` as its parent, as a lock
-    /// record holds it: in epoch zero.
     fn lock_set_plaintext(
         members: [Member<'_>; MEMBERS],
         primary: usize,
@@ -4032,9 +3674,6 @@ mod tests {
         plaintext
     }
 
-    /// A record holds a set for wrapping only in a lock record, and there only a set of one that has
-    /// never changed: a plain record of one, a lock record of a set for external data, of more
-    /// keys, of a changed set or of an epoch, are refused although they open.
     #[test]
     fn a_set_for_wrapping_comes_back_only_from_a_lock_record_of_one_key() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -4089,8 +3728,6 @@ mod tests {
         assert!(!slots.memory[set.index.number()].unlocks);
     }
 
-    /// A stored key for wrapping comes back from its lock record under the key from a secret it was
-    /// locked under, as the stored key it was, and wraps keys for external data.
     #[test]
     fn a_stored_key_comes_back_from_its_lock_record() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -4122,9 +3759,6 @@ mod tests {
             .unwrap();
     }
 
-    /// Each key wraps and unwraps only at its level: a key from a secret only stored keys for
-    /// wrapping, in lock records, and a stored key only keys for external data, in plain records.
-    /// Every other pairing is refused as `WrongLevel`, writes nothing and changes no slot.
     #[test]
     fn every_key_wraps_only_at_its_level() {
         let mut memory = [const { Slot::empty() }; 6];
@@ -4178,9 +3812,6 @@ mod tests {
             .unwrap();
     }
 
-    /// A lock record opens only with its key from a secret and its context, and every changed bit
-    /// of it is refused, loading nothing: under another key from a secret it is `RecordRejected`,
-    /// for another context or changed `StaleRecord`.
     #[test]
     fn a_lock_record_opens_only_with_its_secret_and_context() {
         let mut memory = [const { Slot::empty() }; 4];
@@ -4217,9 +3848,6 @@ mod tests {
         assert!(slots.unlock(secret, b"profile", &record).is_ok());
     }
 
-    /// The keys of the archive lie only where their records allow: none is imported, the seed is
-    /// not generated, a stored key of the archive only in a lock record, a key of a chat for its
-    /// archive only under a stored key for wrapping; a stored key of the archive wraps no set.
     #[test]
     fn the_keys_of_the_archive_lie_only_where_their_records_allow() {
         let mut memory = [const { Slot::empty() }; 5];
@@ -4313,10 +3941,6 @@ mod tests {
         );
     }
 
-    /// A lock record is carried into the next epoch without its key from a secret, which no slot
-    /// then holds. After the commit the carried copy opens and the old one does not, nor does a
-    /// record left behind: so a way in is revoked. A carry needs a change under way, the record's
-    /// context and a record of this epoch, and writes nothing otherwise.
     #[test]
     fn a_lock_record_is_carried_into_the_next_epoch_without_its_secret() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -4369,8 +3993,6 @@ mod tests {
         );
     }
 
-    /// A lock record made during a change of epoch is of the next epoch: it opens only once the
-    /// change is committed, and never if the change is abandoned.
     #[test]
     fn a_lock_during_a_change_is_of_the_next_epoch() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -4405,10 +4027,8 @@ mod tests {
         slots.release(back).unwrap();
     }
 
-    /// A lock record and the same record carried into the next epoch, computed by an implementation
-    /// independent of this library: a 64-byte stored key under a 32-byte key from a secret, in
-    /// "profile", the nonce `NONCE` the source gave each hedged as the next draw, the inner one
-    /// first; the next epoch's key is the key of the test epoch with every bit flipped.
+    /// A lock record and its carry into the next epoch, computed by an independent implementation.
+    /// Each nonce is `NONCE` hedged as the next draw, the inner one first.
     const KNOWN_LOCK: &str = concat!(
         "2d7fafac78ba33a2056ef2ae3f24eeb2ce9eb701f1b749b053ca457729fa13cf",
         "9c420772e867b9a831a0d611dca35747abee9a63e482baf4e4881c1a967e7984",
@@ -4466,10 +4086,8 @@ mod tests {
         assert_eq!(carried, lock_hex(KNOWN_CARRIED));
     }
 
-    /// An export computed by an implementation independent of this library, under the key for
-    /// transfers `pattern(41, 3)` in "move", in epoch `EPOCH` with the key `epoch_key()`: the set
-    /// of the first of `KNOWN_RECORDS`, the full set of the third, and the end, each nonce `NONCE`
-    /// hedged as the next draw.
+    /// An export of the sets of the first and third of `KNOWN_RECORDS`, ended by `KNOWN_END`,
+    /// computed by an independent implementation. Each nonce is `NONCE` hedged as the next draw.
     const KNOWN_EXPORT: [&str; 2] = [
         concat!(
             "c7a1550603080bf1aa1c5192e380992e16666f44fc3fa7685aa5c7fb96716cdf",
@@ -4533,8 +4151,6 @@ mod tests {
         assert_eq!(end, end_hex(KNOWN_END));
     }
 
-    /// The export computed independently comes in whole on other slots, in another epoch: each set
-    /// as it went out, and none wrapped until the end.
     #[test]
     fn an_export_is_received_in_another_epoch() {
         let mut memory = [const { Slot::empty() }; 4];
@@ -4590,8 +4206,6 @@ mod tests {
             .unwrap();
     }
 
-    /// Slots of one device and of another, each with a stored key and the same key for transfers,
-    /// and three sets for external data on the first.
     struct Pair<'a> {
         from: Slots<'a>,
         to: Slots<'a>,
@@ -4628,7 +4242,6 @@ mod tests {
         }
     }
 
-    /// The records of the three sets and the end, exported in order.
     fn exported(pair: &mut Pair<'_>) -> ([[u8; RECORD_LEN]; 3], [u8; END_RECORD_LEN]) {
         let mut records = [[0; RECORD_LEN]; 3];
         for (set, record) in pair.sets.into_iter().zip(&mut records) {
@@ -4643,9 +4256,6 @@ mod tests {
         (records, end)
     }
 
-    /// A record opens only in its place in the export: a record out of order, one given twice, one
-    /// of another context and one under another key are refused and load nothing, and the export
-    /// goes on from where it was.
     #[test]
     fn records_of_an_export_open_only_in_order() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 5], Epoch::empty());
@@ -4695,9 +4305,6 @@ mod tests {
         to.end_receive(into, b"move", &end).unwrap();
     }
 
-    /// Until the end of its export is received, a set that came in it is neither revealed, wrapped,
-    /// exported nor changed, and is released; an end that does not open lets nothing go, and the
-    /// end of one export lets go only the sets that came in it.
     #[test]
     fn sets_wait_for_the_end_of_their_own_export() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
@@ -4769,8 +4376,6 @@ mod tests {
         to.release(third).unwrap();
     }
 
-    /// A key for transfers is imported or derived from words, never generated; it is neither
-    /// revealed, locked, changed nor combined, and refuses every call a stored key takes.
     #[test]
     fn a_key_for_transfers_serves_transfers_alone() {
         let mut memory = [const { Slot::empty() }; 5];
@@ -4843,8 +4448,6 @@ mod tests {
         );
     }
 
-    /// A key for transfers is stored under a stored key and comes back as it went, a set of one
-    /// for transfers.
     #[test]
     fn a_key_for_transfers_is_stored_under_a_stored_key() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -4872,9 +4475,6 @@ mod tests {
         );
     }
 
-    /// The same bytes, a stored key in one set of slots and a key for transfers in another, open
-    /// neither the other's records: a record under a stored key is not received, and a record of
-    /// an export is not unwrapped.
     #[test]
     fn the_same_bytes_in_two_roles_open_neither_record() {
         let bytes = pattern::<32>(43, 5);
@@ -4914,9 +4514,6 @@ mod tests {
         );
     }
 
-    /// A key for transfers carries one export at a time: while it writes one it receives none, and
-    /// the other way round, until the end; an end with no record before it is refused, and a key
-    /// released and loaded again begins afresh.
     #[test]
     fn a_key_for_transfers_carries_one_export_at_a_time() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 5], Epoch::empty());
@@ -4981,9 +4578,6 @@ mod tests {
             .unwrap();
     }
 
-    /// An export is in no epoch: a set changed in this one is exported as it is now, during a
-    /// change or not, the export saves nothing for the next epoch, and its records open after the
-    /// change is committed.
     #[test]
     fn an_export_saves_nothing_and_outlives_the_epoch() {
         let (mut memory, mut epoch) = ([const { Slot::empty() }; 5], Epoch::empty());
@@ -5030,8 +4624,6 @@ mod tests {
         );
     }
 
-    /// A key is held in one place only: an import of a key held here, and a set that holds such a
-    /// key or one key twice, are refused, and leave the source and every slot as they were.
     #[test]
     fn a_key_is_held_in_one_place_only() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -5095,8 +4687,6 @@ mod tests {
         assert_eq!(record, [0x55; RECORD_LEN]);
     }
 
-    /// Only a key for wrapping wraps and unwraps: a parent of another purpose is refused, and
-    /// nothing changes.
     #[test]
     fn only_a_wrapping_key_wraps_and_unwraps() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -5126,8 +4716,6 @@ mod tests {
             .unwrap();
     }
 
-    /// A key for external data is 32 bytes: a longer one is refused by every load and addition
-    /// before anything else happens, and a record that holds one does not open.
     #[test]
     fn a_purpose_takes_only_its_key_lengths() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -5181,8 +4769,6 @@ mod tests {
         assert_eq!(holdings(&slots), before);
     }
 
-    /// The same bytes are one key whatever they serve: a load or an addition of a key held for
-    /// another purpose is refused.
     #[test]
     fn a_key_is_held_once_across_purposes() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -5210,8 +4796,6 @@ mod tests {
         assert!(slots.add32(data, &mut pattern(97, 13)).is_ok());
     }
 
-    /// A key for external data comes out only to a call that names its purpose, from an enabled
-    /// position; no other key ever does, and a refusal leaves the output as it was.
     #[test]
     fn only_an_enabled_key_for_external_data_is_revealed() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -5263,8 +4847,6 @@ mod tests {
         assert_eq!(out, [0x55; 32]);
     }
 
-    /// A set for external data comes back from its record for external data: its key is revealed,
-    /// and it wraps nothing.
     #[test]
     fn a_set_for_external_data_comes_back_for_external_data() {
         let mut memory = [const { Slot::empty() }; 2];
@@ -5296,7 +4878,6 @@ mod tests {
         );
     }
 
-    /// A set keeps the stage of each key and its primary through an unwrap and a wrap.
     #[test]
     fn a_set_comes_out_of_a_wrap_as_it_went_in() {
         let mut memory = [const { Slot::empty() }; 2];
@@ -5326,8 +4907,6 @@ mod tests {
         );
     }
 
-    /// During a change of epoch the nonce of a record, and of the outer layer of a lock record, is
-    /// hedged with the key of the next epoch, the key the record is wrapped in.
     #[test]
     fn a_nonce_during_a_change_is_hedged_with_the_next_key() {
         let mut memory = [const { Slot::empty() }; 4];
@@ -5357,9 +4936,6 @@ mod tests {
         assert_eq!(locked[..12], outer[..]);
     }
 
-    /// The count of draws moves by one with each draw the source answers, and neither with a failed
-    /// draw nor with an import, a release, an unwrap or a change of epoch, begun, committed or
-    /// abandoned.
     #[test]
     fn the_count_moves_only_with_answered_draws() {
         let mut memory = [const { Slot::empty() }; 3];
@@ -5393,8 +4969,7 @@ mod tests {
         assert_eq!(slots.epoch.drawn, 3);
     }
 
-    /// A source that gives the same bytes every time still gives different keys, words, shares and
-    /// nonces: each draw is hedged with its own count.
+    /// Each draw is hedged with its own count.
     #[test]
     fn a_source_that_repeats_itself_gives_different_bytes() {
         let mut memory = [const { Slot::empty() }; 6];
@@ -5613,7 +5188,6 @@ mod tests {
             .collect()
     }
 
-    /// The bytes of every key held in `slots`.
     fn held_keys(slots: &Slots<'_>) -> Vec<Vec<u8>> {
         slots
             .memory
@@ -5629,7 +5203,6 @@ mod tests {
             .collect()
     }
 
-    /// Random stages of three positions whose primary holds an enabled key.
     fn random_stages(random: &mut Random) -> ([Option<Status>; MEMBERS], usize) {
         let mut members: [Option<Status>; MEMBERS] =
             core::array::from_fn(|_| match random.below(3) {
@@ -5642,7 +5215,6 @@ mod tests {
         (members, primary)
     }
 
-    /// The parent of a round: a key imported as a set of one, among other sets and released slots.
     fn random_parent<'a>(slots: &mut Slots<'a>, random: &mut Random) -> Handle<'a> {
         let parent = match random.key().len() {
             32 => slots.import32(Purpose::Wrap, &mut random.bytes()),
@@ -5659,11 +5231,8 @@ mod tests {
         parent
     }
 
-    /// The plaintext of a random set for wrapping, external data, transfers, a chat's archive or data,
-    /// at a random revision naming `named`, at times with a key held in `held` or one key twice, left
-    /// as built, wholly random or with one byte changed. A set not for wrapping mostly holds 32-byte
-    /// keys, as it has to, and one whose keys do not change by their stages is half the time a set of
-    /// one that has never changed, as it has to be.
+    /// Biased towards plaintexts the slots accept: mostly 32-byte keys outside sets for wrapping.
+    /// Half the time it is a set of one that never changed, where the purpose has no stages.
     fn random_plaintext(
         random: &mut Random,
         named: [u8; 16],
@@ -5714,10 +5283,7 @@ mod tests {
     }
 
     /// The keys of `plaintext` by position, if slots in the epoch `EPOCH` accept it from a plain
-    /// record: version 1, purpose 2, 3 or 6, the ones a plain record holds, that epoch, each
-    /// position zero throughout or stage 1 or 2 with 32 bytes and zeros past them, an enabled key at
-    /// the primary position, and for purposes 3 and 6 one enabled key at the first position in a
-    /// set that never changed. Read from the layout, not by the parser.
+    /// record. Read from the layout, not by the parser.
     fn accepted_keys(plaintext: &[u8; PLAINTEXT_LEN]) -> Option<[Option<Vec<u8>>; MEMBERS]> {
         let primary = usize::from(plaintext[2]);
         let purpose = plaintext[1];
@@ -5747,7 +5313,6 @@ mod tests {
         (purpose == 2 || purpose == 7 || one).then_some(keys)
     }
 
-    /// The slot that holds the set of an accepted `plaintext`, as the layout states it.
     fn loaded_from(plaintext: &[u8; PLAINTEXT_LEN], generation: u64) -> Holding {
         let mut holding: Holding = (
             Occupancy::Loaded,
@@ -5779,12 +5344,6 @@ mod tests {
         holding
     }
 
-    /// Records sealed through the real derivation and cipher under the key of a random parent or
-    /// under a key outside it, with random sets, keys held elsewhere, contexts of 0 to 300 bytes,
-    /// and random changes to the plaintext, the record or the context: unwrapping never panics,
-    /// refuses exactly what it should, with the error it should, loads the set the plaintext holds
-    /// into the first free slot with that slot's generation when it accepts, and changes no other
-    /// slot, or none when it refuses.
     fn unwrap_random_records(rounds: u64, seed: u64) {
         let mut random = Random(seed);
         for round in 0..rounds {
@@ -5877,8 +5436,6 @@ mod tests {
         unwrap_random_records(300, 1);
     }
 
-    /// The same over as many rounds and from the seed `LETHEWIS_RANDOM_ROUNDS` and
-    /// `LETHEWIS_RANDOM_SEED` give.
     #[test]
     #[ignore = "long; the rounds and the seed come from the environment"]
     fn many_random_records_unwrap_as_their_plaintext_says() {
@@ -5896,8 +5453,7 @@ mod tests {
     reason = "a test expands an AES key and builds counter blocks"
 )]
 mod stack {
-    //! What wrapping, unwrapping and revealing leave on the stack, read back from the memory of this
-    //! process.
+    //! What the calls leave on the stack, read back from the memory of this process.
 
     extern crate std;
 
@@ -5936,7 +5492,6 @@ mod stack {
         0x31, 0x9c, 0x07, 0xe2, 0x5d, 0xa8, 0x14, 0x6f, 0xc3, 0x2b, 0x90, 0x4e,
     ];
 
-    /// Writes the same nonce every time.
     struct Fixed;
 
     impl Entropy for Fixed {
@@ -5959,12 +5514,10 @@ mod stack {
             .collect()
     }
 
-    /// The key of the parent, which wraps the child set: 64 bytes.
     fn parent_bytes(flip: u8) -> [u8; 64] {
         pattern(43, 9, 64, flip).try_into().unwrap()
     }
 
-    /// The keys of the child set, for external data.
     fn child_keys(flip: u8) -> [Vec<u8>; MEMBERS] {
         [
             pattern(29, 101, 32, flip),
@@ -6037,8 +5590,8 @@ mod stack {
         words.chunks(4).map(<[[u8; 4]]>::concat).collect()
     }
 
-    /// The S-box at zero and at the example of FIPS 197, section 5.1.1, and the key expansion of
-    /// its appendix A.3.
+    /// The S-box at zero and at FIPS 197's example in section 5.1.1, and the key expansion of
+    /// appendix A.3.
     #[test]
     fn the_s_box_and_the_round_keys_are_those_of_fips_197() {
         let bytes = |text: &str| -> Vec<u8> {
@@ -6061,9 +5614,7 @@ mod stack {
         block.into()
     }
 
-    /// What AES-256-GCM-SIV handles for a record of `length` sealed bytes under `key` with `nonce`
-    /// and `tag`, but its plaintext: the key and its round keys, the keys of the message and the
-    /// round keys of the one that encrypts, and the keystream.
+    /// What AES-256-GCM-SIV handles for a record of `length` sealed bytes, but its plaintext.
     pub(super) fn keying_secrets(
         key: &[u8; 32],
         nonce: &[u8; 12],
@@ -6099,13 +5650,12 @@ mod stack {
         )
     }
 
-    /// The keystream of a record whose tag is `tag`: counter blocks from the tag with its top bit
-    /// set, the first word counting up, RFC 8452, section 4; as long as a record's plaintext.
     fn keystream(enc_key: &[u8; 32], tag: &[u8; 16]) -> Vec<u8> {
         keystream_of(enc_key, tag, PLAINTEXT_LEN)
     }
 
-    /// The same, `length` bytes long.
+    /// Counter blocks from the tag with its top bit set, the first word counting up: RFC 8452,
+    /// section 4.
     fn keystream_of(enc_key: &[u8; 32], tag: &[u8; 16], length: usize) -> Vec<u8> {
         let mut block = *tag;
         block[15] |= 0x80;
@@ -6119,8 +5669,6 @@ mod stack {
             .collect()
     }
 
-    /// Loads, under the key `parent` refers to, the set of `keys` for external data with `stages`
-    /// and `primary`, by unwrapping a record of it.
     fn loaded_set(
         slots: &mut Slots<'_>,
         parent: Handle<'static>,
@@ -6155,8 +5703,6 @@ mod stack {
         widen(slots.unwrap(parent, SET_CONTEXT, &record).unwrap())
     }
 
-    /// The parent, and the child set, whose first key is disabled and whose third is the primary,
-    /// all made from `flip`ped patterns.
     fn sets(slots: &mut Slots<'_>, flip: u8) -> (Handle<'static>, Handle<'static>) {
         let parent = slots
             .import64(Purpose::Wrap, &mut parent_bytes(flip))
@@ -6173,8 +5719,7 @@ mod stack {
         (parent, child)
     }
 
-    /// What is measured: a wrap, the trial of an unwrap whose record the key does not open, or a
-    /// whole unwrap.
+    /// `Trial` is an unwrap whose record the key does not open.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Work {
         Wrap,
@@ -6182,11 +5727,6 @@ mod stack {
         Unwrap,
     }
 
-    /// The secrets the work handles on the sets made from `flip`ped patterns: the key of the
-    /// parent, the derivation of the cipher key from it, the cipher key, the message keys, the
-    /// round keys of the cipher key and of the message encryption key in the layout of FIPS 197,
-    /// the keystream, and the plaintext. For a whole unwrap, also the derivations of the
-    /// identifiers of the child's keys.
     fn handled(flip: u8, work: Work) -> Vec<Vec<u8>> {
         let mut memory = [const { Slot::empty() }; 4];
         let mut epoch_memory = Epoch::empty();
@@ -6277,7 +5817,6 @@ mod stack {
         });
     }
 
-    /// The parent set, a free slot, and the record of the child set under the parent.
     fn wrapped(slots: &mut Slots<'_>) -> (Handle<'static>, [u8; RECORD_LEN]) {
         let (parent, child) = sets(slots, 0);
         let mut record = [0; RECORD_LEN];
@@ -6300,10 +5839,8 @@ mod stack {
         });
     }
 
-    /// A record whose ciphertext was changed is decrypted under the key of the parent before the tag
-    /// fails. This is also the unwrap that shows the test sees residue: after a successful one,
-    /// the wipes that follow the derivations of the new keys' identifiers already cover the frames
-    /// the cipher used.
+    /// Only a rejected unwrap shows that the test sees residue. After a successful one, the wipes
+    /// after deriving the new identifiers already cover the cipher's frames.
     #[test]
     fn a_rejected_unwrap_leaves_no_residue() {
         let pieces = pieces(Work::Trial);
@@ -6323,7 +5860,6 @@ mod stack {
         });
     }
 
-    /// The key from a secret of the lock tests, and the stored key it locks: 32 and 64 bytes.
     fn secret_bytes(flip: u8) -> [u8; 32] {
         pattern(61, 13, 32, flip).try_into().unwrap()
     }
@@ -6332,9 +5868,6 @@ mod stack {
         pattern(67, 17, 64, flip).try_into().unwrap()
     }
 
-    /// What the cipher works with under `cipher_key` for a record whose nonce, encrypted part and
-    /// tag are given: the cipher key, the message keys, their round keys, the keystream and what
-    /// the record decrypts to, which it returns as well.
     fn cipher_secrets(
         cipher_key: &[u8; 32],
         nonce: &[u8; 12],
@@ -6356,8 +5889,6 @@ mod stack {
         (found, decrypted)
     }
 
-    /// The outer layer of a lock record, under the key of the epoch `epoch`: the secrets of the
-    /// derivation of its key and of the cipher, and what it decrypts to.
     fn layer_secrets(epoch: &[u8; 32], record: &[u8; LOCK_RECORD_LEN]) -> (Vec<Vec<u8>>, Vec<u8>) {
         let mut layer_key = [0; 32];
         derive_layer_key(&key_from(epoch), &mut layer_key).unwrap();
@@ -6369,7 +5900,6 @@ mod stack {
         (found, layer)
     }
 
-    /// What is measured with lock records.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Locking {
         Lock,
@@ -6377,8 +5907,6 @@ mod stack {
         Carry,
     }
 
-    /// The slots of the lock tests, made from `flip`ped patterns: a key from a secret and the
-    /// stored key it locks.
     fn before_lock(slots: &mut Slots<'_>, flip: u8) -> (Handle<'static>, Handle<'static>) {
         let secret = widen(
             slots
@@ -6391,7 +5919,6 @@ mod stack {
         (secret, widen(slots.store(stored)))
     }
 
-    /// Those keys and their lock record.
     fn locked(
         slots: &mut Slots<'_>,
         flip: u8,
@@ -6404,17 +5931,11 @@ mod stack {
         (secret, stored, record)
     }
 
-    /// The key of the next epoch in the lock tests.
     fn next_key(flip: u8) -> [u8; 32] {
         flipped_epoch_key(flip ^ 0x5a)
     }
 
-    /// The secrets the work with lock records handles on keys made from `flip`ped patterns: both
-    /// layers' derivations, cipher keys, message keys, round keys and keystreams, the record the
-    /// outer layer holds and the plaintext of the inner, both keys, the key of the epoch and the
-    /// hedges of the nonces under it, and for an unlock the derivation of the stored key's
-    /// identifier, for a carry the new outer layer, the key of the next epoch and the hedge of the
-    /// nonce under it; and the start of each outer layer.
+    /// The secrets the work handles, and the start of each outer layer.
     fn lock_handled(flip: u8, work: Locking) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         let mut memory = [const { Slot::empty() }; 4];
         let mut epoch_memory = Epoch::empty();
@@ -6484,9 +6005,8 @@ mod stack {
         (handled, open)
     }
 
-    /// The pieces of [`lock_handled`] that depend on the key, but for the number of an epoch and
-    /// the nonce of the inner record that follows it in an outer layer: the code holds both in the
-    /// open.
+    /// Leaves out the start of each outer layer: the epoch number and the inner nonce, which are
+    /// public.
     fn lock_pieces(work: Locking) -> Vec<Vec<u8>> {
         let (handled, open) = lock_handled(0, work);
         let (mut others, _) = lock_handled(0xff, work);
@@ -6540,9 +6060,7 @@ mod stack {
         });
     }
 
-    /// An unlock under another key from a secret decrypts the outer layer and fails at the inner:
-    /// the record of the outer layer and the secrets of both trials are left on the stack without
-    /// the wipe, and none with it.
+    /// Another key from a secret still decrypts the outer layer, and fails only at the inner.
     #[test]
     fn a_rejected_unlock_leaves_no_residue() {
         let handled = |flip| {
@@ -6617,9 +6135,8 @@ mod stack {
         });
     }
 
-    /// A source that panics on any of its calls leaves none of what a lock or a carry handles on
-    /// the stack, at the panic or after it, and writes nothing. Each runs from the state its test
-    /// above runs it from, so it handles the same values until the panic.
+    /// Each runs from the state its test above runs it from, so it handles the same values until
+    /// the panic.
     #[test]
     fn a_panicking_source_leaves_no_secret_of_a_lock_or_a_carry() {
         for (work, calls) in [(Locking::Lock, 2), (Locking::Carry, 1)] {
@@ -6649,8 +6166,6 @@ mod stack {
         }
     }
 
-    /// The secrets a combination of keys made from `flip`ped patterns handles: the derivation of the
-    /// new key, the key itself and the derivation of its identifier, and both keys it takes.
     fn combination_handled(flip: u8) -> Vec<Vec<u8>> {
         let key = pattern(71, 3, 32, flip);
         let salt = pattern(73, 5, 32, flip);
@@ -6685,8 +6200,6 @@ mod stack {
         });
     }
 
-    /// A challenge is written into the caller's buffer, and no piece of it or of its derivation is
-    /// left on the stack.
     #[test]
     fn a_challenge_leaves_no_residue() {
         let handled = |flip| {
@@ -6709,8 +6222,7 @@ mod stack {
         });
     }
 
-    /// A reveal writes the key into the caller's buffer and leaves no piece of it on the stack;
-    /// without the wipe after it, a build without optimisation leaves the key there.
+    /// Without the wipe, only a build without optimisation leaves the key on the stack.
     #[test]
     fn a_reveal_leaves_no_residue() {
         let key = pattern(37, 11, 32, 0);
@@ -6738,13 +6250,10 @@ mod stack {
         assert_eq!(out[..], key[..]);
     }
 
-    /// The key for transfers of the export tests: 32 bytes.
     fn transfer_bytes(flip: u8) -> [u8; 32] {
         pattern(71, 19, 32, flip).try_into().unwrap()
     }
 
-    /// The child set and a key for transfers, made from `flip`ped patterns, and the record of the
-    /// export of the set under the key.
     fn exported(
         slots: &mut Slots<'_>,
         flip: u8,
@@ -6761,8 +6270,7 @@ mod stack {
         (child, transfer, record)
     }
 
-    /// What is measured: an export or a whole receipt, the trial of a receipt the key does not
-    /// open, or an end.
+    /// `Record` covers an export and the trial of a receipt the key does not open.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Transfer {
         Record,
@@ -6770,10 +6278,6 @@ mod stack {
         End,
     }
 
-    /// The secrets the work handles on the sets made from `flip`ped patterns: the key for
-    /// transfers, the derivation of the cipher key from it, and what the cipher works with on the
-    /// record or on the end. For a whole receipt, also the derivations of the identifiers of the
-    /// child's keys.
     fn transfer_handled(flip: u8, work: Transfer) -> Vec<Vec<u8>> {
         let mut memory = [const { Slot::empty() }; 4];
         let mut epoch_memory = Epoch::empty();
@@ -6856,8 +6360,6 @@ mod stack {
         });
     }
 
-    /// The key for transfers and the record of the export of the child set under it, ready to be
-    /// received in the same slots: the export ended and the set released.
     fn to_receive(slots: &mut Slots<'_>) -> (Handle<'static>, [u8; RECORD_LEN]) {
         let (child, transfer, record) = exported(slots, 0);
         slots
@@ -6879,8 +6381,7 @@ mod stack {
         });
     }
 
-    /// A record of an export whose ciphertext was changed is decrypted under the key for transfers
-    /// before the tag fails; without the wipe that shows.
+    /// A changed record is still decrypted before its tag fails.
     #[test]
     fn a_rejected_receipt_leaves_no_residue() {
         let pieces = transfer_pieces(Transfer::Record);
@@ -6900,9 +6401,8 @@ mod stack {
         });
     }
 
-    /// Writing the end of an export and receiving it leave nothing of the key for transfers, of its
-    /// derivation or of the cipher; without the wipe they do. Each in slots of its own, so that the
-    /// end has the nonce the secrets were worked out with.
+    /// Each case runs in slots of its own, so the end has the nonce the secrets were worked out
+    /// with.
     #[test]
     fn an_end_leaves_no_residue() {
         let pieces = transfer_pieces(Transfer::End);
@@ -6940,9 +6440,6 @@ mod stack {
         }
     }
 
-    /// The wipes that follow an export, its end and their receipts reach as deep as those after a
-    /// wrap, also when the call fails, and no call reaches deeper than its documentation says it
-    /// needs.
     #[test]
     fn transfers_wipe_and_need_the_stack_documented() {
         let mut memory = [const { Slot::empty() }; 4];
@@ -6999,8 +6496,8 @@ mod stack {
         }
     }
 
-    /// The wipe that follows covers more than the cipher uses; the derivations a wrap and an
-    /// unwrap run are measured with the derivation, and wiped after it besides.
+    /// The derivations a wrap and an unwrap run are measured with the derivation, and wiped after
+    /// it besides.
     #[test]
     fn the_wipe_is_deeper_than_the_cipher() {
         let key = [7; 32];
@@ -7030,12 +6527,9 @@ mod stack {
         }
     }
 
-    /// The stack a wrap or an unwrap and a load need in this build, in bytes.
     const WRAP_STACK: usize = 1024 * WRAP_NEEDS[if cfg!(lethewis_unoptimised) { 1 } else { 0 }];
     const LOAD_STACK: usize = 1024 * LOAD_NEEDS[if cfg!(lethewis_unoptimised) { 1 } else { 0 }];
 
-    /// The wipes that follow a wrap, an unwrap and a reveal reach as deep as they are meant to, also
-    /// when the call fails, and no call reaches deeper than its documentation says it needs.
     #[test]
     fn wraps_unwraps_and_loads_wipe_and_need_the_stack_documented() {
         let mut memory = [const { Slot::empty() }; 12];
@@ -7127,8 +6621,6 @@ mod stack {
         }
     }
 
-    /// The wipes that follow a lock, an unlock and a carry reach as deep as those after a wrap, also
-    /// when the call fails, and no call reaches deeper than its documentation says it needs.
     #[test]
     fn lock_records_wipe_and_need_the_stack_documented() {
         let mut memory = [const { Slot::empty() }; 4];
@@ -7179,8 +6671,6 @@ mod stack {
         }
     }
 
-    /// The wipes that follow a challenge and a combination reach as deep as those after a load, also
-    /// when the call fails, and neither reaches deeper than its documentation says it needs.
     #[test]
     fn calls_on_keys_from_a_secret_wipe_and_need_the_stack_documented() {
         let mut memory = [const { Slot::empty() }; 4];

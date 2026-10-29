@@ -3,8 +3,6 @@
 
 //! The work of every call that handles a key, run with data-independent timing on.
 
-/// Runs `work` with data-independent timing on, where the processor and the operating system
-/// offer it.
 pub(crate) fn with<R>(work: impl FnOnce() -> R) -> R {
     #[cfg(test)]
     let _within = Within::enter();
@@ -39,22 +37,17 @@ impl Drop for Within {
     }
 }
 
-/// Notes whether the work on a secret that calls it runs within [`with`], with the mode on where
-/// it is offered.
 #[cfg(test)]
 pub(crate) fn note() {
     let now = WITHIN.get() > 0 && lethewis_dit::active() == lethewis_dit::supported();
     SEEN.set(Some(SEEN.get().unwrap_or(true) && now));
 }
 
-/// Whether all the work on secrets on this thread since the last look ran so, and forget it.
 #[cfg(test)]
 pub(crate) fn seen() -> Option<bool> {
     SEEN.take()
 }
 
-/// Runs `work`, a call, and asserts that it derives, runs the cipher or X-Wing, or reads or writes
-/// words inside [`with`] only, and with the mode on where it is offered.
 #[cfg(test)]
 pub(crate) fn timed<T>(work: impl FnOnce() -> T) -> T {
     let _ = seen();

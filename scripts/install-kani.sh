@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 # SPDX-License-Identifier: AGPL-3.0-only
 
-# Installs the pinned Kani: the verifier from crates.io, then its bundle of CBMC and Kani's
-# compiler, checked against the digest in scripts/kani-pin.sh.
+# Installs the pinned Kani from crates.io, then its CBMC and compiler bundle, checked against
+# scripts/kani-pin.sh.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 # shellcheck source=scripts/kani-pin.sh

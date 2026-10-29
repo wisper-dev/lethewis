@@ -3,13 +3,13 @@
 ## Reporting a vulnerability
 
 Use the private advisory form:
-**[open a private report](https://github.com/wisper-dev/lethewis/security/advisories/new)**. The
+[open a private report](https://github.com/wisper-dev/lethewis/security/advisories/new). The
 report stays invisible until a fix is released.
 
 If the form is unavailable to you, write to <hi@alanwisper.com> with "security lethewis" in the
 subject.
 
-**Do not open a public issue for a vulnerability,** including a draft or a question about whether
+Do not open a public issue for a vulnerability, not even a draft or a question about whether
 something qualifies.
 
 ## Disclosure
@@ -35,7 +35,7 @@ private report before publication.
 
 ## Scope
 
-**In scope:** the crates in this repository.
+In scope are the crates in this repository:
 
 - A key that survives destruction.
 - A key for wrapping that leaves the library in the clear, or a key for external data returned to
@@ -44,7 +44,7 @@ private report before publication.
 - A replacement key created without the caller being told.
 - A counterexample to any property listed as proven in [docs/proofs.md](docs/proofs.md).
 
-**Out of scope,** as stated in the documentation:
+Out of scope, as the documentation states:
 
 - Recovery of data from a copy of the device taken before a key was destroyed.
 - Residue in flash memory readable only by desoldering the chip.

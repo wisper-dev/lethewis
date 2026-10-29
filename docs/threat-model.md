@@ -3,9 +3,11 @@
 This covers the library, not an application built on it: a screen, a network and a user each carry
 threats this document does not reach.
 
-**Lines marked "Intended" are design intentions, not working defences.** A line becomes "In place"
-when the defence works and is checked on every change; what is proven, rather than tested, is
-recorded in [proofs.md](proofs.md). Lines marked "Not defended" are true now and will stay true.
+Sections headed "Intended" are design intentions, not working defences. A section becomes "In
+place" once the defence works and is checked on every change.
+
+What is proven rather than tested is in [proofs.md](proofs.md). Sections headed "Not defended" are
+true now and will stay true.
 
 ## What is protected
 
@@ -17,12 +19,17 @@ Not the data an engine outside the library encrypts with a key it hands out.
 
 ### 1. Someone holding the locked device
 
-**Capability.** Physical possession, commercial forensic tooling, the ability to copy storage and to
+#### Capability
+
+Physical possession, commercial forensic tooling, the ability to copy storage and to
 attempt passwords. No knowledge of the password.
 
-**In place, in the library.** A key is derived from a password with Argon2id over 64 MiB to 2 GiB
-of memory and at least 3 passes. Parameters out of these bounds are neither made nor read, and other
-parameters derive another key, under which no record wrapped under the first key opens.
+#### In place, in the library
+
+A key is derived from a password with Argon2id, over 64 MiB to 2 GiB and 3 passes or more.
+Parameters out of these bounds are neither made nor read.
+
+Other parameters derive another key, under which no record wrapped under the first opens.
 
 A key is also derived from twelve words of the English list of BIP 39. The words a generation
 writes stand for 128 bits of the platform's random source, hedged with the key of the epoch, and
@@ -48,23 +55,35 @@ A backup is an export under a key for transfers derived from the twelve words wi
 own, so not the way in from the same words. It opens with the words alone, on any device and in any
 epoch: a guess at it is a guess at 128 bits. No backup is made under a password.
 
-**Intended.** Parameters tuned to seconds on the target device by the platform layer, and the
-platform layer that puts the challenge to the chip. After destruction, no call returns the key.
+#### Intended
 
-**Not defended.** A device unlocked once since boot holds keys in memory, lock screen or not. Many
-Android devices lack a dedicated secure element, so the password can be attacked off the device on
-fast hardware, where a short secret falls quickly; their share is our estimate. The library is
-intended to record the level actually reached.
+A platform layer that tunes the parameters to seconds on the target device and puts the challenge
+to the chip. After destruction, no call returns the key.
+
+#### Not defended
+
+A device unlocked once since boot holds keys in memory, lock screen or not.
+
+Many Android devices lack a dedicated secure element, so the password can be attacked off the
+device. A short secret then falls quickly on fast hardware.
+
+How many such devices there are is our estimate; the library is meant to record the level reached.
 
 A challenge read on its way to the chip lets guesses at the password run without the chip.
 
 ### 2. Someone who compels the password
 
-**Capability.** Can demand that the owner unlock, lawfully or otherwise.
+#### Capability
 
-**In place, in the library.** A profile's stored key is destroyed by a change of epoch that carries
-none of its lock records and locks it under no key again. Once the change is committed, the old root
-erased and no slot holds the key, the password still derives its key, and that key opens nothing.
+Can demand that the owner unlock, lawfully or otherwise.
+
+#### In place, in the library
+
+A profile's stored key is destroyed by a change of epoch that carries none of its lock records.
+It is locked under no key again.
+
+Once the change is committed, the old root erased and no slot holds the key, the password's key
+opens nothing.
 
 History past a cut-off is archived to an archive key. Its seed opens only under a stored key of
 the archive, which lies only in lock records: under a second password with the chip, or under
@@ -73,15 +92,19 @@ shares, as the application chooses.
 The main password opens the outer layers and shows that an archive exists, not what its batches
 hold, as long as the random source was sound when they were archived.
 
-**Intended.** Give each profile its own entry key, so that a second password derives a different
-profile's key rather than part of the same one.
+#### Intended
 
-**This is not deniable storage.** Whether a second profile exists at all is a question about the
+Give each profile its own entry key, so that a second password derives another profile's key.
+
+This is not deniable storage. Whether a second profile exists at all is a question about the
 storage layer, which is outside this library.
 
-**Not defended.** An adversary who knows a second profile exists and keeps demanding. The library
-cannot demonstrate that a hidden profile is absent. Destruction is a setting the owner enables, and in
-some jurisdictions using it is itself an offence.
+#### Not defended
+
+An adversary who knows of a second profile and keeps demanding. The library cannot show that a
+hidden profile is absent.
+
+Destruction is a setting the owner enables, and in some jurisdictions using it is itself an offence.
 
 An export made before the profile is destroyed still holds the keys of the chats it carried, and
 opens with its key for transfers: the words, or the secret shared with the other device. Asking the
@@ -92,18 +115,25 @@ library cannot tell a share given willingly from one taken.
 
 ### 3. A laboratory reading the flash chip
 
-**Capability.** Desoldering, reading raw flash, recovering superseded writes.
+#### Capability
 
-**In place, in the library.** A record is wrapped under a key derived from its epoch's key, and a
-key set's change is saved only in a new epoch. Once the platform erases the old root, a record left
-on flash from an earlier epoch no longer opens, even with the password; the commit reports how
-surely it was erased.
+Desoldering, reading raw flash, recovering superseded writes.
+
+#### In place, in the library
+
+A record is wrapped under a key derived from its epoch's key. A set's change is saved only in a new
+epoch.
+
+Once the platform erases the old root, an older record left on flash no longer opens, even with the
+password. The commit reports how surely the root was erased.
 
 A lock record is carried into a new epoch without the key from a secret that opens it, and one not
 carried opens no more once the old root is erased: so a way in is revoked. The record of an archive
 key is carried with the profile's stored keys, without the stored key of the archive.
 
-**Intended.** A platform layer whose root the hardware erases.
+#### Intended
+
+A platform layer whose root the hardware erases.
 
 A block of data is encrypted under a key for data, which lies only in records under the profile's
 stored key. Once that key is destroyed and the next epoch committed, a block left on flash is noise,
@@ -112,9 +142,10 @@ as the key's records are.
 A copy carried out under a key for transfers is not noise: on the other device or in a backup, it
 opens with that key.
 
-**Not defended.** Whoever held the key of an epoch while a lock record lived, and knows the secret it
-was locked under, keeps the stored key it holds after that way in is revoked. Only a new stored key,
-with every way in locked again, stands against that.
+#### Not defended
+
+Whoever held an epoch's key while a lock record lived, and knows its secret, keeps the stored key
+it holds. Only a new stored key, with every way in locked again, stands against that.
 
 A record of an export is in no epoch: one left on flash, or a backup kept elsewhere, opens with its
 key for transfers after any change of epoch. No export tells its age, and an older backup under the
@@ -127,11 +158,17 @@ and the flash.
 
 ### 4. An attacker on the same device
 
-**Capability.** Another application, possibly with elevated privileges.
+#### Capability
 
-**In place.** Keys are held only in fixed-size slots whose memory the caller provides, each slot a
-set of up to three keys. A key is held in one place only, whatever purpose it serves: a load of a key
-the slots already hold, or of a set that holds one key twice, is refused.
+Another application, possibly with elevated privileges.
+
+#### In place
+
+Keys are held only in fixed-size slots whose memory the caller provides, each a set of up to three
+keys.
+
+A key is held in one place only, whatever its purpose. Loading a key the slots already hold, or a
+set holding one key twice, is refused.
 
 Each key wraps only at its level. A key from a secret wraps only stored keys, for wrapping or of
 the archive, in lock records, and no call wraps a key from a secret.
@@ -308,11 +345,16 @@ The stack below each call on a block is wiped, 8 KiB after a beginning or 24 KiB
 64 KiB without optimisation. Tests read it back for the key, the key of the epoch, the key of the
 chunks, what the hedge, the derivations and the cipher make of them, and the data.
 
-**Intended.** Drop keys from memory when the device locks.
+#### Intended
 
-**Not defended.** Copies left by a value move, a buffer reallocation, a CPU register, swap, or a
-crash dump. A set of slots leaked instead of dropped keeps its keys in memory. A system component
-with elevated privileges is outside what process isolation provides.
+Drop keys from memory when the device locks.
+
+#### Not defended
+
+Copies left by a value move, a buffer reallocation, a CPU register, swap or a crash dump. A set of
+slots leaked instead of dropped keeps its keys in memory.
+
+A system component with elevated privileges is beyond what process isolation provides.
 
 Whoever holds the key of the epoch and the profile's stored key can change the public key in the
 record of the archive key. Batches archived until its next load go to their key; they come from
@@ -402,28 +444,36 @@ A call on shares needs at least the 8 KiB, or 64 KiB, its wipe reaches.
 
 ### 5. The supply chain
 
-**Capability.** A compromised dependency, a stolen maintainer credential, a rewritten tag.
+#### Capability
 
-**In place.** Licence and advisory gates, a committed lockfile, an exact compiler pin, tag rules that
-forbid moving or deleting a tag, publication only from the build with a thirty-minute credential,
-and a recorded review of every version of every dependency, including any build script or macro
-it brings, read in full where the crate handles key material; the continuous integration check fails
-without one, and nothing from a dependency is built before that check passes. The repository holds no
-Cargo configuration file, no manifest patches or replaces a dependency, no toolchain file names a
-compiler by path, and every dependency comes from crates.io; the same check enforces it.
+A compromised dependency, a stolen maintainer credential, a rewritten tag.
 
-**Not defended.** An undiscovered vulnerability in a dependency. An advisory published outside the
-RustSec database, which is the only one the advisory gate reads. A compromise of the hosting
-platform or of a maintainer's account. A dependent that resolves a newer version of a dependency
-than the one reviewed here receives code this project has not read. A hostile change that also edits
-these checks: they run from the change under review, so they catch a mistake, not an attack, and
-what stands against an attack is the reading of every changed file before it is merged.
+#### In place
+
+- Licence and advisory gates, a committed lockfile and an exact compiler pin.
+- Tag rules that forbid moving or deleting a tag, and publication only from the build with a
+  thirty-minute credential.
+- A recorded review of every version of every dependency, with any build script or macro it brings.
+  Code that handles key material is read in full.
+- CI fails without that review, and nothing from a dependency is built before it passes.
+- No Cargo configuration file, no patched or replaced dependency and no compiler named by path.
+  Every dependency comes from crates.io, and CI enforces all of this.
+
+#### Not defended
+
+- An undiscovered vulnerability in a dependency.
+- An advisory outside the RustSec database, the only one the advisory gate reads.
+- A compromise of the hosting platform or of a maintainer's account.
+- A dependent that resolves a newer version of a dependency than the one reviewed here.
+- A hostile change that also edits these checks: they run from the change itself. Against an attack
+  stands only the reading of every changed file before merging.
 
 ### 6. Timing and other side channels
 
-**Not measured.** The cipher compares its tag, and the library compares the identifier of the
-wrapping key a record names and the check a block's header holds, through a comparison written for
-constant time: inline assembly on x86-64 and aarch64, best effort on other targets.
+Not measured. The cipher's tag, the identifier of a record's wrapping key and a block's check are
+compared in constant time.
+
+The comparison is inline assembly on x86-64 and aarch64, and best effort on other targets.
 
 Which position of a set a block is under is worked out with no branch on which keys match. The key
 is then read from that position, so the timing may tell which position it is, and the count of

@@ -41,12 +41,12 @@ use crate::xwing::{self, CIPHERTEXT_LEN, PUBLIC_LEN, model::answered as xwing_an
 
 type Bytes = [u8; 64];
 type Id = [u8; ID_LEN];
-/// One of each position. Keys and identifiers are kept apart rather than in one array: an array
-/// of them is compared in one piece, which needs a deeper unwinding than any key.
+/// Keys and identifiers are kept apart, not in one array. An array of them is compared in one
+/// piece, which needs a deeper unwinding than any key.
 type Three<T> = (T, T, T);
 
-/// Everything a slot holds. A structure read by field, not a tuple taken apart: Kani 0.68.0
-/// reports spurious failures on values taken from a large tuple by a pattern.
+/// A structure read by field, not a tuple taken apart. Kani 0.68.0 reports spurious failures on
+/// values taken from a large tuple by a pattern.
 #[derive(Clone, Copy, PartialEq)]
 struct Snapshot {
     occupancy: Occupancy,
@@ -90,8 +90,8 @@ fn snapshot(slot: &Slot) -> Snapshot {
     }
 }
 
-// Kani 0.68.0 reports spurious failures when a key buffer is read through a symbolic index, so
-// the reads below take every element and then pick one, with no check left behind a branch.
+// Kani 0.68.0 reports spurious failures when a key buffer is read through a symbolic index. So the
+// reads below take every element and pick one, leaving no check behind a branch.
 
 fn slot_at<'s>(slots: &'s Slots<'_>, index: usize) -> &'s Slot {
     let (first, second) = (&slots.memory[0], &slots.memory[1]);
@@ -125,7 +125,6 @@ fn same<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {
     same_bytes(a, b)
 }
 
-/// The same for two slices of one length.
 fn same_bytes(a: &[u8], b: &[u8]) -> bool {
     a.chunks(64).zip(b.chunks(64)).all(|(x, y)| x == y)
 }
@@ -134,18 +133,15 @@ fn snapshots(slots: &Slots<'_>) -> [Snapshot; 2] {
     [snapshot(&slots.memory[0]), snapshot(&slots.memory[1])]
 }
 
-/// Every slot but `changed` matches its snapshot.
 fn unchanged_except(slots: &Slots<'_>, before: &[Snapshot; 2], changed: usize) -> bool {
     (0..2).all(|index| index == changed || snapshot(&slots.memory[index]) == before[index])
 }
 
-/// The same, from the snapshots taken after a call: slots read once cost the solver about half
-/// of what a read at each check costs.
+/// Slots read once cost the solver about half of what a read at each check costs.
 fn unchanged_but(after: &[Snapshot; 2], before: &[Snapshot; 2], changed: usize) -> bool {
     (0..2).all(|index| index == changed || after[index] == before[index])
 }
 
-/// Whether the slot holds no key, no identifier at any position and no state of a transfer.
 fn wiped(slot: &Slot) -> bool {
     let now = snapshot(slot);
     now.lengths == [KeyLength::Bytes32; MEMBERS]
@@ -174,7 +170,6 @@ fn any_key(key: &mut Key) {
     key.fill_any();
 }
 
-/// The first `length` bytes of `bytes`, followed by zeros.
 fn padded(bytes: Bytes, length: KeyLength) -> Bytes {
     let mut out = bytes;
     if length == KeyLength::Bytes32 {
@@ -183,19 +178,8 @@ fn padded(bytes: Bytes, length: KeyLength) -> Bytes {
     out
 }
 
-/// A slot in any state, for any purpose, with any generation and any stages whose primary is
-/// enabled; when loaded, holding a key of a length its purpose takes and any identifier at each
-/// position the stages fill, a set of one unless it is for external data or for data, from a secret
-/// or stored if it is for wrapping, changed and wrapped for the next epoch or not, and held by a
-/// record of this epoch or not. A loaded set for external data or for data came in a transfer or
-/// not, under a key of either slot with any generation; a loaded key for transfers has any chain
-/// and direction. A free or retired slot keeps the purpose of the set it last held, and holds no
-/// state of a transfer. Every load, addition and unwrap keeps a key's length one its purpose takes,
-/// every load and unwrap makes a set neither for external data nor for data a set of one, and no
-/// change or addition takes one. A receipt marks only the set for external data it loads, and a
-/// receipt of a block only the set for data it makes, with the slot of its key; only an export, a
-/// receipt and their ends give a key for transfers a chain and a direction; every release clears
-/// the state of a transfer. Their proofs show it.
+/// A slot in any state. Its restrictions hold after every call, as the proofs of loads, additions,
+/// unwraps, receipts, exports, their ends and releases show.
 fn any_slot() -> Slot {
     any_slot_in(any_occupancy())
 }
@@ -262,8 +246,6 @@ fn any_slot_in(occupancy: Occupancy) -> Slot {
     slot
 }
 
-/// Any epoch with any key and any count of draws, and, if `changing`, with a change to the next
-/// under way and any key for it.
 fn any_epoch(changing: bool) -> Epoch {
     let mut epoch = Epoch::empty();
     epoch.number = kani::any();
@@ -276,22 +258,19 @@ fn any_epoch(changing: bool) -> Epoch {
     epoch
 }
 
-/// The first 32 bytes of `key`.
 fn first_half(key: &Key) -> [u8; 32] {
     let mut half = [0; 32];
     half.copy_from_slice(&key.bytes()[..32]);
     half
 }
 
-// Three cases by the state of the first slot cover every state; the slot written has a constant
-// state on every path, since a write to a slot chosen at run time costs both.
+// Three cases by the first slot's state cover every state. The slot written has a constant state on
+// every path, since writing a slot chosen at run time costs both.
 
-/// `check` with the first slot free, the slot written, and the second in any state.
 fn into_the_first<T>(check: impl Fn([Slot; 2]) -> T) -> T {
     check([any_slot_in(Occupancy::Free), any_slot()])
 }
 
-/// `check` with the first slot in `first`, and the second free, loaded or retired.
 fn past_a<T>(first: Occupancy, check: impl Fn([Slot; 2]) -> T) -> T {
     match kani::any::<u8>() % 3 {
         0 => check([any_slot_in(first), any_slot_in(Occupancy::Free)]),
@@ -300,7 +279,6 @@ fn past_a<T>(first: Occupancy, check: impl Fn([Slot; 2]) -> T) -> T {
     }
 }
 
-/// Whether a loaded slot of `before` holds a key with the identifier `id`.
 fn held(before: &[Snapshot; 2], id: &Id) -> bool {
     before.iter().any(|snapshot| {
         snapshot.occupancy == Occupancy::Loaded
@@ -310,8 +288,6 @@ fn held(before: &[Snapshot; 2], id: &Id) -> bool {
     })
 }
 
-/// Whether a loaded slot of `before` for a purpose other than `purpose` holds a key with the
-/// identifier `id`.
 fn held_for_another(before: &[Snapshot; 2], id: &Id, purpose: Purpose) -> bool {
     before.iter().any(|snapshot| {
         snapshot.occupancy == Occupancy::Loaded
@@ -322,9 +298,7 @@ fn held_for_another(before: &[Snapshot; 2], id: &Id, purpose: Purpose) -> bool {
     })
 }
 
-/// A platform source that writes any bytes and then either succeeds or fails, as a real one
-/// may fail after writing part of its output. It remembers how often and for how many bytes it
-/// was asked, how often it answered, and what it wrote.
+/// A platform source that writes any bytes, then succeeds or fails: a real one may fail midway.
 struct AnyEntropy {
     written: Bytes,
     calls: u8,
@@ -392,8 +366,6 @@ fn widen(handle: Handle<'_>) -> Handle<'static> {
     }
 }
 
-/// Imports one key of either length with any bytes for `purpose`. Returns the outcome and, on
-/// success, the bytes and length the slot must now hold.
 fn import_any(
     slots: &mut Slots<'_>,
     purpose: Purpose,
@@ -422,9 +394,8 @@ fn import_any(
     (result.map(widen), expected, length)
 }
 
-/// Loads one key by any of the three ways, with any key and length, for `purpose`. Returns the
-/// outcome, the bytes and length the slot must hold on success, whether a platform source was
-/// asked and failed, and whether the key was imported.
+/// Returns the outcome and the bytes and length the slot must hold on success. Then whether a
+/// platform source was asked and failed, and whether the key was imported.
 fn load_any(
     slots: &mut Slots<'_>,
     purpose: Purpose,
@@ -472,7 +443,6 @@ fn load_any(
             "the source writes into a buffer of the library's, not into the slot",
         );
     }
-    // What the slot must hold: the hedge of what the source wrote, worked out from the model.
     let mut hedged = [0; 64];
     if length == KeyLength::Bytes32 {
         let mut drawn = [0; 32];
@@ -504,10 +474,8 @@ fn load_any(
     (result.map(widen), hedged, length, entropy.failed, false)
 }
 
-/// Whether `handle`, issued for a set whose key at `position` is `expected` of `length`,
-/// either still reaches exactly that key in a slot loaded with its generation, or can never be
-/// live again: its slot is retired or has moved past its generation, which no call ever moves
-/// back.
+/// A slot retired or past the handle's generation is never live for it again: no call moves
+/// generations back.
 fn own_key_or_never_again(
     slots: &Slots<'_>,
     handle: &Handle<'_>,
@@ -540,7 +508,6 @@ fn own_key_or_never_again(
         || slot.generation > handle.generation
 }
 
-/// The number, keys, state and count of draws of the epoch.
 fn epoch_snapshot(slots: &Slots<'_>) -> (u64, [u8; 32], [u8; 32], bool, u64) {
     (
         slots.epoch.number,
@@ -560,8 +527,6 @@ fn forged(id: usize) -> Handle<'static> {
     }
 }
 
-/// A handle of this set naming either slot with any generation, and any position whose key the
-/// handle reaches exactly or that can never be live again.
 struct Tracked {
     handle: Handle<'static>,
     position: usize,
@@ -601,8 +566,6 @@ fn track(slots: &Slots<'_>, id: usize) -> Tracked {
     }
 }
 
-/// After one step: the tracked handle still reaches exactly its own key or can never be live
-/// again, and a live one stays live unless it was released.
 fn kept(slots: &Slots<'_>, id: usize, tracked: &Tracked, released: bool) {
     kani::assert(
         own_key_or_never_again(
@@ -624,11 +587,6 @@ fn kept(slots: &Slots<'_>, id: usize, tracked: &Tracked, released: bool) {
     );
 }
 
-/// The step of an import, from `memory`: for any handle of this set and any position whose key
-/// the handle reaches exactly or that can never be live again, the import keeps it so, and a
-/// live handle stays live; a handle the import issues is a live handle of this set that
-/// reaches exactly its own key. Returns whether the import succeeded and whether the handle
-/// was live.
 fn import_step(mut memory: [Slot; 2]) -> (bool, bool) {
     let id = memory.as_ptr().addr();
     let mut epoch = any_epoch(false);
@@ -652,11 +610,8 @@ fn import_step(mut memory: [Slot; 2]) -> (bool, bool) {
     (result.is_ok(), tracked.live)
 }
 
-/// The step of an import with the first slot free; with the next two and
-/// `a_step_by_a_release`, one step of any sequence of imports and releases from any state of
-/// two slots. By induction over the steps, from the moment a handle is issued it reaches
-/// exactly its own keys until it is released, and after that every call refuses it, also while
-/// its slot holds a new set.
+/// With the next two and `a_step_by_a_release`, one step of any sequence of imports and releases.
+/// By induction over the steps, a handle reaches exactly its own keys until it is released.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_step_by_an_import_into_the_first_slot() {
@@ -668,7 +623,6 @@ fn a_step_by_an_import_into_the_first_slot() {
     kani::cover!(imported && live, "a key is imported beside a live handle");
 }
 
-/// The step of an import with the first slot loaded.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_step_by_an_import_past_a_loaded_slot() {
@@ -680,8 +634,7 @@ fn a_step_by_an_import_past_a_loaded_slot() {
     kani::cover!(imported && live, "a key is imported beside a live handle");
 }
 
-/// The step of an import with the first slot retired, where no handle is live beside a free
-/// slot.
+/// With the first slot retired, no handle is live beside a free slot.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_step_by_an_import_past_a_retired_slot() {
@@ -689,11 +642,6 @@ fn a_step_by_an_import_past_a_retired_slot() {
     kani::cover!(imported, "a key is imported beside a released handle");
 }
 
-/// The step of a release, from any state of two slots: for any handle of this set and any
-/// position whose key the handle reaches exactly or that can never be live again, the release
-/// keeps it so, and a live handle stays live unless it is the one released; a release of a live
-/// handle wipes every key and identifier of its set at once, unless the set has changed in
-/// this epoch, and any other is refused.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_step_by_a_release() {
@@ -738,8 +686,6 @@ fn a_step_by_a_release() {
     kept(&slots, id, &tracked, released);
 }
 
-/// From any state of two slots, a handle whose set number is not this set's is refused,
-/// whatever slot and generation it names, and no slot changes.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_handle_from_other_slots_is_refused() {
@@ -774,9 +720,6 @@ fn a_handle_from_other_slots_is_refused() {
     kani::assert(unchanged_except(&slots, &before, 2), "no slot changes");
 }
 
-/// A slot in any state and with any generation whose buffers hold keys of any bytes and either
-/// length and any identifiers at every position, loaded or not, and changed or not and in a
-/// transfer if loaded.
 fn any_dirty_slot() -> Slot {
     let mut slot = Slot::empty();
     slot.generation = kani::any();
@@ -809,8 +752,6 @@ fn any_dirty_slot() -> Slot {
     slot
 }
 
-/// From any state of two slots, with any bytes left in any buffer, creating `Slots` wipes every
-/// key and identifier, loads no slot and leaves none changed, and takes the epoch and its key.
 #[kani::proof]
 #[kani::unwind(65)]
 fn creating_slots_wipes_every_key() {
@@ -859,23 +800,17 @@ fn creating_slots_wipes_every_key() {
     }
 }
 
-/// Whether a key for `purpose` may come from the caller's bytes, as the documentation of the
-/// purposes states it: a key for wrapping, for external data or for transfers. Written apart
-/// from the code.
+/// As the documentation of the purposes states it, written apart from the code.
 fn takes_bytes(purpose: Purpose) -> bool {
     purpose == Purpose::Wrap || purpose == Purpose::ExternalData || purpose == Purpose::Transfer
 }
 
-/// Whether a key for `purpose` may be generated from the platform's source alone, as the
-/// documentation of the purposes states it: any but a key for transfers and an archive seed.
-/// Written apart from the code.
+/// As the documentation of the purposes states it, written apart from the code.
 fn generated_alone(purpose: Purpose) -> bool {
     purpose != Purpose::Transfer && purpose != Purpose::Archive
 }
 
-/// Whether a record under a stored key may hold a set for `purpose`, as the documentation of the
-/// purposes states it: external data, transfers, the outer layers of an archive and data.
-/// Written apart from the code.
+/// As the documentation of the purposes states it, written apart from the code.
 fn kept_in_a_record(purpose: Purpose) -> bool {
     purpose == Purpose::ExternalData
         || purpose == Purpose::Transfer
@@ -883,26 +818,11 @@ fn kept_in_a_record(purpose: Purpose) -> bool {
         || purpose == Purpose::Data
 }
 
-/// Whether a lock record may hold a set for `purpose`, as the documentation of the purposes
-/// states it: a stored key for wrapping, or for wrapping the seed of an archive key. Written
-/// apart from the code.
+/// As the documentation of the purposes states it, written apart from the code.
 fn kept_in_a_lock(purpose: Purpose) -> bool {
     purpose == Purpose::Wrap || purpose == Purpose::ArchiveWrap
 }
 
-/// A load by import or from the platform source for any purpose, from `memory`: it takes the
-/// first free slot, issues that slot's generation, keeps it in the slot and leaves a set of one
-/// there: exactly the expected bytes at the first position, zero past the key's length, enabled
-/// and the primary, with the purpose given and the identifier derived from those bytes and
-/// their length alone, nothing at the other positions, and no state of a transfer; an import
-/// fails with `WrongPurpose` first for a key only the library creates, and a generation for a key
-/// for transfers or an archive seed; a load fails with `WrongLength`
-/// then for a length the purpose does not take, then with `NoFreeSlot` without a free slot,
-/// with `EntropyFailed` when the source fails, with `DerivationFailed` when the derivation
-/// fails, and with `DuplicateKey` exactly when a loaded slot holds a key with that identifier,
-/// for any purpose; a failed load changes no slot, and neither a refused length nor a full set
-/// asks the source; no load panics or overflows. Returns the outcome, and whether a slot for
-/// another purpose holds the key.
 fn load_from(mut memory: [Slot; 2]) -> (Result<Handle<'static>, Error>, bool) {
     let mut epoch = any_epoch(kani::any());
     let mut slots = Slots {
@@ -1013,7 +933,6 @@ fn load_from(mut memory: [Slot; 2]) -> (Result<Handle<'static>, Error>, bool) {
     (result, held_for_another(&before, &id, purpose))
 }
 
-/// A load with the first slot free; with the next two, any state of two slots.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_load_into_the_first_slot() {
@@ -1024,7 +943,6 @@ fn a_load_into_the_first_slot() {
     );
 }
 
-/// A load with the first slot loaded.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_load_past_a_loaded_slot() {
@@ -1040,7 +958,7 @@ fn a_load_past_a_loaded_slot() {
     kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
 }
 
-/// A load with the first slot retired, where no key is held beside a free slot.
+/// With the first slot retired, no key is held beside a free slot.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_load_past_a_retired_slot() {
@@ -1048,13 +966,8 @@ fn a_load_past_a_retired_slot() {
     kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
 }
 
-/// A derivation from a password, from `memory`, with any parameters within the bounds, any
-/// password of up to two bytes and any working memory: an empty password, and memory too small
-/// for the parameters, are refused before anything else; a failing Argon2 is `DerivationFailed`,
-/// never the failure of a platform source; the password is wiped exactly when the derivation
-/// succeeds; a failed derivation changes no slot, and one that succeeds loads the first free
-/// slot with a 32-byte key and the identifier derived from it. The rest is the load of a
-/// generation, proven above for a source that writes any bytes and may fail.
+/// The rest is the load of a generation, proven above for a source that writes any bytes and may
+/// fail.
 fn derivation_from(mut memory: [Slot; 2]) -> Result<Handle<'static>, Error> {
     let mut epoch = any_epoch(false);
     let mut slots = Slots {
@@ -1123,14 +1036,12 @@ fn derivation_from(mut memory: [Slot; 2]) -> Result<Handle<'static>, Error> {
     result.map(widen)
 }
 
-/// A derivation from a password with the first slot free.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_derivation_from_a_password_into_the_first_slot() {
     let _ = into_the_first(derivation_from);
 }
 
-/// A derivation from a password with the first slot loaded.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_derivation_from_a_password_past_a_loaded_slot() {
@@ -1142,8 +1053,7 @@ fn a_derivation_from_a_password_past_a_loaded_slot() {
     kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
 }
 
-/// A derivation from a password with the first slot retired, where no key is held beside a
-/// free slot.
+/// With the first slot retired, no key is held beside a free slot.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_derivation_from_a_password_past_a_retired_slot() {
@@ -1151,13 +1061,8 @@ fn a_derivation_from_a_password_past_a_retired_slot() {
     kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
 }
 
-/// A derivation from any 16 bytes that twelve words or two shares stand for, from `memory`, of a
-/// key from a secret or a key for transfers, under the label of `branch`: a failure of a
-/// derivation is `DerivationFailed`, and nothing else is, never the failure of a platform source;
-/// a failed derivation changes no slot, and one that succeeds loads the first free slot with the
-/// 32-byte key for that purpose derived from the bytes under that label and the identifier derived
-/// from it. The rest is the load of a generation, proven above for a source that writes any bytes
-/// and may fail.
+/// The rest is the load of a generation, proven above for a source that writes any bytes and may
+/// fail.
 fn derivation_from_a_secret(
     mut memory: [Slot; 2],
     branch: Branch,
@@ -1219,7 +1124,6 @@ fn derivation_from_a_secret(
     result.map(widen)
 }
 
-/// A derivation from a secret with the first slot free, under the label of words or of shares.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_derivation_from_a_secret_into_the_first_slot() {
@@ -1234,7 +1138,7 @@ fn a_derivation_from_a_secret_into_the_first_slot() {
     kani::cover!(result.is_ok() && !shares, "a key is derived from words");
 }
 
-/// A derivation from words with the first slot loaded: past a free slot, a load reads no label.
+/// From words only: past a free slot, a load reads no label.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_derivation_from_words_past_a_loaded_slot() {
@@ -1248,7 +1152,6 @@ fn a_derivation_from_words_past_a_loaded_slot() {
     kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
 }
 
-/// A derivation from words with the first slot retired.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_derivation_from_words_past_a_retired_slot() {
@@ -1258,15 +1161,10 @@ fn a_derivation_from_words_past_a_retired_slot() {
     kani::cover!(result == Err(Error::NoFreeSlot), "no slot is free");
 }
 
-/// Whether two sets of words are the same, compared word by word.
 fn same_words(a: &Words, b: &Words) -> bool {
     a.iter().zip(b).all(|(x, y)| x == y)
 }
 
-/// Any twelve words of any list of three, for either purpose a key from words serves, with the
-/// first slot free: words the list refuses
-/// change no slot and derive nothing; the words are wiped exactly when the derivation succeeds;
-/// a failure of the platform source is never reported; a failed derivation changes no slot.
 /// Where the key goes, the derivations from words above prove.
 #[kani::proof]
 #[kani::unwind(65)]
@@ -1344,11 +1242,6 @@ fn words_are_wiped_exactly_when_their_key_is_derived() {
     });
 }
 
-/// Generation with any list of three, with the first slot free: the source is asked once for
-/// 16 bytes, its failure is `EntropyFailed`, the count of draws grows exactly when it answers,
-/// and the words of its bytes hedged with the key of this epoch are written exactly when the key
-/// is derived; a failed generation changes neither the words nor any slot. During a change of
-/// epoch or not.
 #[kani::proof]
 #[kani::unwind(65)]
 fn words_are_written_exactly_when_their_key_is_generated() {
@@ -1421,8 +1314,6 @@ fn words_are_written_exactly_when_their_key_is_generated() {
     });
 }
 
-/// Without a free slot, from `memory`, generation asks nothing of the source and changes
-/// neither the words nor any slot.
 fn generation_without_a_free_slot(mut memory: [Slot; 2]) {
     let mut epoch = any_epoch(kani::any());
     let mut slots = Slots {
@@ -1444,7 +1335,6 @@ fn generation_without_a_free_slot(mut memory: [Slot; 2]) {
     );
 }
 
-/// The same in each of the four ways two slots can be taken.
 #[kani::proof]
 #[kani::unwind(65)]
 fn no_words_are_generated_without_a_free_slot() {
@@ -1459,21 +1349,15 @@ fn no_words_are_generated_without_a_free_slot() {
     kani::cover!(layout == 3, "both slots retired");
 }
 
-/// Whether two shares are the same, compared byte by byte.
 fn same_share(a: &Share, b: &Share) -> bool {
     a.iter().zip(b).all(|(x, y)| x == y)
 }
 
-/// Whether two sets of shares are the same, compared share by share.
 fn same_shares(a: &Shares, b: &Shares) -> bool {
     a.iter().zip(b).all(|(x, y)| same_share(x, y))
 }
 
-/// Any two shares, with the first slot free: shares that do not fit together derive nothing; shares
-/// are refused for their check exactly when the secret they give fails it, and a key is derived
-/// only from a secret with its check; the shares are wiped exactly when the derivation succeeds; a
-/// failure of the platform source is never reported; a failed derivation changes no slot. Where
-/// the key goes, the derivations from a secret above prove.
+/// Where the key goes, the derivations from a secret above prove.
 #[kani::proof]
 #[kani::unwind(65)]
 fn shares_are_wiped_exactly_when_their_key_is_derived() {
@@ -1551,11 +1435,6 @@ fn shares_are_wiped_exactly_when_their_key_is_derived() {
     });
 }
 
-/// Generation of shares, with the first slot free: the source is asked once for 64 bytes, its
-/// failure is `EntropyFailed`, the count of draws grows exactly when it answers, and the shares of
-/// its bytes hedged with the key of this epoch are written exactly when the key of the secret they
-/// begin with is derived; a failed generation changes neither the shares nor any slot. During a
-/// change of epoch or not.
 #[kani::proof]
 #[kani::unwind(65)]
 fn shares_are_written_exactly_when_their_key_is_generated() {
@@ -1627,8 +1506,6 @@ fn shares_are_written_exactly_when_their_key_is_generated() {
     });
 }
 
-/// Without a free slot, from `memory`, a generation of shares asks nothing of the source and
-/// changes neither the shares nor any slot.
 fn shares_without_a_free_slot(mut memory: [Slot; 2]) {
     let mut epoch = any_epoch(kani::any());
     let mut slots = Slots {
@@ -1650,7 +1527,6 @@ fn shares_without_a_free_slot(mut memory: [Slot; 2]) {
     );
 }
 
-/// The same in each of the four ways two slots can be taken.
 #[kani::proof]
 #[kani::unwind(65)]
 fn no_shares_are_generated_without_a_free_slot() {
@@ -1665,12 +1541,6 @@ fn no_shares_are_generated_without_a_free_slot() {
     kani::cover!(layout == 3, "both slots retired");
 }
 
-/// From any state of two slots and any generation, which includes every state a load leaves: a
-/// handle of this set naming any slot and generation releases a set only if that slot is
-/// loaded with that generation and unchanged in this epoch, and otherwise is refused and changes
-/// nothing; a release wipes
-/// every key and identifier of the set and advances the generation by one, or retires the slot
-/// when the generation runs out; no release panics or overflows.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_handle_releases_only_a_matching_loaded_slot() {
@@ -1750,12 +1620,6 @@ fn a_handle_releases_only_a_matching_loaded_slot() {
     }
 }
 
-/// From any state of two slots, for a handle of this set naming any slot and generation, any
-/// position and any purpose named: revealing writes exactly the 32-byte key at that position
-/// into the output when the handle is live, the set and the call both name external data and
-/// the position holds an enabled key of a set in no unfinished transfer; otherwise it is
-/// refused as `StaleHandle`, `WrongPurpose`, `Unfinished` or `WrongStage`, in that order, and
-/// the output is left as it was. No slot changes either way.
 #[kani::proof]
 #[kani::unwind(65)]
 fn only_an_enabled_key_for_external_data_is_revealed() {
@@ -1856,8 +1720,7 @@ fn only_an_enabled_key_for_external_data_is_revealed() {
     );
 }
 
-/// The key at `position` of a set's plaintext, as long as its length byte says, followed by
-/// zeros, and its length; read from the layout, not by the parser.
+/// Read from the layout, not by the parser.
 fn plaintext_key(plaintext: &[u8; PLAINTEXT_LEN], position: usize) -> (Bytes, KeyLength) {
     let start = 35 + 66 * position;
     let length = if plaintext[start + 1] == 32 {
@@ -1869,21 +1732,7 @@ fn plaintext_key(plaintext: &[u8; PLAINTEXT_LEN], position: usize) -> (Bytes, Ke
     (padded(key, length), length)
 }
 
-/// Admitting any 233 bytes of plaintext of any kind of record into `memory`: the set it holds
-/// goes into the first free slot exactly when a slot is free, the bytes parse, each key's
-/// identifier is derived, and no key is held in a loaded slot or twice in the set; then the
-/// slot holds, at each position the plaintext fills, exactly the key it holds there with the
-/// stage it states and the identifier derived from it, nothing at the others, and the purpose,
-/// primary and revision the plaintext states, unchanged in this epoch, a stored set and in no
-/// transfer, held by a record exactly when it came from a plain record. From a plain record, a
-/// plaintext of another epoch or of a set other than for external data, for transfers, of a
-/// chat for its archive or for data is refused as `RecordRejected`; from a lock record, a
-/// plaintext of an epoch other than zero or of a set other than a stored key for wrapping or
-/// for the archive; from a record of an export, a plaintext of an epoch other than zero or of a
-/// set not for external data; from any, a set neither for external data nor for data other than
-/// a set of one that has never changed. Otherwise no slot changes, and the failure is
-/// `NoFreeSlot`, `RecordRejected`, `DerivationFailed` or `DuplicateKey`, in that order. The
-/// offsets are written from the layout, independently of the parser.
+/// The offsets are written from the layout, independently of the parser.
 fn admit_from(mut memory: [Slot; 2]) {
     let id = memory.as_ptr().addr();
     let changing = kani::any();
@@ -2082,30 +1931,24 @@ fn admit_from(mut memory: [Slot; 2]) {
     );
 }
 
-/// Admitting with the first slot free; with the next two, any state of two slots.
 #[kani::proof]
 #[kani::unwind(65)]
 fn admitting_into_the_first_slot() {
     into_the_first(admit_from);
 }
 
-/// Admitting with the first slot loaded.
 #[kani::proof]
 #[kani::unwind(65)]
 fn admitting_past_a_loaded_slot() {
     past_a(Occupancy::Loaded, admit_from);
 }
 
-/// Admitting with the first slot retired.
 #[kani::proof]
 #[kani::unwind(65)]
 fn admitting_past_a_retired_slot() {
     past_a(Occupancy::Retired, admit_from);
 }
 
-/// Stands in for the cipher of `N` bytes: writes any bytes, accepts or rejects at will or as it is
-/// told, and remembers how often it was called, and the key and nonce it was given, what it wrote
-/// and whether it accepted.
 struct AnyCipher<const N: usize> {
     answer: Option<bool>,
     calls: usize,
@@ -2133,7 +1976,6 @@ impl<const N: usize> AnyCipher<N> {
         }
     }
 
-    /// One that accepts every record when `answer` is true and rejects every one otherwise.
     fn answering(answer: bool) -> Self {
         Self {
             answer: Some(answer),
@@ -2141,7 +1983,6 @@ impl<const N: usize> AnyCipher<N> {
         }
     }
 
-    /// Opens as [`AnyCipher::open`] does, and keeps the associated data it was given.
     fn open_bound(
         &mut self,
         key: &[u8; CIPHER_KEY_LEN],
@@ -2154,8 +1995,7 @@ impl<const N: usize> AnyCipher<N> {
         self.open(key, nonce, buffer, tag)
     }
 
-    /// [`AnyCipher::open_bound`], as the stand-in for the cipher it is in the proofs: one closure
-    /// for every proof, so that one that opens reaches it for one that never does.
+    /// One closure for every proof, so that one that opens reaches it for one that never does.
     fn opening(
         &mut self,
     ) -> impl FnMut(
@@ -2187,15 +2027,6 @@ impl<const N: usize> AnyCipher<N> {
     }
 }
 
-/// For a loaded set in any state of the purpose records of any kind are wrapped under, any
-/// 261-byte record, any associated data of up to two bytes and any behaviour of the cipher its
-/// interface allows: opening tries the key of the set, once, with the cipher key derived from
-/// it and the key of this epoch, or from it alone for a lock record, a record of an export and
-/// the seed of an archive key, each kind with a derivation of its own, and not at all when that
-/// derivation fails,
-/// which is `DerivationFailed`; it leaves in the output the plaintext the cipher wrote when the
-/// cipher accepts it and it names that key's identifier as its parent, and otherwise fails with
-/// `RecordRejected` and leaves the output as it was.
 #[kani::proof]
 #[kani::unwind(65)]
 fn opening_uses_the_key_of_the_parent() {
@@ -2279,7 +2110,6 @@ fn opening_uses_the_key_of_the_parent() {
     );
 }
 
-/// Any kind of record.
 fn any_kind() -> Kind {
     match kani::any::<u8>() % 4 {
         0 => Kind::Record,
@@ -2289,14 +2119,12 @@ fn any_kind() -> Kind {
     }
 }
 
-/// Any context of up to two bytes.
 fn any_context(bytes: &[u8; 2]) -> &[u8] {
     let length: usize = kani::any();
     kani::assume(length <= 2);
     &bytes[..length]
 }
 
-/// Whether `handle` names a loaded slot with its generation, read from the snapshots.
 fn names_loaded(before: &[Snapshot; 2], handle: &Handle<'_>) -> bool {
     handle.index.number() < 2 && {
         let named = snapshot_at(before, handle.index.number());
@@ -2304,23 +2132,8 @@ fn names_loaded(before: &[Snapshot; 2], handle: &Handle<'_>) -> bool {
     }
 }
 
-/// Unwrapping, unlocking or receiving in `memory`, for a handle of this set naming any slot and
-/// generation, any record or lock record and any context of up to two bytes, whatever the
-/// cipher does: an empty context, a stale parent, a parent not of the purpose the kind of
-/// record is wrapped under, one of the other level and a full set are refused, in that order,
-/// and then a key for transfers that writes an export, before anything is decrypted. An unlock
-/// opens the outer layer once, under the key derived
-/// from the key of this epoch, and refuses it as `StaleRecord`, decrypting nothing more, unless
-/// the cipher accepts it and it names this epoch; the inner record it then opens is the one the
-/// outer layer holds. A refused call changes no slot, and one that succeeds needs every trial
-/// the cipher accepts and every derivation to succeed, and changes only the first free slot,
-/// and, for a receipt, the key for transfers, which takes the tag of the record as its chain and
-/// the direction of receipts; the set received waits for the end of that key's export, by its
-/// slot and generation, and is otherwise in no transfer, unchanged and stored. What
-/// the trial of the parent's key gives, `opening_uses_the_key_of_the_parent` proves. A receipt
-/// when `receipt` says so, and otherwise an unwrap or an unlock: the kinds apart cost the
-/// solver less than together. Returns the outcome, the kind of record and the purpose of the
-/// parent.
+/// A receipt apart from an unwrap or an unlock: the kinds apart cost the solver less than
+/// together. What the trial of the parent's key gives, `opening_uses_the_key_of_the_parent` proves.
 fn unwrap_from(mut memory: [Slot; 2], receipt: bool) -> (Result<(), Error>, Kind, Purpose) {
     let id = memory.as_ptr().addr();
     let mut epoch = any_epoch(kani::any());
@@ -2461,8 +2274,8 @@ fn unwrap_from(mut memory: [Slot; 2], receipt: bool) -> (Result<(), Error>, Kind
                     && handle.slots == id
                     && handle.generation == snapshot_at(&before, index).generation
                     && if kind == Kind::Export {
-                        // The parent is loaded, so it is the slot other than the first free one:
-                        // read by a known index, a slot costs the solver one copy, not two.
+                        // The parent is loaded, so it is the slot other than the first free one.
+                        // Read by a known index, a slot costs the solver one copy, not two.
                         let other = if index == 0 { 1 } else { 0 };
                         let mut chained = snapshot_at(&before, other);
                         chained.chain = tag;
@@ -2490,7 +2303,6 @@ fn unwrap_from(mut memory: [Slot; 2], receipt: bool) -> (Result<(), Error>, Kind
     (result.map(|_| ()), kind, named.purpose)
 }
 
-/// The outcomes of an unwrap or an unlock that decrypts, and the refusals of a parent.
 fn every_outcome((result, kind, parent): (Result<(), Error>, Kind, Purpose)) {
     kani::cover!(
         result.is_ok() && kind == Kind::Record,
@@ -2519,7 +2331,6 @@ fn every_outcome((result, kind, parent): (Result<(), Error>, Kind, Purpose)) {
     );
 }
 
-/// The outcomes of a receipt that decrypts, and the refusal of a key not for transfers.
 fn every_receipt((result, _, parent): (Result<(), Error>, Kind, Purpose)) {
     kani::cover!(result.is_ok(), "a record of an export is received");
     kani::cover!(result == Err(Error::RecordRejected), "a record is rejected");
@@ -2533,14 +2344,12 @@ fn every_receipt((result, _, parent): (Result<(), Error>, Kind, Purpose)) {
     );
 }
 
-/// Unwrapping with the first slot free; with the next two, any state of two slots.
 #[kani::proof]
 #[kani::unwind(65)]
 fn an_unwrap_into_the_first_slot() {
     every_outcome(into_the_first(|memory| unwrap_from(memory, false)));
 }
 
-/// Unwrapping with the first slot loaded.
 #[kani::proof]
 #[kani::unwind(65)]
 fn an_unwrap_past_a_loaded_slot() {
@@ -2549,8 +2358,7 @@ fn an_unwrap_past_a_loaded_slot() {
     }));
 }
 
-/// Unwrapping with the first slot retired, where a live parent leaves no slot free, so nothing
-/// is decrypted.
+/// With the first slot retired, a live parent leaves no slot free, so nothing is decrypted.
 #[kani::proof]
 #[kani::unwind(65)]
 fn an_unwrap_past_a_retired_slot() {
@@ -2561,14 +2369,12 @@ fn an_unwrap_past_a_retired_slot() {
     );
 }
 
-/// Receiving with the first slot free; with the next two, any state of two slots.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_receipt_into_the_first_slot() {
     every_receipt(into_the_first(|memory| unwrap_from(memory, true)));
 }
 
-/// Receiving with the first slot loaded.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_receipt_past_a_loaded_slot() {
@@ -2577,7 +2383,7 @@ fn a_receipt_past_a_loaded_slot() {
     }));
 }
 
-/// Receiving with the first slot retired, where a live key for transfers leaves no slot free.
+/// With the first slot retired, a live key for transfers leaves no slot free.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_receipt_past_a_retired_slot() {
@@ -2588,21 +2394,6 @@ fn a_receipt_past_a_retired_slot() {
     );
 }
 
-/// From any state of two slots and of the epoch, with a change to the next under way or not,
-/// for handles of this set naming any slots and generations, any context of up to two bytes and
-/// any record buffer, whatever the platform's source and the cipher do: a wrap, a lock or an
-/// export, as `kind` says, changes no key, stage or epoch; a wrap or a lock marks the set
-/// wrapped for the next epoch only when it succeeds during a change, a wrap marks it held by a
-/// record of this epoch when it succeeds outside one, and an export marks nothing and gives the
-/// key for transfers the tag of the record it writes as its chain and the direction of exports;
-/// each writes the record only when it succeeds, starting with the nonce the source gave last,
-/// hedged at its count with the key the record is wrapped in, or for an export the key of this
-/// epoch; it refuses an empty context, a stale handle, a set wrapped under itself, a parent not
-/// of the purpose the kind takes, a set or a parent of the wrong level, a set of a transfer
-/// that has not ended or an export under a key that receives one, a set changed in this epoch
-/// outside a change unless it is exported, and a failed source. Each draw the source answers is
-/// counted once. Returns the outcome, the set as it was, and whether a change of epoch was
-/// under way.
 fn wrap_from(kind: Kind) -> (Result<(), Error>, Snapshot, bool) {
     let mut memory = [any_slot(), any_slot()];
     let id = memory.as_ptr().addr();
@@ -2781,8 +2572,8 @@ fn wrap_from(kind: Kind) -> (Result<(), Error>, Snapshot, bool) {
             epoch_key
         }[..32],
     );
-    // What a check could fail on is worked out on every path, so that no proof of one kind
-    // leaves a check of another unreached.
+    // What a check could fail on is worked out on every path. So no proof of one kind leaves a
+    // check of another unreached.
     let (length, head) = (wrapping.lengths[0], key_head(&wrapping));
     let record_key = match kind {
         Kind::Record => expected_wrap_key(&wrapping.keys.0, length, &salt),
@@ -2847,8 +2638,6 @@ fn wrap_from(kind: Kind) -> (Result<(), Error>, Snapshot, bool) {
     (result, child, changing)
 }
 
-/// The wrap of a set for external data, of a key for transfers or of a key of a chat for its
-/// archive.
 #[kani::proof]
 #[kani::unwind(234)]
 fn a_wrap_changes_no_slot_and_writes_only_when_it_succeeds() {
@@ -2883,7 +2672,6 @@ fn a_wrap_changes_no_slot_and_writes_only_when_it_succeeds() {
     );
 }
 
-/// The lock of a stored key, for wrapping or of the archive.
 #[kani::proof]
 #[kani::unwind(270)]
 fn a_lock_changes_no_slot_and_writes_only_when_it_succeeds() {
@@ -2902,7 +2690,6 @@ fn a_lock_changes_no_slot_and_writes_only_when_it_succeeds() {
     );
 }
 
-/// The export of a set for external data.
 #[kani::proof]
 #[kani::unwind(234)]
 fn an_export_changes_no_set_and_writes_only_when_it_succeeds() {
@@ -2921,14 +2708,6 @@ fn an_export_changes_no_set_and_writes_only_when_it_succeeds() {
     );
 }
 
-/// From any state of two slots and of the epoch, with a change to the next under way or not,
-/// for any lock record, any output buffer and any context of up to two bytes, whatever the
-/// platform's source and the cipher do: a carry changes no slot and no epoch but its count of
-/// draws. It refuses an empty context and a missing change before it asks the source, and a
-/// failed source before it decrypts, then opens the record once, under the key derived from the
-/// key of this epoch and with the record's nonce, and refuses it as `StaleRecord` unless the
-/// cipher accepts it and it names this epoch. It writes the output only when it succeeds,
-/// starting with the nonce the source gave, hedged with the key of the next epoch.
 #[kani::proof]
 #[kani::unwind(270)]
 fn a_carry_changes_no_slot_and_writes_only_when_it_succeeds() {
@@ -3050,11 +2829,6 @@ fn a_carry_changes_no_slot_and_writes_only_when_it_succeeds() {
     kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
 }
 
-/// From any state of two slots and of the epoch, for handles of these slots naming any slots
-/// and generations, any context of up to two bytes and any record of an archive key: a load
-/// refuses an empty context, then a stale handle, then a store not of the archive or a profile
-/// not for wrapping, then a key from a secret as the profile, and when it refuses none of them,
-/// finds no free slot. It decrypts nothing and changes no slot.
 #[kani::proof]
 #[kani::unwind(1530)]
 fn a_load_of_an_archive_key_refuses_its_parents_before_it_decrypts() {
@@ -3119,8 +2893,7 @@ fn a_load_of_an_archive_key_refuses_its_parents_before_it_decrypts() {
     kani::cover!(result == Err(Error::NoFreeSlot), "a load needs a free slot");
 }
 
-/// The associated data a cipher was given, as far as a context of up to two bytes reaches: its
-/// first bytes, zero past its end, and its length.
+/// The associated data a cipher was given, as far as a context of up to two bytes reaches.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Bound {
     bytes: [u8; seal::model::AAD_HEAD],
@@ -3142,8 +2915,7 @@ impl Bound {
         }
     }
 
-    /// The associated data of a record bound to `context`, of up to two bytes, written out from
-    /// the layout: the label, the version, the length of the context, and the context.
+    /// Written out from the layout.
     fn to(context: &[u8]) -> Self {
         let mut bytes = [0; seal::model::AAD_HEAD];
         bytes[..19].copy_from_slice(b"lethewis key record");
@@ -3157,9 +2929,7 @@ impl Bound {
         }
     }
 
-    /// The associated data of a record of an export or of its end, `label`, bound to `context`,
-    /// of up to two bytes, and chained to `chain`, written out from the layout: the label, the
-    /// version, the length of the context, the chain, and the context.
+    /// Written out from the layout.
     fn chained(label: &[u8; 19], chain: &[u8; TAG_LEN], context: &[u8]) -> Self {
         let mut bytes = [0; seal::model::AAD_HEAD];
         bytes[..19].copy_from_slice(label);
@@ -3174,7 +2944,6 @@ impl Bound {
         }
     }
 
-    /// The associated data a seal of the model of the cipher was given, as the model keeps it.
     fn kept(sealed: &seal::model::Sealed) -> Self {
         Self {
             bytes: sealed.aad,
@@ -3183,8 +2952,6 @@ impl Bound {
     }
 }
 
-/// Any cipher sealing a plaintext of `N` bytes: it writes any bytes and gives any tag, or
-/// fails at will, and keeps what it was given.
 struct AnySeal<const N: usize> {
     calls: usize,
     key: [u8; CIPHER_KEY_LEN],
@@ -3227,8 +2994,7 @@ impl<const N: usize> AnySeal<N> {
         if failed { Err(SealFailed) } else { Ok(tag) }
     }
 
-    /// [`AnySeal::seal`], as the stand-in for the cipher it is in the proofs: one closure for
-    /// every proof, so that one that seals reaches it for one that never does.
+    /// One closure for every proof, so that one that seals reaches it for one that never does.
     fn sealing(
         &mut self,
     ) -> impl FnMut(
@@ -3242,9 +3008,6 @@ impl<const N: usize> AnySeal<N> {
     }
 }
 
-/// Any sealer or opener of the body of a batch: it writes any bytes into its output, succeeds or
-/// fails at will as `failure`, and keeps what it was given: the key, the associated data, and
-/// where its input and output lie and how long they are.
 struct AnyBody {
     calls: usize,
     key: [u8; CIPHER_KEY_LEN],
@@ -3281,8 +3044,8 @@ impl AnyBody {
         (self.key, self.aad) = (*key, Bound::of(aad));
         self.input = (input.as_ptr().addr(), input.len());
         self.output = (output.as_ptr().addr(), output.len());
-        // One copy, not a loop: a loop over a buffer of a length known only at run time unwinds
-        // to the bound of the whole proof.
+        // One copy, not a loop: a loop over a buffer of run-time length unwinds to the whole
+        // proof's bound.
         self.written = kani::any();
         output.copy_from_slice(&self.written[..output.len()]);
         self.failed = kani::any();
@@ -3294,8 +3057,7 @@ impl AnyBody {
         }
     }
 
-    /// [`AnyBody::run`], as the stand-in for the sealer or opener of a body it is in the proofs:
-    /// one closure for every proof, so that one that runs it reaches it for one that never does.
+    /// One closure for every proof, so that one that runs it reaches it for one that never does.
     fn running(
         &mut self,
     ) -> impl FnMut(&[u8; CIPHER_KEY_LEN], &[u8], &[u8], &mut [u8]) -> Result<(), Error> + '_ {
@@ -3319,7 +3081,6 @@ fn seventeen_value(bytes: &[u8; 17]) -> (u128, u8) {
     (u128::from_le_bytes(head), bytes[16])
 }
 
-/// Where `bytes` lie and how long they are.
 fn place(bytes: &[u8]) -> (usize, usize) {
     (bytes.as_ptr().addr(), bytes.len())
 }
@@ -3351,22 +3112,12 @@ impl Entropy for Kept {
     }
 }
 
-/// The first 32 bytes of the first key of `snapshot`.
 fn key_head(snapshot: &Snapshot) -> [u8; 32] {
     let mut key = [0; 32];
     key.copy_from_slice(&snapshot.keys.0[..32]);
     key
 }
 
-/// From any state of two slots and of the epoch, for a handle of these slots naming any slot
-/// and generation, any record of an archive key and any context of up to two bytes, whatever
-/// the cipher does: reading the public key of an archive key changes no slot and no epoch. It
-/// refuses an empty context, a stale handle, a set not for wrapping and a key from a secret, in
-/// that order, before it decrypts. It opens the record once, under the key of the profile and
-/// this epoch, with the record's nonce, ciphertext and tag and the associated data of the
-/// context, and refuses it as `StaleRecord` unless the cipher accepts it and it names this
-/// epoch; then it gives the identifier and the public key the record holds, for these slots
-/// and this epoch.
 #[kani::proof]
 #[kani::unwind(1530)]
 fn a_public_key_is_read_from_its_record() {
@@ -3467,19 +3218,6 @@ fn a_public_key_is_read_from_its_record() {
     );
 }
 
-/// From any state of two slots and of the epoch, with a change to the next under way or not,
-/// for a handle of these slots naming any slot and generation, any public key read for any slots
-/// and epoch, any context of up to two bytes, data of one byte, their body of 17 and any record,
-/// whatever the platform's source, X-Wing, the cipher and the sealer of the body do: archiving
-/// changes no slot and no epoch but its count of draws. It refuses an empty context, a stale
-/// handle, a set not of a chat for its archive, a public key of other slots or another epoch and a
-/// wrong answer of X-Wing before it draws, then a failed source; `DerivationFailed` is a failed derivation, `RecordRejected` a public key
-/// X-Wing refuses and `CipherFailed` a failed seal of the record or of the body, each and only
-/// that. It writes the record only when it succeeds, and wipes the body when it fails: after two
-/// draws, the randomness given to X-Wing with the public key is the hedge of the second under the
-/// key of this epoch, derived under the key of the chat, and the body is sealed once, from the
-/// data into the body, under the key derived from the shared secret, with the ciphertext as the
-/// salt, and the associated data of a batch of the context.
 #[kani::proof]
 #[kani::unwind(1181)]
 fn an_archive_writes_only_when_it_succeeds() {
@@ -3621,11 +3359,6 @@ fn an_archive_writes_only_when_it_succeeds() {
     kani::cover!(result == Err(Error::DerivationFailed), "a derivation fails");
 }
 
-/// From the same states as the proof above, a successful archive seals, under the key of the
-/// chat, with the nonce of its first draw hedged with the key of this epoch and with the
-/// associated data of the context, the identifier of the archive key, the ciphertext X-Wing gave
-/// and the check of its shared secret; and its record holds that nonce, what the cipher wrote
-/// and its tag.
 #[kani::proof]
 #[kani::unwind(1181)]
 fn an_archive_seals_its_identifier_ciphertext_and_check() {
@@ -3696,17 +3429,6 @@ fn an_archive_seals_its_identifier_ciphertext_and_check() {
     );
 }
 
-/// From any state of two slots and of the epoch, for handles of these slots naming any slots
-/// and generations, any record of an archive, any context of up to two bytes, a body of 17 bytes
-/// and its data of one, whatever X-Wing, the cipher and the opener of the body do: opening a batch
-/// changes no slot and no epoch. It refuses an empty context, then for each handle in turn a stale
-/// one and a set not of its purpose, then a wrong answer of X-Wing, before it decrypts. It opens the record once, under the key of the chat, with the
-/// record's nonce, ciphertext and tag and the associated data of the context, as
-/// `RecordRejected` unless the cipher accepts it, and as `WrongArchiveKey`, decapsulating
-/// nothing, unless it names the archive key. Then it gives the seed and the ciphertext to X-Wing,
-/// refuses as `PublicKeyMismatch` a check that is not the shared secret's, and opens the body
-/// once, into the data, under the key derived from the shared secret, with the ciphertext as the
-/// salt, and the associated data of a batch of the context. Data not opened are wiped.
 #[kani::proof]
 #[kani::unwind(1181)]
 fn an_opened_archive_opens_its_body_only_under_its_archive_key() {
@@ -3852,14 +3574,6 @@ fn an_opened_archive_opens_its_body_only_under_its_archive_key() {
     );
 }
 
-/// From any state of two slots and of the epoch, for handles of these slots naming any slots
-/// and generations, any record of an archive, any context of up to two bytes and any output, with
-/// a cipher that rejects every record: moving a record changes no slot and no epoch but its count
-/// of draws, and writes nothing. It refuses an empty context, then for each handle in turn a stale one and a set not of
-/// a chat for its archive, before it asks the source, and a failed source before it decrypts. It
-/// opens the record at most once, under the key of the first chat, with the record's nonce,
-/// ciphertext and tag and the associated data of the context, and refuses it as
-/// `RecordRejected`.
 #[kani::proof]
 #[kani::unwind(1181)]
 fn a_reseal_refuses_what_it_cannot_move() {
@@ -3956,15 +3670,6 @@ fn a_reseal_refuses_what_it_cannot_move() {
     );
 }
 
-/// From any state of two slots and of the epoch, for handles that name sets of chats for their
-/// archive held there now, any record of an archive, any context of one or two bytes and any
-/// output, whatever the platform's source does and with a cipher that accepts every record:
-/// moving a record changes no slot and no epoch but its count of draws. It draws once, then opens
-/// the record once, under the key of the first chat, with the record's nonce, ciphertext and tag
-/// and the associated data of the context, unless the source or a derivation fails. On success it
-/// seals what the record held, under the key of the second chat, with the nonce the source gave,
-/// hedged with the key of this epoch, and the same associated data; otherwise it fails as the
-/// source, a derivation or the seal failed, and writes nothing.
 #[kani::proof]
 #[kani::unwind(1181)]
 fn a_reseal_seals_what_the_record_held() {
@@ -4074,19 +3779,6 @@ fn a_reseal_seals_what_the_record_held() {
     kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
 }
 
-/// For three slots, the first a loaded stored key of the archive, the second a loaded key for
-/// wrapping that is not from a secret and the third free, all else about them and the epoch
-/// any, for handles of these slots naming either of the first two and any generation, any
-/// context of up to two bytes and any record of an archive key, whatever X-Wing and the cipher
-/// do: a load refuses an empty context, a stale handle, a store not of the archive or a profile
-/// not for wrapping and a wrong answer of X-Wing before it decrypts. It opens the outer layer
-/// once, under the key of the profile and this epoch, and refuses it as `StaleRecord` unless the
-/// cipher accepts it and it names this epoch; then it opens the seed once under the store, and
-/// refuses it as `RecordRejected` unless the cipher accepts it, it names the store, and it is
-/// one seed of an archive key of epoch zero; then the identifier and the public key of the outer
-/// layer must be the seed's, or `PublicKeyMismatch`, and the seed held nowhere, or
-/// `DuplicateKey`. A refusal changes no slot; a success loads the seed into the third slot as a
-/// set of one for the archive, stored, in no transfer, with its identifier.
 #[kani::proof]
 #[kani::unwind(1530)]
 fn a_load_of_an_archive_key_checks_its_public_key() {
@@ -4270,15 +3962,6 @@ fn a_load_of_an_archive_key_checks_its_public_key() {
     );
 }
 
-/// From any state of two slots and of the epoch, with a change to the next under way or not,
-/// for handles of these slots naming any slots and generations, any context of up to two bytes
-/// and any output buffer, whatever the platform's source, X-Wing and the cipher do: a creation
-/// of an archive key changes no slot and no epoch but its count of draws, and writes the record
-/// only when it succeeds, starting with the nonce of the second draw, hedged with the key of the
-/// epoch it is written in. It refuses an empty context, a stale handle, a store not of the
-/// archive or a profile not for wrapping, a key from a secret as the profile, a change to the
-/// last epoch and a wrong answer of X-Wing before it asks the source, then a failed source, and
-/// a new key pair that does not agree with itself after its three draws.
 #[kani::proof]
 #[kani::unwind(1530)]
 fn a_creation_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds() {
@@ -4449,17 +4132,6 @@ fn a_creation_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds
     );
 }
 
-/// From any state of two slots and of the epoch, with a change to the next under way or not,
-/// for handles of these slots naming any slots and generations, any record of an archive key,
-/// any output buffer and any context of up to two bytes, whatever the platform's source and the
-/// cipher do: a carry of the record of an archive key changes no slot and no epoch but its
-/// count of draws. It refuses an empty context, then for each handle in turn a stale one, a set
-/// not for wrapping and a key from a secret, then a missing change, before it asks the source,
-/// and a failed source before it decrypts. It opens the record once, under the key derived from
-/// the first stored key and the key of this epoch and with the record's nonce, and refuses it as
-/// `StaleRecord` unless the cipher accepts it and it names this epoch. It writes the output only
-/// when it succeeds, starting with the nonce the source gave, hedged with the key of the next
-/// epoch.
 #[kani::proof]
 #[kani::unwind(1530)]
 fn a_carry_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds() {
@@ -4619,9 +4291,6 @@ fn a_carry_of_an_archive_key_changes_no_slot_and_writes_only_when_it_succeeds() 
     kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
 }
 
-/// `before` as an end of the export under the key for transfers in slot `transfer`, whose
-/// generation is `generation`, leaves it: that key idle with a chain of zero, and, when the end
-/// is received, every set received under that key and generation free to be wrapped again.
 fn ended(
     before: Snapshot,
     index: usize,
@@ -4640,21 +4309,7 @@ fn ended(
     after
 }
 
-/// From any state of two slots and of the epoch, with a change to the next under way or not,
-/// for a handle of this set naming any slot and generation, any context of up to two bytes and
-/// any end, whatever the platform's source and the cipher do: ending an export, or receiving
-/// the end of one when `receiving` says so, refuses an empty context, a stale handle, a set that
-/// is not a key for transfers, a key that carries no export (`NoTransfer`) and one that carries
-/// an export the other way (`Unfinished`), in that order, before anything else. The end of an
-/// export
-/// is written only when it succeeds, starting with the nonce the source gave, hedged with the
-/// key of this epoch, and each draw the source answers is counted once; the end received is
-/// opened once, under the key the key for transfers derives, with its own nonce and tag, and
-/// rejected as `RecordRejected` unless the cipher accepts it. Either succeeds exactly then, and
-/// then leaves the key idle with a chain of zero, and a receipt lets every set received under
-/// that key and its generation be wrapped again; nothing else changes, no epoch either, and a
-/// failure changes no slot. Returns the outcome, the set in the slot other than the one the handle names, and the
-/// handle.
+/// Returns the outcome, the set in the slot other than the one the handle names, and the handle.
 fn end_from(receiving: bool) -> (Result<(), Error>, Snapshot, Handle<'static>) {
     let mut memory = [any_slot(), any_slot()];
     let id = memory.as_ptr().addr();
@@ -4830,8 +4485,7 @@ fn end_from(receiving: bool) -> (Result<(), Error>, Snapshot, Handle<'static>) {
     )
 }
 
-/// The end of an export. The seal checks the cipher on a record first, so the unwinding is that
-/// of a wrap.
+/// The seal checks the cipher on a record first, so the unwinding is that of a wrap.
 #[kani::proof]
 #[kani::unwind(234)]
 fn an_end_of_an_export_is_written_only_when_it_succeeds() {
@@ -4841,7 +4495,6 @@ fn an_end_of_an_export_is_written_only_when_it_succeeds() {
     kani::cover!(result == Err(Error::CipherFailed), "the cipher fails");
 }
 
-/// The receipt of the end of an export.
 #[kani::proof]
 #[kani::unwind(65)]
 fn an_end_received_lets_go_only_the_sets_of_its_export() {
@@ -4861,11 +4514,7 @@ fn an_end_received_lets_go_only_the_sets_of_its_export() {
     );
 }
 
-/// From any state of three slots, for handles of this set naming any slots and generations: the
-/// check a combination starts with refuses a stale handle, one set twice, a set not for
-/// wrapping, one that is not a key from a secret, a salt not of 32 bytes and a want of a free
-/// slot, in that order, and passes otherwise. What follows the check,
-/// `a_combination_loads_its_key_and_releases_both` proves.
+/// What follows the check, `a_combination_loads_its_key_and_releases_both` proves.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_combination_refuses_in_order() {
@@ -4937,8 +4586,6 @@ fn a_combination_refuses_in_order() {
     );
 }
 
-/// A loaded slot of any generation that holds a key from a secret of `length`, any bytes, with
-/// any identifier.
 fn any_secret(length: KeyLength) -> Slot {
     let mut slot = Slot::empty();
     slot.generation = kani::any();
@@ -4951,14 +4598,9 @@ fn any_secret(length: KeyLength) -> Slot {
     slot
 }
 
-/// With keys from a secret of 32 bytes in the first two slots and the third free: combining them
-/// through their live handles succeeds exactly when every derivation succeeds and neither holds
-/// the new key. It then loads into the third slot a set of one 32-byte key from a secret, the
-/// derivation of the first key with the second as the salt, with its identifier, and releases
-/// both: their slots hold nothing and are past their generation. A refusal changes no slot.
-/// Without a free slot the check before refuses, as `a_combination_refuses_in_order` proves;
-/// other places of the three sets, the whole of a 64-byte key, and which key is the salt, which
-/// the model of the derivation does not tell apart, unit tests check.
+/// Without a free slot the check before refuses, as `a_combination_refuses_in_order` proves. Unit
+/// tests check what the derivation model cannot tell apart: set places, whole 64-byte keys and
+/// which key salts.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_combination_loads_its_key_and_releases_both() {
@@ -5054,10 +4696,6 @@ fn a_combination_loads_its_key_and_releases_both() {
     kani::cover!(result == Err(Error::DerivationFailed), "a derivation fails");
 }
 
-/// From any state of two slots, for a handle of this set naming any slot and generation: a
-/// challenge is written exactly from a live key from a secret, the derivation of its key, and
-/// is otherwise refused as `StaleHandle`, `WrongPurpose`, `WrongLevel` or `DerivationFailed`,
-/// in that order, writing nothing. No slot changes either way.
 #[kani::proof]
 #[kani::unwind(65)]
 fn only_a_key_from_a_secret_gives_a_challenge() {
@@ -5121,8 +4759,6 @@ fn any_position() -> Position {
     }
 }
 
-/// Promotes, disables, enables or destroys the key at any position through `handle`, and returns
-/// what the call gave, what the transition of the stages gave, and whether it destroyed.
 fn any_change(
     slots: &mut Slots<'_>,
     handle: Handle<'static>,
@@ -5151,15 +4787,6 @@ fn any_change(
     (result, outcome.map_err(Error::from), destroying)
 }
 
-/// From `memory`, with the slot `index` loaded and any position: promoting, disabling, enabling
-/// and destroying through the live handle of that slot are refused as `WrongPurpose` for a set
-/// neither for external data nor for data, then as `EpochChanging` during a change of epoch,
-/// then as `Unfinished` for a set of a transfer that has not ended, then as `Unsaved` if the
-/// set has changed in this epoch, and otherwise change its stages exactly as the transition of
-/// the stages gives, marking the set changed, not wrapped for the next epoch and held by no
-/// record; a refusal changes nothing; a destroy wipes the key and the identifier at the
-/// position and leaves every other key as it was; the slot keeps its generation and purpose,
-/// and no other slot changes.
 fn change_in(mut memory: [Slot; 2], index: usize) {
     let id = memory.as_ptr().addr();
     let changing = kani::any();
@@ -5278,22 +4905,19 @@ fn change_in(mut memory: [Slot; 2], index: usize) {
     );
 }
 
-/// A change through the first slot; with the next, through either slot of two in any state.
+/// With the next, a change through either slot of two in any state.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_change_of_stage_in_the_first_slot() {
     change_in([any_slot_in(Occupancy::Loaded), any_slot()], 0);
 }
 
-/// A change through the second slot.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_change_of_stage_in_the_second_slot() {
     change_in([any_slot(), any_slot_in(Occupancy::Loaded)], 1);
 }
 
-/// From any state of two slots, a handle of this set that names no loaded slot with its
-/// generation is refused by every change of stage, at any position, and no slot changes.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_change_of_stage_with_a_stale_handle_changes_nothing() {
@@ -5326,17 +4950,7 @@ fn a_change_of_stage_with_a_stale_handle_changes_nothing() {
     );
 }
 
-/// From `memory`, with the slot `index` loaded and no change of epoch under way: adding a key
-/// of 32 bytes, any bytes, through its live handle puts it into the first empty position of
-/// the set, enabled, with the identifier derived from its bytes and its length alone, marks the
-/// set changed and not wrapped for the next epoch, and changes nothing else; it fails as
-/// `WrongPurpose` for a set not for external data, as `Unfinished` for a set of a transfer that
-/// has not ended, as `Unsaved` if the set has changed in this epoch, as
-/// the transition of the stages does when no position is empty or the set is exhausted, and
-/// otherwise with DerivationFailed when the derivation fails and with DuplicateKey exactly when
-/// a loaded slot holds a key with that identifier, for any purpose; the source is wiped exactly
-/// when the addition succeeds, and a failed addition changes no slot. A generation fills a key
-/// as a load does, which the proofs of a load cover. Returns the outcome and the set's purpose.
+/// A generation fills a key as a load does, which the proofs of a load cover.
 fn add_in(mut memory: [Slot; 2], index: usize) -> (Result<Position, Error>, Purpose) {
     let id = memory.as_ptr().addr();
     let mut epoch = any_epoch(false);
@@ -5454,8 +5068,6 @@ fn add_in(mut memory: [Slot; 2], index: usize) -> (Result<Position, Error>, Purp
     (result, named.purpose)
 }
 
-/// Stands in for the platform: switches the root or fails, as chosen when made, erases with any
-/// outcome, and remembers what it was asked.
 struct AnyRoot {
     switches: bool,
     answer: Erasure,
@@ -5492,7 +5104,6 @@ fn any_root() -> AnyRoot {
     }
 }
 
-/// `snapshot` with its marks of a change set to `changed` and `sealed`.
 fn marked(snapshot: Snapshot, changed: bool, sealed: bool) -> Snapshot {
     let mut marked = snapshot;
     marked.changed = changed;
@@ -5500,24 +5111,12 @@ fn marked(snapshot: Snapshot, changed: bool, sealed: bool) -> Snapshot {
     marked
 }
 
-/// `snapshot` after a commit: saved, and held by a record of the new epoch exactly when it was
-/// wrapped for it.
 fn committed(snapshot: Snapshot) -> Snapshot {
     let mut committed = marked(snapshot, false, false);
     committed.recorded = snapshot.sealed;
     committed
 }
 
-/// From any state of two slots and of the epoch, with a change to the next under way or not:
-/// beginning a change is refused while one is under way and in the last epoch, and otherwise
-/// takes the key of the next epoch and wipes its source; abandoning, only while a change is
-/// under way, wipes that key, has the platform erase the root made for it and forgets which
-/// sets were wrapped for the next epoch; committing is refused without a change, while
-/// a set changed in this epoch has not been wrapped for the next since, and when the platform
-/// does not switch the root, and then changes nothing and asks the platform nothing more;
-/// otherwise the next epoch with its key becomes this one, the old key is gone, every set
-/// counts as saved and keeps its keys and stages, the platform is asked to switch to the next
-/// epoch and then to erase the old, and its answer is returned.
 #[kani::proof]
 #[kani::unwind(65)]
 fn an_epoch_changes_only_in_order() {
@@ -5666,8 +5265,7 @@ fn at_length(lengths: &[KeyLength; MEMBERS], position: usize) -> KeyLength {
     at(lengths, position)
 }
 
-/// An addition through the first slot; with the next, an addition through either slot of two in
-/// any state.
+/// With the next, an addition through either slot of two in any state.
 #[kani::proof]
 #[kani::unwind(65)]
 fn an_addition_in_the_first_slot() {
@@ -5678,7 +5276,6 @@ fn an_addition_in_the_first_slot() {
     );
 }
 
-/// An addition through the second slot.
 #[kani::proof]
 #[kani::unwind(65)]
 fn an_addition_in_the_second_slot() {
@@ -5689,14 +5286,7 @@ fn an_addition_in_the_second_slot() {
     );
 }
 
-/// With the first of two slots loaded, the second in any state and no change of epoch under
-/// way: an addition of a key of either length, any bytes, through the live handle of the first,
-/// by the code a generated addition runs, is refused as `WrongPurpose` for a set neither for
-/// external data nor for data, as `Unfinished` for a set of a transfer that has not ended, as
-/// `Unsaved` for a set changed in this epoch, and then as `WrongLength` exactly for a length
-/// its purpose does not take, changing nothing; otherwise it fails only as the stages, the
-/// source, the derivation or a key held already refuse it, and a success marks the set changed,
-/// not wrapped for the next epoch and held by no record. No set takes an addition of 64 bytes.
+/// An addition of a key of either length, by the code a generated addition runs.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_long_addition_in_the_first_slot() {
@@ -5774,12 +5364,7 @@ fn a_long_addition_in_the_first_slot() {
     kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
 }
 
-/// From any state of two slots during a change of epoch, for a handle of this set naming any
-/// slot and generation: every change of stage and an addition are refused, as `StaleHandle` if
-/// the handle is not live, as `WrongPurpose` for a change of a set neither for external data
-/// nor for data and for an addition of a key the caller gives to a set not for external data,
-/// and as `EpochChanging` otherwise; the key given is left as it was, and nothing changes. A
-/// generated key goes through the same code as the addition, which refuses before it fills the
+/// A generated key goes through the same code as the addition, which refuses before it fills the
 /// slot.
 #[kani::proof]
 #[kani::unwind(65)]
@@ -5821,8 +5406,7 @@ fn no_set_changes_during_a_change_of_epoch() {
     kani::cover!(live && !wrapping, "a live set is refused");
 }
 
-/// The associated data of a chunk of a block bound to `context`, of up to two bytes, written
-/// out from the layout: the label, the version, the length of the context, and the context.
+/// Written out from the layout.
 fn data_bound(context: &[u8]) -> Bound {
     let mut bytes = [0; seal::model::AAD_HEAD];
     bytes[..19].copy_from_slice(b"lethewis data block");
@@ -5836,15 +5420,13 @@ fn data_bound(context: &[u8]) -> Bound {
     }
 }
 
-/// The first 32 bytes of the key at `position` of `snapshot`.
 fn key_head_at(snapshot: &Snapshot, position: usize) -> [u8; 32] {
     let mut key = [0; 32];
     key.copy_from_slice(&pick(&snapshot.keys, position)[..32]);
     key
 }
 
-/// The nonce of the chunk numbered `index`, written out from the layout: the number, least
-/// significant byte first, three zero bytes, and 1 for the last chunk or 0.
+/// Written out from the layout.
 fn nonce_of(index: u64, last: bool) -> [u8; NONCE_LEN] {
     let mut nonce = [0; NONCE_LEN];
     nonce[..8].copy_from_slice(&index.to_le_bytes());
@@ -5852,13 +5434,10 @@ fn nonce_of(index: u64, last: bool) -> [u8; NONCE_LEN] {
     nonce
 }
 
-/// The first bytes of a chunk, zero past its end, read one by one.
 fn chunk_head(chunk: &[u8]) -> [u8; 17] {
     core::array::from_fn(|at| chunk.get(at).copied().unwrap_or(0))
 }
 
-/// Any cipher on a chunk of any length: it writes any bytes, and gives any tag or fails, or
-/// accepts or refuses, at will, and keeps what it was given.
 struct AnyChunk {
     calls: usize,
     key: [u8; CIPHER_KEY_LEN],
@@ -5931,8 +5510,7 @@ impl AnyChunk {
         if self.failed { Err(Rejected) } else { Ok(()) }
     }
 
-    /// [`AnyChunk::open`], as the stand-in for the cipher it is in the proofs: one closure for
-    /// every proof, so that one that opens reaches it for one that never does.
+    /// One closure for every proof, so that one that opens reaches it for one that never does.
     fn opening(
         &mut self,
     ) -> impl FnMut(
@@ -5946,8 +5524,7 @@ impl AnyChunk {
         |key, nonce, aad, buffer, tag| self.open(key, nonce, aad, buffer, tag)
     }
 
-    /// [`AnyChunk::seal`], as the stand-in for the cipher it is in the proofs, one closure for
-    /// every proof.
+    /// One closure for every proof.
     fn sealing(
         &mut self,
     ) -> impl FnMut(
@@ -5961,7 +5538,6 @@ impl AnyChunk {
     }
 }
 
-/// `seal`, as the stand-in for the cipher of a chunk it is in the proofs.
 fn chunk_sealing<F>(seal: F) -> F
 where
     F: FnMut(
@@ -5974,7 +5550,6 @@ where
     seal
 }
 
-/// `open`, as the stand-in for the cipher of a chunk it is in the proofs.
 fn chunk_opening<F>(open: F) -> F
 where
     F: FnMut(
@@ -5988,22 +5563,13 @@ where
     open
 }
 
-/// Any context of one or two bytes, as a block under way was begun with.
+/// One or two bytes, as a block under way was begun with.
 fn any_block_context(bytes: &[u8; 2]) -> &[u8] {
     let length: usize = kani::any();
     kani::assume(length == 1 || length == 2);
     &bytes[..length]
 }
 
-/// From any state of two slots and of the epoch, for a handle of these slots naming any slot and
-/// generation, any context of up to two bytes and any header, whatever the platform's source does:
-/// beginning a block changes no slot, and the epoch only by the count of the draws the source
-/// answers. It refuses an empty context, a stale handle, a set not for data, one of an unfinished
-/// transfer and one no record of this epoch holds as it is, in that order, before it draws; then a
-/// failed source and a failed derivation. A block begun writes into its header the salt, the hedge
-/// of the one draw under the key of this epoch, and the check derived from the primary key of the
-/// set and that salt; it names the set, the primary's position, the set's revision, the salt and
-/// the associated data of the context, from the first chunk. A refused one writes nothing.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_block_begins_under_the_primary_of_a_recorded_set() {
@@ -6103,12 +5669,8 @@ fn a_block_begins_under_the_primary_of_a_recorded_set() {
     kani::cover!(error == Some(Error::DerivationFailed), "a derivation fails");
 }
 
-/// A block under way in any state: any handle of these slots, position, revision, salt and
-/// next chunk, and the associated data of `context`. Only a beginning makes one, which the
-/// proof above covers; this covers every state one can be in afterwards, but for its set,
-/// which a proof takes to be for data while the slot it names is loaded with its generation:
-/// a beginning names only a set for data, and a set keeps its purpose until it is released,
-/// which gives its slot another generation.
+/// Covers every state a beginning can leave: only a set for data begins a block. That set keeps its
+/// purpose while its slot keeps the generation.
 fn any_sealing(id: usize, context: &[u8]) -> Sealing<'static> {
     Sealing {
         set: forged(id),
@@ -6120,15 +5682,6 @@ fn any_sealing(id: usize, context: &[u8]) -> Sealing<'static> {
     }
 }
 
-/// From any state of two slots and of the epoch, any block under way and any chunk of up to 17
-/// bytes, the last or one of a full 16, whatever the cipher does: sealing a chunk changes no
-/// slot and no epoch. It refuses a last chunk longer than a chunk or empty after others, a set
-/// that is not held, one that has changed since the block began and one no record holds, and a
-/// block that has run out of numbers, before it derives; then a failed derivation, before it
-/// seals. It seals once, under the key derived from the key at the block's position and its
-/// salt, with the nonce of the chunk's number and mark of the last and the associated data the
-/// block was begun with, and then writes the tag and moves on to the next chunk; a refused or
-/// failed chunk writes no tag and keeps the block where it was.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_chunk_is_sealed_under_the_key_its_block_began_with() {
@@ -6273,17 +5826,6 @@ fn a_chunk_is_sealed_under_the_key_its_block_began_with() {
     kani::cover!(result == Err(Error::CipherFailed), "the cipher fails");
 }
 
-/// From any state of two slots and of the epoch, for a handle of these slots naming any slot and
-/// generation, any context of up to two bytes, any header and any length of a block, beginning to
-/// read a block changes no slot and no epoch. It refuses an empty context, a stale handle, a set
-/// not for data, one of an unfinished transfer and a length no block has, in that order, before it
-/// derives; it then derives the check of the key at every position the set fills, one derivation
-/// each, with the salt of the header, and refuses a failed one. It reads the block under the first
-/// position whose check is the header's, as `KeyDisabled` if that key is disabled, and as
-/// `RecordRejected` if none is: an empty position matches nothing, though the header hold the check
-/// of an empty key. The block it reads names the set, the position, the revision, the salt and the
-/// associated data of the context, from the first chunk, and holds as many chunks as the length
-/// gives.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_block_opens_only_under_the_key_its_header_names() {
@@ -6398,10 +5940,7 @@ fn a_block_opens_only_under_the_key_its_header_names() {
     kani::cover!(error == Some(Error::DerivationFailed), "a derivation fails");
 }
 
-/// A block being read in any state: any handle of these slots, position, revision, salt, next
-/// chunk, count of chunks and length of the last, and the associated data of `context`. Only a
-/// beginning makes one, which the proof above covers; this covers every state one can be in
-/// afterwards, its set taken to be for data as for a block under way.
+/// Covers every state a beginning can leave, its set taken to be for data as for a block under way.
 fn any_opening(id: usize, context: &[u8]) -> Opening<'static> {
     Opening {
         set: forged(id),
@@ -6415,15 +5954,6 @@ fn any_opening(id: usize, context: &[u8]) -> Opening<'static> {
     }
 }
 
-/// From any state of two slots and of the epoch, any block being read and any chunk of up to
-/// 17 bytes, the last or one of a full 16, whatever the cipher does: opening a chunk changes no
-/// slot and no epoch. It refuses a last chunk where more are due or of another length than the
-/// block's last, another where the last is due, a set that is not held and one that has
-/// changed since the block began to be read, before it derives; then a failed derivation,
-/// before it opens. It opens once, under the key derived from the key at the block's position
-/// and its salt, with the nonce of the chunk's number and mark of the last, the associated data
-/// of the block and the tag given, refuses what the cipher refuses, and moves on to the next
-/// chunk only when the chunk opens.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_chunk_opens_only_as_the_next_of_its_block() {
@@ -6469,8 +5999,8 @@ fn a_chunk_opens_only_as_the_next_of_its_block() {
         unchanged_except(&slots, &before, 2) && epoch_snapshot(&slots) == epoch_before,
         "opening a chunk changes no slot and no epoch",
     );
-    // In numbers of 128 bits, apart from the code: the chunk after `next` is the last when it
-    // is the count's last.
+    // In 128-bit numbers, apart from the code: the chunk after `next` is the last when it is the
+    // count's last.
     let after = u128::from(next) + 1;
     let out_of_order = if last {
         after != u128::from(chunks) || u64::try_from(length) != Ok(last_len)
@@ -6555,17 +6085,11 @@ fn a_chunk_opens_only_as_the_next_of_its_block() {
     );
 }
 
-/// The associated data of a chunk of a block carried under a key for transfers, after `chain`,
-/// for the export's `context` of up to two bytes, written out from the layout: the label, the
-/// version, the length of the context, the chain, and the context.
 fn carry_bound(chain: &[u8; TAG_LEN], context: &[u8]) -> Bound {
     Bound::chained(b"lethewis data carry", chain, context)
 }
 
-/// A block being carried out in any state: any block being read, for `context`, any handle of
-/// these slots as the key for transfers, any chain and salt, and the associated data of the
-/// export's `export` after that chain. Only a beginning makes one; this covers every state one
-/// can be in afterwards, its sets taken to be for data and for transfers.
+/// Covers every state a beginning can leave, its sets taken to be for data and for transfers.
 fn any_exporting(id: usize, context: &[u8], export: &[u8]) -> Exporting<'static> {
     let chain: [u8; TAG_LEN] = kani::any();
     Exporting {
@@ -6579,8 +6103,6 @@ fn any_exporting(id: usize, context: &[u8], export: &[u8]) -> Exporting<'static>
     }
 }
 
-/// Chunks in their place, the last if `last` says so, from any state of two slots and of the
-/// epoch, any block being carried out and any chunk, whatever the ciphers do.
 fn carry_out(last: bool) {
     let mut memory = [any_slot(), any_slot()];
     let id = memory.as_ptr().addr();
@@ -6752,12 +6274,6 @@ fn carry_out(last: bool) {
     );
 }
 
-/// From any state of two slots and of the epoch, any block being carried out and any chunk of up
-/// to 17 bytes, the last or one of a full 16, out of its place in the block, with a set not held,
-/// a set for data that has changed or a key for transfers whose chain has moved since the block
-/// began, or a key that receives an export: carrying it out is refused, in that order, before any
-/// derivation and before the ciphers run, and changes no slot, no epoch, no tag, no chunk and no
-/// block.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_chunk_carried_out_of_its_place_or_stream_is_refused() {
@@ -6860,33 +6376,19 @@ fn a_chunk_carried_out_of_its_place_or_stream_is_refused() {
     );
 }
 
-/// From the same states, a chunk in its place and not the last, under live sets: carrying it out
-/// changes no slot and no epoch. A failed derivation is refused before the ciphers run. The chunk
-/// opens once, under the key of its position and salt, with its nonce, the associated data of the
-/// block and the tag given, and is refused where it does not; what opened is sealed once, under
-/// the key derived from the key for transfers and the carried salt, with the same nonce and the
-/// associated data of the export after the chain. A success writes the new tag and moves the
-/// block on; a failure writes no tag and keeps the block where it was.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_chunk_is_carried_out_under_the_key_for_transfers() {
     carry_out(false);
 }
 
-/// From the same states, the last chunk, in its place, under live sets: as any other chunk, and a
-/// success moves the chain of the key for transfers to the new tag and marks the key as writing
-/// an export, which nothing else changes.
 #[kani::proof]
 #[kani::unwind(65)]
 fn the_last_chunk_carried_out_moves_the_chain_of_the_export() {
     carry_out(true);
 }
 
-/// A carried block being received in any state: any handle of these slots as the key for
-/// transfers, any chain, salt, count of chunks and length of the last, the associated data of the
-/// export's `export` after that chain; any handle as the set it is written under, any position,
-/// salt and next chunk, and the associated data of `context`. Only a beginning makes one; this
-/// covers every state one can be in afterwards, its sets taken to be for transfers and for data.
+/// Covers every state a beginning can leave, its sets taken to be for transfers and for data.
 fn any_receiving(id: usize, export: &[u8], context: &[u8]) -> Receiving<'static> {
     let chain: [u8; TAG_LEN] = kani::any();
     Receiving {
@@ -6908,8 +6410,6 @@ fn any_receiving(id: usize, export: &[u8], context: &[u8]) -> Receiving<'static>
     }
 }
 
-/// Chunks received in their place, the last if `last` says so, from any state of two slots and of
-/// the epoch, any carried block being received and any chunk, whatever the ciphers do.
 fn receive_in(last: bool) {
     let mut memory = [any_slot(), any_slot()];
     let id = memory.as_ptr().addr();
@@ -7078,12 +6578,6 @@ fn receive_in(last: bool) {
     );
 }
 
-/// From any state of two slots and of the epoch, any carried block being received and any chunk
-/// of up to 17 bytes, the last or one of a full 16, out of its place in the block, with a set not
-/// held or no longer waiting for the end of this transfer, or a key for transfers whose chain has
-/// moved since the block began, or that writes an export: receiving it is refused, in that order,
-/// before any derivation and before the ciphers run, and changes no slot, no epoch, no tag, no
-/// chunk and no block.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_chunk_received_out_of_its_place_or_stream_is_refused() {
@@ -7187,40 +6681,18 @@ fn a_chunk_received_out_of_its_place_or_stream_is_refused() {
     );
 }
 
-/// From the same states, a chunk in its place and not the last, under live sets: receiving it
-/// changes no slot and no epoch. A failed derivation is refused before the ciphers run. The chunk
-/// opens once, under the key derived from the key for transfers and the carried salt, with its
-/// nonce, the associated data of the export after the chain and the tag given, and is refused
-/// where it does not; what opened is sealed once, under the key of its position in the set for
-/// data and the block's salt, with the same nonce and the associated data of the block. A success
-/// writes the new tag and moves the block on; a failure writes no tag and keeps the block where it
-/// was.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_chunk_is_received_under_the_set_it_is_written_to() {
     receive_in(false);
 }
 
-/// From the same states, the last chunk, in its place, under live sets: as any other chunk, and a
-/// success moves the chain of the key for transfers to the tag the chunk came with and marks the
-/// key as receiving an export, which nothing else changes.
 #[kani::proof]
 #[kani::unwind(65)]
 fn the_last_chunk_received_moves_the_chain_of_the_export() {
     receive_in(true);
 }
 
-/// From any state of two slots and of the epoch, any block being read, a handle of these slots
-/// naming any slot and generation as the key for transfers, any context of up to two bytes and
-/// any header, whatever the platform's source does: beginning to carry a block out changes no
-/// slot, and the epoch only by the count of the draws the source answers. It refuses an empty
-/// context, a set for data not held or changed since the block began to be read, a key for
-/// transfers not held or of another purpose, one that receives an export, and a block a chunk
-/// has been read from, in that order, before it draws; then a failed source and a failed
-/// derivation. A block begun writes into its header the salt, the hedge of the one draw under the
-/// key of this epoch, and the check derived from the key for transfers and that salt; it holds the
-/// block being read, the key for transfers, its chain, the salt and the associated data of the
-/// export after that chain. A refused one writes nothing.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_block_is_carried_out_after_the_chain_of_its_export() {
@@ -7347,14 +6819,6 @@ fn a_block_is_carried_out_after_the_chain_of_its_export() {
     kani::cover!(error == Some(Error::DerivationFailed), "a derivation fails");
 }
 
-/// From any state of two slots and of the epoch, for a handle of these slots naming any slot and
-/// generation, any context of up to two bytes, any header and any length of a block: beginning to
-/// receive a carried block changes no slot and no epoch. It refuses an empty context, a stale
-/// handle, a key not for transfers, one that writes an export and a length no block has, in that
-/// order, before it derives; it then derives the check of the key for transfers once, with the
-/// salt of the header, refuses a failed derivation, and refuses as `RecordRejected` a header that
-/// does not hold that check. A receipt holds the key, its chain, the salt, the associated data of
-/// the export after that chain, and as many chunks as the length gives.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_carried_block_is_received_only_under_the_key_its_header_names() {
@@ -7435,16 +6899,6 @@ fn a_carried_block_is_received_only_under_the_key_its_header_names() {
     );
 }
 
-/// From any state of two slots and of the epoch, any receipt, a handle of these slots naming any
-/// slot and generation as the set, any context of up to two bytes and any header, whatever the
-/// platform's source does: giving a receipt a set that came in its transfer changes no slot, and
-/// the epoch only by the count of the draws the source answers. It refuses an empty context, a key
-/// for transfers not held or whose chain has moved since the receipt began, a set not held or not
-/// for data and one that did not come in this transfer, in that order, before it draws; then a
-/// failed source and a failed derivation. A block begun writes into its header the salt, the hedge
-/// of the one draw under the key of this epoch, and the check derived from the primary key of the
-/// set and that salt; it receives into that set from the first chunk. A refused one writes
-/// nothing.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_received_block_is_written_under_a_set_of_its_transfer() {
@@ -7554,9 +7008,8 @@ fn a_received_block_is_written_under_a_set_of_its_transfer() {
     kani::cover!(error == Some(Error::DerivationFailed), "a derivation fails");
 }
 
-/// A new set given to a receipt in `memory`, whose first free slot is `free_at`: from any epoch,
-/// any receipt, any context of up to two bytes and any header, whatever the platform's source
-/// does. Whether the receipt succeeded, its error, and whether its failure released a set it made.
+/// Returns whether the receipt succeeded, its error, and whether its failure released a set it
+/// made.
 fn into_new(mut memory: [Slot; 2], free_at: usize) -> (bool, Option<Error>, bool) {
     let id = memory.as_ptr().addr();
     let changing = kani::any();
@@ -7698,16 +7151,6 @@ fn into_new(mut memory: [Slot; 2], free_at: usize) -> (bool, Option<Error>, bool
     )
 }
 
-/// With the first of two slots free and the second in any state, from any epoch, receipt, context
-/// of up to two bytes and header, whatever the platform's source does: giving a receipt a new set
-/// changes no slot but the first free one, and the epoch only by the count of the draws the source
-/// answers. It refuses an empty context and a key for transfers not held or whose chain has moved
-/// since the receipt began before it draws. It then draws the salt; a failed source and a failed
-/// load change no slot, and a failed check after the load releases the new set. On success
-/// the first free slot holds a set for data of one enabled key of 32 bytes, generated as any is,
-/// marked as having come in the receipt's transfer; the header holds the salt hedged from the
-/// first draw and the check of the new key and that salt; and the block is received into the new
-/// set, under its key, from the first chunk, as the receipt began. A refused one writes nothing.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_received_block_takes_a_new_set_in_the_first_slot() {
@@ -7724,22 +7167,17 @@ fn a_received_block_takes_a_new_set_in_the_first_slot() {
     kani::cover!(error == Some(Error::StaleHandle), "a stale key is refused");
 }
 
-/// From the same states with a key for transfers in the first slot and the second free: the new set
-/// takes the second slot, as above.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_received_block_takes_a_new_set_in_the_second_slot() {
-    // Past the first slot, which holds a key for transfers, a set of one: where the new set goes
-    // past other sets is the load's, which the proofs of loads cover.
+    // Past the first slot, which holds a key for transfers, lies a set of one. Where a new set goes
+    // past others is the load's, which the load proofs cover.
     let memory = [any_slot_in(Occupancy::Loaded), any_slot_in(Occupancy::Free)];
     kani::assume(memory[0].purpose == Purpose::Transfer);
     let (received, ..) = into_new(memory, 1);
     kani::cover!(received, "a new set takes the second slot");
 }
 
-/// From the same states with a key for transfers in the first slot and the second retired: a new
-/// set is refused as `NoFreeSlot` after the one draw of the salt, unless a refusal or a failure
-/// comes first, and changes no slot and writes nothing.
 #[kani::proof]
 #[kani::unwind(65)]
 fn a_received_block_needs_a_free_slot_for_a_new_set() {
@@ -7810,9 +7248,7 @@ fn a_received_block_needs_a_free_slot_for_a_new_set() {
     );
 }
 
-/// The associated data of a chunk of the body of a batch bound to `context`, of up to two bytes,
-/// written out from the layout: the label, the version, the length of the context, and the
-/// context.
+/// Written out from the layout.
 fn batch_bound(context: &[u8]) -> Bound {
     let mut bytes = [0; seal::model::AAD_HEAD];
     bytes[..19].copy_from_slice(b"lethewis data batch");
@@ -7826,10 +7262,8 @@ fn batch_bound(context: &[u8]) -> Bound {
     }
 }
 
-/// What a cipher on a chunk of a body of chunks of 16 bytes was given and gave in one call: where
-/// the key and the associated data lay, the nonce, the chunk, its length and where it lay, what the
-/// cipher wrote and the tag. Places, not copies, and copies, not loops: a loop over bytes would
-/// unwind the loop over the chunks as far.
+/// Places, not copies, and copies, not loops: a loop over bytes would unwind the loop over the
+/// chunks as far.
 #[derive(Clone, Copy)]
 struct ChunkCall {
     key: usize,
@@ -7843,8 +7277,6 @@ struct ChunkCall {
     failed: bool,
 }
 
-/// Any cipher on up to three chunks of 16 bytes: it writes any bytes, and gives any tag or fails,
-/// or accepts or refuses, at will, and keeps what each call was given.
 struct ChunkCalls {
     calls: usize,
     made: [ChunkCall; 3],
@@ -7928,7 +7360,7 @@ impl ChunkCalls {
         }
     }
 
-    /// The first call that failed, if any did, read at constant indexes.
+    /// Read at constant indexes.
     fn failure(&self) -> Option<usize> {
         if self.calls > 0 && self.made[0].failed {
             Some(0)
@@ -7942,9 +7374,8 @@ impl ChunkCalls {
     }
 }
 
-/// Sixteen bytes of `bytes` from `at`, those past `length` taken as zero, as a number: read in one
-/// copy, and compared as numbers, since in Kani 0.68.0 comparing arrays whole reads bytes from
-/// before the latest write.
+/// Read in one copy and compared as numbers: in Kani 0.68.0 comparing whole arrays reads stale
+/// bytes.
 fn piece_at(bytes: &[u8], at: usize, length: usize) -> u128 {
     let mut piece = [0; 16];
     piece.copy_from_slice(&bytes[at..at + 16]);
@@ -7963,20 +7394,12 @@ fn nonce_value(nonce: &[u8; NONCE_LEN]) -> u128 {
     u128::from_le_bytes(padded)
 }
 
-/// Whether `bytes` and `original` hold the same from `at` on, sixteen bytes at a time.
 fn same_from<const N: usize>(bytes: &[u8; N], original: &[u8; N], at: usize) -> bool {
     (0..N / 16).all(|piece| {
         16 * piece < at || piece_at(bytes, 16 * piece, 16) == piece_at(original, 16 * piece, 16)
     })
 }
 
-/// For any key, associated data of up to two bytes, data of up to 48 bytes, a body of up to 96
-/// and whatever the cipher does: sealing the body refuses as `WrongLength` a body not as long as
-/// the chunks of 16 bytes of the data with their tags, before the cipher and writing nothing.
-/// Otherwise it seals each chunk in turn, under the key, the nonce of its number and of whether
-/// it is the last and the associated data, in a buffer that is not the body, and stops at the
-/// first that fails, as `CipherFailed`. Each chunk sealed is in the body as the cipher wrote it,
-/// followed by its tag, and the body past them is as it was.
 #[kani::proof]
 #[kani::unwind(8)]
 fn a_body_is_sealed_chunk_by_chunk_outside_it() {
@@ -8016,8 +7439,8 @@ fn a_body_is_sealed_chunk_by_chunk_outside_it() {
         "a body of another length is refused before the cipher, and the seal stops at the first \
          chunk that fails",
     );
-    // A constant index in each round: a field of an element read at an index known only at run
-    // time fails falsely in Kani 0.68.0.
+    // A constant index in each round: in Kani 0.68.0 a field read at a run-time index fails
+    // falsely.
     for index in 0..3 {
         if index >= cipher.calls {
             continue;
@@ -8077,14 +7500,6 @@ fn a_body_is_sealed_chunk_by_chunk_outside_it() {
     );
 }
 
-/// For any key, associated data of up to two bytes, a body of up to 96 bytes, data of up to 48
-/// and whatever the cipher does: opening the body refuses, before the cipher and writing nothing,
-/// a body of a length no body has, as `RecordRejected`, and data not as long as it holds, as
-/// `WrongLength`. Otherwise it opens each chunk in turn, under the key, the nonce of its number and
-/// of whether it is the last and the associated data, with the tag that follows it, in a buffer
-/// that is not the data, and stops at the first the cipher refuses, as `RecordRejected`. Each
-/// chunk that opened is in the data as the cipher wrote it, and the data past them are as they
-/// were.
 #[kani::proof]
 #[kani::unwind(8)]
 fn a_body_opens_chunk_by_chunk_outside_its_data() {
@@ -8127,8 +7542,8 @@ fn a_body_opens_chunk_by_chunk_outside_its_data() {
         "a body of no length a body has and data of another length are refused before the \
          cipher, and the opening stops at the first chunk refused",
     );
-    // A constant index in each round: a field of an element read at an index known only at run
-    // time fails falsely in Kani 0.68.0.
+    // A constant index in each round: in Kani 0.68.0 a field read at a run-time index fails
+    // falsely.
     for index in 0..3 {
         if index >= cipher.calls {
             continue;
@@ -8185,12 +7600,6 @@ fn a_body_opens_chunk_by_chunk_outside_its_data() {
     kani::cover!(result == Err(Error::WrongLength), "data of another length");
 }
 
-/// From any state of two slots and of the epoch, for handles of these slots naming any slots and
-/// generations, any public key read for any slots and epoch, any context of up to two bytes and
-/// any record: archiving empty data into a body of 15 bytes, and opening a body of 15 bytes into
-/// one byte or a body of 17 bytes into two, change no slot and no epoch. After the refusals of a context, the
-/// handles and, for archiving, the public key, in order, they are refused for the length, before
-/// X-Wing, any draw and any decryption, writing no record and wiping the body or the data.
 #[kani::proof]
 #[kani::unwind(1181)]
 fn buffers_of_another_length_are_refused_before_anything_else() {

@@ -10,8 +10,8 @@ pub(crate) const PLAINTEXT_LEN: usize = 233;
 /// The size of a record of a wrapped key set in bytes: the nonce, the encrypted plaintext and the
 /// tag.
 pub const RECORD_LEN: usize = 261;
-/// The size of a lock record in bytes: the nonce, the number of the epoch and the record of a
-/// stored key for wrapping, encrypted together, and the tag.
+/// A lock record's size in bytes: the nonce, epoch number and a stored wrapping key's record,
+/// encrypted, then the tag.
 pub const LOCK_RECORD_LEN: usize = 297;
 /// The size of what the outer layer of a lock record encrypts: the number of the epoch and the
 /// record.
@@ -19,31 +19,23 @@ pub(crate) const LAYER_LEN: usize = 8 + RECORD_LEN;
 /// The size of the record that ends an export in bytes: the nonce and the tag of an empty
 /// plaintext.
 pub const END_RECORD_LEN: usize = 28;
-/// The size of the record of an archive key in bytes: the nonce, the number of the epoch, the
-/// identifier and the public key of the archive key and the record of its seed, encrypted
-/// together, and the tag.
+/// An archive key record's size in bytes: the nonce, then the epoch number, identifier, public key
+/// and seed record, encrypted. Then the tag.
 pub const ARCHIVE_KEY_RECORD_LEN: usize = 1529;
 /// What the outer layer of the record of an archive key holds after the number of its epoch.
 pub(crate) const ARCHIVE_BODY_LEN: usize = ID_LEN + PUBLIC_LEN + RECORD_LEN;
-/// The size of what that outer layer encrypts.
 pub(crate) const ARCHIVE_LAYER_LEN: usize = 8 + ARCHIVE_BODY_LEN;
-/// The size of a record of an archive in bytes: the nonce, the identifier of the archive key, a
-/// ciphertext of X-Wing to it and a check of its shared secret, encrypted together, and the tag.
+/// An archive record's size in bytes: the nonce, then the key identifier, X-Wing ciphertext and
+/// secret check, encrypted. Then the tag.
 pub const ARCHIVE_RECORD_LEN: usize = 1180;
-/// What a record of an archive encrypts.
 pub(crate) const ARCHIVED_LEN: usize = ID_LEN + CIPHERTEXT_LEN + ID_LEN;
-/// The longest context a record can be bound to, in bytes.
 pub(crate) const MAX_CONTEXT: usize = 255;
 pub(crate) const LABEL_LEN: usize = 19;
 const AAD_LABEL: &[u8; LABEL_LEN] = b"lethewis key record";
 pub(crate) const EXPORT_LABEL: &[u8; LABEL_LEN] = b"lethewis key export";
 pub(crate) const END_LABEL: &[u8; LABEL_LEN] = b"lethewis export end";
-/// The label, the version, the length of the context, the tag a chain of records goes on from and
-/// the longest context.
 const AAD_CAPACITY: usize = 292;
-/// The label and the two bytes after it.
 const AAD_HEAD: usize = LABEL_LEN + 2;
-/// The size of a key identifier in bytes.
 pub(crate) const ID_LEN: usize = 16;
 /// The version of the record format, in the associated data and in the plaintext.
 pub(crate) const VERSION: u8 = 1;
@@ -61,29 +53,21 @@ const _: () = assert!(AAD_HEAD + TAG_LEN + MAX_CONTEXT == AAD_CAPACITY);
 #[non_exhaustive]
 #[repr(u8)]
 pub enum Purpose {
-    /// A key of 32 or 64 bytes that wraps other keys. Its set holds this one key and never changes.
-    /// A key from a secret, such as a password, wraps only stored keys, for wrapping or of the
-    /// archive, which [`Slots::lock`](crate::Slots::lock) keeps under it; a stored key for wrapping
-    /// wraps only keys for external data, keys for transfers, keys of chats for their archives and
-    /// keys for data.
-    /// Leaves the library only wrapped, or as the words
-    /// [`Slots::generate_words`](crate::Slots::generate_words) or the shares
-    /// [`Slots::generate_shares`](crate::Slots::generate_shares) write once; a key from a secret
-    /// gives out a [`Slots::challenge`](crate::Slots::challenge) derived from it.
+    /// A wrapping key: one from a secret wraps stored keys, which wrap external data, transfer,
+    /// chat archive and data keys. Of 32 or 64 bytes, alone in its set, it leaves only wrapped or
+    /// once as generated words or shares.
     Wrap = 1,
-    /// A key of 32 bytes for data an engine outside the library encrypts, such as a database. It
-    /// wraps no key, and leaves the library only as a record wrapped by another key or through
-    /// [`Slots::reveal32`](crate::Slots::reveal32) naming this purpose.
+    /// A 32-byte key for data an engine outside the library encrypts, such as a database. It wraps
+    /// no key, and leaves only wrapped or through [`Slots::reveal32`](crate::Slots::reveal32)
+    /// naming this purpose.
     ExternalData = 2,
-    /// A key of 32 bytes that carries keys for external data to another device or into a backup:
-    /// it wraps them into records of an export, which open with this key alone, in any epoch. It
-    /// comes from a secret shared with the other device, or from words, and is stored under a
-    /// stored key for wrapping. Its set holds this one key and never changes; it leaves the library
-    /// only wrapped, or as the words a generation writes.
+    /// A 32-byte key whose export records carry keys for external data to another device or a
+    /// backup, in any epoch. It comes from a shared secret or words, alone in its set, and leaves
+    /// only wrapped or as words.
     Transfer = 3,
-    /// The seed of an X-Wing key pair, 32 bytes, that keeps old history: whoever holds the public
-    /// key writes records that only this key opens. Only the record of an archive key creates it,
-    /// and it lies in no other record. It never leaves the library.
+    /// The 32-byte seed of an X-Wing pair that keeps old history: records to its public key open
+    /// only with it. Only an archive key's record creates and holds it; it never leaves the
+    /// library.
     Archive = 4,
     /// A stored key of 32 bytes that wraps only the seed of an archive key. It lies only in lock
     /// records, and leaves the library only wrapped.
@@ -91,10 +75,9 @@ pub enum Purpose {
     /// A key of 32 bytes for the outer layer of the records of an archive, one for each chat. It is
     /// stored under a stored key for wrapping, and leaves the library only wrapped.
     ArchiveSeal = 6,
-    /// A key of 32 bytes that encrypts the caller's data in the library, in blocks with
-    /// AES-256-GCM-SIV: whatever one key covers, such as one chat, is unreadable once it is
-    /// destroyed. Only the platform's source creates it, and it is stored under a stored key for
-    /// wrapping; it is never exported and leaves the library only wrapped.
+    /// A 32-byte key that encrypts the caller's data in blocks with AES-256-GCM-SIV; what it covers
+    /// is lost with it. Only the platform's source creates it, under a stored wrapping key; it is
+    /// never exported and leaves only wrapped.
     Data = 7,
 }
 
@@ -112,7 +95,6 @@ impl Purpose {
         }
     }
 
-    /// Whether a key of `length` may serve this purpose.
     pub(crate) const fn takes(self, length: KeyLength) -> bool {
         match self {
             Self::Wrap => true,
@@ -139,8 +121,7 @@ impl Purpose {
         )
     }
 
-    /// Whether a set for this purpose holds up to three keys that change by their stages: a set
-    /// for any other purpose holds one key that never changes.
+    /// Whether a set for this purpose holds up to three keys changing by stages, not one fixed key.
     pub(crate) const fn staged(self) -> bool {
         matches!(self, Self::ExternalData | Self::Data)
     }
@@ -150,7 +131,6 @@ impl Purpose {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum Status {
-    /// It may be used.
     Enabled = 1,
     /// It is kept, but may not be used.
     Disabled = 2,
@@ -189,8 +169,8 @@ pub(crate) struct Malformed;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InvalidContext;
 
-/// The associated data of a record: a label of the format and its version, the length of the
-/// context, and the context, which names the place the record belongs to.
+/// A record's associated data: a format label and version, the context length, and the context
+/// naming its place.
 pub(crate) struct AssociatedData {
     bytes: [u8; AAD_CAPACITY],
     len: usize,
@@ -201,14 +181,10 @@ impl AssociatedData {
         Self::labelled(AAD_LABEL, VERSION, context)
     }
 
-    /// The associated data of a chunk of a block of data: its own label and version, the length of
-    /// the context, and the context.
     pub(crate) fn of_data(context: &[u8]) -> Result<Self, InvalidContext> {
         Self::labelled(crate::block::DATA_LABEL, crate::block::VERSION, context)
     }
 
-    /// The associated data of a chunk of the body of a batch of an archive: its own label and
-    /// version, the length of the context, and the context.
     pub(crate) fn of_batch(context: &[u8]) -> Result<Self, InvalidContext> {
         Self::labelled(
             crate::block::BATCH_LABEL,
@@ -226,7 +202,7 @@ impl AssociatedData {
             .ok()
             .filter(|&len| len != 0)
             .ok_or(InvalidContext)?;
-        // The fixed part at fixed offsets: under the proofs a piece of a length known only at run
+        // The fixed part at fixed offsets. Under the proofs a piece of a length known only at run
         // time costs many times its bytes.
         let mut bytes = [0; AAD_CAPACITY];
         let (label, rest) = bytes
@@ -242,9 +218,8 @@ impl AssociatedData {
         Ok(Self { bytes, len })
     }
 
-    /// The associated data of a record of an export, or of the record that ends one, as `label`
-    /// says: the label, the version, the length of the context, `chain`, which is the tag of the
-    /// record before or zero for the first, and the context.
+    /// The associated data of an export record or its end, as `label` says. `chain`, the tag before
+    /// or zero for the first, comes before the context.
     pub(crate) fn chained(&self, label: &[u8; LABEL_LEN], chain: &[u8; TAG_LEN]) -> Self {
         let mut bytes = [0; AAD_CAPACITY];
         // The context moves with the zeros past it, so that every copy is of a fixed length.
@@ -282,7 +257,6 @@ pub(crate) fn tail_is_zero(key: &[u8; CAPACITY], length: KeyLength) -> bool {
     }
 }
 
-/// A key buffer as four numbers of sixteen bytes each.
 // Under the proofs a number costs many times less than its bytes one at a time.
 pub(crate) fn lanes(key: &[u8; CAPACITY]) -> Option<[u128; 4]> {
     let pieces: &[[u8; 16]; 4] = key.as_chunks::<16>().0.try_into().ok()?;

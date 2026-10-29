@@ -9,29 +9,25 @@ use core::fmt;
 pub enum Error {
     /// Every slot holds a key set or is out of use.
     NoFreeSlot,
-    /// The handle does not refer to a key set held now, a block began before its set last changed,
-    /// or another record or block went under the key for transfers since a carried block began.
+    /// The handle refers to no set held now, or a block began before its set last changed. Or,
+    /// since a carried block began, another element went under its transfer key.
     StaleHandle,
     /// The source of random bytes failed.
     EntropyFailed,
     /// A value could not be derived from a key.
     DerivationFailed,
-    /// The record does not open with the key of the parent set and this context, holds a plaintext
-    /// this version of the library cannot read, or names a key other than the one that opens it;
-    /// or X-Wing refuses the public key of an archive key; or no block has the length given, the
-    /// header of a block names no key of the set, or a chunk does not open as the next of its
-    /// block; or no body of a batch has the length given, or a chunk of it does not open.
+    /// A record, block, chunk or batch does not open under this key and context, or names another
+    /// key. Or its length or plaintext is not one this version reads, or X-Wing refused an archive
+    /// key's public key.
     RecordRejected,
     /// A key set cannot wrap itself.
     SameKey,
     /// The context is empty or longer than 255 bytes.
     InvalidContext,
-    /// The cipher or X-Wing gave a known input a wrong answer, a new key pair of X-Wing did not agree
-    /// with itself, the cipher refused the input, or a sealed chunk did not open or seal again to
-    /// the same tag and ciphertext, so nothing was written.
+    /// The cipher or X-Wing refused the input, or failed a known answer or self-check; nothing was
+    /// written.
     CipherFailed,
-    /// A key of the set is held here already, or the set holds one key twice: a key is held in one
-    /// place only.
+    /// A key of the set is held here already, or the set holds one key twice.
     DuplicateKey,
     /// Every position of the set holds a key.
     SetFull,
@@ -41,8 +37,8 @@ pub enum Error {
     WrongStage,
     /// The set has changed as many times as its counter holds.
     SetExhausted,
-    /// The set has changed in this epoch, and only a new epoch saves the change; or a block is to
-    /// be written under a set no record of this epoch holds as it is now.
+    /// The set changed in this epoch, and only a new epoch saves that. Or a block is to go under a
+    /// set no current record of this epoch holds.
     Unsaved,
     /// A change to the next epoch has begun already.
     EpochChanging,
@@ -53,7 +49,7 @@ pub enum Error {
     /// The platform did not switch the root of the epoch.
     RootFailed,
     /// The parameters of a derivation from a password are out of bounds, or not ones this version
-    /// of the library writes.
+    /// writes.
     InvalidParams,
     /// The password is empty or longer than 2^32 - 1 bytes.
     InvalidPassword,
@@ -67,37 +63,30 @@ pub enum Error {
     WrongPurpose,
     /// The purpose takes no key of this length, or a buffer is not as long as the call takes.
     WrongLength,
-    /// The set is not of the level the call takes: a key from a secret wraps only stored keys, for
-    /// wrapping or of the archive; a stored key for wrapping wraps only keys for external data, keys
-    /// for transfers, keys of chats for their archives and keys for data; a key for transfers
-    /// exports only keys for external data.
+    /// The set is not of the level the call takes, as [`Purpose::Wrap`](crate::Purpose::Wrap) and
+    /// [`Purpose::Transfer`](crate::Purpose::Transfer) describe.
     WrongLevel,
-    /// The lock record or the record of an archive key does not open in this epoch for this
-    /// context: it was not written or carried into it, or it was changed; or the public key of an
-    /// archive key was read from other slots or in another epoch.
+    /// The lock or archive key record was not written or carried into this epoch for this context,
+    /// or was changed. A public key read from other slots or in another epoch gives it too.
     StaleRecord,
-    /// The record of an archive key holds an identifier or a public key other than the ones its seed
-    /// gives, changed by someone who held the key of the epoch and the stored key it is under; or
-    /// the record of a batch fails its check, archived to another public key or changed under the
-    /// key of its chat.
+    /// An archive key's record names an identifier or public key not from its seed, or a batch
+    /// fails its check. A holder of the keys above changed it, or the batch went to another public
+    /// key.
     PublicKeyMismatch,
     /// The record of an archive was written to another archive key.
     WrongArchiveKey,
-    /// A transfer has not ended: the set came in an export whose end has not been received, and is
-    /// neither revealed, wrapped, exported nor changed, and begins and reads no block, until then;
-    /// or the key for transfers carries an export the other way.
+    /// A transfer has not ended, so a set it brought is not yet revealed, wrapped, exported,
+    /// changed or used. A transfer key carrying an export the other way gives it too.
     Unfinished,
     /// The key for transfers has written or received no record or block of an export to end.
     NoTransfer,
     /// The block is under a key of the set that is disabled: it opens once the key is enabled
     /// again.
     KeyDisabled,
-    /// The chunk is not the one its block takes next: the last one where more are due, another
-    /// where the last is due, a last one of another length, longer than a chunk or empty after
-    /// others, or one past as many chunks as a number of 64 bits counts.
+    /// The chunk is not its block's next: out of order, of a wrong length, or past a 64-bit count.
     WrongChunk,
-    /// The set for data did not come in the transfer under way, so a received block is not written
-    /// under it.
+    /// The data set did not come in the transfer under way, so no received block is written under
+    /// it.
     NotReceived,
     /// A share is numbered other than 1, 2 or 3.
     InvalidShare,
@@ -105,8 +94,8 @@ pub enum Error {
     MixedShares,
     /// Both shares carry the same number.
     SameShare,
-    /// The secret the shares give fails the check they carry: a share was changed, or the shares
-    /// come from two splits with one mark.
+    /// The secret the shares give fails their check: a share was changed, or two splits share one
+    /// mark.
     ChangedShare,
 }
 

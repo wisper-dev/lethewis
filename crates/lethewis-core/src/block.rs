@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The layout of a block of data: a header of a salt and a check, then the data in chunks, each
-//! followed by its tag. The body of a batch of an archive is the same chunks without the header.
+//! The layout of a block: a header of a salt and a check, then chunks, each followed by its tag.
 
 use crate::record::LABEL_LEN;
 use crate::seal::{NONCE_LEN, TAG_LEN};
@@ -13,8 +12,7 @@ pub(crate) const SALT_LEN: usize = 16;
 pub(crate) const CHECK_LEN: usize = 32;
 /// The size of the header of a block in bytes: the salt, then the check.
 pub const BLOCK_HEADER_LEN: usize = SALT_LEN + CHECK_LEN;
-/// How many bytes of data a chunk of a block holds: every chunk but the last holds this many, and
-/// the last holds from 1 to this many, or none when the data are empty.
+/// Bytes of data in each chunk but the last, which holds 1 to this many, or none for empty data.
 pub const CHUNK_LEN: usize = 65_536;
 /// The size of the tag that follows each chunk, in bytes.
 pub const CHUNK_TAG_LEN: usize = TAG_LEN;
@@ -29,8 +27,6 @@ pub(crate) const VERSION: u8 = 1;
 /// The version of the format of the body of a batch, in the associated data of each chunk.
 pub(crate) const BATCH_VERSION: u8 = 1;
 
-/// The length of the chunks of `C` bytes that data of `len` bytes take, each followed by its tag;
-/// `None` past what a number of 64 bits holds.
 pub(crate) const fn body_len_in<const C: usize>(len: u64) -> Option<u64> {
     let Some(tags) = chunks_in::<C>(len).0.checked_mul(TAG_LEN as u64) else {
         return None;
@@ -38,8 +34,6 @@ pub(crate) const fn body_len_in<const C: usize>(len: u64) -> Option<u64> {
     len.checked_add(tags)
 }
 
-/// The length of a block whose chunks hold `C` bytes each and whose data are `len` bytes long: the
-/// header, the data, and a tag for each chunk; `None` past what a number of 64 bits holds.
 pub(crate) const fn block_len_in<const C: usize>(len: u64) -> Option<u64> {
     match body_len_in::<C>(len) {
         Some(body) => body.checked_add(BLOCK_HEADER_LEN as u64),
@@ -47,8 +41,8 @@ pub(crate) const fn block_len_in<const C: usize>(len: u64) -> Option<u64> {
     }
 }
 
-/// How many chunks of `C` bytes data of `len` bytes take, one at least, and how many bytes the last
-/// one holds.
+/// How many chunks of `C` bytes data of `len` bytes take, at least one, and how many the last
+/// holds.
 pub(crate) const fn chunks_in<const C: usize>(len: u64) -> (u64, u64) {
     let chunk = C as u64;
     match (len.checked_div(chunk), len.checked_rem(chunk)) {
@@ -58,8 +52,8 @@ pub(crate) const fn chunks_in<const C: usize>(len: u64) -> (u64, u64) {
     }
 }
 
-/// The length of the data a block of `block` bytes holds, in chunks of `C` bytes, if a block of
-/// that length is one the library writes.
+/// The data length in a block of `block` bytes with chunks of `C` bytes, if the library writes such
+/// blocks.
 pub(crate) const fn data_len_in<const C: usize>(block: u64) -> Option<u64> {
     let Some(body) = block.checked_sub(BLOCK_HEADER_LEN as u64) else {
         return None;
@@ -67,8 +61,8 @@ pub(crate) const fn data_len_in<const C: usize>(block: u64) -> Option<u64> {
     body_data_len_in::<C>(body)
 }
 
-/// The length of the data that chunks of `C` bytes with their tags hold in `body` bytes, if chunks
-/// the library writes take that many.
+/// The data length that `body` bytes of `C`-byte chunks with their tags hold, if the library writes
+/// such bodies.
 pub(crate) const fn body_data_len_in<const C: usize>(body: u64) -> Option<u64> {
     let whole = (C as u64).saturating_add(TAG_LEN as u64);
     // A chunk and its tag take `whole` bytes; the last chunk takes at least its tag.
@@ -92,31 +86,27 @@ pub(crate) const fn body_data_len_in<const C: usize>(body: u64) -> Option<u64> {
     }
 }
 
-/// The length of a block whose data are `len` bytes long, or `None` past what a number of 64 bits
-/// holds: [`BLOCK_HEADER_LEN`], the data, and [`CHUNK_TAG_LEN`] for each chunk of up to
-/// [`CHUNK_LEN`] bytes, one chunk at least.
+/// The length of a block of `len` data bytes, or `None` past 64 bits. That is [`BLOCK_HEADER_LEN`],
+/// the data, and [`CHUNK_TAG_LEN`] per chunk of up to [`CHUNK_LEN`] bytes, one at least.
 #[must_use]
 pub const fn block_len(len: u64) -> Option<u64> {
     block_len_in::<CHUNK_LEN>(len)
 }
 
-/// The length of the body of a batch of an archive whose data are `len` bytes long, or `None` past
-/// what a number of 64 bits holds: the data, and [`CHUNK_TAG_LEN`] for each chunk of up to
-/// [`CHUNK_LEN`] bytes, one chunk at least.
+/// The length of a batch body of `len` data bytes, or `None` past 64 bits. That is the data and
+/// [`CHUNK_TAG_LEN`] per chunk of up to [`CHUNK_LEN`] bytes, one at least.
 #[must_use]
 pub const fn batch_len(len: u64) -> Option<u64> {
     body_len_in::<CHUNK_LEN>(len)
 }
 
-/// The length of the data the body of a batch of `body` bytes holds, or `None` if no body of a
-/// batch is that long.
+/// The data length a batch body of `body` bytes holds, or `None` if no body is that long.
 #[must_use]
 pub const fn batch_data_len(body: u64) -> Option<u64> {
     body_data_len_in::<CHUNK_LEN>(body)
 }
 
-/// Whether two checks are equal, compared in constant time. Kept out of line, so that the check of
-/// its machine code finds it.
+/// Constant time, and out of line so that the check of its machine code finds it.
 #[inline(never)]
 pub(crate) fn same_check(a: &[u8; CHECK_LEN], b: &[u8; CHECK_LEN]) -> bool {
     #[cfg(not(kani))]
@@ -128,8 +118,8 @@ pub(crate) fn same_check(a: &[u8; CHECK_LEN], b: &[u8; CHECK_LEN]) -> bool {
     model::same_check(a, b)
 }
 
-/// Which of three positions is the first to hold a match, and whether any does, worked out with no
-/// branch on the matches. Kept out of line, so that the check of its machine code finds it.
+/// Which of three positions first holds a match, and whether any does, with no branch on the
+/// matches. Kept out of line so the machine-code check finds it.
 #[inline(never)]
 pub(crate) fn first_match(matches: [bool; 3]) -> (usize, bool) {
     let [first, second, third] = matches.map(u8::from);
@@ -141,8 +131,6 @@ pub(crate) fn first_match(matches: [bool; 3]) -> (usize, bool) {
     )
 }
 
-/// The nonce of the chunk numbered `index`: the number, least significant byte first, three zero
-/// bytes, and one byte that is 1 for the last chunk of a block and 0 for any other.
 pub(crate) fn chunk_nonce(index: u64, last: bool) -> [u8; NONCE_LEN] {
     let mut nonce = [0; NONCE_LEN];
     if let Some((number, rest)) = nonce.split_first_chunk_mut::<8>() {
@@ -182,8 +170,8 @@ mod tests {
             let block = block_len_in::<16>(len).unwrap();
             assert_eq!(data_len_in::<16>(block), Some(len), "{len}");
         }
-        // 64 is the empty block, 65 to 80 hold one chunk; 81 would be a full chunk and an empty
-        // one, and a whole chunk takes 32 bytes, so 97 is the shortest block of two.
+        // An empty block is 64 bytes, and 65 to 80 hold one chunk. With 32 per whole chunk, a full
+        // and an empty chunk would be 81; 97 is the shortest of two.
         let lengths: [u64; 8] = [0, 47, 63, 81, 82, 96, 113, 114];
         for block in lengths {
             assert_eq!(data_len_in::<16>(block), None, "{block}");
@@ -225,9 +213,8 @@ mod tests {
 mod model {
     use super::CHECK_LEN;
 
-    /// [`super::same_check`] as Kani sees it: the comparison ends in inline assembly, which Kani
-    /// cannot model; as numbers, comparing the arrays whole reads bytes from before the latest
-    /// write in Kani 0.68.0.
+    /// The comparison ends in inline assembly, which Kani cannot model. Compared as numbers:
+    /// comparing the arrays whole reads bytes from before the latest write in Kani 0.68.0.
     pub(super) fn same_check(a: &[u8; CHECK_LEN], b: &[u8; CHECK_LEN]) -> bool {
         let halves = |bytes: &[u8; CHECK_LEN]| {
             bytes
@@ -251,12 +238,8 @@ mod proofs {
         chunks_in, data_len_in, first_match,
     };
 
-    /// For data of any length, in chunks of 64 KiB, and of 16 bytes as the proofs of the calls
-    /// take: they take at least one chunk, each but the last full, and the last holds the rest,
-    /// from 1 byte to a whole chunk, or none for empty data; the body of a batch is the data and a
-    /// tag for each chunk, and the block the header and that body, unless it does not fit in 64
-    /// bits, and each gives back the length of its data. Worked out in numbers of 128 bits, apart
-    /// from the code.
+    /// Also in chunks of 16 bytes, as the proofs of the calls take. Worked out in numbers of 128
+    /// bits, apart from the code.
     #[kani::proof]
     fn data_of_any_length_take_the_chunks_and_the_block_their_layout_says() {
         layout::<CHUNK_LEN>();
@@ -321,9 +304,6 @@ mod proofs {
         );
     }
 
-    /// For any length of a block or of the body of a batch, in chunks of 64 KiB and of 16 bytes,
-    /// the length of data it gives is one whose block or body has exactly that length: a length no
-    /// block or body has gives none.
     #[kani::proof]
     fn only_the_length_of_a_block_gives_a_length_of_data() {
         lengths::<CHUNK_LEN>();
@@ -366,8 +346,6 @@ mod proofs {
         );
     }
 
-    /// The nonce of any chunk holds its number, least significant byte first, three zero bytes and
-    /// the mark of the last chunk, as the layout says.
     #[kani::proof]
     fn a_nonce_holds_the_number_and_the_mark_of_its_chunk() {
         let (index, last): (u64, bool) = (kani::any(), kani::any());
@@ -381,8 +359,6 @@ mod proofs {
         kani::cover!(last && index == u64::MAX, "the last of the most chunks");
     }
 
-    /// For every combination of matches, the position given is the first that matches, and whether
-    /// any does.
     #[kani::proof]
     fn the_first_match_is_found() {
         let matches: [bool; 3] = kani::any();
