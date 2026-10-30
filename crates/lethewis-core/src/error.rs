@@ -88,7 +88,7 @@ pub enum Error {
     /// The data set did not come in the transfer under way, so no received block is written under
     /// it.
     NotReceived,
-    /// A share is numbered other than 1, 2 or 3.
+    /// A share is numbered other than 1, 2 or 3, or its words are of a later format.
     InvalidShare,
     /// The shares carry the marks of different splits.
     MixedShares,

@@ -28,7 +28,7 @@ const CHECKSUM_BITS: u16 = 0xf;
 const LIST_TEXT: &[u8] = include_bytes!("words/english.txt");
 
 /// The list, each word as a number: its bytes and the zeros after them, in little-endian order.
-static LIST: [u64; LIST_LEN] = numbers_of(LIST_TEXT);
+pub(crate) static LIST: [u64; LIST_LEN] = numbers_of(LIST_TEXT);
 
 /// Read at compile time: anything but 2048 lines of 3 to 8 lowercase letters fails the build.
 #[expect(
@@ -266,7 +266,7 @@ fn same_checksum(a: u16, b: u16) -> bool {
 
 /// The number of the entry of `list` that `word` is, and whether it is one, as all ones or zero.
 /// Every entry is compared, in constant time.
-fn find_in<const N: usize>(list: &[u64; N], word: u64) -> (u16, u8) {
+pub(crate) fn find_in<const N: usize>(list: &[u64; N], word: u64) -> (u16, u8) {
     let mut found = (0, 0);
     for (number, &entry) in (0..).zip(list) {
         found = find_step(word, entry, number, found);
@@ -275,7 +275,7 @@ fn find_in<const N: usize>(list: &[u64; N], word: u64) -> (u16, u8) {
 }
 
 /// Every entry is read, in constant time.
-fn select_in<const N: usize>(list: &[u64; N], number: u16) -> u64 {
+pub(crate) fn select_in<const N: usize>(list: &[u64; N], number: u16) -> u64 {
     let mut word = 0;
     for (at, &entry) in (0..).zip(list) {
         word = select_step(at, number, entry, word);

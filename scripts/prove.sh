@@ -7,7 +7,8 @@
 #
 #   prove.sh             runs every proof, two at a time or LETHEWIS_PROOF_JOBS, then judges them
 #   prove.sh list        writes the declared proofs and prints their names as a JSON array
-#   prove.sh run PROOF   runs one proof; its results and peak memory go to target/proofs/runs/
+#   prove.sh run PROOF   runs one proof and judges it by the rules of a proof alone; its results
+#                        and peak memory go to target/proofs/runs/
 #   prove.sh part K N    runs part K of N, balanced by scripts/proof-times, LETHEWIS_PROOF_JOBS at
 #                        a time. A proof joins others only if their peaks fit LETHEWIS_PROOF_MEMORY
 #                        megabytes.
@@ -26,6 +27,54 @@ out=target/proofs
 runs=$out/runs
 results=$out/results.json
 times=scripts/proof-times
+
+# The rules a proof's results meet by themselves, alone or among all others: `own_problems` gives
+# what breaks them. Every check is judged by itself, not by a summary field that another Kani
+# version may drop. A file is ours if git lists it, as $names does, since Kani also writes relative
+# paths for its own library.
+# shellcheck disable=SC2016 # the dollars are jq's
+proof_rules='
+  (.project.workspace_root // "") as $root
+  | ($names | split("\u0000") | map(select(. != ""))) as $files
+  | def relative: (.location.file // "") as $file
+      | if $root != "" and ($file | startswith($root + "/"))
+        then $file[($root | length) + 1:] else $file end;
+  def ours: relative as $relative | any($files[]; . == $relative);
+  def coverage: .category == "code_coverage";
+  ["Success", "Failure", "Unreachable", "Satisfied", "Unsatisfiable", "Undetermined"] as $known
+  | def own_problems:
+        .harness_id as $proof
+      | [.checks[] | select(coverage | not)] as $checks
+      | if .status != "Success" then "\($proof): \(.status)" else empty end,
+        if ($checks | length) == 0 then "\($proof): no check at all" else empty end,
+        if ([$checks[] | select(.category == "cover")] | length) == 0
+          then "\($proof): no cover property" else empty end,
+        if ([$checks[] | select(ours)] | length) == 0
+          then "\($proof): no check in this repository code" else empty end,
+        if ([.checks[] | select(coverage and ours and .function == $proof and .status == "Covered")]
+            | length) == 0
+          then "\($proof): no line coverage of the proof itself" else empty end,
+        (.checks[] | select(coverage)
+          | if (.location.file // "") == "" then
+              "\($proof): line coverage without a location: \(.description)"
+            elif .status != "Covered" and .status != "Uncovered" then
+              "\($proof): unknown coverage status \(.status): \(.description)"
+            else empty end),
+        ($checks[]
+          | if (.location.file // "") == "" then
+              "\($proof): a check without a location: \(.description)"
+            elif (.status as $s | $known | index($s)) == null then
+              "\($proof): unknown status \(.status): \(.description)"
+            elif .category == "cover" then
+              if .status != "Satisfied"
+                then "\($proof): cover not reached: \(.description)" else empty end
+            elif .status == "Unreachable" and ours then
+              "\($proof): never reached, so a proof may hold vacuously:" +
+                " \(.location.file):\(.location.line) \(.description)"
+            elif .status != "Success" and .status != "Unreachable" then
+              "\($proof): \(.status): \(.description)"
+            else empty end);
+'
 
 placed() {
   local misplaced
@@ -98,7 +147,7 @@ sources() {
 }
 
 run_proof() {
-  local proof=$1 file before
+  local proof=$1 file before problems
   file=$(run_file "$proof")
   mkdir -p "$runs"
   rm -f "${file%.json}.sources"
@@ -111,6 +160,14 @@ run_proof() {
   read_run Cargo.toml "$proof" "$file"
   if [ "$(sources)" = "$before" ]; then
     printf '%s\n' "$before" >"${file%.json}.sources"
+  fi
+  git -c core.excludesFile=/dev/null ls-files -z --cached --others --exclude-standard \
+    >"${file%.json}.files"
+  problems=$(jq -r --rawfile names "${file%.json}.files" \
+    "$proof_rules"'.verification_results.results[] | own_problems' "$file")
+  if [ -n "$problems" ]; then
+    printf 'prove: %s\n' "$problems" >&2
+    return 1
   fi
 }
 
@@ -371,51 +428,10 @@ judge() {
     fail=1
   fi
 
-  # Every check is judged by itself, not by a summary field that another Kani version may drop.
-  # A file is ours if git lists it, since Kani also writes relative paths for its own library.
-  problems=$(jq -r --rawfile names "$out/files" --rawfile asserted "$out/asserted" '
-    (.project.workspace_root // "") as $root
-    | ($names | split("\u0000") | map(select(. != ""))) as $files
-    | def relative: (.location.file // "") as $file
-        | if $root != "" and ($file | startswith($root + "/"))
-          then $file[($root | length) + 1:] else $file end;
-    def ours: relative as $relative | any($files[]; . == $relative);
-    def coverage: .category == "code_coverage";
+  problems=$(jq -r --rawfile names "$out/files" --rawfile asserted "$out/asserted" "$proof_rules"'
     def region: .description | sub("^.*\\$ - "; "");
     def proof_code: (.function // "") | sub("::<(?!impl ).*$"; "") | test("(^|::)proofs::");
-    ["Success", "Failure", "Unreachable", "Satisfied", "Unsatisfiable", "Undetermined"] as $known
-    | (.verification_results.results[]
-      | .harness_id as $proof
-      | [.checks[] | select(coverage | not)] as $checks
-      | if .status != "Success" then "\($proof): \(.status)" else empty end,
-        if ($checks | length) == 0 then "\($proof): no check at all" else empty end,
-        if ([$checks[] | select(.category == "cover")] | length) == 0
-          then "\($proof): no cover property" else empty end,
-        if ([$checks[] | select(ours)] | length) == 0
-          then "\($proof): no check in this repository code" else empty end,
-        if ([.checks[] | select(coverage and ours and .function == $proof and .status == "Covered")]
-            | length) == 0
-          then "\($proof): no line coverage of the proof itself" else empty end,
-        (.checks[] | select(coverage)
-          | if (.location.file // "") == "" then
-              "\($proof): line coverage without a location: \(.description)"
-            elif .status != "Covered" and .status != "Uncovered" then
-              "\($proof): unknown coverage status \(.status): \(.description)"
-            else empty end),
-        ($checks[]
-          | if (.location.file // "") == "" then
-              "\($proof): a check without a location: \(.description)"
-            elif (.status as $s | $known | index($s)) == null then
-              "\($proof): unknown status \(.status): \(.description)"
-            elif .category == "cover" then
-              if .status != "Satisfied"
-                then "\($proof): cover not reached: \(.description)" else empty end
-            elif .status == "Unreachable" and ours then
-              "\($proof): never reached, so a proof may hold vacuously:" +
-                " \(.location.file):\(.location.line) \(.description)"
-            elif .status != "Success" and .status != "Unreachable" then
-              "\($proof): \(.status): \(.description)"
-            else empty end)),
+    (.verification_results.results[] | own_problems),
       ([.verification_results.results[].checks[] | select(coverage and ours and proof_code)]
         | group_by(region)[]
         | select(all(.[]; .status != "Covered"))

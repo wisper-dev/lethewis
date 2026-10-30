@@ -397,8 +397,9 @@ jobs:
           LETHEWIS_RANDOM_SEED: ${{ github.run_id }}
         run: |
           cargo test -p lethewis-core --lib --locked --release -- --ignored --exact \
-            words::tests::many_random_words_are_read_as_the_list_says | tee random-words.txt
-          grep -q '^test result: ok. 1 passed' random-words.txt
+            words::tests::many_random_words_are_read_as_the_list_says \
+            shares::words::tests::many_random_changes_of_symbols_are_refused | tee random-words.txt
+          grep -q '^test result: ok. 2 passed' random-words.txt
 
       - name: Ten thousand random records of the archive
         # X-Wing runs in every round, so the rounds are fewer.
@@ -568,7 +569,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        part: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     permissions:
       contents: read
     env:
@@ -592,7 +593,8 @@ jobs:
         run: |
           echo "$PARTS" >parts
           cargo mutants --workspace --list --json >listed.json
-          cargo mutants --workspace --shard "$PART/$PARTS"
+          # Taken in turn, so that the mutants of one file spread over the parts.
+          cargo mutants --workspace --shard "$PART/$PARTS" --sharding round-robin
           # A mutant whose build fails for any reason is unviable and goes untested. Only a compiler
           # that reported errors and exited with 1 marks one that does not build.
           crashed='internal compiler error|unexpectedly panicked|unexpectedly overflowed its stack|/rust(c|doc) .*\(signal:'

@@ -10,6 +10,10 @@ use crate::key::wipe;
 use crate::record::Purpose;
 use crate::slots::{Handle, Slots};
 
+mod words;
+
+pub use words::{SHARE_WORD_COUNT, ShareWords, share_from_words, share_to_words, wrong_share_word};
+
 /// How many shares a secret is split into; any two of them give it back.
 pub const SHARE_COUNT: usize = 3;
 /// The length of a share in bytes.

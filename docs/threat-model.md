@@ -42,6 +42,9 @@ share alone fits every secret alike, so it narrows no guess.
 A 4-byte check of the secret is split with it, each byte on a line of its own. Shares whose secret
 fails the check are refused.
 
+A share is also written as 21 words: 18 carry it and its format, 3 check them. Up to three changed
+words are refused, and a single one is found.
+
 A key for wrapping from a password, words, shares or an import is never wrapped. It wraps only
 stored keys, in lock records of two layers.
 
@@ -308,7 +311,11 @@ optimisation.
 
 Tests read it back and find no 16-byte piece of a share, the secret, the derivation or the key.
 
-Words and shares are wiped when their key is derived, and left as they were when it is not.
+Calls on the words of a share wipe the stack alike. Tests find no 16-byte piece of the share, its
+words or their numbers.
+
+Words and shares are wiped when their key is derived, and left as they were when it is not. Words
+of a share are wiped when read into it.
 
 Generations of words and of shares are the only calls that give out what a key derives from, once.
 
