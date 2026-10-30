@@ -121,8 +121,8 @@ Nothing is published while the version is below 0.1.0.
 - Proofs with Kani 0.68.0 for the change of epoch and for the refusals of an unsaved set.
 - Derivation from a password: `Slots::derive_from_password` derives a 32-byte key for wrapping
   with Argon2id, version 0x13, in one lane, straight into a free slot. It takes its working memory
-  from the caller (`MemoryBlock`), wipes the blocks it used whether it succeeds or not, and wipes the
-  password when it succeeds.
+  from the caller (`MemoryBlock`), wipes the blocks it used whether it succeeds or not, and wipes
+  the password when it succeeds.
 - `PasswordParams` holds the memory, the passes and a 16-byte salt from the platform's random
   source, kept as `PASSWORD_PARAMS_LEN` bytes, 25. Only memory from 64 MiB to 2 GiB, at least 3
   passes and memory times passes up to 8 GiB are made or read.
@@ -200,7 +200,8 @@ Nothing is published while the version is below 0.1.0.
   key for wrapping.
 - `Slots::export` writes a set for external data as a record of an export, of `RECORD_LEN` bytes,
   under a key derived from the key for transfers alone, in no epoch; each record is bound to the tag
-  of the one before. `Slots::end_export` ends the export with a record of `END_RECORD_LEN` bytes, 28.
+  of the one before. `Slots::end_export` ends the export with a record of `END_RECORD_LEN` bytes,
+  28.
 - `Slots::receive` loads the records of an export, in order, into free slots; a set received is
   neither revealed, wrapped, exported nor changed until `Slots::end_receive` receives the end. A key
   for transfers carries one export at a time, one way, and an export without records has no end.
@@ -306,5 +307,12 @@ Nothing is published while the version is below 0.1.0.
   wrong word.
 - Kani 0.68.0 proves the field, reading back, and that up to three changed words are refused and
   one is found. Tests against an independent implementation, and of the stack.
+- Crate `lethewis-timelock`: `Network::verify` checks a round's signature from the drand network
+  `QUICKNET`; `Network::round_at_or_after` and `Network::time_of` convert between rounds and times.
+  No network and no clock: the caller brings both.
+- Dependency of `lethewis-timelock`: `blst` 0.3.17 or a later compatible version, with `no-threads`
+  and `portable`. Its assembly was read through its generators.
+- Kani 0.68.0 proves the conversions for every time and round, and what a check asks of the curve.
+  Tests against beacons of quicknet, changed bits, the identity and points outside the group.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

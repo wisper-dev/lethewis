@@ -50,8 +50,8 @@ All six must hold. A row missing any one of them is not written.
 | Data blocks | a block is written only under the primary key of a set a record of this epoch holds as it is, and opens only under the key its header names, for its context: each chunk only as the next, the last only as the last and of its length. An empty position names no key; a disabled key opens nothing | `lethewis-core` |
 | Carried data blocks | a block leaves the library only sealed again under a key for transfers, chunk by chunk, as the next element of its export, which the end covers. A carried block is received only in that order, into a new set for data of that transfer, which begins and reads no block until the end is received | `lethewis-core` |
 | Whole transfers | a set that came in an export is revealed, wrapped, exported or changed only once the end of that export is received under the same load of its key for transfers. That key carries one export at a time. The records of an export open only in the order they were written, and its end only after the last | `lethewis-core` |
-
-The time lock will add a row when its crate exists.
+| Time lock, rounds | The round for a time is the first published then or later; none before round 1. | `lethewis-timelock` |
+| Time lock, signatures | A round's signature is accepted only when quicknet's key verifies it for that round. | `lethewis-timelock` |
 
 Calls into the operating system are checked by tests and measurements on real devices, not by
 proof. Crates that make them, `lethewis-dit` among them, are in neither table; under Kani,
@@ -152,6 +152,9 @@ proof. Crates that make them, `lethewis-dit` among them, are in neither table; u
 | Share words, one set | Symbols read are the symbols of the share read: a share has one set of words. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
 | Share words, changes | Syndromes add; symbols followed by their check have none; changes at up to three places have some. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any symbols, places and changes | more than three changes, which three words of check cannot all catch |
 | Share words, the wrong word | One change is located at its place; a place is named only for syndromes of one change there. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the step's comparisons, in inline assembly, modelled as plain equality; unit tests check the real step | two not taken for one follows from this row and the one above; words out of the list, tested exhaustively |
+| Time lock, rounds | For any time, the round found is the first published then or later, and none before round 1. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the clock of quicknet, worked out in 128-bit numbers apart from the code | other networks; whether the time the caller gives is right |
+| Time lock, times | Every round but 0 has its time, if 64 bits hold it, and that time gives the round back. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
+| Time lock, signatures | Accepted exactly when the curve accepts the signature for quicknet's key and the round's message; round 0 is refused first. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the curve answers at will and keeps what it was given; SHA-256 of a round stands in as its bytes | the call into blst, the pairing, the hash to G1 and SHA-256, tested against beacons of quicknet; blst's own code |
 | Record layout, the format | A record's plaintext has 233 bytes: version, purpose and primary position (1 byte each), parent identifier (16), epoch and revision (8 each, least significant byte first). Three positions of 66 bytes follow, each a stage (1 enabled, 2 disabled), a key length (1) and a key (64, zero past a 32-byte key), or zeros when empty. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the accepted values and the offsets are written from the layout, independently of the parser and the builder; a key is built only by the functions that load it, so its bytes past its length are zero, as the proofs on slots and the round trip in this row show | the encryption of the record, which the rows on wrapping and on record integrity cover with a model of the cipher; whether the checks of a 32-byte key's tail and of an empty position take the same time for every key |
 | Record layout, parsing | For any 233 bytes, parsing never panics or overflows and accepts them exactly when the version is 1 and the purpose one of the seven values of `Purpose`, 1 to 7. A position is zero or holds stage 1 or 2, length 32, or 64 for purpose 1 (wrapping), zeros past a short key. The primary, 0 to 2, is enabled.| `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
 | Record layout, building | For any header of any purpose, any stages whose primary position holds an enabled key and keys of lengths the purpose takes, building writes every field at its offset and an empty position as zeros. The parent identifier is read back from its offset, and parsing gives back the same set. Bytes that parse build back to the same bytes. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
@@ -526,6 +529,18 @@ compile error.
 | share words written, read or looked for without the stack wipe | no proof: tests of the stack |
 | calls on share words documented with another stack | no proof: tests of the stack |
 | share words written, read, looked up, located or named outside the mode of data-independent timing | no proof: unit tests |
+| a round for a time that rounds down | `a_time_gives_the_first_round_published_then_or_later`, unit tests |
+| a round for a time one round late | `a_time_gives_the_first_round_published_then_or_later`, `a_round_is_published_at_its_time`, unit tests |
+| round 1 for a time before it | `a_time_gives_the_first_round_published_then_or_later`, unit tests |
+| round 1 for time 0 | `a_time_gives_the_first_round_published_then_or_later`, unit tests |
+| the time of a round one period late | `a_round_is_published_at_its_time`, unit tests |
+| the time of a round that wraps past the largest time | `a_round_is_published_at_its_time`, unit tests |
+| round 0 handed to the curve | `a_signature_is_accepted_exactly_when_the_curve_accepts_it_for_the_round`, unit tests |
+| a signature checked under another key, or for the next round | `a_signature_is_accepted_exactly_when_the_curve_accepts_it_for_the_round`, unit tests |
+| the answer of the curve taken the other way | `a_signature_is_accepted_exactly_when_the_curve_accepts_it_for_the_round`, unit tests |
+| the round hashed least significant byte first, or to G1 under another tag | no proof: unit tests |
+| a key of quicknet with one bit changed | no proof: unit tests |
+| a signature taken without the check of its group | no proof: unit tests |
 | a generation of shares that writes them when the key is held already | `shares_are_written_exactly_when_their_key_is_generated` |
 | a generation of shares that asks the source without a free slot | `no_shares_are_generated_without_a_free_slot` |
 | the label of shares, of their hedge or of their check spelt otherwise | no proof: the unit tests against an independent HKDF-SHA-256 and the label written by hand |

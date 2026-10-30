@@ -65,15 +65,24 @@ The full statement of what is and is not defended: [docs/threat-model.md](docs/t
 
 ## Dependencies
 
-Every dependency of the published crates is reviewed before a version of it enters the lockfile, to
-the depth its use requires. A crate is read in full unless
-[supply-chain/config.toml](supply-chain/config.toml) lowers the requirement for it by name, and a
-crate that handles key material is always read in full; where the requirement is lowered, the crate
-is checked for unsafe code, build scripts, procedural macros, and access to the system, files and
-network. Crates used only by the tests are checked to be safe to run. Each review is recorded with
-its version and what was read in [supply-chain/audits.toml](supply-chain/audits.toml), kept with
-cargo-vet. The continuous integration check fails on a version without a record; an exemption, an
-imported review or a trusted publisher does not count as one.
+Every dependency of the published crates is reviewed before a version of it enters the lockfile.
+The depth of the review is the depth its use requires.
+
+A crate is read in full unless [supply-chain/config.toml](supply-chain/config.toml) lowers the
+requirement for it by name. A crate that handles key material, or chooses how such code is
+compiled, is always read in full.
+
+Where the requirement is lowered, the crate is checked for unsafe code, build scripts and
+procedural macros. It is also checked for access to the system, files and network.
+
+A generated file the crate ships, such as assembly, counts as read when its generator was read in
+full. Running the generator at the published commit must give the file byte for byte.
+
+Crates used only by the tests are checked to be safe to run. Each review is recorded with its
+version and what was read in [supply-chain/audits.toml](supply-chain/audits.toml).
+
+The record is kept with cargo-vet, and the continuous integration check fails on a version without
+one. An exemption, an imported review or a trusted publisher does not count as a record.
 
 The manifests set each dependency's lower bound to a reviewed version, and the continuous
 integration check builds and tests with every direct dependency at that bound. `Cargo.lock` in this

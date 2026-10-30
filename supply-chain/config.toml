@@ -7,6 +7,9 @@ version = "0.10"
 [policy.argon2]
 dependency-criteria = { base64ct = "safe-to-deploy" }
 
+[policy.blst]
+dependency-criteria = { glob = "safe-to-deploy", threadpool = "safe-to-deploy" }
+
 [policy.cpufeatures]
 dependency-criteria = { libc = "safe-to-deploy" }
 
@@ -26,5 +29,11 @@ criteria = "read-in-full"
 criteria = "read-in-full"
 dependency-criteria = { libc = "safe-to-deploy" }
 
+[policy.lethewis-timelock]
+criteria = "read-in-full"
+
 [policy.num-traits]
 dependency-criteria = { autocfg = "safe-to-deploy" }
+
+[policy.zeroize_derive]
+dependency-criteria = { proc-macro2 = "safe-to-deploy", quote = "safe-to-deploy", syn = "safe-to-deploy" }

@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 [workspace]
-members = ["crates/lethewis-core", "crates/lethewis-dit"]
+members = [
+  "crates/lethewis-core",
+  "crates/lethewis-dit",
+  "crates/lethewis-timelock",
+]
 resolver = "3"
 
 # Crates are split along the boundary of what is proven. A crate that reaches the system or the
@@ -88,9 +92,9 @@ panic = "abort"
 overflow-checks = true
 
 [profile.mutants]
-# Every mutant is a build of its own. The derivation from a password and the lattice, hash and curve
-# code of X-Wing, the slowest tests by far, run optimised; the other dependencies are built as for the
-# tests, whose stack depths depend on them.
+# Every mutant is a build of its own. The derivation from a password, the lattice, hash and curve
+# code of X-Wing and the pairing of the time lock, the slowest tests by far, run optimised; the
+# other dependencies are built as for the tests, whose stack depths depend on them.
 inherits = "test"
 debug = "none"
 
@@ -110,4 +114,7 @@ opt-level = 3
 opt-level = 3
 
 [profile.mutants.package.curve25519-dalek]
+opt-level = 3
+
+[profile.mutants.package.blst]
 opt-level = 3

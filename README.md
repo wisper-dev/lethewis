@@ -104,8 +104,9 @@ separate crate, so the proof perimeter is visible from the directory listing.
 |---|---|
 | `lethewis-core` | derivation, hierarchy, lifecycle, destruction, two-tier access, key shares, data in blocks; no network or clock, the system only through `lethewis-dit` |
 | `lethewis-dit` | data-independent timing on aarch64 for a piece of work, where Linux, Android or an Apple system reports it; the one crate with unsafe code |
+| `lethewis-timelock` | a time lock on the drand network quicknet: round signatures, rounds and times; no network or clock |
 
-Hardware binding and the time lock will each be a crate of its own, listed here when it exists.
+Hardware binding will be a crate of its own, listed here when it exists.
 
 Claimed and proven properties: [docs/proofs.md](docs/proofs.md).
 

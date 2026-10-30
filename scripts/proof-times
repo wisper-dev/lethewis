@@ -7,6 +7,9 @@
 5 305 keyset::proofs::a_transition_keeps_the_set_whole
 37 1210 keyset::proofs::building_then_parsing_gives_back_the_set
 11 370 keyset::proofs::parsing_a_set_accepts_exactly_what_building_can_write
+2 143 network::proofs::a_round_is_published_at_its_time
+4 288 network::proofs::a_signature_is_accepted_exactly_when_the_curve_accepts_it_for_the_round
+4 143 network::proofs::a_time_gives_the_first_round_published_then_or_later
 5 404 password::proofs::parameters_are_made_only_within_the_bounds
 6 400 password::proofs::parameters_are_read_exactly_as_written
 1 272 password::proofs::passwords_are_taken_by_their_length
