@@ -569,7 +569,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        part: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     permissions:
       contents: read
     env:
@@ -593,7 +593,8 @@ jobs:
         run: |
           echo "$PARTS" >parts
           cargo mutants --workspace --list --json >listed.json
-          cargo mutants --workspace --shard "$PART/$PARTS"
+          # Taken in turn, so that the mutants of one file spread over the parts.
+          cargo mutants --workspace --shard "$PART/$PARTS" --sharding round-robin
           # A mutant whose build fails for any reason is unviable and goes untested. Only a compiler
           # that reported errors and exited with 1 marks one that does not build.
           crashed='internal compiler error|unexpectedly panicked|unexpectedly overflowed its stack|/rust(c|doc) .*\(signal:'

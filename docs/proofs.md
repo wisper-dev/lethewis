@@ -523,7 +523,7 @@ compile error.
 | a word out of the list named whatever the rest, counted as listed, or two taken for one | no proof: unit tests |
 | a choice of the place named that reads one syndrome | no proof: unit tests |
 | share words left when read, or wiped when refused | no proof: unit tests |
-| share words written, read or looked for without the stack wipe, or read inlined into the caller | no proof: tests of the stack |
+| share words written, read or looked for without the stack wipe | no proof: tests of the stack |
 | calls on share words documented with another stack | no proof: tests of the stack |
 | share words written, read, looked up, located or named outside the mode of data-independent timing | no proof: unit tests |
 | a generation of shares that writes them when the key is held already | `shares_are_written_exactly_when_their_key_is_generated` |

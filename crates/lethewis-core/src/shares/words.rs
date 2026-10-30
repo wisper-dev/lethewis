@@ -56,8 +56,8 @@ pub fn share_to_words(share: &Share, words: &mut ShareWords) -> Result<(), Error
 ///
 /// # Errors
 ///
-/// [`Error::UnknownWord`], [`Error::InvalidChecksum`], or [`Error::InvalidShare`] for a later format
-/// or no number. `words` and `share` then stay as they were.
+/// [`Error::UnknownWord`], [`Error::InvalidChecksum`], or [`Error::InvalidShare`] for a later
+/// format or no number. `words` and `share` then stay as they were.
 pub fn share_from_words(words: &mut ShareWords, share: &mut Share) -> Result<(), Error> {
     let read = from_words_on_stack(words, share);
     wipe_stack();
@@ -225,8 +225,9 @@ struct Bits<'a> {
 }
 
 impl Bits<'_> {
+    /// The next `bits` bits. One more symbol is always enough: no take is wider than a symbol.
     fn take(&mut self, bits: u32) -> u32 {
-        while self.count < bits {
+        if self.count < bits {
             let next = self.symbols.next().copied().unwrap_or(0);
             self.held = self.held.wrapping_shl(SYMBOL_BITS) | u32::from(next);
             self.count = self.count.wrapping_add(SYMBOL_BITS);
@@ -576,6 +577,24 @@ mod tests {
             from_environment("LETHEWIS_RANDOM_ROUNDS", 100_000),
             from_environment("LETHEWIS_RANDOM_SEED", 12),
         );
+    }
+
+    /// (x + 2)(x + 4) added in the last three places is zero at the first two roots only.
+    #[test]
+    fn a_change_only_the_third_root_sees_is_refused() {
+        let mut symbols = symbols_of(&unhex(VECTORS[0].0));
+        for (symbol, change) in symbols[DATA..].iter_mut().zip([1, 6, 8]) {
+            *symbol ^= change;
+        }
+        let [first, second, third] = syndromes(&symbols);
+        assert_eq!([first, second], [0, 0]);
+        assert_ne!(third, 0);
+        let mut read_back: Share = [0x5a; SHARE_LEN];
+        assert_eq!(
+            read(&symbols, true, &mut read_back),
+            Err(Error::InvalidChecksum)
+        );
+        assert_eq!(read_back, [0x5a; SHARE_LEN]);
     }
 
     #[test]
@@ -934,6 +953,7 @@ mod proofs {
             product(a, b) == reference(a, b),
             "the product is that of GF(2^11)",
         );
+        kani::cover!(a != 1 && product(a, b) == 1, "a symbol times its inverse");
     }
 
     /// With the syndromes of a share's symbols zero, those of the symbols changed are those of the
@@ -948,16 +968,24 @@ mod proofs {
             syndromes(&sum) == [a1 ^ b1, a2 ^ b2, a3 ^ b3],
             "the syndromes of a sum are the sum of the syndromes",
         );
+        kani::cover!(
+            [a1, a2, a3] != [0; CHECK] && [b1, b2, b3] != [0; CHECK],
+            "two sets of symbols, neither a codeword"
+        );
     }
 
     /// Kissat solves this one in half the time of the default solver.
     #[kani::proof]
     #[kani::solver(kissat)]
     fn up_to_three_changes_are_seen() {
-        let (change, _) = changed_at_places::<3>();
+        let (change, places) = changed_at_places::<3>();
         kani::assert(
             syndromes(&change) != [0; CHECK],
             "a change at up to three places has syndromes",
+        );
+        kani::cover!(
+            places.iter().all(|&at| change[at] != 0),
+            "a change at three places"
         );
     }
 
@@ -968,6 +996,7 @@ mod proofs {
             usize::from(changed_at(syndromes(&one))) == at,
             "one change is found",
         );
+        kani::cover!(at == 0, "a change of the first word");
     }
 
     /// With syndromes that add and three changes seen, two changes are never taken for one.
@@ -1012,6 +1041,7 @@ mod proofs {
             result == Ok(()) && read_back == share,
             "the share is read back",
         );
+        kani::cover!(share[0] == 3, "the third share");
     }
 
     #[kani::proof]
