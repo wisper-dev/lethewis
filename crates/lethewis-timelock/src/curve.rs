@@ -103,7 +103,7 @@ pub(crate) mod model {
         }
     }
 
-    fn keep<const W: usize>(words: &[AtomicU64; W], bytes: &[u8]) {
+    pub(crate) fn keep<const W: usize>(words: &[AtomicU64; W], bytes: &[u8]) {
         for (word, chunk) in words.iter().zip(bytes.chunks_exact(8)) {
             let mut eight = [0; 8];
             eight.copy_from_slice(chunk);
@@ -111,7 +111,7 @@ pub(crate) mod model {
         }
     }
 
-    fn kept<const W: usize, const N: usize>(words: &[AtomicU64; W]) -> [u8; N] {
+    pub(crate) fn kept<const W: usize, const N: usize>(words: &[AtomicU64; W]) -> [u8; N] {
         let mut bytes = [0; N];
         for (word, chunk) in words.iter().zip(bytes.chunks_exact_mut(8)) {
             chunk.copy_from_slice(&word.load(Ordering::Relaxed).to_le_bytes());

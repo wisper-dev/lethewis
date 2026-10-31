@@ -52,6 +52,9 @@ All six must hold. A row missing any one of them is not written.
 | Whole transfers | a set that came in an export is revealed, wrapped, exported or changed only once the end of that export is received under the same load of its key for transfers. That key carries one export at a time. The records of an export open only in the order they were written, and its end only after the last | `lethewis-core` |
 | Time lock, rounds | The round for a time is the first published then or later; none before round 1. | `lethewis-timelock` |
 | Time lock, signatures | A round's signature is accepted only when quicknet's key verifies it for that round. | `lethewis-timelock` |
+| Time lock, locking | A key is locked to the first round published at its time or later, at most a year ahead. | `lethewis-timelock` |
+| Time lock, opening | A key leaves its lock only with the signature of the round it was locked to, under an intact header. | `lethewis-timelock` |
+| Time lock, the format | A lock is read exactly as written; bytes are read only when they are a lock as written. | `lethewis-timelock` |
 
 Calls into the operating system are checked by tests and measurements on real devices, not by
 proof. Crates that make them, `lethewis-dit` among them, are in neither table; under Kani,
@@ -155,6 +158,16 @@ proof. Crates that make them, `lethewis-dit` among them, are in neither table; u
 | Time lock, rounds | For any time, the round found is the first published then or later, and none before round 1. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the clock of quicknet, worked out in 128-bit numbers apart from the code | other networks; whether the time the caller gives is right |
 | Time lock, times | Every round but 0 has its time, if 64 bits hold it, and that time gives the round back. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
 | Time lock, signatures | Accepted exactly when the curve accepts the signature for quicknet's key and the round's message; round 0 is refused first. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the curve answers at will and keeps what it was given; SHA-256 of a round stands in as its bytes | the call into blst, the pairing, the hash to G1 and SHA-256, tested against beacons of quicknet; blst's own code |
+| Time lock, decimal steps | A step takes a digit of at most nine, never more than is left. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any rest, any power of the table | the steps in turn; by induction, a round below 10^19 is its decimal, as tests check |
+| Time lock, decimal powers | From under ten times its power, a step leaves under the power. Powers fall tenfold to one. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
+| Time lock, decimal digits | A round is written exactly below 10^19 and read back; nineteen bytes are read exactly when digits. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any round, any nineteen bytes | as in the row above |
+| Time lock, the format | Any lock written is read back as written, for any round, body, MAC, nonce and payload. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any round of nineteen digits, any bytes | bytes of another length, refused unread; whether tlock tools open a lock, tested on their files |
+| Time lock, only locks read | Any 402 bytes are read only when they are a lock as written. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
+| Time lock, time out of range | A time out of range is refused before any work. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the encryption, MAC and payload cipher answer at will: every answer is covered; which bytes the MAC covers is tested | the pairing, hashes and ChaCha20-Poly1305, tested on files of tlock; the stack wipe and timing, tested |
+| Time lock, locking | In range, the file key is encrypted to the first round published then or later, under the bytes given. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above; SHA-256 of a round stands in as its bytes, one message per round | as in the row above |
+| Time lock, the lock written | The lock holds the key sealed under the bytes given; only unusable bytes make locking fail. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
+| Time lock, opening | The signature is checked for the round the lock names; a key changes only on opening. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above; locks as written, as the format rows show only those are read | as in the row above; a lock with its round changed, refused by IBE and MAC: tested |
+| Time lock, the key opened | A key comes only from the payload under the file key the signature decrypts and the MAC confirms. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
 | Record layout, the format | A record's plaintext has 233 bytes: version, purpose and primary position (1 byte each), parent identifier (16), epoch and revision (8 each, least significant byte first). Three positions of 66 bytes follow, each a stage (1 enabled, 2 disabled), a key length (1) and a key (64, zero past a 32-byte key), or zeros when empty. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the accepted values and the offsets are written from the layout, independently of the parser and the builder; a key is built only by the functions that load it, so its bytes past its length are zero, as the proofs on slots and the round trip in this row show | the encryption of the record, which the rows on wrapping and on record integrity cover with a model of the cipher; whether the checks of a 32-byte key's tail and of an empty position take the same time for every key |
 | Record layout, parsing | For any 233 bytes, parsing never panics or overflows and accepts them exactly when the version is 1 and the purpose one of the seven values of `Purpose`, 1 to 7. A position is zero or holds stage 1 or 2, length 32, or 64 for purpose 1 (wrapping), zeros past a short key. The primary, 0 to 2, is enabled.| `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
 | Record layout, building | For any header of any purpose, any stages whose primary position holds an enabled key and keys of lengths the purpose takes, building writes every field at its offset and an empty position as zeros. The parent identifier is read back from its offset, and parsing gives back the same set. Bytes that parse build back to the same bytes. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
@@ -541,6 +554,23 @@ compile error.
 | the round hashed least significant byte first, or to G1 under another tag | no proof: unit tests |
 | a key of quicknet with one bit changed | no proof: unit tests |
 | a signature taken without the check of its group | no proof: unit tests |
+| a digit of nine never taken, or a power out of the tens | `a_step_takes_the_digit_of_its_power`, unit tests |
+| a digit that takes more than is left | `a_step_takes_the_digit_of_its_power` |
+| the decimal of the limit written, or a sign read as a digit | `a_decimal_is_read_exactly_as_written`, unit tests |
+| the value of a decimal without its last digit | no proof: unit tests |
+| a lock read without its intro, or with bits past the last byte of base64 | `only_what_is_written_is_read`, unit tests |
+| a chain hash in capitals read | `only_what_is_written_is_read`, unit tests |
+| a separator not read, or a network differing in the last byte read | `only_what_is_written_is_read` |
+| the nonce read a byte late, or the lines of the body in another order | `a_lock_is_read_as_written`, unit tests |
+| plus written as minus in base64 | `a_lock_is_read_as_written`, unit tests |
+| a lock for the round before, or until now | `a_key_is_locked_until_the_round_of_its_time_within_a_year`, unit tests |
+| an opening that checks the signature of the next round | `a_key_is_opened_only_with_the_signature_of_its_round_as_locked`, unit tests |
+| a key opened without its MAC | `a_key_is_opened_only_with_the_signature_of_its_round_as_locked` |
+| a failed payload written to the key | no proof: unit tests |
+| the stack of a lock or an opening not wiped, or an opening outside DIT | no proof: tests of the stack |
+| the scalar of a lock chosen by a branch | no proof: the check of machine code |
+| candidates for the scalar not halved, or the pairing hashed in another order | no proof: unit tests |
+| a file key taken without the check of U | no proof: unit tests |
 | a generation of shares that writes them when the key is held already | `shares_are_written_exactly_when_their_key_is_generated` |
 | a generation of shares that asks the source without a free slot | `no_shares_are_generated_without_a_free_slot` |
 | the label of shares, of their hedge or of their check spelt otherwise | no proof: the unit tests against an independent HKDF-SHA-256 and the label written by hand |

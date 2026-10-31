@@ -3,6 +3,10 @@
 
 # Spell-check settings for the typos checker.
 
+[default]
+# Test data quoted in base64, such as the lines of reference files, is not text.
+extend-ignore-re = ['"[A-Za-z0-9+/=]{40,}"']
+
 [default.extend-words]
 # The author's surname, present in the copyright line of every source file.
 Wisper = "Wisper"

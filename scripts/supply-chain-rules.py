@@ -35,11 +35,11 @@ UNSAFE_LINTS = {
 # Crates that handle key material, and those that choose how such code is compiled: every locked
 # version read in full, never lowered in a policy.
 ALWAYS_READ_IN_FULL = {
-    "aead", "aes", "aes-gcm-siv", "argon2", "blake2", "block-buffer", "blst", "cc", "cipher",
-    "cmov", "ctr", "ctutils", "curve25519-dalek", "digest", "find-msvc-tools", "hkdf", "hmac",
-    "hybrid-array", "inout", "keccak", "ml-kem", "module-lattice", "polyval", "sha2", "sha3",
-    "shake", "shlex", "sponge-cursor", "subtle", "universal-hash", "x25519-dalek", "zeroize",
-    "zeroize_derive",
+    "aead", "aes", "aes-gcm-siv", "argon2", "blake2", "block-buffer", "blst", "cc", "chacha20",
+    "chacha20poly1305", "cipher", "cmov", "ctr", "ctutils", "curve25519-dalek", "digest",
+    "find-msvc-tools", "hkdf", "hmac", "hybrid-array", "inout", "keccak", "ml-kem",
+    "module-lattice", "poly1305", "polyval", "sha2", "sha3", "shake", "shlex", "sponge-cursor",
+    "subtle", "universal-hash", "x25519-dalek", "zeroize", "zeroize_derive",
 }
 
 

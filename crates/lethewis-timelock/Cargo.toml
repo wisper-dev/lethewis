@@ -18,11 +18,30 @@ publish = false
 include = ["src/**/*", "README.md", "LICENSE"]
 
 [dependencies]
-# Default features bring in `alloc` and `oid`.
-sha2 = { version = "0.11.0", default-features = false }
+# Default features bring in `alloc` and `oid`. `zeroize` also wipes the HMAC state inside HKDF.
+sha2 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+# Data-independent timing on aarch64 around the work on a key.
+lethewis-dit = { path = "../lethewis-dit", version = "0.0.0" }
 
-# The curve is a model in the proofs, so Kani builds none of its C code.
+# The curve, the hashes and the cipher are models in the proofs, so Kani builds none of them.
 [target.'cfg(not(kani))'.dependencies]
+# Default features bring in `alloc`, which blst turns on all the same.
+zeroize = { version = "1.9.0", default-features = false }
+hkdf = { version = "0.13.0", default-features = false }
+hmac = { version = "0.13.0", default-features = false }
+# Compares and chooses in constant time.
+ctutils = { version = "0.4.5", default-features = false }
+# The payload of an age file. Default features bring in `alloc` and `getrandom`; `zeroize` wipes
+# the cipher state on drop.
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = [
+  "zeroize",
+] }
+# Direct only for `zeroize`: without it the Poly1305 state is not wiped on drop.
+poly1305 = { version = "0.9.1", default-features = false, features = [
+  "zeroize",
+] }
+# Direct only for `zeroize`: without it the keystream the ChaCha20 buffer keeps is not wiped.
+cipher = { version = "0.5.2", default-features = false, features = ["zeroize"] }
 # BLS12-381 in C and assembly; its build script turns on `std` for every target with an operating
 # system. `no-threads` keeps its checks of signatures on the calling thread; `portable` picks the
 # x86-64 code at run time, not by the machine that builds it.

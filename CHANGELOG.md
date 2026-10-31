@@ -314,5 +314,19 @@ Nothing is published while the version is below 0.1.0.
   and `portable`. Its assembly was read through its generators.
 - Kani 0.68.0 proves the conversions for every time and round, and what a check asks of the curve.
   Tests against beacons of quicknet, changed bits, the identity and points outside the group.
+- `Network::lock` locks a 32-byte key until the first round of quicknet at a time or later. The
+  time is at most a year ahead (`LOCK_MAX_SECONDS`); 48 random bytes go in (`LOCK_RANDOM_LEN`).
+- A lock (`Lock`) is an age file of `LOCK_LEN` bytes, its round in nineteen digits. tlock tools
+  open it.
+- `Network::open` opens a lock with its round's signature, and `Network::round_of` names the round.
+  New errors: `InvalidTime`, `RandomUnusable`, `LockMalformed`, `OtherNetwork`, `LockRejected`.
+- Dependencies of `lethewis-timelock`, or later compatible versions, read in full:
+  `chacha20poly1305` 0.11.0, `hkdf` and `hmac` 0.13.0, `ctutils` 0.4.5, `zeroize` 1.9.0.
+- `poly1305` 0.9.1 and `cipher` 0.5.2 come in only for their `zeroize` feature. `lethewis-dit`
+  gives data-independent timing.
+- Kani 0.68.0 proves the format, the decimal of a round step by step, locking and opening. Tests
+  against files of `tle`, changed bytes, and the stack.
+- A build step checks that the choice of a lock's scalar runs straight through on x86-64 and
+  aarch64.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

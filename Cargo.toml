@@ -33,7 +33,7 @@ unsafe_code = "forbid"
 unreachable_pub = "deny"
 # Kani sets cfg(kani) when it compiles the proofs; the build script of the core sets
 # cfg(lethewis_unoptimised) when it is built without optimisation, and a build may set it itself.
-# The other four select the portable code of the hashes and the cipher in the dependencies.
+# The others select the portable code of the hashes and the ciphers in the dependencies.
 unexpected_cfgs = { level = "deny", check-cfg = [
   "cfg(kani)",
   "cfg(lethewis_unoptimised)",
@@ -41,6 +41,8 @@ unexpected_cfgs = { level = "deny", check-cfg = [
   'cfg(aes_backend, values("soft"))',
   'cfg(polyval_backend, values("soft"))',
   'cfg(keccak_backend, values("soft"))',
+  'cfg(chacha20_backend, values("soft"))',
+  'cfg(poly1305_backend, values("soft"))',
 ] }
 unused_qualifications = "deny"
 # missing_docs and unused_crate_dependencies are declared in the crates themselves, not here: from

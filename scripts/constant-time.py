@@ -3,10 +3,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 """Checks that `KeyId::is`, both `same_check`, `first_match`, `find_step`, `select_step`, both
-`product`, `locate_step` and `named` run straight through on every target. No branch, call or
-program counter write is allowed; the timing itself is not checked.
+`product`, `locate_step` and `named` run straight through on every target, and the time lock's
+`take_first` on the 64-bit targets it is built for. No branch, call or program counter write is
+allowed; the timing itself is not checked.
 """
 
+import os
 import re
 import subprocess
 import sys
@@ -33,6 +35,10 @@ FUNCTIONS = {
     "the comparison of the checks of shares": re.compile(
         r"^(_RNv\S*13lethewis_core6shares10same_check):\s*$"),
 }
+TIME_LOCK_FUNCTIONS = {
+    "the choice of the scalar of a lock": re.compile(
+        r"^(_RNv\S*17lethewis_timelock3ibe10take_first):\s*$"),
+}
 # A name of that shape, for the listings the rules are run on.
 NAME = "_RNvMNtCs0_13lethewis_core6deriveNtB2_5KeyId2is"
 END = re.compile(r"^\s*(\.Lfunc_end\d+:|end_function\b|\.size\b)")
@@ -42,6 +48,14 @@ AARCH64 = "aarch64-unknown-linux-gnu"
 THUMB = "thumbv7em-none-eabihf"
 WASM = "wasm32-unknown-unknown"
 TARGETS = (X86, AARCH64, THUMB, WASM)
+TIME_LOCK_TARGETS = (X86, AARCH64)
+# The C code of blst, which the check does not read, is built for aarch64 by clang without the C
+# library, so no cross toolchain is needed.
+TIME_LOCK_BUILD = {
+    "CC_aarch64_unknown_linux_gnu": "clang",
+    "AR_aarch64_unknown_linux_gnu": "ar",
+    "CFLAGS_aarch64_unknown_linux_gnu": "-ffreestanding",
+}
 
 COMMENTS = {X86: "#", AARCH64: "//", THUMB: "@", WASM: "#"}
 # Directives that describe the code and emit none of it.
@@ -55,10 +69,10 @@ STRAIGHT = {
         r"|sbb|cmp|test|shl|shr|sar|rol|ror|inc|dec|push|pop|bswap|nop)[bwlq]?|v?p[a-z0-9]+"
         r"|vzeroupper)$"),
     AARCH64: re.compile(
-        r"^(adds?|subs?|ands?|orr|orn|eor|eon|bics?|mvn|negs?|mov[knz]?|cmp|cmn|tst|cs(el|inc|inv"
-        r"|neg|et|etm)|cin[cv]|cneg|ccmp|ccmn|ldu?r[bh]?|ldrs[bhw]|ldp|stu?r[bh]?|stp|lsl|lsr|asr"
-        r"|ror|[su]bfx|ubfiz|bfi|bfxil|extr|[su]xt[bhw]|rev(16|32)?|clz|adrp?|mul|madd|msub|fmov"
-        r"|dup|ins|umov|cmeq|u(min|max)v|addv|ld1|st1|nop)$"),
+        r"^(adds?|adcs?|subs?|sbcs?|ands?|orr|orn|eor|eon|bics?|mvn|negs?|mov[knz]?|cmp|cmn|tst"
+        r"|cs(el|inc|inv|neg|et|etm)|cin[cv]|cneg|ccmp|ccmn|ldu?r[bh]?|ldrs[bhw]|ldp|stu?r[bh]?|stp"
+        r"|lsl|lsr|asr|ror|[su]bfx|ubfiz|bfi|bfxil|extr|[su]xt[bhw]|rev(16|32)?|clz|adrp?|mul|madd"
+        r"|msub|fmov|dup|ins|umov|cmeq|u(min|max)v|addv|ld1|st1|nop)$"),
     THUMB: re.compile(
         rf"^(it[te]{{0,3}}|(adc|add|sbc|sub|rsb|and|orr|orn|eor|bic|mvn|mov|movw|movt|cmp|cmn|tst"
         rf"|teq|lsl|lsr|asr|ror|rrx|ldr|ldrb|ldrh|ldrsb|ldrsh|ldrd|ldm|ldmia|ldmdb|str|strb|strh"
@@ -81,6 +95,7 @@ KNOWN = {
           "data16 callq f": False, "xbegin .LBB0_1": False, "ljmpq *(%rax)": False, "retq": False,
           ".byte 0x75, 0x02": False, "xorl %eax, %eax; jne f": False, "JNE f": False},
     AARCH64: {"csel x0, x1, x2, ne": True, "ldrb w8, [x0]": True, ".cfi_def_cfa_offset 16": True,
+              "adc x0, x1, x2": True,
               "b.ne .LBB0_1": False, "b f": False, "bl f": False, "br x0": False, "blr x0": False,
               "cbgt x0, #1, .LBB0_1": False, "braa x0, x1": False, "tbz w0, #0, .LBB0_1": False,
               "ret": False, ".inst 0x54000041": False},
@@ -184,20 +199,23 @@ def main() -> int:
         return 1
     out = root / "target" / "constant-time"
     out.mkdir(parents=True, exist_ok=True)
-    for target in TARGETS:
-        assembly = out / f"{target}.s"
+    builds = [("lethewis-core", target, FUNCTIONS) for target in TARGETS]
+    builds += [("lethewis-timelock", target, TIME_LOCK_FUNCTIONS) for target in TIME_LOCK_TARGETS]
+    for package, target, functions in builds:
+        assembly = out / f"{package}-{target}.s"
         assembly.unlink(missing_ok=True)
         # A build Cargo counts as fresh would not write the assembly again.
-        subprocess.run(["cargo", "clean", "-p", "lethewis-core", "--release", "--target", target],
+        subprocess.run(["cargo", "clean", "-p", package, "--release", "--target", target],
                        cwd=root, check=True, capture_output=True)
-        subprocess.run(["cargo", "rustc", "-p", "lethewis-core", "--lib", "--release", "--locked",
+        subprocess.run(["cargo", "rustc", "-p", package, "--lib", "--release", "--locked",
                         "--target", target, "--", "--emit", f"asm={assembly}",
-                        "-C", "codegen-units=1"], cwd=root, check=True)
+                        "-C", "codegen-units=1"], cwd=root, check=True,
+                       env=dict(os.environ, **TIME_LOCK_BUILD))
         if not assembly.is_file():
             problems.append(f"{target}: no assembly was written")
             continue
         text = assembly.read_text()
-        for function, symbol in FUNCTIONS.items():
+        for function, symbol in functions.items():
             instructions = body(target, text, symbol)
             if not instructions:
                 problems.append(f"{target}: {function} is not in the assembly")

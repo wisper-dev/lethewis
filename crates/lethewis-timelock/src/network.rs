@@ -9,10 +9,10 @@ pub const SIGNATURE_LEN: usize = 48;
 /// A drand network: the hash naming its chain, its group key, and when its rounds come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Network {
-    chain_hash: [u8; 32],
-    public_key: [u8; curve::KEY_LEN],
-    genesis: u64,
-    period: u64,
+    pub(crate) chain_hash: [u8; 32],
+    pub(crate) public_key: [u8; curve::KEY_LEN],
+    pub(crate) genesis: u64,
+    pub(crate) period: u64,
 }
 
 /// The drand network quicknet. Round 1 comes at 1692803367 seconds since the Unix epoch, then one
@@ -97,53 +97,8 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{Network, QUICKNET, SIGNATURE_LEN};
+    use crate::vectors::{BEACONS, signature_of, unhex};
     use crate::{Error, curve};
-
-    /// Beacons of quicknet, as https://api.drand.sh/<chain hash>/public/<round> gives them.
-    const BEACONS: [(u64, &str); 6] = [
-        (
-            1,
-            concat!(
-                "b55e7cb2d5c613ee0b2e28d6750aabbb78c39dcc96bd9d38",
-                "c2c2e12198df95571de8e8e402a0cc48871c7089a2b3af4b",
-            ),
-        ),
-        (
-            2,
-            concat!(
-                "b6b6a585449b66eb12e875b64fcbab3799861a00e4dbf092",
-                "d99e969a5eac57dd3f798acf61e705fe4f093db926626807",
-            ),
-        ),
-        (
-            1000,
-            concat!(
-                "b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b1957",
-                "6350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e39",
-            ),
-        ),
-        (
-            1_000_000,
-            concat!(
-                "83ad29e4c409f9470fc2ef02f90214df49e02b441a1a241a",
-                "82d622d9f608ef98fd8b11a029f1bee9d9e83b45088abe72",
-            ),
-        ),
-        (
-            10_000_000,
-            concat!(
-                "a187c9f5800521e986b5658924696682071ce7ae965486e8",
-                "fd08bc2c4758bdbb9ed9ecb7beee392a38214e321ecd434f",
-            ),
-        ),
-        (
-            33_512_211,
-            concat!(
-                "b5e488939196e9e4ab7de45e1d0b6e6a8e26ce2f8b0a30f9",
-                "6a0c795ac8d48f54a8de0065cf6cca64ae305973e403e5d1",
-            ),
-        ),
-    ];
 
     /// The genesis seed of quicknet, which its chain hash covers.
     const SEED: &str = "f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e";
@@ -153,21 +108,6 @@ mod tests {
         "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf",
         "6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab",
     );
-
-    fn unhex<const N: usize>(text: &str) -> [u8; N] {
-        let mut bytes = [0; N];
-        assert_eq!(text.len(), 2 * N);
-        for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
-            let digit = |c: u8| char::from(c).to_digit(16).unwrap();
-            *byte = u8::try_from(digit(pair[0]) * 16 + digit(pair[1])).unwrap();
-        }
-        bytes
-    }
-
-    fn signature_of(round: u64) -> [u8; SIGNATURE_LEN] {
-        let (_, signature) = BEACONS.iter().find(|(at, _)| *at == round).unwrap();
-        unhex(signature)
-    }
 
     #[test]
     fn the_key_and_the_clock_are_those_the_chain_hash_names() {

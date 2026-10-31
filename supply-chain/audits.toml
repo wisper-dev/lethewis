@@ -500,6 +500,50 @@ dependency rustc-std-workspace-core is behind rustc-dep-of-std, off here. No acc
 system, files or network.
 """
 
+[[audits.chacha20]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.10.2"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/variants.rs, src/backends.rs, src/chacha.rs, src/xchacha.rs,
+src/backends/soft.rs, src/backends/sse2.rs, src/backends/avx2.rs, src/backends/neon.rs, and
+src/backends/avx512.rs, src/legacy.rs and src/rng.rs, which are not built here.
+
+Unsafe code: the dispatch in lib.rs calls target_feature functions only after cpufeatures detects
+the feature at run time on x86_64, or when it is on at compile time, as NEON is on aarch64. The
+SSE2, AVX2 and NEON backends load and store through pointers to fixed-size arrays within bounds,
+and the AVX2 transmutes are between arrays of equal size; sound by reading. No build script, no
+procedural macros, no access to files, network or environment. No branch, loop bound or memory
+index depends on the key, the nonce or the state.
+
+With the zeroize feature the 16-word state is cleared on drop. Not cleared: backend temporaries,
+the extra keystream blocks the SIMD backends compute for a single one, eight of them on the stack
+with NEON, and the block buffer of the StreamCipherCoreWrapper of cipher, which only the zeroize
+feature of cipher clears. The IETF counter is 32 bits; remaining_blocks stops one block short of
+its wrap.
+"""
+
+[[audits.chacha20poly1305]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.11.0"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/cipher.rs. No unsafe code, no build script, no procedural macros,
+no access to files, network or environment.
+
+The construction is that of RFC 8439: the Poly1305 key from the first 32 bytes of keystream block
+0, the payload from block 1, the MAC over the associated data and the ciphertext, each padded to
+16 bytes, then both lengths. Decryption checks the tag before it decrypts and leaves the buffer
+untouched on failure. The length limit keeps the 32-bit counter from wrapping. No branch depends
+on secret data; the tag is compared by UniversalHash::verify of universal-hash, not by subtle as
+the comment at cipher.rs:89 says.
+
+The zeroize feature clears the key on drop and the derived Poly1305 key after use, and turns on
+the clearing of chacha20, but not that of poly1305.
+"""
+
 [[audits.cipher]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -1254,6 +1298,30 @@ Unsafe code calls sched_getaffinity and sysconf on Linux, and the system calls o
 with buffers of the right size; sound. Reads /proc/self/cgroup, /proc/self/mountinfo, the
 cgroup's CPU quota files and /proc/cpuinfo; writes nothing, and touches no environment, process
 or network. Used by threadpool.
+"""
+
+[[audits.poly1305]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.9.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/backend.rs, src/backend/soft.rs, src/backend/autodetect.rs,
+src/backend/avx2.rs, src/backend/avx2/helpers.rs, and src/fuzz.rs, built only for tests and
+fuzzing with AVX2 on at compile time.
+
+Unsafe code: zeroize_flat_type in Drop with the zeroize feature, which 0.9.1 makes sound; the
+union of backends in autodetect.rs, whose variant the cpufeatures token chosen in new() fixes and
+every access checks; the AVX2 backend, reached only after detection, with unaligned loads and
+stores through pointers to fixed-size arrays of the width accessed. No build script, no
+procedural macros, no access to files, network or environment. No branch or memory index depends
+on the key or the accumulator in either backend; the portable one is constant time where 32-bit
+multiplication is.
+
+The AVX2 arithmetic was read for structure and memory safety, not derived again: its carries were
+fixed three times after fuzzing, and the README says no audit covers it. It runs on x86_64 with
+AVX2; aarch64 always runs the portable backend. With the zeroize feature the whole state is
+cleared on drop, without it nothing is.
 """
 
 [[audits.polyval]]
