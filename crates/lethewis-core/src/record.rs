@@ -55,7 +55,7 @@ const _: () = assert!(AAD_HEAD + TAG_LEN + MAX_CONTEXT == AAD_CAPACITY);
 pub enum Purpose {
     /// A wrapping key: one from a secret wraps stored keys, which wrap external data, transfer,
     /// chat archive and data keys. Of 32 or 64 bytes, alone in its set, it leaves only wrapped or
-    /// once as generated words or shares.
+    /// once as generated words, shares or a time lock.
     Wrap = 1,
     /// A 32-byte key for data an engine outside the library encrypts, such as a database. It wraps
     /// no key, and leaves only wrapped or through [`Slots::reveal32`](crate::Slots::reveal32)

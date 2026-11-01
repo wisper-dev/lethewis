@@ -5,10 +5,38 @@ use super::{LOCK_MAX_SECONDS, LOCK_RANDOM_LEN};
 use crate::age::model::{made, payload};
 use crate::age::{LOCKED_KEY_LEN, MAC_LEN, NONCE_LEN, PAYLOAD_LEN, header};
 use crate::curve::model::{asked, message};
-use crate::decimal::{self, Decimal};
+use crate::decimal::{self, Decimal, LIMIT};
 use crate::ibe::BODY_LEN;
 use crate::ibe::model::{unwrapped, wrapped};
 use crate::{Error, QUICKNET};
+
+#[kani::proof]
+fn a_lock_waits_for_the_first_round_of_its_time_within_a_year() {
+    let now: u64 = kani::any();
+    let until: u64 = kani::any();
+    let round = QUICKNET.round_for(now, until);
+    let in_time =
+        QUICKNET.genesis <= now && now < until && until.wrapping_sub(now) <= LOCK_MAX_SECONDS;
+    kani::assert(
+        round.is_ok() == in_time && round.is_ok() != (round == Err(Error::InvalidTime)),
+        "a round exactly for a time in range",
+    );
+    if let Ok(round) = round {
+        kani::assert(
+            QUICKNET.time_of(round).is_some_and(|time| until <= time)
+                && QUICKNET
+                    .time_of(round.wrapping_sub(1))
+                    .is_none_or(|time| time < until)
+                && round < LIMIT,
+            "the first round published at the time or later, of nineteen digits at most",
+        );
+    }
+    kani::cover!(round.is_ok(), "a round");
+    kani::cover!(
+        round.is_ok_and(|round| QUICKNET.time_of(round) == Some(until)),
+        "a round published exactly at the time"
+    );
+}
 
 #[kani::proof]
 #[kani::solver(kissat)]

@@ -47,8 +47,10 @@ const CARRY_CHUNK: &[u8; 11] = b"carry chunk";
 const HEDGE_SHARES: &[u8; 12] = b"hedge shares";
 const FROM_SHARES: &[u8; 11] = b"from shares";
 const SHARE_CHECK: &[u8; 11] = b"share check";
+const HEDGE_TIME_LOCK: &[u8; 15] = b"hedge time lock";
+const FROM_TIME_LOCK: &[u8; 14] = b"from time lock";
 const COUNT_LEN: usize = 8;
-/// How many bytes twelve words, or two shares, stand for.
+/// How many bytes twelve words, or two shares, stand for, or a time lock holds.
 pub(crate) const SECRET_LEN: usize = 16;
 /// At least twice the stack a derivation uses, as a test measures in each build and SHA-256 back
 /// end.
@@ -110,6 +112,16 @@ pub(crate) enum Branch {
     FromShares,
     /// The check of the bytes two shares stand for, split with them.
     ShareCheck,
+    #[cfg_attr(
+        not(any(feature = "timelock", test, kani)),
+        expect(dead_code, reason = "only the time lock derives under it")
+    )]
+    HedgeTimeLock,
+    #[cfg_attr(
+        not(any(feature = "timelock", test, kani)),
+        expect(dead_code, reason = "only the time lock derives under it")
+    )]
+    FromTimeLock,
 }
 
 #[cfg(test)]
@@ -118,6 +130,7 @@ pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
         Branch::WrapKey
         | Branch::FromWords
         | Branch::FromShares
+        | Branch::FromTimeLock
         | Branch::LockKey
         | Branch::EpochLayer
         | Branch::Combined
@@ -134,6 +147,7 @@ pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
         | Branch::HedgeEncaps
         | Branch::HedgeSalt
         | Branch::HedgeShares
+        | Branch::HedgeTimeLock
         | Branch::ShareCheck
         | Branch::Challenge => None,
     }
@@ -394,7 +408,8 @@ pub(crate) fn derive_carry_chunk(
     derive(key, salt, Some(Purpose::Transfer), Branch::CarryChunk, out)
 }
 
-/// `branch` is [`Branch::FromWords`], [`Branch::FromShares`] or [`Branch::ShareCheck`].
+/// `branch` is [`Branch::FromWords`], [`Branch::FromShares`], [`Branch::FromTimeLock`] or
+/// [`Branch::ShareCheck`].
 pub(crate) fn derive_from_secret(
     secret: &[u8; SECRET_LEN],
     purpose: Option<Purpose>,
@@ -458,7 +473,11 @@ pub(crate) fn hedge(
     #[cfg(kani)]
     if matches!(
         branch,
-        Branch::HedgeKey | Branch::HedgeWords | Branch::HedgeEncaps | Branch::HedgeShares
+        Branch::HedgeKey
+            | Branch::HedgeWords
+            | Branch::HedgeEncaps
+            | Branch::HedgeShares
+            | Branch::HedgeTimeLock
     ) {
         crate::entropy::model::step();
     }
@@ -818,13 +837,16 @@ pub(crate) mod stack {
             Branch::KeyId | Branch::HedgeWords | Branch::ArchiveCheck => 16,
             Branch::HedgeNonce => 12,
             Branch::ShareCheck => 4,
-            Branch::HedgeKey | Branch::HedgeEncaps | Branch::HedgeSalt | Branch::HedgeShares => {
-                key.len() - 8
-            }
+            Branch::HedgeKey
+            | Branch::HedgeEncaps
+            | Branch::HedgeSalt
+            | Branch::HedgeShares
+            | Branch::HedgeTimeLock => key.len() - 8,
             Branch::ArchiveEncaps => 64,
             Branch::WrapKey
             | Branch::FromWords
             | Branch::FromShares
+            | Branch::FromTimeLock
             | Branch::LockKey
             | Branch::EpochLayer
             | Branch::Combined
@@ -1408,6 +1430,8 @@ fn label(
         Branch::HedgeShares => joined(head, HEDGE_SHARES),
         Branch::FromShares => joined(head, FROM_SHARES),
         Branch::ShareCheck => joined(head, SHARE_CHECK),
+        Branch::HedgeTimeLock => joined(head, HEDGE_TIME_LOCK),
+        Branch::FromTimeLock => joined(head, FROM_TIME_LOCK),
     }
 }
 
@@ -1440,10 +1464,10 @@ mod tests {
     use super::{
         ARCHIVE_BATCH, ARCHIVE_CHECK, ARCHIVE_ENCAPS, ARCHIVE_KEY, ARCHIVE_LAYER, ARCHIVE_SEAL,
         ARCHIVE_SEED, Branch, CARRY_CHECK, CARRY_CHUNK, CHALLENGE, COMBINED, DATA_CHECK,
-        DATA_CHUNK, DerivationFailed, EPOCH_LAYER, EXPORT_KEY, FROM_SHARES, FROM_WORDS,
-        HEDGE_ENCAPS, HEDGE_KEY, HEDGE_NONCE, HEDGE_SALT, HEDGE_SHARES, HEDGE_WORDS, Hedged,
-        KEY_ID, KeyId, LOCK_KEY, SALT, SHARE_CHECK, WRAP_KEY, derive, derive_from_secret,
-        derive_key_id, hedge, label, purpose_of,
+        DATA_CHUNK, DerivationFailed, EPOCH_LAYER, EXPORT_KEY, FROM_SHARES, FROM_TIME_LOCK,
+        FROM_WORDS, HEDGE_ENCAPS, HEDGE_KEY, HEDGE_NONCE, HEDGE_SALT, HEDGE_SHARES,
+        HEDGE_TIME_LOCK, HEDGE_WORDS, Hedged, KEY_ID, KeyId, LOCK_KEY, SALT, SHARE_CHECK, WRAP_KEY,
+        derive, derive_from_secret, derive_key_id, hedge, label, purpose_of,
     };
     use crate::entropy::{Entropy, EntropyError};
     use crate::key::{Key, KeyLength};
@@ -1565,6 +1589,7 @@ mod tests {
         for (branch, name) in [
             (Branch::FromWords, &b"from words"[..]),
             (Branch::FromShares, &b"from shares"[..]),
+            (Branch::FromTimeLock, &b"from time lock"[..]),
         ] {
             for purpose in [Purpose::Wrap, Purpose::Transfer] {
                 let mut ours = [0; 32];
@@ -1851,6 +1876,8 @@ mod tests {
             Branch::HedgeShares,
             Branch::FromShares,
             Branch::ShareCheck,
+            Branch::HedgeTimeLock,
+            Branch::FromTimeLock,
         ] {
             let (_, used) = label(purpose_of(branch), 64, branch, 32).unwrap();
             let name = match branch {
@@ -1881,6 +1908,8 @@ mod tests {
                 Branch::HedgeShares => HEDGE_SHARES.len(),
                 Branch::FromShares => FROM_SHARES.len(),
                 Branch::ShareCheck => SHARE_CHECK.len(),
+                Branch::HedgeTimeLock => HEDGE_TIME_LOCK.len(),
+                Branch::FromTimeLock => FROM_TIME_LOCK.len(),
             };
             assert_eq!(used, 14 + name);
         }
@@ -2181,6 +2210,8 @@ pub(crate) mod proofs {
             23 => Branch::CarryChunk,
             24 => Branch::HedgeShares,
             25 => Branch::FromShares,
+            26 => Branch::HedgeTimeLock,
+            27 => Branch::FromTimeLock,
             _ => Branch::ShareCheck,
         }
     }

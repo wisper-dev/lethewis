@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! A time lock on the drand network quicknet, which signs one round every three seconds. A key is
-//! locked until a round as an age file that tlock tools open, and opened with that round's
+//! locked until a round as an age file that `tle` opens, and opened with that round's
 //! signature. No network and no clock: the caller brings the signature and the time.
 
 #![deny(missing_docs, unused_crate_dependencies)]

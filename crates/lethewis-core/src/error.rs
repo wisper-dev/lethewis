@@ -24,8 +24,8 @@ pub enum Error {
     SameKey,
     /// The context is empty or longer than 255 bytes.
     InvalidContext,
-    /// The cipher or X-Wing refused the input, or failed a known answer or self-check; nothing was
-    /// written.
+    /// The cipher or X-Wing refused the input, or failed a known answer or self-check, or the
+    /// random bytes of a time lock gave no scalar; nothing was written.
     CipherFailed,
     /// A key of the set is held here already, or the set holds one key twice.
     DuplicateKey,
@@ -97,6 +97,14 @@ pub enum Error {
     /// The secret the shares give fails their check: a share was changed, or two splits share one
     /// mark.
     ChangedShare,
+    /// The time to lock until is not after the time now, is more than a year after it, or the time
+    /// now is before the network's first round.
+    InvalidTime,
+    /// The signature is not the network's for the round of the time lock.
+    SignatureRejected,
+    /// The bytes are not a time lock this version writes for the network, or do not open with the
+    /// signature of its round: they were changed.
+    LockRejected,
 }
 
 impl From<crate::keyset::Refused> for Error {
@@ -152,6 +160,9 @@ impl fmt::Display for Error {
             Self::MixedShares => "shares of different splits",
             Self::SameShare => "same share twice",
             Self::ChangedShare => "changed share",
+            Self::InvalidTime => "invalid time",
+            Self::SignatureRejected => "signature rejected",
+            Self::LockRejected => "time lock rejected",
         })
     }
 }
@@ -209,5 +220,8 @@ mod tests {
         assert_eq!(Error::MixedShares.to_string(), "shares of different splits");
         assert_eq!(Error::SameShare.to_string(), "same share twice");
         assert_eq!(Error::ChangedShare.to_string(), "changed share");
+        assert_eq!(Error::InvalidTime.to_string(), "invalid time");
+        assert_eq!(Error::SignatureRejected.to_string(), "signature rejected");
+        assert_eq!(Error::LockRejected.to_string(), "time lock rejected");
     }
 }

@@ -52,6 +52,7 @@ mod residue;
 mod seal;
 mod shares;
 mod slots;
+mod timelock;
 mod timing;
 mod words;
 mod xwing;
@@ -62,6 +63,9 @@ pub use epoch::{Epoch, Erasure, Root, RootFailed};
 pub use error::Error;
 pub use key::KeyLength;
 pub use keyset::Position;
+/// The time-lock crate, in the version this crate uses.
+#[cfg(feature = "timelock")]
+pub use lethewis_timelock;
 pub use password::{MemoryBlock, PASSWORD_PARAMS_LEN, PasswordParams};
 pub use record::{
     ARCHIVE_KEY_RECORD_LEN, ARCHIVE_RECORD_LEN, END_RECORD_LEN, LOCK_RECORD_LEN, Purpose,
@@ -74,6 +78,8 @@ pub use shares::{
 pub use slots::{
     ArchivePublic, Exporting, Handle, Opening, Receipt, Receiving, Sealing, Slot, Slots,
 };
+#[cfg(feature = "timelock")]
+pub use timelock::{ROUND_SIGNATURE_LEN, TIME_LOCK_LEN};
 pub use words::{WORD_COUNT, WORD_LEN, Words};
 
 #[cfg(test)]

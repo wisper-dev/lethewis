@@ -4,7 +4,7 @@
 //! A key locked until a round of the network, and opened with that round's signature.
 
 use crate::age::{self, LOCKED_KEY_LEN, Lock, PAYLOAD_LEN};
-use crate::decimal::Decimal;
+use crate::decimal::{Decimal, LIMIT};
 use crate::ibe::{self, BODY_LEN, FILE_KEY_LEN};
 use crate::network::{Network, SIGNATURE_LEN};
 use crate::{Error, curve, timing};
@@ -19,9 +19,26 @@ pub const LOCK_MAX_SECONDS: u64 = 31_536_000;
 const STACK_WIPE: usize = 98_304;
 
 impl Network {
-    /// Locks `key` until the first round of this network published at `until` or later, in
-    /// seconds since the Unix epoch, as `now` is. `random` must be fresh random bytes, never used
-    /// before. The lock is an age file that tlock tools for this network open.
+    /// The round a lock made at `now` until `until` waits for, in seconds since the Unix epoch:
+    /// the first round of this network published at `until` or later. Show its time to whoever
+    /// locks: a clock set back gives a round already published, and the lock opens at once.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidTime`] when `until` is not after `now`, is more than [`LOCK_MAX_SECONDS`]
+    /// after it, or `now` is before round 1.
+    pub fn round_for(&self, now: u64, until: u64) -> Result<u64, Error> {
+        let latest = now.saturating_add(LOCK_MAX_SECONDS);
+        if now < self.genesis || until <= now || until > latest {
+            return Err(Error::InvalidTime);
+        }
+        self.round_at_or_after(until)
+            .filter(|&round| round < LIMIT)
+            .ok_or(Error::InvalidTime)
+    }
+
+    /// Locks `key` until the round [`Self::round_for`] gives for `now` and `until`. `random` must
+    /// be fresh random bytes, never used before. The lock is an age file that `tle` opens.
     ///
     /// Wipe `random` after the call: its first 16 bytes open the lock without the round's
     /// signature.
@@ -31,9 +48,8 @@ impl Network {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidTime`] when `until` is not after `now`, is more than [`LOCK_MAX_SECONDS`]
-    /// after it, or `now` is before round 1; [`Error::RandomUnusable`] for random bytes that give
-    /// no scalar in constant time.
+    /// Those of [`Self::round_for`]; [`Error::RandomUnusable`] for random bytes that give no scalar
+    /// in constant time.
     pub fn lock(
         &self,
         key: &[u8; LOCKED_KEY_LEN],
@@ -41,15 +57,8 @@ impl Network {
         until: u64,
         random: &[u8; LOCK_RANDOM_LEN],
     ) -> Result<Lock, Error> {
-        let latest = now.saturating_add(LOCK_MAX_SECONDS);
-        if now < self.genesis || until <= now || until > latest {
-            return Err(Error::InvalidTime);
-        }
-        let round = self.round_at_or_after(until);
-        let decimal = round.and_then(Decimal::of);
-        let (Some(round), Some(decimal)) = (round, decimal) else {
-            return Err(Error::InvalidTime);
-        };
+        let round = self.round_for(now, until)?;
+        let decimal = Decimal::of(round).ok_or(Error::InvalidTime)?;
         let locked = self.lock_on_stack(key, round, &decimal, random);
         wipe_stack();
         locked
@@ -159,17 +168,36 @@ mod proofs;
 #[cfg(test)]
 mod tests {
     use super::{LOCK_MAX_SECONDS, LOCK_RANDOM_LEN};
-    use crate::age::LOCKED_KEY_LEN;
+    use crate::age::{LOCK_LEN, LOCKED_KEY_LEN};
+    use crate::decimal::LIMIT;
+    use crate::network::Network;
     use crate::vectors::{
-        AgeParts, REFERENCE_LOCK, TESTNET, TESTNET_LOCK, age_parts, dearmor, signature_of,
+        AgeParts, REFERENCE_LOCK, TESTNET, TESTNET_LOCK, age_parts, dearmor, signature_of, unhex,
     };
     use crate::{Error, QUICKNET, timing};
 
-    const KEY: [u8; LOCKED_KEY_LEN] = *b"the key locked for one round now";
+    const KEY: [u8; LOCKED_KEY_LEN] = *b"locked one round";
     const RANDOM: [u8; LOCK_RANDOM_LEN] = *b"file key, sigma and nonce: fresh for every lock.";
 
     /// Times of quicknet: round 1000 comes at this one.
     const ROUND_1000: u64 = 1_692_806_364;
+
+    /// The lock of `KEY` and `RANDOM` for round 1000, which the reference tool opens to `KEY`.
+    const OPENED_BY_THE_REFERENCE: &str = concat!(
+        "6167652d656e6372797074696f6e2e6f72672f76310a2d3e20746c6f636b2030",
+        "3030303030303030303030303030313030302035326462396261373065306363",
+        "3066366561663738303364643037343437613166353437373733356664336636",
+        "363137393262613934363030633834653937310a706e6a30394e7a66304d4143",
+        "74722f4c62354d362b44546f57724d466e396641772f4a6b74485a427a684878",
+        "415337665745662f303271652b615954385669300a45412b432f2b484255444a",
+        "6664507a69366968555168334c6e7a5778763739464d74394767426e47395a2b",
+        "564e695a39765747537163614b776f526c676237430a68363030716832386b57",
+        "684861316a7a727443636f5533443348613232304e6a6d5534476545696b6538",
+        "6b0a2d2d2d2036763452624455757076704a62643179326b42384374652f3371",
+        "463962434a7765506b734b54482f56726b0a20666f72206576657279206c6f63",
+        "6b2ef3910d5302bc82ab8f368ba7237a4d1309e70473b7730252f7d9334976db",
+        "436e",
+    );
 
     #[test]
     fn a_key_opens_with_the_signature_of_the_round_it_is_locked_until() {
@@ -187,6 +215,14 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_is_written_as_the_reference_tool_opens_it() {
+        let lock = QUICKNET
+            .lock(&KEY, ROUND_1000 - 100, ROUND_1000, &RANDOM)
+            .unwrap();
+        assert_eq!(lock.as_bytes(), &unhex::<LOCK_LEN>(OPENED_BY_THE_REFERENCE));
+    }
+
+    #[test]
     fn a_lock_is_for_the_first_round_at_or_after_its_time() {
         for (until, round) in [
             (ROUND_1000 - 3, 999),
@@ -197,6 +233,18 @@ mod tests {
             let lock = QUICKNET.lock(&KEY, until - 1, until, &RANDOM).unwrap();
             assert_eq!(QUICKNET.round_of(lock.as_bytes()), Ok(round));
         }
+    }
+
+    /// A network of a round a second reaches rounds of twenty digits, which no lock carries.
+    #[test]
+    fn no_lock_waits_for_a_round_of_twenty_digits() {
+        let fast = Network {
+            genesis: 1,
+            period: 1,
+            ..QUICKNET
+        };
+        assert_eq!(fast.round_for(LIMIT - 10, LIMIT - 1), Ok(LIMIT - 1));
+        assert_eq!(fast.round_for(LIMIT - 10, LIMIT), Err(Error::InvalidTime));
     }
 
     #[test]
@@ -301,7 +349,7 @@ mod tests {
         assert_eq!(mac[..], expected[..]);
     }
 
-    /// Locks hold a key of 32 bytes; the reference files hold other payloads.
+    /// Locks hold a key of 16 bytes; the reference files hold other payloads.
     #[test]
     fn files_other_than_locks_are_not_opened() {
         for (network, armor) in [
@@ -409,7 +457,7 @@ mod stack {
         key_dependent(&this, &secrets(&[0x5a; LOCKED_KEY_LEN], &other_random))
     }
 
-    const KEY: [u8; LOCKED_KEY_LEN] = *b"a key for the stack to forget it";
+    const KEY: [u8; LOCKED_KEY_LEN] = *b"key of the stack";
     const RANDOM: [u8; LOCK_RANDOM_LEN] = *b"random bytes of a lock, which no stack may keep.";
 
     #[test]

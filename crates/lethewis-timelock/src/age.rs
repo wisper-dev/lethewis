@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The age file of a lock: one tlock stanza, then a key of 32 bytes as the payload. Its MAC and
+//! The age file of a lock: one tlock stanza, then a key of 16 bytes as the payload. Its MAC and
 //! payload cipher are models under Kani.
 
 use crate::Error;
@@ -13,13 +13,13 @@ use crate::ibe::FILE_KEY_LEN;
 /// The length of the payload nonce.
 pub(crate) const NONCE_LEN: usize = 16;
 /// The length of a locked key.
-pub const LOCKED_KEY_LEN: usize = 32;
+pub const LOCKED_KEY_LEN: usize = 16;
 /// The length of the payload: the key, then its tag.
-pub(crate) const PAYLOAD_LEN: usize = 48;
+pub(crate) const PAYLOAD_LEN: usize = 32;
 /// The length of the header MAC.
 pub(crate) const MAC_LEN: usize = 32;
 /// The length of a lock.
-pub const LOCK_LEN: usize = 402;
+pub const LOCK_LEN: usize = 386;
 /// The header through the three dashes: what the header MAC covers.
 pub(crate) const COVERED: usize = 293;
 
@@ -66,7 +66,7 @@ pub struct Lock {
 }
 
 impl Lock {
-    /// The bytes of the lock: an age file that tlock tools for quicknet open.
+    /// The bytes of the lock: an age file that `tle` opens.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; LOCK_LEN] {
         &self.bytes
@@ -627,8 +627,8 @@ pub(crate) mod model {
     static OPENS: AtomicU64 = AtomicU64::new(0);
     static FILE_KEY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     static NONCE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-    static KEY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-    static PAYLOAD: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    static KEY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static PAYLOAD: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
     /// What the last MAC was made under and was.
     pub(crate) struct Mac {

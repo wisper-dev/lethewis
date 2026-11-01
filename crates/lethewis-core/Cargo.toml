@@ -54,6 +54,10 @@ blake2 = { version = "0.11.0", default-features = false, features = [
   "zeroize",
 ] }
 
+# Keys from a time lock on drand's quicknet, which builds the curve's C code. Off, the crate needs
+# no allocator.
+lethewis-timelock = { path = "../lethewis-timelock", version = "0.0.0", optional = true }
+
 # X-Wing is left out of the proofs, so Kani builds none of its code.
 [target.'cfg(not(kani))'.dependencies]
 # X-Wing: ML-KEM-768 with X25519. Default features bring in `alloc`; `hazmat` makes encapsulation
@@ -70,6 +74,12 @@ x25519-dalek = { version = "3.0.0", default-features = false, features = [
 # and for `sha3` also `oid`.
 sha3 = { version = "0.12.0", default-features = false, features = ["zeroize"] }
 shake = { version = "0.1.0", default-features = false, features = ["zeroize"] }
+
+[features]
+timelock = ["dep:lethewis-timelock"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lints]
 workspace = true

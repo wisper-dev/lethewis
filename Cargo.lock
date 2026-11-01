@@ -327,6 +327,7 @@ dependencies = [
  "ctutils",
  "hkdf",
  "lethewis-dit",
+ "lethewis-timelock",
  "ml-kem",
  "polyval",
  "sha2",

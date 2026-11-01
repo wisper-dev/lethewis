@@ -421,3 +421,68 @@ fn a_backup_under_the_words_restores_on_a_new_phone() {
     }
     words.zeroize();
 }
+
+/// A profile locked until round 1000 of quicknet opens in another run with that round's signature.
+#[cfg(feature = "timelock")]
+#[test]
+fn a_profile_locked_until_a_round_opens_with_its_signature() {
+    use lethewis_core::lethewis_timelock::QUICKNET;
+    use lethewis_core::{ROUND_SIGNATURE_LEN, TIME_LOCK_LEN};
+
+    /// Round 1000 of quicknet comes at this time, and this is its signature.
+    const ROUND_1000: u64 = 1_692_806_364;
+    const SIGNATURE_1000: &str = concat!(
+        "b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b1957",
+        "6350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e39",
+    );
+    let signature: [u8; ROUND_SIGNATURE_LEN] = SIGNATURE_1000
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect::<Vec<u8>>()
+        .try_into()
+        .unwrap();
+    let mut source = Source(5);
+    let mut lock = [0; TIME_LOCK_LEN];
+    let mut by_time = [0; LOCK_RECORD_LEN];
+    let mut chat = [0; RECORD_LEN];
+    let mut key = [0; 32];
+    {
+        let mut memory = [const { Slot::empty() }; 4];
+        let mut epoch = Epoch::empty();
+        let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut root(1));
+        let timed = slots
+            .generate_time_lock(
+                &QUICKNET,
+                ROUND_1000 - 100,
+                ROUND_1000,
+                &mut source,
+                &mut lock,
+            )
+            .unwrap();
+        let profile = slots
+            .generate(Purpose::Wrap, KeyLength::Bytes32, &mut source)
+            .unwrap();
+        slots
+            .lock(profile, timed, b"time lock", &mut source, &mut by_time)
+            .unwrap();
+        slots.release(timed).unwrap();
+        let created = slots
+            .generate(Purpose::ExternalData, KeyLength::Bytes32, &mut source)
+            .unwrap();
+        slots
+            .wrap(created, profile, b"chat", &mut source, &mut chat)
+            .unwrap();
+        slots
+            .reveal32(created, Position::First, Purpose::ExternalData, &mut key)
+            .unwrap();
+    }
+    let mut memory = [const { Slot::empty() }; 4];
+    let mut epoch = Epoch::empty();
+    let mut slots = Slots::new(&mut memory, &mut epoch, 1, &mut root(1));
+    let timed = slots.open_time_lock(&QUICKNET, &lock, &signature).unwrap();
+    let profile = slots.unlock(timed, b"time lock", &by_time).unwrap();
+    assert_eq!(chat_key(&mut slots, profile, b"chat", &chat), Ok(key));
+}
