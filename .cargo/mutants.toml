@@ -15,7 +15,8 @@ profile = "mutants"
 # compiled only by Kani, which a mutant run does not invoke. The proofs are checked against
 # deliberate errors instead.
 # The low 4 bits of the last number of words are zero before the checksum goes in, so the `|` that
-# puts it there is a `^`. For share words, the bits each `|` puts in are zero before too.
+# puts it there is a `^`. For share words, the bits each `|` puts in are zero before too. So are
+# they in the hex and base64 of a time lock.
 # A symbol read there while exactly enough bits are held only comes one take early, so the `<`
 # that decides it is a `<=`.
 # lethewis-dit acts only on aarch64 where the system reports data-independent timing: the mutants of
@@ -31,4 +32,5 @@ exclude_re = [
   '^crates/lethewis-core/src/shares/words\.rs:[0-9]+:[0-9]+: replace \| with \^ in data_of$',
   '^crates/lethewis-core/src/shares/words\.rs:[0-9]+:[0-9]+: replace \| with \^ in Bits<.*>::take$',
   '^crates/lethewis-core/src/shares/words\.rs:[0-9]+:[0-9]+: replace < with <= in Bits<.*>::take$',
+  '^crates/lethewis-timelock/src/age\.rs:[0-9]+:[0-9]+: replace \| with \^ in (from_hex|encode_group|decode_group)$',
 ]
