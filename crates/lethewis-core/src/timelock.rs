@@ -422,6 +422,7 @@ pub(crate) mod tests {
                 Err(Error::InvalidTime)
             );
         }
+        assert_eq!(lock, [0xa5; TIME_LOCK_LEN]);
         slots
             .generate_time_lock(
                 &QUICKNET,

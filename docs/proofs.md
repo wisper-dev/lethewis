@@ -582,7 +582,7 @@ compile error.
 | a lock until a round of twenty digits | no proof: a unit test on a network of a round a second |
 | a time lock of the core drawn under the hedge of words, or with its time checked after the source | `a_time_lock_is_written_exactly_when_its_key_is_generated`, unit tests |
 | a key from a time lock under the label of shares | `a_time_lock_is_written_exactly_when_its_key_is_generated`, unit tests |
-| the random bytes of a time lock that begin with its secret, or a lock written though its key failed | `a_time_lock_is_written_exactly_when_its_key_is_generated` |
+| a time lock whose random bytes begin with its secret, or written though its key or time failed | `a_time_lock_is_written_exactly_when_its_key_is_generated` |
 | an opened time lock derived under the label of words | `a_key_comes_from_a_time_lock_only_as_it_opens`, unit tests |
 | a time lock made without a free slot | `no_time_lock_is_made_or_opened_without_a_free_slot`, unit tests |
 | a time lock opened without a free slot | `no_time_lock_is_made_or_opened_without_a_free_slot` |
