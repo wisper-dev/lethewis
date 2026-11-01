@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use core::cell::Cell;
 use core::marker::PhantomData;
 
 use super::{
@@ -12,7 +13,7 @@ use super::{
 };
 use crate::block::{BLOCK_HEADER_LEN, CARRY_LABEL, SALT_LEN, chunks_in, data_len_in};
 use crate::derive::{
-    Branch,
+    Branch, SECRET_LEN,
     model::{any_failed, failed, id_bytes, id_from_bytes, runs},
     proofs::{
         expected_archive_batch, expected_archive_check, expected_archive_key,
@@ -33,6 +34,7 @@ use crate::shares::{
     SHARE_LEN, Share, Shares,
     proofs::{expected_secret_and_check, expected_shares},
 };
+use crate::timelock::{LOCK_RANDOM_LEN, ROUND_SIGNATURE_LEN, TIME_LOCK_LEN, TimeLocker};
 use crate::words::{
     Words, bits_of,
     proofs::{any_list, expected_words},
@@ -1539,6 +1541,281 @@ fn no_shares_are_generated_without_a_free_slot() {
         _ => shares_without_a_free_slot([any_slot_in(retired), any_slot_in(retired)]),
     }
     kani::cover!(layout == 3, "both slots retired");
+}
+
+/// What stands in for the time lock: it answers at will and keeps what it was given.
+struct AnyLocker {
+    in_time: bool,
+    locked: Result<(), Error>,
+    written: [u8; TIME_LOCK_LEN],
+    opened: Result<(), Error>,
+    secret: [u8; SECRET_LEN],
+    locks: Cell<u8>,
+    given: Cell<([u8; SECRET_LEN], [u8; LOCK_RANDOM_LEN], u64, u64)>,
+    opens: Cell<u8>,
+    asked: Cell<(*const u8, usize, [u8; ROUND_SIGNATURE_LEN])>,
+}
+
+impl AnyLocker {
+    fn new() -> Self {
+        let failure = |errors: [Error; 2]| if kani::any() { errors[0] } else { errors[1] };
+        Self {
+            in_time: kani::any(),
+            locked: if kani::any() {
+                Ok(())
+            } else {
+                Err(failure([Error::CipherFailed, Error::InvalidTime]))
+            },
+            written: kani::any(),
+            opened: if kani::any() {
+                Ok(())
+            } else {
+                Err(failure([Error::SignatureRejected, Error::LockRejected]))
+            },
+            secret: kani::any(),
+            locks: Cell::new(0),
+            given: Cell::new(([0; SECRET_LEN], [0; LOCK_RANDOM_LEN], 0, 0)),
+            opens: Cell::new(0),
+            asked: Cell::new((core::ptr::null(), 0, [0; ROUND_SIGNATURE_LEN])),
+        }
+    }
+}
+
+impl TimeLocker for AnyLocker {
+    fn round_for(&self, _: u64, _: u64) -> Result<u64, Error> {
+        if self.in_time {
+            Ok(kani::any())
+        } else {
+            Err(Error::InvalidTime)
+        }
+    }
+
+    fn lock(
+        &self,
+        secret: &[u8; SECRET_LEN],
+        now: u64,
+        until: u64,
+        random: &[u8; LOCK_RANDOM_LEN],
+        out: &mut [u8; TIME_LOCK_LEN],
+    ) -> Result<(), Error> {
+        self.locks.set(self.locks.get().saturating_add(1));
+        self.given.set((*secret, *random, now, until));
+        if self.locked.is_ok() {
+            *out = self.written;
+        }
+        self.locked
+    }
+
+    fn open(
+        &self,
+        lock: &[u8],
+        signature: &[u8; ROUND_SIGNATURE_LEN],
+        secret: &mut [u8; SECRET_LEN],
+    ) -> Result<(), Error> {
+        self.opens.set(self.opens.get().saturating_add(1));
+        self.asked.set((lock.as_ptr(), lock.len(), *signature));
+        if self.opened.is_ok() {
+            *secret = self.secret;
+        }
+        self.opened
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(388)]
+fn a_time_lock_is_written_exactly_when_its_key_is_generated() {
+    into_the_first(|mut memory| {
+        let mut epoch = any_epoch(kani::any());
+        let mut slots = Slots {
+            memory: Table::new(&mut memory),
+            epoch: &mut epoch,
+        };
+        let before = snapshots(&slots);
+        let locker = AnyLocker::new();
+        let mut source = AnyEntropy::new();
+        let (epoch_key, count) = (first_half(&slots.epoch.key), slots.epoch.drawn);
+        let (now, until) = (kani::any(), kani::any());
+        let mut lock: [u8; TIME_LOCK_LEN] = kani::any();
+        let original = lock;
+        let result = slots.generate_time_lock_with(&locker, now, until, &mut source, &mut lock);
+        let (secret, random, at_now, at_until) = locker.given.get();
+        if locker.in_time {
+            kani::assert(
+                source.calls == 1 && source.requested == 64,
+                "the source is asked once for 64 bytes",
+            );
+            kani::assert(
+                source.failed == (result == Err(Error::EntropyFailed)),
+                "a failure of the source is EntropyFailed, and nothing else is",
+            );
+            kani::assert(
+                slots.epoch.drawn == count.wrapping_add(u64::from(!source.failed)),
+                "the count of draws grows by one exactly when the source answers",
+            );
+            let hedged = expected_hedge(&epoch_key, count, Branch::HedgeTimeLock, &source.written);
+            kani::assert(
+                locker.locks.get() <= 1
+                    && (locker.locks.get() == 0
+                        || (secret[..] == hedged[..SECRET_LEN]
+                            && random[..] == hedged[SECRET_LEN..]
+                            && (at_now, at_until) == (now, until))),
+                "the time lock is asked at most once, for the secret the hedged bytes begin with, \
+                 the rest of them and the times",
+            );
+            kani::assert(
+                locker.locks.get() == 1
+                    || result == Err(Error::EntropyFailed)
+                    || result == Err(Error::DerivationFailed),
+                "the time lock is asked unless the source or a derivation fails",
+            );
+        } else {
+            kani::assert(
+                result == Err(Error::InvalidTime) && source.calls == 0 && locker.locks.get() == 0,
+                "a time out of range is refused before the source is asked",
+            );
+        }
+        kani::assert(
+            lock == if result.is_ok() {
+                locker.written
+            } else {
+                original
+            },
+            "the lock is written exactly when the key is derived",
+        );
+        if result.is_ok() {
+            let now = snapshot(&slots.memory[0]);
+            kani::assert(
+                now.keys.0[..32]
+                    == expected_secret_key(&secret, Purpose::Wrap, Branch::FromTimeLock)
+                    && now.unlocks
+                    && !now.recorded,
+                "the key in the slot is the one the locked secret derives, a key from a secret held \
+                 by no record",
+            );
+        } else {
+            kani::assert(
+                unchanged_except(&slots, &before, 2),
+                "a failed generation changes no slot",
+            );
+        }
+        kani::cover!(result.is_ok(), "a time lock is generated");
+        kani::cover!(
+            result.is_ok() && slots.epoch.changing,
+            "a time lock is generated during a change of epoch"
+        );
+        kani::cover!(result == Err(Error::InvalidTime), "a time out of range");
+        kani::cover!(
+            result == Err(Error::DerivationFailed),
+            "the derivation fails"
+        );
+        kani::cover!(result == Err(Error::EntropyFailed), "the source fails");
+        kani::cover!(
+            locker.locks.get() == 1 && locker.locked.is_err(),
+            "the time lock fails"
+        );
+        kani::cover!(
+            result == Err(Error::DuplicateKey),
+            "the key generated is held"
+        );
+    });
+}
+
+fn time_lock_without_a_free_slot(mut memory: [Slot; 2]) {
+    let mut epoch = any_epoch(kani::any());
+    let mut slots = Slots {
+        memory: Table::new(&mut memory),
+        epoch: &mut epoch,
+    };
+    let before = snapshots(&slots);
+    let locker = AnyLocker::new();
+    let mut source = AnyEntropy::new();
+    let mut lock: [u8; TIME_LOCK_LEN] = kani::any();
+    let original = lock;
+    let generated =
+        slots.generate_time_lock_with(&locker, kani::any(), kani::any(), &mut source, &mut lock);
+    let opened = slots.open_time_lock_with(&locker, &lock, &kani::any());
+    kani::assert(
+        generated == Err(Error::NoFreeSlot)
+            && opened == Err(Error::NoFreeSlot)
+            && source.calls == 0
+            && locker.locks.get() == 0
+            && locker.opens.get() == 0,
+        "without a free slot nothing is asked",
+    );
+    kani::assert(
+        lock == original && unchanged_except(&slots, &before, 2),
+        "nothing changes",
+    );
+}
+
+#[kani::proof]
+#[kani::unwind(388)]
+fn no_time_lock_is_made_or_opened_without_a_free_slot() {
+    let (loaded, retired) = (Occupancy::Loaded, Occupancy::Retired);
+    let layout = kani::any::<u8>() % 4;
+    match layout {
+        0 => time_lock_without_a_free_slot([any_slot_in(loaded), any_slot_in(loaded)]),
+        1 => time_lock_without_a_free_slot([any_slot_in(loaded), any_slot_in(retired)]),
+        2 => time_lock_without_a_free_slot([any_slot_in(retired), any_slot_in(loaded)]),
+        _ => time_lock_without_a_free_slot([any_slot_in(retired), any_slot_in(retired)]),
+    }
+    kani::cover!(layout == 3, "both slots retired");
+}
+
+#[kani::proof]
+#[kani::unwind(65)]
+fn a_key_comes_from_a_time_lock_only_as_it_opens() {
+    into_the_first(|mut memory| {
+        let mut epoch = any_epoch(kani::any());
+        let mut slots = Slots {
+            memory: Table::new(&mut memory),
+            epoch: &mut epoch,
+        };
+        let before = snapshots(&slots);
+        let locker = AnyLocker::new();
+        let lock: [u8; TIME_LOCK_LEN] = kani::any();
+        let signature: [u8; ROUND_SIGNATURE_LEN] = kani::any();
+        let result = slots.open_time_lock_with(&locker, &lock, &signature);
+        let (pointer, length, asked) = locker.asked.get();
+        kani::assert(
+            locker.opens.get() == 1
+                && pointer == lock.as_ptr()
+                && length == TIME_LOCK_LEN
+                && asked == signature,
+            "the time lock is opened once, with the lock and the signature given",
+        );
+        if result.is_ok() {
+            let now = snapshot(&slots.memory[0]);
+            kani::assert(
+                locker.opened.is_ok()
+                    && now.keys.0[..32]
+                        == expected_secret_key(&locker.secret, Purpose::Wrap, Branch::FromTimeLock)
+                    && now.unlocks
+                    && !now.recorded,
+                "a key comes only from a lock that opens, the one its secret derives, a key from a \
+                 secret held by no record",
+            );
+        } else {
+            kani::assert(
+                locker.opened.is_ok() || result.err() == locker.opened.err(),
+                "a lock that does not open gives its own error",
+            );
+            kani::assert(
+                unchanged_except(&slots, &before, 2),
+                "a refused lock changes no slot",
+            );
+        }
+        kani::cover!(result.is_ok(), "a key comes from a time lock");
+        kani::cover!(
+            result == Err(Error::SignatureRejected),
+            "the signature is refused"
+        );
+        kani::cover!(result == Err(Error::LockRejected), "the lock is refused");
+        kani::cover!(
+            result == Err(Error::DuplicateKey),
+            "the key from the lock is held"
+        );
+    });
 }
 
 #[kani::proof]

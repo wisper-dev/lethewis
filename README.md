@@ -8,16 +8,20 @@ A Rust library for the lifecycle of encryption keys on a device that may be take
 - recovery independent of the hardware, and detection of a lost key;
 - conditional access: key shares held by other people, and a time lock.
 
-It is for applications where seizure is part of the threat model: wallets, password managers, notes,
-tools for crossing a border, evidence collection. Properties that can be stated precisely are proven
-formally wherever that is possible; what cannot be proven is measured on real devices and described
-as measured. The core is platform-independent and builds without the standard library and without a
-memory allocator; hardware binding is a crate of its own for each platform, Android first.
+It is for applications where the device may be seized: wallets, password managers, notes, border
+crossings, evidence collection.
+
+What can be stated precisely is proven formally where possible. The rest is measured on real
+devices and described as measured.
+
+The core runs on any platform; without its `timelock` feature it needs no standard library or
+allocator. Hardware binding is a crate per platform, Android first.
+
 Suggestions for functionality not listed here are accepted as issues.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/rustc-1.99.0-orange.svg)
-![Readiness](https://img.shields.io/badge/readiness-50%25-yellow.svg)
+![Readiness](https://img.shields.io/badge/readiness-53%25-yellow.svg)
 
 ## How the keys relate
 
@@ -71,8 +75,8 @@ password and the hardware secret at each unlock, and neither alone is enough.
   So is bringing typed text into one Unicode form.
 - A key handed out is the caller's to wipe. Only a key for external data leaves in the clear,
   through `Slots::reveal32`.
-- Keys for wrapping and for transfers leave in the clear only as words or shares of a generation.
-  Keeping them is the caller's.
+- Keys for wrapping and for transfers leave in the clear only as words, shares or a time lock made
+  once. Keeping them is the caller's.
 - A broken random source is covered in part, by hedging with the epoch key per RFC 8937. Not
   covered: an epoch key from that source, a copied process or machine, repeats across `Slots`, and
   password salts.
@@ -85,6 +89,14 @@ password and the hardware secret at each unlock, and neither alone is enough.
   learns nothing.
 - A changed share is refused, not named. A 4-byte check split with the secret catches a change,
   except once in 2^32.
+- Once its round is signed, a time lock opens for whoever holds it. Before then it keeps the owner
+  out only if no other way in is left.
+- If drand's network stops before a lock's round, the lock never opens. Enough of its members
+  acting together can sign a round early.
+- The time and the signature of a round are the caller's. A clock set back locks to a round already
+  signed, which opens at once.
+- A time lock rests on pairings, which a quantum computer breaks.
+- A lock names its round openly: whoever holds it knows when it opens.
 - A dedicated secure element is missing on a large share of Android devices, by our estimate.
   There protection falls back and records the level it reached.
 - A device unlocked since boot has its keys in memory already. No key-storage library changes
@@ -102,10 +114,11 @@ separate crate, so the proof perimeter is visible from the directory listing.
 
 | Crate | Contents |
 |---|---|
-| `lethewis-core` | derivation, hierarchy, lifecycle, destruction, two-tier access, key shares, data in blocks; no network or clock, the system only through `lethewis-dit` |
+| `lethewis-core` | keys from derivation to destruction, two-tier access, shares, time locks with `timelock`, data in blocks; the system only through `lethewis-dit` |
 | `lethewis-dit` | data-independent timing on aarch64 for a piece of work, where Linux, Android or an Apple system reports it; the one crate with unsafe code |
+| `lethewis-timelock` | keys locked until a round of drand's quicknet, as age files `tle` opens; no network or clock |
 
-Hardware binding and the time lock will each be a crate of its own, listed here when it exists.
+Hardware binding will be a crate of its own, listed here when it exists.
 
 Claimed and proven properties: [docs/proofs.md](docs/proofs.md).
 

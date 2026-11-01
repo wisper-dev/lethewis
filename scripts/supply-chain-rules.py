@@ -32,12 +32,14 @@ UNSAFE_LINTS = {
     "rust": {"unsafe_code": "deny", "unsafe_op_in_unsafe_fn": "deny"},
     "clippy": {"multiple_unsafe_ops_per_block": "deny"},
 }
-# Crates that handle key material: every locked version read in full, never lowered in a policy.
-HANDLE_SECRETS = {
-    "aead", "aes", "aes-gcm-siv", "argon2", "blake2", "block-buffer", "cipher", "cmov", "ctr",
-    "ctutils", "curve25519-dalek", "digest", "hkdf", "hmac", "hybrid-array", "inout", "keccak",
-    "ml-kem", "module-lattice", "polyval", "sha2", "sha3", "shake", "sponge-cursor", "subtle",
-    "universal-hash", "x25519-dalek", "zeroize",
+# Crates that handle key material, and those that choose how such code is compiled: every locked
+# version read in full, never lowered in a policy.
+ALWAYS_READ_IN_FULL = {
+    "aead", "aes", "aes-gcm-siv", "argon2", "blake2", "block-buffer", "blst", "cc", "chacha20",
+    "chacha20poly1305", "cipher", "cmov", "ctr", "ctutils", "curve25519-dalek", "digest",
+    "find-msvc-tools", "hkdf", "hmac", "hybrid-array", "inout", "keccak", "ml-kem",
+    "module-lattice", "poly1305", "polyval", "sha2", "sha3", "shake", "shlex", "sponge-cursor",
+    "subtle", "universal-hash", "x25519-dalek", "zeroize", "zeroize_derive",
 }
 
 
@@ -92,9 +94,9 @@ def main() -> int:
     records = audits.get("audits", {})
     for package in tomllib.loads((root / "Cargo.lock").read_text()).get("package", []):
         name, version = package["name"], package["version"]
-        if name in HANDLE_SECRETS and version not in read_in_full(records.get(name, [])):
+        if name in ALWAYS_READ_IN_FULL and version not in read_in_full(records.get(name, [])):
             problems.append(
-                f"Cargo.lock: {name} {version} handles secrets"
+                f"Cargo.lock: {name} {version} is always read in full"
                 " and has no record of a reading in full"
             )
 
@@ -119,9 +121,9 @@ def main() -> int:
                     f"config.toml: [policy.{key}] gives {dependency} a list;"
                     " write one criterion as a string, as cargo vet fmt does"
                 )
-            elif dependency in HANDLE_SECRETS and required != OWN_CRITERION:
+            elif dependency in ALWAYS_READ_IN_FULL and required != OWN_CRITERION:
                 problems.append(
-                    f"config.toml: [policy.{key}] lowers {dependency}, which handles secrets"
+                    f"config.toml: [policy.{key}] lowers {dependency}, which is always read in full"
                 )
             elif required not in DEPENDENCY_CRITERIA:
                 problems.append(

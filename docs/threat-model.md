@@ -45,8 +45,11 @@ fails the check are refused.
 A share is also written as 21 words: 18 carry it and its format, 3 check them. Up to three changed
 words are refused, and a single one is found.
 
-A key for wrapping from a password, words, shares or an import is never wrapped. It wraps only
-stored keys, in lock records of two layers.
+A key is also derived from a time lock: 128 hedged bits, encrypted until a round of drand's
+quicknet. Before the round nobody derives it again, if the source was sound.
+
+A key for wrapping from a password, words, shares, a time lock or an import is never wrapped. It
+wraps only stored keys, in lock records of two layers.
 
 The inner layer opens only under that key, the outer only under the key of the epoch. A guess at a
 password against a lock record needs that epoch's key too.
@@ -95,6 +98,11 @@ shares, as the application chooses.
 The main password opens the outer layers and shows that an archive exists, not what its batches
 hold, as long as the random source was sound when they were archived.
 
+A stored key can also be locked under a key from a time lock, until a round of drand's quicknet.
+Before that round is signed, nobody derives that key again, the owner included.
+
+This holds only once the key from the lock is released and a new epoch drops every other way in.
+
 #### Intended
 
 Give each profile its own entry key, so that a second password derives another profile's key.
@@ -115,6 +123,17 @@ owner again before an export, and how long a key for transfers lives, are the ap
 
 Two holders of shares who agree, are forced or are deceived open what the shares protect. The
 library cannot tell a share given willingly from one taken.
+
+Enough members of the network acting together, or a flaw in its software, can sign a round early.
+Any lock of that round then opens.
+
+A clock set back locks to a round already signed, which opens at once. One set forward locks for
+longer, and the time is the application's to show and confirm.
+
+A lock names its round openly, so whoever holds it knows when it opens and can wait for it.
+
+If the network stops before a round, its locks never open. A quantum computer breaks the pairings,
+and with them every lock.
 
 ### 3. A laboratory reading the flash chip
 
@@ -249,7 +268,7 @@ caller names.
 Only a key for wrapping wraps and unwraps, only a key for transfers exports and receives, and the
 set of either holds one key and never changes.
 
-Before every wrap and export the cipher encrypts a known input of the shape of a record and must give
+Before every wrap and export the cipher encrypts a known input shaped like a record. It must give
 the answer an independent implementation gives, or nothing is written.
 
 A record is unwrapped into a slot only after its tag, its layout and the identifier of the key that
@@ -260,10 +279,12 @@ or 64 KiB in a build without optimisation. Tests read the memory of their own pr
 without optimisation and with the hardware and the software SHA-256, and check that the wipe reaches
 that depth.
 
-They also check that the derivation uses less than half of it and more than a sixteenth. They find
-no 16-byte piece of the key, the extracted key, the HMAC key blocks, the SHA-256 states, inner hashes
-and message schedules, or the output beyond the identifier, in the byte orders and arrangements the
-two SHA-256 paths use.
+They also check that the derivation uses less than half of it and more than a sixteenth.
+
+They find no 16-byte piece of the key, the extracted key, the HMAC key blocks or the SHA-256 states.
+
+Nor do they find inner hashes, message schedules or the output past the identifier, in either
+SHA-256 path's layout.
 
 The same wipe follows a combination of two keys and a challenge to the chip, and tests read the
 stack back after each.
@@ -273,9 +294,10 @@ an export, a receipt and either end of an export. The wipe reaches 24 KiB, or 64
 optimisation: at least twice what the cipher uses at every level of optimisation, by the same
 measurement.
 
-Tests read the stack back after a wrap, an unwrap and an unwrap whose record fails its tag, with a set
-of three keys under a 64-byte parent. They look for pieces of every key, of the derived cipher key
-and of the message keys.
+Tests read the stack back after a wrap, an unwrap and an unwrap whose record fails its tag. The set
+holds three keys under a 64-byte parent.
+
+They look for pieces of every key, of the derived cipher key and of the message keys.
 
 They also look for the AES round keys of the derived key and of the message encryption key as laid
 out by the instructions, the keystream and what the record decrypts to.
@@ -288,8 +310,10 @@ After each call on an archive key or a record of the archive the stack is wiped 
 224 KiB without optimisation, and after archiving or opening a batch 160 KiB deep, or 224 KiB: at
 least twice what each uses.
 
-Tests read it back for the seed, what X-Wing expands it to, the stored keys, the keys of chats, the
-shared secret, the key of a body and the data of a batch. The inner values of ML-KEM-768 and X25519 are not looked for.
+Tests read it back for the seed, what X-Wing expands it to, the stored keys and the keys of chats.
+And for the shared secret, a body's key and a batch's data.
+
+The inner values of ML-KEM-768 and X25519 are not looked for.
 
 The wipe on release and on creating the slots, and the refusal of a released or foreign handle, are
 proven for two slots; the statements and their limits are in [proofs.md](proofs.md).
@@ -314,10 +338,14 @@ Tests read it back and find no 16-byte piece of a share, the secret, the derivat
 Calls on the words of a share wipe the stack alike. Tests find no 16-byte piece of the share, its
 words or their numbers.
 
+The lock wipes 96 KiB of stack below itself, and the call 8 KiB, or 64 KiB, below the caller. Tests
+find no 16-byte piece of the bytes drawn, the secret, the derivation or key.
+
 Words and shares are wiped when their key is derived, and left as they were when it is not. Words
 of a share are wiped when read into it.
 
-Generations of words and of shares are the only calls that give out what a key derives from, once.
+Generations of words, shares and time locks are the only calls that give out what a key derives
+from, once.
 
 A key for external data is added enabled, and only a disabled key other than the primary is
 destroyed, wiped with its identifier. A record of its set wrapped afterwards does not hold it; one
@@ -400,10 +428,13 @@ A carried block is as long as its source, which links a backup to the blocks on 
 under a disabled key is not carried; a caller that goes on past that refusal leaves it out of the
 copy.
 
-The stack wipe is best effort. It does not reach registers, and it relies on the compiler keeping
-the derivation, the hedge, the reveal, the wrap and the unwrap out of their caller's frame. Its depth
-follows the optimisation of this crate: a build that optimises it but not the hash and cipher code
-sets `--cfg lethewis_unoptimised`.
+The stack wipe is best effort. It does not reach registers.
+
+It relies on the compiler keeping each derivation, hedge, reveal, wrap and unwrap out of its
+caller's frame.
+
+Its depth follows the optimisation of this crate. A build that optimises it but not the hash and
+cipher code sets `--cfg lethewis_unoptimised`.
 
 The wipe is measured only where the tests run, so far x86-64 and aarch64 Linux, not on a
 microcontroller such as Cortex-M. A call needs at least the stack its documentation states, as
@@ -427,9 +458,10 @@ For such bytes to unwrap under both keys they must also name each key's identifi
 work to no less than about 2^64 by estimate; this is not proven. A set cannot wrap itself, and since
 no key is held in two places, no set is wrapped under one of its own keys.
 
-Longer cycles, such as one set wrapped under another that is wrapped under the first, and a key whose
-bytes begin with the bytes of the key it is wrapped under, are not detected. Two sets of slots alive
-at once may hold the same key; the one-place rule holds within each.
+Longer cycles are not detected, such as one set under another that is under the first. Nor is a key
+whose bytes begin with those of the key it is wrapped under.
+
+Two sets of slots alive at once may hold the same key; the one-place rule holds within each.
 
 The copy a reveal writes, and what the engine it goes to keeps, are the caller's to wipe; a key
 revealed before a record of its set is stored is lost with the slots. The wipe after a reveal relies
@@ -448,6 +480,8 @@ The shares a generation writes are the caller's to hand out once and to wipe. Wh
 them holds the key.
 
 A call on shares needs at least the 8 KiB, or 64 KiB, its wipe reaches.
+
+A call on a time lock needs 104 KiB of stack, or 108 KiB without optimisation.
 
 ### 5. The supply chain
 
@@ -487,9 +521,12 @@ is then read from that position, so the timing may tell which position it is, an
 derivations tells how many keys the set holds.
 
 A build step compiles those comparisons and that choice for x86-64, aarch64, Cortex-M4 and
-WebAssembly and fails unless the machine code of each runs straight through: no branch, no call and no write of the program
-counter but the final return. This shows how the pinned compiler laid the code out, before
-link-time optimisation, not how long each instruction takes.
+WebAssembly. It fails on any branch, call or write of the program counter but the final return.
+
+This shows how the pinned compiler laid the code out, before link-time optimisation. It does not
+show how long each instruction takes.
+
+The same step checks the choice of a time lock's scalar among its candidates, on x86-64 and aarch64.
 
 AES and POLYVAL run on the processor's instructions where present and on bitsliced portable code
 elsewhere. Whether those instructions take the same time for all data is up to the processor. On
@@ -546,12 +583,16 @@ all of it.
    fields of 8 bytes, lowercase ASCII followed by zeros, is the application's.
 7. The holders of shares keep them apart, and no two of them act against the owner. Bringing a
    share into its 25 bytes is the application's.
+8. Fewer than a threshold of quicknet's members act against the owner, and the network runs past
+   every lock's round. Bringing the round's signature to the device is the application's.
 
 ## Known gaps
 
 - No external audit has been performed.
-- X-Wing is specified by an Internet-Draft, not a standard, and the ML-KEM code it runs on has had no
-  independent audit.
+- X-Wing follows an Internet-Draft, not a standard; the ML-KEM code under it has had no independent
+  audit.
 - Deniable storage is outside this library, which supplies keys to it and makes no claim about it.
+- The time lock rests on drand's network and on blst's C and assembly, read but neither proven nor
+  audited.
 - Reproducible builds for native code inside an Android application: no published recipe was found.
   A CI job measures reproducibility of the Rust build.

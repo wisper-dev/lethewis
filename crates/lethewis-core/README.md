@@ -4,6 +4,9 @@ Key derivation, hierarchy, lifecycle and destruction for a device that may be ta
 Pure logic: no filesystem, no network, no clock, no memory allocator. The one question put to the
 system, through `lethewis-dit`, is whether the processor offers data-independent timing.
 
+The `timelock` feature adds keys locked until a round of drand's quicknet. It builds blst, which
+needs the standard library and an allocator.
+
 What is guaranteed, what is not, and which properties are proven:
 [the repository](https://github.com/wisper-dev/lethewis).
 

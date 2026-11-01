@@ -342,7 +342,7 @@ jobs:
       - name: The core builds with no standard library and no memory allocator
         run: cargo build --manifest-path checks/no-alloc/Cargo.toml --locked --target thumbv7em-none-eabihf
 
-      - name: The comparison of key identifiers runs straight through on four targets
+      - name: Choices on secret data run straight through on every target
         run: scripts/constant-time.py
 
       - name: Documentation builds, and its links resolve
@@ -368,9 +368,10 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: The runner has the instructions of the hardware paths
-        # Otherwise the hardware paths of SHA-256, AES and POLYVAL would go untested.
+        # Otherwise the hardware paths of SHA-256, AES, POLYVAL, ChaCha20 and Poly1305 would go
+        # untested.
         run: |
-          for feature in sha_ni aes pclmulqdq avx; do
+          for feature in sha_ni aes pclmulqdq avx avx2; do
             grep -qw "$feature" /proc/cpuinfo || { echo "::error::no $feature on this runner"; exit 1; }
           done
 
@@ -413,10 +414,10 @@ jobs:
             | tee random-archive.txt
           grep -q '^test result: ok. 2 passed' random-archive.txt
 
-      - name: Tests, software SHA-256, AES and POLYVAL
+      - name: Tests, software hashes and ciphers
         # The portable code, whose stack use differs, would otherwise go untested on these runners.
         env:
-          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
+          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft" --cfg chacha20_backend="soft" --cfg poly1305_backend="soft"'
           LETHEWIS_BACK_ENDS: portable
         run: |
           cargo test --workspace --all-features --locked
@@ -425,7 +426,7 @@ jobs:
       - name: Core tests at the other levels of optimisation
         # The stack the hash and the cipher use, and so the wipes' depth, changes with the level.
         env:
-          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
+          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft" --cfg chacha20_backend="soft" --cfg poly1305_backend="soft"'
         run: |
           for level in 1 2 s z; do
             export CARGO_PROFILE_RELEASE_OPT_LEVEL=$level
@@ -467,9 +468,9 @@ jobs:
           cargo test --workspace --all-features --locked
           cargo test --workspace --all-features --locked --release
 
-      - name: Tests, software SHA-256, AES and POLYVAL
+      - name: Tests, software hashes and ciphers
         env:
-          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
+          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft" --cfg chacha20_backend="soft" --cfg poly1305_backend="soft"'
           LETHEWIS_BACK_ENDS: portable
         run: |
           cargo test --workspace --all-features --locked
@@ -477,7 +478,7 @@ jobs:
 
       - name: Core tests at the other levels of optimisation
         env:
-          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
+          SOFTWARE: '--cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft" --cfg chacha20_backend="soft" --cfg poly1305_backend="soft"'
         run: |
           for level in 1 2 s z; do
             export CARGO_PROFILE_RELEASE_OPT_LEVEL=$level
@@ -534,9 +535,9 @@ jobs:
           cargo test --workspace --all-features --locked
           cargo test --workspace --all-features --locked --release
 
-      - name: Tests, software SHA-256, AES and POLYVAL
+      - name: Tests, software hashes and ciphers
         env:
-          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft"'
+          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft" --cfg chacha20_backend="soft" --cfg poly1305_backend="soft"'
           LETHEWIS_BACK_ENDS: portable
         run: |
           cargo test --workspace --all-features --locked

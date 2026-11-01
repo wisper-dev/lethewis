@@ -47,6 +47,10 @@ allow = ["AGPL-3.0-only"]
 name = "lethewis-dit"
 allow = ["AGPL-3.0-only"]
 
+[[licenses.exceptions]]
+name = "lethewis-timelock"
+allow = ["AGPL-3.0-only"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

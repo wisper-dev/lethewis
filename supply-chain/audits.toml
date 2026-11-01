@@ -8,6 +8,9 @@ build script, every source file and every file a source file includes with inclu
 include_bytes!, has been read in full, and the archive's checksum matches the lockfile. The review
 covered every unsafe block, build scripts, procedural macros, and access to the system, files and
 network, and, where the crate handles secrets, branches and memory accesses that depend on them.
+A file the archive carries as the output of a generator in the crate's source repository counts as
+read when the generator was read in full and running it at the published commit gives the file
+byte for byte.
 """
 implies = "safe-to-deploy"
 
@@ -406,6 +409,83 @@ uninitialized block, or N = U0 in a release build, they read uninitialized memor
 bounds. digest, hmac, sha2 and hkdf call only the public methods of BlockBuffer.
 """
 
+[[audits.blst]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.3.17"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md, build.rs, every .rs file under src/ (lib.rs
+includes bindings.rs and the pippenger files), every .c and .h file under blst/src/, the headers
+blst/bindings/blst.h and blst_aux.h, blst/build/assembly.S, and the files blst/build keeps for
+other builds (win64/dll.c, win64/blst.def, refresh.sh, bindings_trim.pl). The C++ headers
+blst.hpp and blst_t.hpp and srcroot.go, which no Rust build compiles, were read far enough to
+establish that. The archive matches the repository at the commit in .cargo_vcs_info.json
+(54e6e556, tag v0.3.17).
+
+The assembly under blst/build/{elf,mach-o,coff,win64,cheri} is generated. Its generators in the
+repository at that commit, src/asm/*-x86_64.pl, *-armv8.pl, x86_64-xlate.pl and arm-xlate.pl,
+were read in full, and running each with perl 5.38.2 for every flavour blst/build/refresh.sh
+names gives the shipped files byte for byte. The generators read only their arguments and their
+own text and write only their output; the mingw64 flavour runs $CC.
+
+build.rs reads the target cfgs, CARGO_ENCODED_RUSTFLAGS, CARGO_MANIFEST_DIR, BLST_TEST_NO_STD and
+CC, and through cc compiles blst/src/server.c, which includes the other C files, and
+blst/build/assembly.S on x86_64 and aarch64, writing only to OUT_DIR; no network. It sets the std
+feature on every target but bare metal, UEFI and wasm32-unknown, and no-threads on wasm32 and an
+unknown OS. For UEFI, SGX and 32-bit MSVC without CC it runs clang or clang-cl with --version and
+takes it as the compiler when found. Without the portable or force-adx feature it assembles only
+the ADX code when the build host has ADX (build.rs:202-208); lethewis-timelock sets portable,
+which picks it at run time. A libblst.a in the package directory would be linked instead of the
+sources; the archive has none.
+
+Unsafe code: the FFI calls of the Rust layer pass pointers to initialised values of fixed size
+and slices checked to the length C reads, and C writes every MaybeUninit output in full. Sound on
+the paths used here: PublicKey and Signature from_bytes and Signature::verify, and Pairing and
+AggregateSignature in tests. The C code
+allocates nothing on the heap and touches no file, environment, process or network; cpuid.c
+reads CPUID or the auxiliary vector from a constructor.
+
+Checks: decompression rejects coordinates >= p and points off the curve and accepts the infinity
+encoding; it checks no subgroup, but refuses x = 0 on G1. The subgroup tests compare an
+endomorphism of the point with a multiple of it and accept the identity. The pairing context
+always rejects an infinite key, checks the groups only when its flags ask, and skips an infinite
+signature, which then fails the final check. Signature::verify hands its work to a process-wide
+pool of threads unless no-threads is set, which lethewis-timelock sets; the work then runs on the
+calling thread.
+
+Hashing to G1 follows RFC 9380: expand_message_xmd with SHA-256, hash_to_field with L = 64, the
+simplified SWU map with the 11-isogeny, and cofactor clearing by h_eff. Its constants were
+checked by arithmetic and reproduce the vectors of RFC 9380 J.9.1.
+
+Secret data: scalar multiplication in G1 and G2 uses signed windows at public positions, reads
+every table entry and selects by mask, with complete additions. Inversion is a binary GCD with a
+fixed 512 or 768 steps, or a fixed addition chain; the Miller loop and the final
+exponentiation are straight-line. In the assembly no branch, loop count or address depends on
+operand values; this assumes constant-time mul, mulx, bsr and shld on x86_64, and mul, umulh,
+clz and variable shifts on aarch64, where blst never sets DIT. Secret-derived temporaries stay
+on the stack and in registers; only scalar copies are wiped. SecretKey and blst_scalar derive
+Debug, which prints the scalar. The bound on the steps of the narrowed inversion was taken as
+published, not re-derived.
+"""
+
+[[audits.cc]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "1.10.0"
+notes = """
+Files read: Cargo.toml and every file under src/, with detect_compiler_family.c and
+detect_cpp_stdlib.cpp, which tool.rs includes by include_bytes!; the files behind the parallel and
+compile-commands features, off here, as well. No build script, no procedural macros. The only
+unsafe code built here is a private OnceLock in utilities.rs; sound.
+
+A build dependency of blst that chooses the flags its C and assembly are compiled with. It adds to
+blst's own flags those of OPT_LEVEL, DEBUG, the target and CFLAGS, and turns a fixed list of
+codegen options in CARGO_ENCODED_RUSTFLAGS into compiler flags, each probed first; other options
+are not passed on. It runs the C compiler and the archiver it finds through CC, AR and PATH, with
+the whole environment and arguments as argv, no shell, and writes only under OUT_DIR. It prints
+the value of every variable it reads, PATH among them, into Cargo's build output. No network.
+"""
+
 [[audits.cfg-if]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -418,6 +498,50 @@ One macro_rules! macro, cfg_if, that expands to the given items under #[cfg] att
 runtime code, no unsafe code. No build script (build = false), no procedural macros; the optional
 dependency rustc-std-workspace-core is behind rustc-dep-of-std, off here. No access to the
 system, files or network.
+"""
+
+[[audits.chacha20]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.10.2"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/variants.rs, src/backends.rs, src/chacha.rs, src/xchacha.rs,
+src/backends/soft.rs, src/backends/sse2.rs, src/backends/avx2.rs, src/backends/neon.rs, and
+src/backends/avx512.rs, src/legacy.rs and src/rng.rs, which are not built here.
+
+Unsafe code: the dispatch in lib.rs calls target_feature functions only after cpufeatures detects
+the feature at run time on x86_64, or when it is on at compile time, as NEON is on aarch64. The
+SSE2, AVX2 and NEON backends load and store through pointers to fixed-size arrays within bounds,
+and the AVX2 transmutes are between arrays of equal size; sound by reading. No build script, no
+procedural macros, no access to files, network or environment. No branch, loop bound or memory
+index depends on the key, the nonce or the state.
+
+With the zeroize feature the 16-word state is cleared on drop. Not cleared: backend temporaries,
+the extra keystream blocks the SIMD backends compute for a single one, eight of them on the stack
+with NEON, and the block buffer of the StreamCipherCoreWrapper of cipher, which only the zeroize
+feature of cipher clears. The IETF counter is 32 bits; remaining_blocks stops one block short of
+its wrap.
+"""
+
+[[audits.chacha20poly1305]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.11.0"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/cipher.rs. No unsafe code, no build script, no procedural macros,
+no access to files, network or environment.
+
+The construction is that of RFC 8439: the Poly1305 key from the first 32 bytes of keystream block
+0, the payload from block 1, the MAC over the associated data and the ciphertext, each padded to
+16 bytes, then both lengths. Decryption checks the tag before it decrypts and leaves the buffer
+untouched on failure. The length limit keeps the 32-bit counter from wrapping. No branch depends
+on secret data; the tag is compared by UniversalHash::verify of universal-hash, not by subtle as
+the comment at cipher.rs:89 says.
+
+The zeroize feature clears the key on drop and the derived Poly1305 key after use, and turns on
+the clearing of chacha20, but not that of poly1305.
 """
 
 [[audits.cipher]]
@@ -801,9 +925,42 @@ version = "0.3.0"
 notes = """
 Not read in full: about 100 000 lines of field arithmetic generated by the Fiat Cryptography
 compiler. Read Cargo.toml, Cargo.toml.orig and src/lib.rs, and searched every file of src/: no
-unsafe code, no extern block, no inline assembly, no macro, no include_str!, include_bytes!, env! or
-#[path], no use of std beyond the no_std switch; no build script and no dependencies. curve25519-dalek
-builds it only with cfg curve25519_dalek_backend = "fiat", which is not set here.
+unsafe code, no extern block, no inline assembly, no macro, no include_str!, include_bytes!, env!
+or #[path], no use of std beyond the no_std switch; no build script and no dependencies.
+curve25519-dalek builds it only with cfg curve25519_dalek_backend = "fiat", which is not set here.
+"""
+
+[[audits.find-msvc-tools]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.1.15"
+notes = """
+Files read: Cargo.toml and every file under src/. No build script, no procedural macros, no
+dependencies. Off Windows only an environment lookup is built: it reads VCINSTALLDIR,
+VSINSTALLDIR and PATH and checks that a file exists; no unsafe code there. The Windows code reads
+the registry and runs cl.exe and vswhere.exe to find the tools cc runs; its unsafe code is sound
+but for com.rs:101-102, which builds a slice from a null BSTR of length 0 when a COM call returns
+an empty string. cc uses it for MSVC targets only.
+"""
+
+[[audits.glob]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "0.3.4"
+notes = """
+Read in full: Cargo.toml and src/lib.rs. No unsafe code, no build script, no procedural macros, no
+dependencies. Reads directories and metadata along the pattern it is given; writes nothing, and
+touches no environment, process or network. Used only by blst's build script on MSVC.
+"""
+
+[[audits.hermit-abi]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "0.5.3"
+notes = """
+Read in full: Cargo.toml, src/lib.rs and src/errno.rs. No build script, no procedural macros.
+Declarations of the Hermit kernel's functions and constants, and two inline wrappers that call
+them; no other code. Built only for target_os = "hermit", through num_cpus.
 """
 
 [[audits.hkdf]]
@@ -1131,6 +1288,42 @@ files, network or environment at run time. Integer trait methods forward to core
 reaches num-traits code here: module-lattice uses its traits as bounds and One::one on constants.
 """
 
+[[audits.num_cpus]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "1.17.0"
+notes = """
+Read in full: Cargo.toml, src/lib.rs and src/linux.rs. No build script, no procedural macros.
+Unsafe code calls sched_getaffinity and sysconf on Linux, and the system calls of other targets
+with buffers of the right size; sound. Reads /proc/self/cgroup, /proc/self/mountinfo, the
+cgroup's CPU quota files and /proc/cpuinfo; writes nothing, and touches no environment, process
+or network. Used by threadpool.
+"""
+
+[[audits.poly1305]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.9.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md (compiled in as the crate documentation by
+include_str!), src/lib.rs, src/backend.rs, src/backend/soft.rs, src/backend/autodetect.rs,
+src/backend/avx2.rs, src/backend/avx2/helpers.rs, and src/fuzz.rs, built only for tests and
+fuzzing with AVX2 on at compile time.
+
+Unsafe code: zeroize_flat_type in Drop with the zeroize feature, which 0.9.1 makes sound; the
+union of backends in autodetect.rs, whose variant the cpufeatures token chosen in new() fixes and
+every access checks; the AVX2 backend, reached only after detection, with unaligned loads and
+stores through pointers to fixed-size arrays of the width accessed. No build script, no
+procedural macros, no access to files, network or environment. No branch or memory index depends
+on the key or the accumulator in either backend; the portable one is constant time where 32-bit
+multiplication is.
+
+The AVX2 arithmetic was read for structure and memory safety, not derived again: its carries were
+fixed three times after fuzzing, and the README says no audit covers it. It runs on x86_64 with
+AVX2; aarch64 always runs the portable backend. With the zeroize feature the whole state is
+cleared on drop, without it nothing is.
+"""
+
 [[audits.polyval]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -1368,6 +1561,18 @@ reader, by-value returns of the reader, temporaries in keccak and sponge-cursor.
 reader is as secret as the seed until it is dropped.
 """
 
+[[audits.shlex]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "2.0.1"
+notes = """
+Files read: Cargo.toml, src/lib.rs, src/bytes.rs, and src/quoting_warning.md, a module of
+documentation only, which rustdoc alone compiles. No build script, no procedural macros, no
+dependencies, no access to the system. The four unchecked UTF-8 conversions are sound: the parser
+drops only ASCII bytes and the quoter inserts only ASCII. cc uses only the splitting, for CFLAGS
+when CC_SHELL_ESCAPED_FLAGS is set.
+"""
+
 [[audits.sponge-cursor]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -1406,6 +1611,17 @@ Not read in full. No build script. Read buffer.rs in full and every other unsafe
 pointer walk, the Cursor lifetime transmutes in parse.rs and discouraged.rs, the repr(transparent)
 casts in token.rs and the Send and Sync impls in thread.rs; sound. No access to files, network,
 environment or processes in src/, found by search rather than by reading every parser module.
+"""
+
+[[audits.threadpool]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-deploy"
+version = "1.8.1"
+notes = """
+Read in full: Cargo.toml and src/lib.rs. No unsafe code, no build script, no procedural macros.
+Spawns threads that run boxed jobs from a channel; num_cpus gives their number when none is set.
+No files, environment, processes or network. blst uses it only to hand work to threads, which its
+no-threads feature turns off; lethewis-timelock sets that feature.
 """
 
 [[audits.typenum]]
@@ -1534,4 +1750,18 @@ Unsafe code, each use sound as read:
 
 README.md says the crate uses no inline assembly and relies on atomic fences; barrier.rs uses inline
 assembly on the architectures listed above, and no fence appears in the source.
+"""
+
+[[audits.zeroize_derive]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "1.5.0"
+notes = """
+Files read: Cargo.toml and src/lib.rs. #![forbid(unsafe_code)], no build script. A procedural
+macro that only transforms tokens, with no access to files, environment, processes or network,
+and that generates no unsafe code. The Zeroize derive binds every field of a struct, or of every
+variant of an enum, and calls zeroize on it, except fields or variants marked #[zeroize(skip)];
+#[zeroize(drop)] adds a Drop that calls it. The generated code does not branch on the values.
+blst derives it for blst_scalar and SecretKey with #[zeroize(drop)]; copies made before the drop
+are not cleared.
 """
