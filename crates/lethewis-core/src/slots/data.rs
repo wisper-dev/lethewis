@@ -1311,7 +1311,7 @@ pub(super) mod tests {
             assert_eq!(
                 open_block(&slots, set, &context, &block).unwrap(),
                 data,
-                "round {round}"
+                "round {round} of seed {seed}"
             );
             let mut changed = block.clone();
             let at = random.below(changed.len());
@@ -1319,7 +1319,7 @@ pub(super) mod tests {
             assert_eq!(
                 open_block(&slots, set, &context, &changed),
                 Err(Error::RecordRejected),
-                "round {round}, byte {at}"
+                "round {round} of seed {seed}, byte {at}"
             );
         }
     }

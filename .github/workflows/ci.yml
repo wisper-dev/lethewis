@@ -382,37 +382,11 @@ jobs:
         # The stack the hash and the cipher leave behind differs between the two builds.
         run: cargo test --workspace --all-features --locked --release
 
-      - name: A million random records
+      - name: Long random tests
         # A new seed on every run, shown with the step; the same seed repeats the run.
         env:
-          LETHEWIS_RANDOM_ROUNDS: "1000000"
           LETHEWIS_RANDOM_SEED: ${{ github.run_id }}
-        run: |
-          cargo test -p lethewis-core --lib --locked --release -- --ignored --exact \
-            slots::tests::many_random_records_unwrap_as_their_plaintext_says | tee random.txt
-          grep -q '^test result: ok. 1 passed' random.txt
-
-      - name: A million random words
-        env:
-          LETHEWIS_RANDOM_ROUNDS: "1000000"
-          LETHEWIS_RANDOM_SEED: ${{ github.run_id }}
-        run: |
-          cargo test -p lethewis-core --lib --locked --release -- --ignored --exact \
-            words::tests::many_random_words_are_read_as_the_list_says \
-            shares::words::tests::many_random_changes_of_symbols_are_refused | tee random-words.txt
-          grep -q '^test result: ok. 2 passed' random-words.txt
-
-      - name: Ten thousand random records of the archive
-        # X-Wing runs in every round, so the rounds are fewer.
-        env:
-          LETHEWIS_RANDOM_ROUNDS: "10000"
-          LETHEWIS_RANDOM_SEED: ${{ github.run_id }}
-        run: |
-          cargo test -p lethewis-core --lib --locked --release -- --ignored --exact \
-            slots::archive::tests::many_random_records_of_archive_keys_load_as_their_layers_say \
-            slots::archived::tests::many_random_records_of_an_archive_open_as_their_parts_say \
-            | tee random-archive.txt
-          grep -q '^test result: ok. 2 passed' random-archive.txt
+        run: scripts/random-tests.sh
 
       - name: Tests, software hashes and ciphers
         # The portable code, whose stack use differs, would otherwise go untested on these runners.
@@ -468,6 +442,11 @@ jobs:
           cargo test --workspace --all-features --locked
           cargo test --workspace --all-features --locked --release
 
+      - name: Long random tests
+        env:
+          LETHEWIS_RANDOM_SEED: ${{ github.run_id }}
+        run: scripts/random-tests.sh
+
       - name: Tests, software hashes and ciphers
         env:
           RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft" --cfg chacha20_backend="soft" --cfg poly1305_backend="soft"'
@@ -475,6 +454,15 @@ jobs:
         run: |
           cargo test --workspace --all-features --locked
           cargo test --workspace --all-features --locked --release
+
+      - name: Long random tests, software hashes and ciphers
+        # A tenth of the rounds, which take most of the job's time in full. The portable code is the
+        # same on x86-64, so it runs only here, beside the hardware paths of phones.
+        env:
+          RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft" --cfg chacha20_backend="soft" --cfg poly1305_backend="soft"'
+          LETHEWIS_BACK_ENDS: portable
+          LETHEWIS_RANDOM_SEED: ${{ github.run_id }}
+        run: scripts/random-tests.sh 10
 
       - name: Core tests at the other levels of optimisation
         env:
