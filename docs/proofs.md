@@ -55,11 +55,15 @@ All six must hold. A row missing any one of them is not written.
 | Time lock, locking | A key is locked to the first round published at its time or later, at most a year ahead. | `lethewis-timelock` |
 | Time lock, opening | A key leaves its lock only with the signature of the round it was locked to, under an intact header. | `lethewis-timelock` |
 | Time lock, the format | A lock is read exactly as written; bytes are read only when they are a lock as written. | `lethewis-timelock` |
+| Profile, the format | A profile's record and identifier are read exactly as written; bytes are read only when written so. | `lethewis-android` |
 | Time lock, keys | A key comes from a time lock only once its round's signature opens it; nothing else derives it again. | `lethewis-core` |
 
-Calls into the operating system are checked by tests and measurements on real devices, not by
-proof. Crates that make them, `lethewis-dit` among them, are in neither table; under Kani,
-`lethewis-dit` only runs its work.
+Calls into the operating system are checked by tests, not by proof. `lethewis-dit` is measured on
+real machines, `lethewis-android` and `lethewis-jni` are tested on emulators.
+
+The crates that make those calls are in neither table, apart from the format of a profile.
+
+Under Kani, `lethewis-dit` only runs its work.
 
 ## Proven
 
@@ -163,6 +167,7 @@ proof. Crates that make them, `lethewis-dit` among them, are in neither table; u
 | Time lock, decimal powers | From under ten times its power, a step leaves under the power. Powers fall tenfold to one. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
 | Time lock, decimal digits | A round is written exactly below 10^19 and read back; nineteen bytes are read exactly when digits. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any round, any nineteen bytes | as in the row above |
 | Time lock, the format | Any lock written is read back as written, for any round, body, MAC, nonce and payload. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any round of nineteen digits, any bytes | bytes of another length, refused unread; whether `tle` and this crate open each other's locks, tested on locks of each |
+| Profile, the format | Any record and identifier written is read back as written; only bytes so written are read. | `lethewis-android` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any level, flag, check, tag and identifier; any bytes up to one past a record | the files themselves; the check and the tag, which only the chip's key gives |
 | Time lock, only locks read | Any 386 bytes are read only when they are a lock as written. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
 | Time lock, time out of range | A time out of range is refused before any work. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the encryption, MAC and payload cipher answer at will: every answer is covered; which bytes the MAC covers is tested | the pairing, hashes and ChaCha20-Poly1305, tested on files of tlock; the stack wipe and timing, tested |
 | Time lock, locking | In range, the file key is encrypted to the first round published then or later, under the bytes given. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above; SHA-256 of a round stands in as its bytes, one message per round | as in the row above |
@@ -570,6 +575,11 @@ compile error.
 | a separator not read, or a network differing in the last byte read | `only_what_is_written_is_read` |
 | the nonce read a byte late, or the lines of the body in another order | `a_lock_is_read_as_written`, unit tests |
 | plus written as minus in base64 | `a_lock_is_read_as_written`, unit tests |
+| capitals read in a profile's identifier | `only_a_written_identifier_is_read`, unit tests |
+| a profile's identifier written low digit first | `an_identifier_is_read_as_written`, unit tests |
+| the last level of a profile written as the one before, or its unlocking read the other way | `a_record_is_read_as_written`, unit tests |
+| a profile's record one byte longer read, or a flag past the one defined | `only_a_written_record_is_read`, unit tests |
+| a profile's tag read from its check | `a_record_is_read_as_written`, unit tests |
 | a lock for the round before, or until now | `a_key_is_locked_until_the_round_of_its_time_within_a_year`, unit tests |
 | an opening that checks the signature of the next round | `a_key_is_opened_only_with_the_signature_of_its_round_as_locked`, unit tests |
 | a key opened without its MAC | `a_key_is_opened_only_with_the_signature_of_its_round_as_locked` |

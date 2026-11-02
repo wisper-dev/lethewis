@@ -3,7 +3,7 @@
 
 [package]
 name = "lethewis-dit"
-description = "Data-independent timing on aarch64 for a piece of work: the one crate of the workspace with unsafe code."
+description = "Data-independent timing on aarch64 for a piece of work: one of the two crates of the workspace with unsafe code."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

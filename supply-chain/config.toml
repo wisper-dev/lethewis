@@ -22,12 +22,21 @@ dependency-criteria = { proc-macro2 = "safe-to-deploy", quote = "safe-to-deploy"
 [policy.hybrid-array]
 dependency-criteria = { typenum = "safe-to-deploy" }
 
+[policy.jni-sys-macros]
+dependency-criteria = { proc-macro2 = "safe-to-deploy", quote = "safe-to-deploy", syn = "safe-to-deploy" }
+
+[policy.lethewis-android]
+criteria = "read-in-full"
+
 [policy.lethewis-core]
 criteria = "read-in-full"
 
 [policy.lethewis-dit]
 criteria = "read-in-full"
 dependency-criteria = { libc = "safe-to-deploy" }
+
+[policy.lethewis-jni]
+criteria = "read-in-full"
 
 [policy.lethewis-timelock]
 criteria = "read-in-full"

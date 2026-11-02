@@ -9,8 +9,8 @@
 # Needs REPO, BASE, HEAD and a token for gh; fails on any error of git or the API.
 set -euo pipefail
 
-checks=("Tests" "Tests on aarch64 Linux" "Tests on macOS" "Every mutant is caught" "Proofs hold"
-  "Advisories, licences, sources")
+checks=("Tests" "Tests on aarch64 Linux" "Tests on macOS" "Tests on Android" "Every mutant is caught"
+  "Proofs hold" "Advisories, licences, sources")
 # The newest run of each check; nothing when one page does not hold them all.
 newest='select(.total_count <= 100) | [.check_runs[] | select(.app.slug == "github-actions")]
   | group_by(.name) | map(max_by(.id))[] | "\(.conclusion) \(.name)"'

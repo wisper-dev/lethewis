@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# lethewis-jni calls these by name from native code, which R8 cannot see.
+-keep class com.alanwisper.lethewis.Keystore {
+    static int apiLevel();
+    static int contains(java.lang.String);
+    static int generate(java.lang.String, boolean, boolean);
+    static int mac(java.lang.String, byte[], byte[]);
+    static int delete(java.lang.String);
+}

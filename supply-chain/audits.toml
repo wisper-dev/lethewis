@@ -1150,6 +1150,45 @@ Unsafe code, each use sound as read unless stated otherwise:
 - reserved.rs:176, 195, 246: behind block-padding, off here.
 """
 
+[[audits.jni-sys]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.4.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md, CHANGELOG.md, src/lib.rs. The archive matches
+the repository at the commit in .cargo_vcs_info.json apart from the files cargo generates.
+
+No build script (build = false), no features. no_std; the declarations of jni.h and nothing
+else. No access to the system, files, network or environment. The extern block of
+JNI_CreateJavaVM and its kin declares symbols without linking them; nothing here calls them.
+
+The 233 entries of JNINativeInterface_ before GetModule are those of jni.h of NDK r30, in its
+order, and the 8 of JNIInvokeInterface_ too. GetModule, IsVirtualThread and
+GetStringUTFLengthAsLong follow, from JNI 9, 19 and 24; Android's JVM has no such entries, and a
+call through them would read past its table.
+
+jboolean is bool, not u8: a byte other than 0 or 1 from the JVM would be undefined behaviour.
+ART returns JNI_TRUE and JNI_FALSE only.
+
+Unsafe code only in the Debug of jvalue (lib.rs:61-87), which reads every field of the union,
+bytes never written included: undefined behaviour for a jvalue made from a narrower field. Not
+reached here: nothing formats a jvalue.
+"""
+
+[[audits.jni-sys-macros]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.4.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md, src/lib.rs. The archive matches the
+repository at the commit in .cargo_vcs_info.json apart from the files cargo generates.
+
+No build script (build = false). One procedural macro, jni_to_union: it turns a struct of fields
+marked with the JNI version that added them into one struct per version, later fields as
+padding, and a union of them. It reads only the tokens it is given: no access to the system,
+files, network or environment, no unsafe code.
+"""
+
 [[audits.keccak]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"

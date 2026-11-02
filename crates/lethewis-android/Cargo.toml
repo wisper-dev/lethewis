@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "lethewis-android"
+description = "The Android platform of LetheWis: profiles on the device, and the chip's answer from a key in the Android keystore."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories = ["cryptography"]
+readme = "README.md"
+publish = false
+include = ["src/**/*", "README.md", "LICENSE"]
+
+[dependencies]
+# Compares the chip's answers with a record in constant time.
+ctutils = { version = "0.4.5", default-features = false }
+# Default features bring in `alloc`.
+zeroize = { version = "1.9.0", default-features = false }
+
+[dev-dependencies]
+# The stand-in for the keystore in the tests computes HMAC-SHA256 as the chip does.
+hmac = { version = "0.13.0", default-features = false }
+sha2 = { version = "0.11.0", default-features = false }
+
+[lints]
+workspace = true

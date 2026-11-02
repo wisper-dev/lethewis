@@ -21,7 +21,7 @@ Suggestions for functionality not listed here are accepted as issues.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/rustc-1.99.0-orange.svg)
-![Readiness](https://img.shields.io/badge/readiness-53%25-yellow.svg)
+![Readiness](https://img.shields.io/badge/readiness-61%25-yellow.svg)
 
 ## How the keys relate
 
@@ -98,7 +98,13 @@ password and the hardware secret at each unlock, and neither alone is enough.
 - A time lock rests on pairings, which a quantum computer breaks.
 - A lock names its round openly: whoever holds it knows when it opens.
 - A dedicated secure element is missing on a large share of Android devices, by our estimate.
-  There protection falls back and records the level it reached.
+  Android 9 offers none for this key; protection falls back and records the level it reached.
+- A chip's key in secure hardware stops guesses from a copy of the flash; one only software holds
+  does not. Code running as the app or as root asks the chip as the library does.
+- A chip's key made below Android 15 answers on a locked device too, after an update as well. One
+  made on 15 or later answers only while unlocked.
+- On Android the challenge and the answer pass through the Java heap and the keystore's process.
+  Copies the runtime makes there are beyond wiping.
 - A device unlocked since boot has its keys in memory already. No key-storage library changes
   that, and a lock screen is no defence against someone holding such a device.
 - A proof is about one named statement, not about safety. Each claim names the tool, its version,
@@ -115,10 +121,10 @@ separate crate, so the proof perimeter is visible from the directory listing.
 | Crate | Contents |
 |---|---|
 | `lethewis-core` | keys from derivation to destruction, two-tier access, shares, time locks with `timelock`, data in blocks; the system only through `lethewis-dit` |
-| `lethewis-dit` | data-independent timing on aarch64 for a piece of work, where Linux, Android or an Apple system reports it; the one crate with unsafe code |
+| `lethewis-dit` | data-independent timing on aarch64 where Linux, Android or an Apple system reports it; unsafe code |
 | `lethewis-timelock` | keys locked until a round of drand's quicknet, as age files `tle` opens; no network or clock |
-
-Hardware binding will be a crate of its own, listed here when it exists.
+| `lethewis-android` | profiles on Android, and the chip's answer to the core's challenge |
+| `lethewis-jni` | the bridge to the Java layer in `android/`, through JNI; unsafe code |
 
 Claimed and proven properties: [docs/proofs.md](docs/proofs.md).
 

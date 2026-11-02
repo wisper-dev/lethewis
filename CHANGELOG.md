@@ -337,5 +337,25 @@ Nothing is published while the version is below 0.1.0.
 - Kani 0.68.0 proves that a time lock is written exactly when its key loads. A key comes from a
   lock only as it opens; its round is the first at its time or later.
 - Tests take a profile through a lock and its opening.
+- Crate `lethewis-android`, the platform on Android. `Profile::create` makes a profile under a
+  directory the caller keeps out of backups, with an HMAC-SHA256 key in the Android keystore.
+- The key goes into the secure element where the system offers one for it, which Android 9 does
+  not. A key only software would hold needs the caller's consent; `Level` names where a key is.
+- `Profile::open` never creates a profile. An open profile is locked: a second opening is
+  `Error::Busy`, in any process.
+- `Profile::answer` answers the core's challenge with the key, after `Profile::verify`. A replaced
+  key is `Error::ChipChanged`, never a wrong password; a changed level or unlocking is
+  `Error::Damaged`.
+- From API level 35 the key works only while the device is unlocked. `Keystore` reaches the
+  keystore, and `Failure` names why it refused.
+- Crate `lethewis-jni`: `JniKeystore` implements `Keystore` through JNI, on the thread of the call.
+  Its other half is `com.alanwisper.lethewis.Keystore`.
+- `android/`: that Java layer, built without Gradle, and `proguard.txt` for apps that shrink
+  with R8.
+- Dependency of `lethewis-jni`: `jni-sys` 0.4.1 or a later compatible version, read in full.
+- Tests on emulators of Android 9 and of Android 17 with pages of 16 KiB. The Rust tests run there,
+  and the tests on a device run under CheckJNI.
+- The tests on a device go through the Java layer shrunk by R8, and on a locked device too. The
+  shared library of `lethewis-jni` is aligned to 16 KiB for both targets.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

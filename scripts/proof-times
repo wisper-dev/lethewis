@@ -20,6 +20,10 @@
 5 404 password::proofs::parameters_are_made_only_within_the_bounds
 6 400 password::proofs::parameters_are_read_exactly_as_written
 1 272 password::proofs::passwords_are_taken_by_their_length
+1 176 profile::proofs::a_record_is_read_as_written
+9 457 profile::proofs::an_identifier_is_read_as_written
+10 407 profile::proofs::only_a_written_identifier_is_read
+2 175 profile::proofs::only_a_written_record_is_read
 14 522 seal::proofs::a_failed_seal_leaves_the_buffer_wiped
 8 428 seal::proofs::a_rejected_chunk_leaves_it_wiped
 3 280 seal::proofs::a_rejected_record_leaves_the_buffer_wiped

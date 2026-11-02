@@ -3,9 +3,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 """Checks that `KeyId::is`, both `same_check`, `first_match`, `find_step`, `select_step`, both
-`product`, `locate_step` and `named` run straight through on every target, and the time lock's
-`take_first` on the 64-bit targets it is built for. No branch, call or program counter write is
-allowed; the timing itself is not checked.
+`product`, `locate_step` and `named` run straight through on every target. The time lock's
+`take_first` and the profile's `same_mac` are checked on the 64-bit targets they are built for.
+No branch, call or program counter write is allowed; the timing itself is not checked.
 """
 
 import os
@@ -39,6 +39,10 @@ TIME_LOCK_FUNCTIONS = {
     "the choice of the scalar of a lock": re.compile(
         r"^(_RNv\S*17lethewis_timelock3ibe10take_first):\s*$"),
 }
+ANDROID_FUNCTIONS = {
+    "the comparison of the chip's answers with a profile's record": re.compile(
+        r"^(_RNv\S*16lethewis_android7profile8same_mac):\s*$"),
+}
 # A name of that shape, for the listings the rules are run on.
 NAME = "_RNvMNtCs0_13lethewis_core6deriveNtB2_5KeyId2is"
 END = re.compile(r"^\s*(\.Lfunc_end\d+:|end_function\b|\.size\b)")
@@ -49,6 +53,7 @@ THUMB = "thumbv7em-none-eabihf"
 WASM = "wasm32-unknown-unknown"
 TARGETS = (X86, AARCH64, THUMB, WASM)
 TIME_LOCK_TARGETS = (X86, AARCH64)
+ANDROID_TARGETS = (X86, AARCH64)
 # The C code of blst, which the check does not read, is built for aarch64 by clang without the C
 # library, so no cross toolchain is needed.
 TIME_LOCK_BUILD = {
@@ -201,6 +206,7 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     builds = [("lethewis-core", target, FUNCTIONS) for target in TARGETS]
     builds += [("lethewis-timelock", target, TIME_LOCK_FUNCTIONS) for target in TIME_LOCK_TARGETS]
+    builds += [("lethewis-android", target, ANDROID_FUNCTIONS) for target in ANDROID_TARGETS]
     for package, target, functions in builds:
         assembly = out / f"{package}-{target}.s"
         assembly.unlink(missing_ok=True)

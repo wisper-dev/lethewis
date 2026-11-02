@@ -195,8 +195,8 @@ jobs:
       - name: Every source file carries its licence header
         run: |
           fail=0
-          tracked=$(git ls-files '*.rs' '*.sh' '*.py' '*.kt' '*.kts' '*.toml' '*.yml' '*.yaml' \
-            supply-chain/imports.lock)
+          tracked=$(git ls-files '*.rs' '*.sh' '*.py' '*.java' '*.kt' '*.kts' '*.toml' '*.xml' \
+            '*.yml' '*.yaml' '*proguard.txt' supply-chain/imports.lock)
           if [ -z "$tracked" ]; then
             echo "::error::no source files found to check; the listing must have failed"
             exit 1
@@ -546,6 +546,79 @@ jobs:
             --exclude-re 'sysctl::detect -> bool with true'
           jq -e '.caught > 0' mutants.out/outcomes.json >/dev/null ||
             { echo "::error::no mutant was caught, so nothing was tested"; exit 1; }
+
+  test-android:
+    # The lowest API level and the newest, with pages of 4 KiB and of 16 KiB.
+    name: Tests on Android ${{ matrix.emulator }}
+    needs: [lockfile, text]
+    if: >-
+      ${{ !cancelled() && github.event_name == 'pull_request' && needs.lockfile.result == 'success'
+      && !(needs.text.result == 'success' && needs.text.outputs.only == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        emulator: ["28", "37-16k"]
+    env:
+      EMULATOR: ${{ matrix.emulator }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The emulator may use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -w /dev/kvm
+
+      - name: Install the pinned toolchain with the Android targets
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add x86_64-linux-android aarch64-linux-android
+
+      - name: Install the pinned Android tools
+        # The runner's own SDK changes every week; the pieces of android/versions.sh replace it.
+        run: |
+          echo "ANDROID_HOME=$RUNNER_TEMP/sdk" >>"$GITHUB_ENV"
+          echo "ANDROID_USER_HOME=$RUNNER_TEMP/android" >>"$GITHUB_ENV"
+          scripts/android-sdk.sh "$RUNNER_TEMP/sdk" "$EMULATOR"
+
+      - name: Build and test on the emulator
+        run: scripts/android.sh "$EMULATOR"
+
+      - name: Keep the logs of the emulator and the device
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-${{ matrix.emulator }}
+          path: target/android-${{ matrix.emulator }}/*.log
+          if-no-files-found: warn
+
+  android:
+    name: Tests on Android
+    needs: [test-android, text]
+    # Runs after a failed or cancelled emulator too: a required check that is skipped counts as
+    # passed.
+    if: >-
+      ${{ always() && github.event_name == 'pull_request'
+      && !(needs.text.result == 'success' && needs.text.outputs.only == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every emulator succeeded
+        if: needs.test-android.result != 'success'
+        env:
+          RESULT: ${{ needs.test-android.result }}
+        run: |
+          echo "android: the tests on an emulator did not succeed: $RESULT" >&2
+          exit 1
 
   mutant-parts:
     name: Mutants, part ${{ matrix.part }} of ${{ strategy.job-total }}
