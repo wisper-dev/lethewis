@@ -151,22 +151,23 @@ impl Deref for Dir {
 
 impl Drop for Dir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
     }
 }
 
-/// A directory named after the test that asks for it, which the test harness names its thread
-/// after, so that tests running at once never share one.
+/// A directory named `no_backup`, as profiles need, in one named after the test that asks for it,
+/// which the test harness names its thread after, so that tests running at once never share one.
 pub(crate) fn dir(name: &str) -> Dir {
     let test = std::thread::current()
         .name()
         .unwrap_or_default()
         .replace("::", "-");
-    let dir = std::env::temp_dir().join(format!(
+    let parent = std::env::temp_dir().join(format!(
         "lethewis-android-{}-{test}-{name}",
         std::process::id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&parent);
+    let dir = parent.join("no_backup");
     std::fs::create_dir_all(&dir).unwrap();
     Dir(dir)
 }

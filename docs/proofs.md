@@ -60,11 +60,12 @@ All six must hold. A row missing any one of them is not written.
 | Time lock, keys | A key comes from a time lock only once its round's signature opens it; nothing else derives it again. | `lethewis-core` |
 
 Calls into the operating system are checked by tests, not by proof. `lethewis-dit` is measured on
-real machines, `lethewis-android` and `lethewis-jni` are tested on emulators.
+real machines, `lethewis-android` and `lethewis-jni` are tested on emulators, `lethewis-locked` on
+Linux and on emulators.
 
 The crates that make those calls are in neither table, apart from the formats of a profile.
 
-Under Kani, `lethewis-dit` only runs its work.
+Under Kani, `lethewis-dit` only runs its work, and `lethewis-locked` is empty.
 
 ## Proven
 

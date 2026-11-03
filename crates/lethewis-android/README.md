@@ -1,7 +1,7 @@
 # lethewis-android
 
-The Android platform of LetheWis. A profile keeps its files under a directory of profiles alone,
-which the caller keeps out of backups.
+The Android platform of LetheWis. A profile keeps its files in a directory of profiles alone, under
+one named `no_backup`, as `Context.getNoBackupFilesDir()` is.
 
 A key in the Android keystore answers the core's challenge. The key that opens the profile then
 needs both the password and this device.

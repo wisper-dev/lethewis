@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Profiles on Android. A profile keeps its files under a directory of profiles alone, kept out
-//! of backups, and an HMAC-SHA256 key in the Android keystore answers the core's challenge: the key
-//! that opens the profile needs both the password and this device. Each epoch has a root of its
+//! Profiles on Android. A profile keeps its files in a directory of profiles alone, under one named
+//! `no_backup`, and an HMAC-SHA256 key in the Android keystore answers the core's challenge: the
+//! key that opens the profile needs both the password and this device. Each epoch has a root of its
 //! own, a key in the keystore and random bytes beside it, which [`Profile::roots`] keeps for the
 //! core.
 //!

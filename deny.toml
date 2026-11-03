@@ -56,6 +56,10 @@ name = "lethewis-jni"
 allow = ["AGPL-3.0-only"]
 
 [[licenses.exceptions]]
+name = "lethewis-locked"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
 name = "lethewis-timelock"
 allow = ["AGPL-3.0-only"]
 

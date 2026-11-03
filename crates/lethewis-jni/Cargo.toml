@@ -3,7 +3,7 @@
 
 [package]
 name = "lethewis-jni"
-description = "The bridge of LetheWis to its Java layer on Android: the keystore through JNI. One of the two crates of the workspace with unsafe code."
+description = "The bridge of LetheWis to its Java layer on Android: the keystore through JNI. One of the three crates of the workspace with unsafe code."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

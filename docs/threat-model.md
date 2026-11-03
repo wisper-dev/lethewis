@@ -66,6 +66,10 @@ key: a change to it or to the unlocking is found.
 
 A check written at creation tells a replaced key from a wrong password.
 
+A profile is created and opened only where it lies under a directory named `no_backup`, as
+`Context.getNoBackupFilesDir()` is. No backup of the system takes that one: not to the cloud, to
+another device or over adb.
+
 A key reads as lost only on the system's word. Below API 31, where that word is unclear, the
 keystore must first show it works.
 
@@ -113,6 +117,12 @@ The root's file is only unlinked, and its bytes may stay on the flash.
 
 Apps cannot ask for keys that resist a rollback, so a copy of the keystore's files may open it
 again. Until the old root is deleted, its pointer put back returns the old epoch.
+
+Only the name is checked: a directory named `no_backup` elsewhere, such as among the files the
+system backs up, passes.
+
+An app's own backup agent, or a maker's transfer tool that does not follow the platform, may copy a
+profile. Without the device's keystore the copy opens nothing.
 
 ### 2. Someone who compels the password
 
@@ -225,6 +235,9 @@ Another application, possibly with elevated privileges.
 
 Keys are held only in fixed-size slots whose memory the caller provides, each a set of up to three
 keys.
+
+On Linux and Android a caller can hold that memory and the epoch in `lethewis-locked`. Its pages
+are locked in RAM, kept out of core dumps and forked processes, and wiped when dropped.
 
 A key is held in one place only, whatever its purpose. Loading a key the slots already hold, or a
 set holding one key twice, is refused.
@@ -423,8 +436,23 @@ Drop keys from memory when the device locks.
 
 #### Not defended
 
-Copies left by a value move, a buffer reallocation, a CPU register, swap or a crash dump. A set of
-slots leaked instead of dropped keeps its keys in memory.
+Copies left by a value move, a buffer reallocation or a CPU register. A set of slots leaked instead
+of dropped keeps its keys in memory.
+
+Memory outside `lethewis-locked`, and any memory off Linux and Android, may go to swap or a core
+dump. On Android swap may be written to flash, and hibernation on Linux writes locked pages too.
+
+Only the bytes of a value are locked, not what it points to. A process killed, aborted or ended
+gives its pages back unwiped.
+
+An Android app's process locks 64 KiB in all, counted in whole pages: four values where pages are
+16 KiB. Beyond that `lethewis-locked` refuses, and the caller decides what holds the keys.
+
+A native crash on Android, of any library in the process, leaves a trace the system keeps. It holds
+256 bytes near each register of the crashing thread, which may point at a key.
+
+Below API 31 it holds words of that thread's stack too. From API 31 the app reads its own trace, and
+a crash reporter in it may send it away.
 
 A system component with elevated privileges is beyond what process isolation provides.
 

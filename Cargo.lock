@@ -384,6 +384,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lethewis-locked"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "lethewis-timelock"
 version = "0.0.0"
 dependencies = [

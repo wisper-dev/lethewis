@@ -27,7 +27,7 @@ DEPENDENCY_CRITERIA = {LOWERED, OWN_CRITERION}
 TESTS_ONLY = "safe-to-run"
 MEMBER_PREFIX = "lethewis-"
 TOOLCHAIN_KEYS = {"channel", "components", "targets", "profile"}
-UNSAFE_CRATES = {"lethewis-dit", "lethewis-jni"}
+UNSAFE_CRATES = {"lethewis-dit", "lethewis-jni", "lethewis-locked"}
 UNSAFE_LINTS = {
     "rust": {"unsafe_code": "deny", "unsafe_op_in_unsafe_fn": "deny"},
     "clippy": {"multiple_unsafe_ops_per_block": "deny"},

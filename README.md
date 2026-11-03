@@ -66,8 +66,12 @@ password and the hardware secret at each unlock, and neither alone is enough.
   An older block put back, or one deleted, goes unnoticed unless the caller's index catches it.
 - A challenge to the chip is as sensitive as a hash of the password. Whoever reads one can test
   guesses without the chip; keeping it to the chip and wiping it is the caller's.
-- Wiping does not reach copies left by a move, a reallocation, a register, swap or a crash dump.
-  Every call that derives, encrypts or runs X-Wing wipes its stack, measured on Linux.
+- Wiping does not reach copies left by a move, a reallocation or a register. Every call that
+  derives, encrypts or runs X-Wing wipes its stack, measured on Linux.
+- Memory outside `lethewis-locked`, and any memory off Linux and Android, may go to swap or a core
+  dump. An Android app's process locks 64 KiB in all, in whole pages.
+- A native crash on Android leaves a trace with memory near the crashing thread's registers. From
+  API 31 the app reads it, and so may a crash reporter in it.
 - The stack a call needs is not measured on microcontrollers, where an unguarded overflow corrupts
   memory silently. Each call documents the least it needs; a derivation from a password also needs
   64 MiB of memory.
@@ -105,6 +109,8 @@ password and the hardware secret at each unlock, and neither alone is enough.
   made on 15 or later answers only while unlocked.
 - On Android every challenge to the chip and its answer pass through the Java heap and the
   keystore's process. Copies the runtime makes there are beyond wiping.
+- On Android a profile is made only under a directory named `no_backup`, as the one no backup of
+  the system takes. Only the name is checked; a copy opens nothing without the device's keystore.
 - On Android a deleted root is erased by best effort: no keystore confirms the overwrite. Apps
   cannot ask for keys that resist a rollback.
 - A device unlocked since boot has its keys in memory already. No key-storage library changes
@@ -127,6 +133,7 @@ separate crate, so the proof perimeter is visible from the directory listing.
 | `lethewis-timelock` | keys locked until a round of drand's quicknet, as age files `tle` opens; no network or clock |
 | `lethewis-android` | profiles on Android: the chip's answer to the core's challenge, roots of epochs |
 | `lethewis-jni` | the bridge to the Java layer in `android/`, through JNI; unsafe code |
+| `lethewis-locked` | memory locked in RAM, out of core dumps and forks, on Linux and Android; unsafe code |
 
 Claimed and proven properties: [docs/proofs.md](docs/proofs.md).
 

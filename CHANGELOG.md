@@ -337,8 +337,10 @@ Nothing is published while the version is below 0.1.0.
 - Kani 0.68.0 proves that a time lock is written exactly when its key loads. A key comes from a
   lock only as it opens; its round is the first at its time or later.
 - Tests take a profile through a lock and its opening.
-- Crate `lethewis-android`, the platform on Android. `Profile::create` makes a profile under a
-  directory of profiles alone, kept out of backups, with an HMAC-SHA256 key in the keystore.
+- Crate `lethewis-android`, the platform on Android. `Profile::create` makes a profile in a
+  directory of profiles alone, with an HMAC-SHA256 key in the keystore.
+- A profile is made and opened only under a directory named `no_backup`, as
+  `Context.getNoBackupFilesDir()` is; elsewhere `Error::BackedUp`.
 - The key goes into the secure element where the system offers one for it, which Android 9 does
   not. A key only software would hold needs the caller's consent; `Level` names where a key is.
 - `Profile::open` never creates a profile. An open profile is locked: a second opening is
@@ -373,5 +375,9 @@ Nothing is published while the version is below 0.1.0.
 - Tests on the emulators stop the keystore service under a running process and between runs.
 - The tests on a device go through the Java layer shrunk by R8, and on a locked device too. The
   shared library of `lethewis-jni` is aligned to 16 KiB for both targets.
+- Crate `lethewis-locked`, on Linux and Android: `Locked` holds a value in pages locked in RAM, out
+  of core dumps and forks. It wipes them when dropped; a refusal of the system is an `Error`.
+- Dependency of `lethewis-locked`: `libc` 0.2.190 or a later compatible version, without default
+  features, on Linux and Android.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

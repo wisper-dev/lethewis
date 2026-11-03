@@ -16,7 +16,8 @@ profile = "mutants"
 # deliberate errors instead.
 # The low 4 bits of the last number of words are zero before the checksum goes in, so the `|` that
 # puts it there is a `^`. For share words, the bits each `|` puts in are zero before too. So are
-# they in the hex and base64 of a time lock, and in the hex of a profile's identifier.
+# they in the hex and base64 of a time lock, and in the hex of a profile's identifier, and in the
+# flags of a mapping of lethewis-locked.
 # An fsync of a directory changes nothing a test can see before a crash of the machine.
 # A symbol read there while exactly enough bits are held only comes one take early, so the `<`
 # that decides it is a `<=`.
@@ -38,5 +39,6 @@ exclude_re = [
   '^crates/lethewis-core/src/shares/words\.rs:[0-9]+:[0-9]+: replace < with <= in Bits<.*>::take$',
   '^crates/lethewis-timelock/src/age\.rs:[0-9]+:[0-9]+: replace \| with \^ in (from_hex|encode_group|decode_group)$',
   '^crates/lethewis-android/src/profile\.rs:[0-9]+:[0-9]+: replace \| with \^ in Id::from_hex$',
+  '^crates/lethewis-locked/src/lib\.rs:[0-9]+:[0-9]+: replace \| with \^ in map$',
   '^crates/lethewis-android/src/profile\.rs:[0-9]+:[0-9]+: replace sync_dir -> io::Result<\(\)> with Ok\(\(\)\)$',
 ]

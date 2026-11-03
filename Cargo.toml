@@ -7,6 +7,7 @@ members = [
   "crates/lethewis-core",
   "crates/lethewis-dit",
   "crates/lethewis-jni",
+  "crates/lethewis-locked",
   "crates/lethewis-timelock",
 ]
 resolver = "3"
@@ -28,8 +29,8 @@ categories = ["cryptography", "no-std"]
 
 [workspace.lints.rust]
 # No unsafe anywhere. "forbid" cannot be relaxed further down, which is the point and also the
-# catch: a crate that genuinely needs unsafe (lethewis-dit and lethewis-jni) cannot inherit these
-# lints and must declare its own, with a written reason in front of every block.
+# catch: a crate that genuinely needs unsafe (lethewis-dit, lethewis-jni, lethewis-locked) cannot
+# inherit these lints and must declare its own, with a written reason in front of every block.
 unsafe_code = "forbid"
 unreachable_pub = "deny"
 # Kani sets cfg(kani) when it compiles the proofs; the build script of the core sets

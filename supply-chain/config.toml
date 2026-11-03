@@ -38,6 +38,10 @@ dependency-criteria = { libc = "safe-to-deploy" }
 [policy.lethewis-jni]
 criteria = "read-in-full"
 
+[policy.lethewis-locked]
+criteria = "read-in-full"
+dependency-criteria = { libc = "safe-to-deploy" }
+
 [policy.lethewis-timelock]
 criteria = "read-in-full"
 

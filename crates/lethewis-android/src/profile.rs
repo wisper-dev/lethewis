@@ -19,6 +19,8 @@ pub(crate) const LOCK: &str = "lock";
 pub(crate) const DESTROYED: &str = "destroyed";
 /// What a file is named while it is written, before it takes its name.
 pub(crate) const WRITING: &str = ".new";
+/// The name of `Context.getNoBackupFilesDir()`, which no backup of the system takes.
+const NO_BACKUP: &str = "no_backup";
 const MAGIC: [u8; 4] = *b"LWp1";
 pub(crate) const RECORD_LEN: usize = 70;
 pub(crate) const UNLOCKED: u8 = 1;
@@ -95,6 +97,8 @@ pub enum Error {
     Busy,
     /// No profile has this identifier, or its destruction has begun.
     NotFound,
+    /// The directory of profiles is under none named `no_backup`, so the system may back it up.
+    BackedUp,
     /// The files of the profile are not as this library writes them, or the level, unlocking or tag
     /// of its record was changed since. At creation, the key name drawn is taken.
     Damaged,
@@ -130,6 +134,7 @@ impl fmt::Display for Error {
         match self {
             Self::Busy => f.write_str("the profile is open elsewhere"),
             Self::NotFound => f.write_str("there is no such profile"),
+            Self::BackedUp => f.write_str("the profiles are where the system may back them up"),
             Self::Damaged => f.write_str("the files of the profile are damaged"),
             Self::ChipChanged => f.write_str("the chip's key was replaced"),
             Self::SoftwareOnly => f.write_str("only software would hold the chip's key"),
@@ -176,24 +181,24 @@ pub(crate) struct Record {
 }
 
 impl Profile {
-    /// Creates a profile in a new directory under `root`, a directory of profiles alone that the
-    /// system must not back up, such as one in `Context.getNoBackupFilesDir()`, with the root of
-    /// epoch 0. The chip's keys go into the secure element where the system offers one for them,
-    /// and into the isolated part of the processor otherwise; keys only software would hold are
-    /// taken only if `software` allows it.
+    /// Creates a profile in a new directory under `root`, a directory of profiles alone in
+    /// `Context.getNoBackupFilesDir()`, with the root of epoch 0. The chip's keys go into the
+    /// secure element where the system offers one for them, and into the isolated part of the
+    /// processor otherwise; keys only software would hold are taken only if `software` allows it.
     ///
     /// # Errors
     ///
-    /// [`Error::SoftwareOnly`], [`Error::Damaged`] for a key name already taken, the keystore's
-    /// failure or the file system's. Nothing of the profile is then left, as far as the keystore
-    /// and the file system allow: where a key could not be deleted, or after a crash, a directory
-    /// without the record, or marked destroyed, stays for [`sweep`](crate::sweep). A sweep under
-    /// way delays a creation.
+    /// [`Error::BackedUp`], before anything is made, [`Error::SoftwareOnly`], [`Error::Damaged`]
+    /// for a key name already taken, the keystore's failure or the file system's. Nothing of the
+    /// profile is then left, as far as the keystore and the file system allow: where a key could
+    /// not be deleted, or after a crash, a directory without the record, or marked destroyed,
+    /// stays for [`sweep`](crate::sweep). A sweep under way delays a creation.
     pub fn create(
         root: &Path,
         keystore: &mut impl Keystore,
         software: bool,
     ) -> Result<Self, Error> {
+        out_of_backups(root)?;
         let id = Id::random()?;
         let dir = root.join(id.to_string());
         let alias = alias(id);
@@ -252,7 +257,7 @@ impl Profile {
     /// # Errors
     ///
     /// [`Error::NotFound`], also for a profile whose destruction has begun, [`Error::Busy`],
-    /// [`Error::Damaged`] or the file system's failure.
+    /// [`Error::BackedUp`], [`Error::Damaged`] or the file system's failure.
     pub fn open(root: &Path, id: Id) -> Result<Self, Error> {
         let dir = root.join(id.to_string());
         let lock = match lock(&dir) {
@@ -263,6 +268,7 @@ impl Profile {
             }
             locked => locked?,
         };
+        out_of_backups(&dir)?;
         if exists(&dir.join(DESTROYED))? {
             return Err(Error::NotFound);
         }
@@ -529,6 +535,16 @@ pub(crate) fn fill_random(out: &mut [u8]) -> io::Result<()> {
     File::open("/dev/urandom")?.read_exact(out)
 }
 
+/// [`Error::BackedUp`] unless `path`, where it really is, is in a directory named `no_backup`.
+fn out_of_backups(path: &Path) -> Result<(), Error> {
+    let path = path.canonicalize()?;
+    if path.ancestors().any(|dir| dir.ends_with(NO_BACKUP)) {
+        Ok(())
+    } else {
+        Err(Error::BackedUp)
+    }
+}
+
 pub(crate) fn lock(dir: &Path) -> Result<File, Error> {
     let file = OpenOptions::new()
         .read(true)
@@ -669,6 +685,33 @@ mod tests {
             assert_eq!(bytes[6..38], check);
             assert_eq!(bytes[38..], tag);
         }
+    }
+
+    #[test]
+    fn profiles_are_made_and_opened_only_out_of_backups() {
+        let root = dir("backups");
+        let parent = root.parent().unwrap();
+        let mut stand = Stand::new();
+        let id = Profile::create(&root, &mut stand, false).unwrap().id();
+        let backed = parent.join("files");
+        std::fs::rename(&*root, &backed).unwrap();
+        assert_eq!(
+            Profile::create(&backed, &mut stand, false).err(),
+            Some(Error::BackedUp)
+        );
+        assert_eq!(Profile::open(&backed, id).err(), Some(Error::BackedUp));
+        assert_eq!(entries(&backed), [id.to_string()]);
+        assert_eq!(stand.keys.len(), 2);
+        // Only where the directory really is counts.
+        std::os::unix::fs::symlink(&backed, &*root).unwrap();
+        assert_eq!(Profile::open(&root, id).err(), Some(Error::BackedUp));
+        let inner = backed.join("no_backup");
+        std::fs::create_dir(&inner).unwrap();
+        let kept = Profile::create(&inner, &mut stand, false).unwrap().id();
+        assert!(Profile::open(&inner, kept).is_ok());
+        let name = id.to_string();
+        std::os::unix::fs::symlink(backed.join(&name), inner.join(&name)).unwrap();
+        assert_eq!(Profile::open(&inner, id).err(), Some(Error::BackedUp));
     }
 
     #[test]
@@ -1118,6 +1161,7 @@ mod tests {
         let errors = [
             Error::Busy,
             Error::NotFound,
+            Error::BackedUp,
             Error::Damaged,
             Error::ChipChanged,
             Error::SoftwareOnly,
