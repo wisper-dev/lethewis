@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use jni_sys::{JNIEnv, jclass, jint, jstring};
-use lethewis_android::{Error, Failure, Id, Keystore, Level, Profile};
+use lethewis_android::{Erasure, Error, Failure, Id, Keystore, Level, Profile, Root, sweep};
 
 use crate::keystore::JniKeystore;
 
@@ -22,6 +22,8 @@ const KNOWN_ANSWER: [u8; 32] = [
 ];
 /// The file under the directory of the tests that names the profile kept across a lock.
 const KEPT: &str = "kept";
+/// The directory of profiles under the directory of the tests.
+const PROFILES: &str = "profiles";
 
 /// Runs the tests `test` under `root`, a directory of the app, on a system of API level `api`.
 /// Returns `passed` when every check holds, the first that failed otherwise, and null when the
@@ -41,11 +43,7 @@ extern "system" fn Java_com_alanwisper_lethewis_test_Tests_run(
     let Ok(mut keystore) = (unsafe { JniKeystore::find(env) }) else {
         return ptr::null_mut();
     };
-    let outcome = match (
-        text(&keystore, root),
-        text(&keystore, test),
-        u32::try_from(api),
-    ) {
+    let outcome = match (keystore.text(root), keystore.text(test), u32::try_from(api)) {
         (Some(root), Some(test), Ok(api)) => run(Path::new(&root), &mut keystore, api, &test),
         _ => Err("the arguments are not as the runner passes them".to_owned()),
     };
@@ -84,30 +82,6 @@ extern "system" fn Java_com_alanwisper_lethewis_test_Tests_misuse(
     keystore.thrown();
 }
 
-/// The string `string` as UTF-8, if it is one.
-#[allow(unsafe_code)]
-fn text(keystore: &JniKeystore<'_>, string: jstring) -> Option<String> {
-    if string.is_null() {
-        return None;
-    }
-    let functions = keystore.table();
-    let env = keystore.env();
-    // SAFETY: the environment is valid, no exception is pending, and `string` is a string.
-    let characters = unsafe { (functions.GetStringLength)(env, string) };
-    // SAFETY: as above.
-    let length = unsafe { (functions.GetStringUTFLength)(env, string) };
-    let mut bytes = vec![0_u8; usize::try_from(length).ok()?.checked_add(1)?];
-    // SAFETY: as above; `bytes` takes the modified UTF-8 of all `characters` and the NUL after it.
-    unsafe {
-        (functions.GetStringUTFRegion)(env, string, 0, characters, bytes.as_mut_ptr().cast());
-    }
-    if keystore.thrown() {
-        return None;
-    }
-    bytes.truncate(usize::try_from(length).ok()?);
-    String::from_utf8(bytes).ok()
-}
-
 fn check(holds: bool, what: &str) -> Result<(), String> {
     if holds { Ok(()) } else { Err(what.to_owned()) }
 }
@@ -119,17 +93,19 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
         keystore.api_level() == api,
         &format!("API level {} for {api}", keystore.api_level()),
     )?;
+    let home = root.join(PROFILES);
     match test {
         "all" => {
-            empty(root)?;
+            empty(&home)?;
             known(keystore)?;
             let expected = keystore_alone(keystore)?;
-            profiles(root, keystore, api, expected)?;
+            profiles(&home, keystore, api, expected)?;
+            epochs(&home, keystore)?;
             remove(root)
         }
         "before-lock" => {
-            empty(root)?;
-            let profile = Profile::create(root, keystore, true)
+            empty(&home)?;
+            let profile = Profile::create(&home, keystore, true)
                 .map_err(|error| format!("creating: {error}"))?;
             fs::write(root.join(KEPT), profile.id().to_string())
                 .map_err(|error| format!("keeping the profile: {error}"))?;
@@ -139,24 +115,28 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
             let profile = kept(root)?;
             let mut out = [0; 32];
             let answered = profile.answer(keystore, &[1; 32], &mut out);
-            // Below API 35 the key is not bound to the lock screen, so it answers.
+            let root_answered = keystore
+                .mac(
+                    &format!("lethewis/{}/root/0", profile.id()),
+                    b"data",
+                    &mut out,
+                )
+                .map_err(Error::Keystore);
+            // Below API 35 the keys are not bound to the lock screen, so they answer.
             let expected = if api >= 35 {
                 Err(Error::Keystore(Failure::Locked))
             } else {
                 Ok(())
             };
             check(
-                answered == expected,
-                &format!("a locked device answers: {answered:?}"),
+                answered == expected && root_answered == expected,
+                &format!("a locked device answers: {answered:?} {root_answered:?}"),
             )
         }
         "after-lock" => {
             let profile = kept(root)?;
             answers(&profile, keystore)?;
-            keystore
-                .delete(&alias(profile.id()))
-                .map_err(|failure| format!("deleting: {failure}"))?;
-            drop(profile);
+            destroyed(profile, keystore).map(|_| ())?;
             remove(root)
         }
         other => Err(format!("no tests named {other}")),
@@ -176,12 +156,26 @@ fn alias(id: Id) -> String {
     format!("lethewis/{id}/chip")
 }
 
+/// Destroys the profile and checks it leaves no key.
+fn destroyed(profile: Profile, keystore: &mut JniKeystore<'_>) -> Result<Erasure, String> {
+    let id = profile.id();
+    let erasure = profile
+        .destroy(keystore)
+        .map_err(|error| format!("destroying: {error}"))?;
+    let listed = keystore.aliases(&format!("lethewis/{id}/"));
+    check(
+        listed == Ok(Vec::new()),
+        &format!("the keys after a destruction: {listed:?}"),
+    )?;
+    Ok(erasure)
+}
+
 /// The profile the step before kept.
 fn kept(root: &Path) -> Result<Profile, String> {
     let id =
         fs::read_to_string(root.join(KEPT)).map_err(|error| format!("the kept id: {error}"))?;
     let id = Id::parse(&id).ok_or("the kept id is not one")?;
-    Profile::open(root, id).map_err(|error| format!("opening: {error}"))
+    Profile::open(&root.join(PROFILES), id).map_err(|error| format!("opening: {error}"))
 }
 
 fn answers(profile: &Profile, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
@@ -339,8 +333,99 @@ fn profiles(
         replaced == Err(Error::ChipChanged),
         &format!("a replaced key: {replaced:?}"),
     )?;
+    destroyed(profile, keystore).map(|_| ())
+}
+
+/// The roots of epochs on the keystore of the device: a change, an erasure, what an unfinished
+/// change leaves, a key only the listing finds, and a destruction.
+fn epochs(root: &Path, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
+    let created =
+        Profile::create(root, keystore, true).map_err(|error| format!("creating: {error}"))?;
+    let id = created.id();
+    drop(created);
+    // In the order of the names: the system lists them in its own.
+    let names = |keystore: &mut JniKeystore<'_>| {
+        keystore
+            .aliases(&format!("lethewis/{id}/"))
+            .map(|mut names| {
+                names.sort();
+                names
+            })
+    };
+    let (mut profile, first) = epoch(root, id, keystore, 0)?;
+    let mut second = [0; 32];
+    let next = profile
+        .next_epoch(keystore, true, &mut second)
+        .map_err(|error| format!("the next epoch: {error}"))?;
+    check(next.number == 1 && second != first, "the next epoch's key")?;
+    let mut roots = profile.roots(keystore);
+    check(roots.switch(1).is_ok(), "switching")?;
+    let expected = if next.previous.secure() {
+        Erasure::BestEffort
+    } else {
+        Erasure::NotErased
+    };
+    let erased = roots.erase(0);
+    check(erased == expected, &format!("erasing: {erased:?}"))?;
+    let listed = names(keystore);
+    let wanted = Ok(vec![
+        format!("lethewis/{id}/chip"),
+        format!("lethewis/{id}/root/1"),
+    ]);
+    check(
+        listed == wanted,
+        &format!("the keys after a change: {listed:?}"),
+    )?;
+    drop(profile);
+    let (mut profile, again) = epoch(root, id, keystore, 1)?;
+    check(again == second, "the key of the epoch read again")?;
+    // A change cut short leaves the root of epoch 2, and a key with no file only the listing
+    // finds; the next reading erases both, the second with its level unknown.
+    profile
+        .next_epoch(keystore, true, &mut [0; 32])
+        .map_err(|error| format!("a change cut short: {error}"))?;
+    drop(profile);
     keystore
-        .delete(&alias)
-        .map_err(|failure| format!("deleting: {failure}"))?;
-    Ok(())
+        .generate(&format!("lethewis/{id}/root/7"), false, false)
+        .map_err(|failure| format!("a key with no file: {failure}"))?;
+    let mut profile = Profile::open(root, id).map_err(|error| format!("opening: {error}"))?;
+    let current = profile
+        .epoch(keystore, &mut [0; 32])
+        .map_err(|error| format!("reading after a change cut short: {error}"))?;
+    check(
+        current.number == 1 && current.swept == Some(Erasure::NotErased),
+        &format!("what a change cut short left: {current:?}"),
+    )?;
+    let listed = names(keystore);
+    check(
+        listed == wanted,
+        &format!("the keys after a change cut short: {listed:?}"),
+    )?;
+    let erasure = destroyed(profile, keystore)?;
+    check(erasure == expected, &format!("a destruction: {erasure:?}"))?;
+    check(
+        !root.join(id.to_string()).exists(),
+        "the directory after a destruction",
+    )?;
+    let swept = sweep(root, keystore);
+    check(swept == Ok(None), &format!("a sweep of nothing: {swept:?}"))
+}
+
+/// Opens the profile `id`, reads its epoch, and checks the number.
+fn epoch(
+    root: &Path,
+    id: Id,
+    keystore: &mut JniKeystore<'_>,
+    number: u64,
+) -> Result<(Profile, [u8; 32]), String> {
+    let mut profile = Profile::open(root, id).map_err(|error| format!("opening: {error}"))?;
+    let mut key = [0; 32];
+    let current = profile
+        .epoch(keystore, &mut key)
+        .map_err(|error| format!("reading the epoch: {error}"))?;
+    check(
+        current.number == number && current.swept.is_none(),
+        &format!("the epoch: {current:?}"),
+    )?;
+    Ok((profile, key))
 }

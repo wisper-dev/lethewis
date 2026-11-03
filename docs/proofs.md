@@ -56,12 +56,13 @@ All six must hold. A row missing any one of them is not written.
 | Time lock, opening | A key leaves its lock only with the signature of the round it was locked to, under an intact header. | `lethewis-timelock` |
 | Time lock, the format | A lock is read exactly as written; bytes are read only when they are a lock as written. | `lethewis-timelock` |
 | Profile, the format | A profile's record and identifier are read exactly as written; bytes are read only when written so. | `lethewis-android` |
+| Epoch roots on Android, the format | A pointer, a root and a name's number are read exactly as written, and only bytes so written. | `lethewis-android` |
 | Time lock, keys | A key comes from a time lock only once its round's signature opens it; nothing else derives it again. | `lethewis-core` |
 
 Calls into the operating system are checked by tests, not by proof. `lethewis-dit` is measured on
 real machines, `lethewis-android` and `lethewis-jni` are tested on emulators.
 
-The crates that make those calls are in neither table, apart from the format of a profile.
+The crates that make those calls are in neither table, apart from the formats of a profile.
 
 Under Kani, `lethewis-dit` only runs its work.
 
@@ -168,6 +169,7 @@ Under Kani, `lethewis-dit` only runs its work.
 | Time lock, decimal digits | A round is written exactly below 10^19 and read back; nineteen bytes are read exactly when digits. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any round, any nineteen bytes | as in the row above |
 | Time lock, the format | Any lock written is read back as written, for any round, body, MAC, nonce and payload. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any round of nineteen digits, any bytes | bytes of another length, refused unread; whether `tle` and this crate open each other's locks, tested on locks of each |
 | Profile, the format | Any record and identifier written is read back as written; only bytes so written are read. | `lethewis-android` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any level, flag, check, tag and identifier; any bytes up to one past a record | the files themselves; the check and the tag, which only the chip's key gives |
+| Epoch roots on Android, the format | Any pointer, root and number written is read back as written; only bytes so written are read. | `lethewis-android` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | zero stores for the wipe; any number, level, flag, bytes, tag; to one byte past a file, or 21 digits | the files; the real wipe; tags, given only by chip keys; numbers in names, unit-tested |
 | Time lock, only locks read | Any 386 bytes are read only when they are a lock as written. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
 | Time lock, time out of range | A time out of range is refused before any work. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the encryption, MAC and payload cipher answer at will: every answer is covered; which bytes the MAC covers is tested | the pairing, hashes and ChaCha20-Poly1305, tested on files of tlock; the stack wipe and timing, tested |
 | Time lock, locking | In range, the file key is encrypted to the first round published then or later, under the bytes given. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above; SHA-256 of a round stands in as its bytes, one message per round | as in the row above |
@@ -580,6 +582,12 @@ compile error.
 | the last level of a profile written as the one before, or its unlocking read the other way | `a_record_is_read_as_written`, unit tests |
 | a profile's record one byte longer read, or a flag past the one defined | `only_a_written_record_is_read`, unit tests |
 | a profile's tag read from its check | `a_record_is_read_as_written`, unit tests |
+| a pointer's number read with its bytes the other way | `a_pointer_is_read_as_written`, unit tests |
+| a pointer of another mark read | `only_a_written_pointer_is_read` |
+| a root's stored bytes and tag read the other way | `a_root_is_read_as_written`, unit tests |
+| a root one byte longer read | `only_a_written_root_is_read` |
+| a number with a leading zero read | `a_number_is_read_exactly_when_written_so`, unit tests |
+| the key of an epoch labelled as an export key | `different_derivations_have_different_labels`, unit tests |
 | a lock for the round before, or until now | `a_key_is_locked_until_the_round_of_its_time_within_a_year`, unit tests |
 | an opening that checks the signature of the next round | `a_key_is_opened_only_with_the_signature_of_its_round_as_locked`, unit tests |
 | a key opened without its MAC | `a_key_is_opened_only_with_the_signature_of_its_round_as_locked` |

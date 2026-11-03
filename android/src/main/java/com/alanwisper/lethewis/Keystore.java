@@ -14,6 +14,7 @@ import java.security.Key;
 import java.security.KeyStore;
 import java.security.UnrecoverableKeyException;
 import java.util.Arrays;
+import java.util.Enumeration;
 import javax.crypto.KeyGenerator;
 import javax.crypto.Mac;
 import javax.crypto.SecretKey;
@@ -22,7 +23,7 @@ import javax.crypto.SecretKeyFactory;
 /**
  * The Android keystore as LetheWis uses it: HMAC-SHA256 keys under names. Only the native code of
  * lethewis-jni calls it; every method returns a level of storage, a result or a failure as a code,
- * and throws nothing of its own.
+ * or a list of names, and throws nothing of its own.
  */
 final class Keystore {
     static final int OK = 0;
@@ -92,6 +93,25 @@ final class Keystore {
             return OK;
         } catch (Exception e) {
             return failure(e);
+        }
+    }
+
+    /**
+     * The names that begin with {@code prefix}, each followed by a new line; null if the keystore
+     * throws. A keystore that fails without throwing lists fewer names.
+     */
+    static String aliases(String prefix) {
+        try {
+            StringBuilder names = new StringBuilder();
+            for (Enumeration<String> all = store().aliases(); all.hasMoreElements(); ) {
+                String alias = all.nextElement();
+                if (alias.startsWith(prefix)) {
+                    names.append(alias).append('\n');
+                }
+            }
+            return names.toString();
+        } catch (Exception e) {
+            return null;
         }
     }
 

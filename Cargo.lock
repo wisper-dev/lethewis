@@ -341,6 +341,7 @@ version = "0.0.0"
 dependencies = [
  "ctutils",
  "hmac",
+ "lethewis-core",
  "sha2",
  "zeroize",
 ]

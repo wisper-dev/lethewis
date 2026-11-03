@@ -4,23 +4,24 @@
 use core::fmt::{self, Write as _};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use zeroize::Zeroize;
 
+use crate::epoch::{self, Known, root_alias};
 use crate::keystore::{Failure, Keystore, Level};
 
-/// The file that describes a profile.
-const RECORD: &str = "profile";
-/// The record while it is written, before it takes its name.
-const RECORD_NEW: &str = "profile.new";
+/// The file that describes a profile, written last at creation.
+pub(crate) const RECORD: &str = "profile";
 /// The file an open profile holds a lock on.
-const LOCK: &str = "lock";
+pub(crate) const LOCK: &str = "lock";
+/// The file that marks a profile whose destruction has begun.
+pub(crate) const DESTROYED: &str = "destroyed";
+/// What a file is named while it is written, before it takes its name.
+pub(crate) const WRITING: &str = ".new";
 const MAGIC: [u8; 4] = *b"LWp1";
-const RECORD_LEN: usize = 70;
-/// One byte past a record, so a longer file reads as too long.
-const RECORD_READ: u64 = 71;
-const UNLOCKED: u8 = 1;
+pub(crate) const RECORD_LEN: usize = 70;
+pub(crate) const UNLOCKED: u8 = 1;
 /// Below this API level a key usable only while the device is unlocked was deleted with the lock
 /// screen.
 const UNLOCKED_SAFE_FROM: u32 = 35;
@@ -30,12 +31,12 @@ const ANSWER_LABEL: &[u8; 16] = b"lethewis answer ";
 
 /// The identifier of a profile: 128 random bits, written as 32 lowercase hexadecimal digits.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Id([u8; 16]);
+pub struct Id(pub(crate) [u8; 16]);
 
 impl Id {
     fn random() -> io::Result<Self> {
         let mut bytes = [0; 16];
-        File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        fill_random(&mut bytes)?;
         Ok(Self(bytes))
     }
 
@@ -92,7 +93,7 @@ impl fmt::Debug for Id {
 pub enum Error {
     /// The profile is open elsewhere, in this process or another.
     Busy,
-    /// No profile has this identifier.
+    /// No profile has this identifier, or its destruction has begun.
     NotFound,
     /// The files of the profile are not as this library writes them, or the level, unlocking or tag
     /// of its record was changed since. At creation, the key name drawn is taken.
@@ -103,6 +104,15 @@ pub enum Error {
     /// Only software of the operating system would hold the chip's key. Below API 31 the system
     /// may make it in software after a failure of the secure hardware, so a later try may succeed.
     SoftwareOnly,
+    /// The current epoch is not known yet: [`Profile::epoch`] reads it.
+    NoEpoch,
+    /// The root of the next epoch is made, and neither switched to nor erased yet.
+    Changing,
+    /// No epoch follows the current one.
+    Exhausted,
+    /// A switch of epoch may or may not have been written: the profile changes no epoch until
+    /// [`Profile::epoch`] reads the current one again.
+    Unsettled,
     /// The keystore refused.
     Keystore(Failure),
     /// The file system refused.
@@ -123,6 +133,10 @@ impl fmt::Display for Error {
             Self::Damaged => f.write_str("the files of the profile are damaged"),
             Self::ChipChanged => f.write_str("the chip's key was replaced"),
             Self::SoftwareOnly => f.write_str("only software would hold the chip's key"),
+            Self::NoEpoch => f.write_str("the current epoch was not read"),
+            Self::Changing => f.write_str("a change of epoch is under way"),
+            Self::Exhausted => f.write_str("no epoch follows the current one"),
+            Self::Unsettled => f.write_str("a switch of epoch was not settled"),
             Self::Keystore(failure) => write!(f, "the keystore refused: {failure}"),
             Self::Io(kind) => write!(f, "the file system refused: {kind}"),
         }
@@ -133,16 +147,27 @@ impl std::error::Error for Error {}
 
 /// A profile on this device, held open: no other opening of it succeeds until this one is dropped.
 pub struct Profile {
-    id: Id,
-    alias: String,
-    record: Record,
+    pub(crate) id: Id,
+    pub(crate) dir: PathBuf,
+    pub(crate) alias: String,
+    pub(crate) record: Record,
+    /// The root of the current epoch, once read.
+    pub(crate) current: Option<Known>,
+    /// The root made for the next epoch, not yet current.
+    pub(crate) next: Option<Known>,
+    /// A root other than the current whose level is known, until it is erased: the one current
+    /// before the last switch, or the one an unsettled switch was found not to reach.
+    pub(crate) previous: Option<Known>,
+    pub(crate) unsettled: bool,
+    /// The epoch an unsettled switch was found to reach, until the switch to it is asked again.
+    pub(crate) settled: Option<u64>,
     _lock: File,
 }
 
 /// What the file of a profile holds.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Record {
-    level: Level,
+pub(crate) struct Record {
+    pub(crate) level: Level,
     unlocked: bool,
     /// The chip's answer to the check of the identifier, which tells a replaced key.
     check: [u8; 32],
@@ -150,33 +175,20 @@ struct Record {
     tag: [u8; 32],
 }
 
-/// A failed creation, and whether a key of the profile may be left in the keystore.
-struct Failed {
-    error: Error,
-    key_left: bool,
-}
-
-impl From<Error> for Failed {
-    fn from(error: Error) -> Self {
-        Self {
-            error,
-            key_left: false,
-        }
-    }
-}
-
 impl Profile {
-    /// Creates a profile in a new directory under `root`, which the system must not back up, such
-    /// as `Context.getNoBackupFilesDir()`. The chip's key goes into the secure element where the
-    /// system offers one for it, and into the isolated part of the processor otherwise; a key only
-    /// software would hold is taken only if `software` allows it.
+    /// Creates a profile in a new directory under `root`, a directory of profiles alone that the
+    /// system must not back up, such as one in `Context.getNoBackupFilesDir()`, with the root of
+    /// epoch 0. The chip's keys go into the secure element where the system offers one for them,
+    /// and into the isolated part of the processor otherwise; keys only software would hold are
+    /// taken only if `software` allows it.
     ///
     /// # Errors
     ///
     /// [`Error::SoftwareOnly`], [`Error::Damaged`] for a key name already taken, the keystore's
     /// failure or the file system's. Nothing of the profile is then left, as far as the keystore
-    /// and the file system allow: where the chip's key could not be deleted, or after a crash, its
-    /// directory stays.
+    /// and the file system allow: where a key could not be deleted, or after a crash, a directory
+    /// without the record, or marked destroyed, stays for [`sweep`](crate::sweep). A sweep under
+    /// way delays a creation.
     pub fn create(
         root: &Path,
         keystore: &mut impl Keystore,
@@ -184,42 +196,54 @@ impl Profile {
     ) -> Result<Self, Error> {
         let id = Id::random()?;
         let dir = root.join(id.to_string());
-        fs::create_dir(&dir)?;
-        Self::create_in(root, &dir, id, keystore, software).map_err(|failed| {
-            if !failed.key_left {
-                let _ = fs::remove_dir_all(&dir);
-            }
-            failed.error
-        })
-    }
-
-    fn create_in(
-        root: &Path,
-        dir: &Path,
-        id: Id,
-        keystore: &mut impl Keystore,
-        software: bool,
-    ) -> Result<Self, Failed> {
-        // The directory is to outlast a crash before the key is made, so a key is never left
-        // without it.
-        sync_dir(root).map_err(Error::from)?;
-        let lock = lock(dir)?;
         let alias = alias(id);
         // A key under a name just drawn at random belongs to nothing of ours.
         if keystore.contains(&alias).map_err(Error::Keystore)? {
-            return Err(Error::Damaged.into());
+            return Err(Error::Damaged);
         }
-        match make_key(dir, id, &alias, keystore, software) {
-            Ok(record) => Ok(Self {
+        // Shared with other creations, so that a sweep never finds a directory not yet locked.
+        let creating = File::open(root)?;
+        creating.lock_shared()?;
+        fs::create_dir(&dir)?;
+        // The directory is to outlast a crash before a key is made, so a key is never left
+        // without it.
+        let locked = sync_dir(root)
+            .map_err(Error::from)
+            .and_then(|()| lock(&dir));
+        if locked.is_err() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        drop(creating);
+        let lock = locked?;
+        match make_profile(&dir, id, &alias, keystore, software) {
+            Ok((record, root)) => Ok(Self {
                 id,
+                dir,
                 alias,
                 record,
+                current: Some(root),
+                next: None,
+                previous: None,
+                unsettled: false,
+                settled: None,
                 _lock: lock,
             }),
-            Err(error) => Err(Failed {
-                error,
-                key_left: keystore.delete(&alias).is_err(),
-            }),
+            Err(error) => {
+                // Without its record, or with the mark, the directory is left for a sweep.
+                let unrecorded = match fs::remove_file(dir.join(RECORD)) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+                    _ => sync_dir(&dir),
+                };
+                if unrecorded.is_err() {
+                    let _ = mark_destroyed(&dir);
+                }
+                let chip = keystore.delete(&alias);
+                let root = keystore.delete(&root_alias(id, 0));
+                if chip.is_ok() && root.is_ok() {
+                    let _ = fs::remove_dir_all(&dir);
+                }
+                Err(error)
+            }
         }
     }
 
@@ -227,29 +251,41 @@ impl Profile {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`], [`Error::Busy`], [`Error::Damaged`] or the file system's failure.
+    /// [`Error::NotFound`], also for a profile whose destruction has begun, [`Error::Busy`],
+    /// [`Error::Damaged`] or the file system's failure.
     pub fn open(root: &Path, id: Id) -> Result<Self, Error> {
         let dir = root.join(id.to_string());
-        match fs::metadata(&dir) {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => return Err(Error::Damaged),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(Error::NotFound),
-            Err(error) => return Err(error.into()),
+        let lock = match lock(&dir) {
+            Err(Error::Io(io::ErrorKind::NotFound)) => return Err(Error::NotFound),
+            // A file under the profile's name, rather than `root` itself.
+            Err(Error::Io(io::ErrorKind::NotADirectory)) if root.is_dir() => {
+                return Err(Error::Damaged);
+            }
+            locked => locked?,
+        };
+        if exists(&dir.join(DESTROYED))? {
+            return Err(Error::NotFound);
         }
-        let lock = lock(&dir)?;
-        let mut bytes = Vec::new();
-        File::open(dir.join(RECORD))
-            .map_err(|error| match error.kind() {
+        let mut bytes = [0; RECORD_LEN + 1];
+        let read =
+            read_file(&dir.join(RECORD), &mut bytes).map_err(|error| match error.kind() {
                 io::ErrorKind::NotFound => Error::Damaged,
                 kind => Error::Io(kind),
-            })?
-            .take(RECORD_READ)
-            .read_to_end(&mut bytes)?;
-        let record = Record::parse(&bytes).ok_or(Error::Damaged)?;
+            })?;
+        let record = bytes
+            .get(..read)
+            .and_then(Record::parse)
+            .ok_or(Error::Damaged)?;
         Ok(Self {
             id,
+            dir,
             alias: alias(id),
             record,
+            current: None,
+            next: None,
+            previous: None,
+            unsettled: false,
+            settled: None,
             _lock: lock,
         })
     }
@@ -332,23 +368,20 @@ impl fmt::Debug for Profile {
     }
 }
 
-/// Makes the chip's key under `alias` and writes the record; returns the record.
-fn make_key(
+/// Makes the chip's key under `alias`, the root of epoch 0 and the pointer to it, and last the
+/// record; returns the record and the root.
+fn make_profile(
     dir: &Path,
     id: Id,
     alias: &str,
     keystore: &mut impl Keystore,
     software: bool,
-) -> Result<Record, Error> {
-    let unlocked = keystore.api_level() >= UNLOCKED_SAFE_FROM;
-    let level = match keystore.generate(alias, true, unlocked) {
-        Err(Failure::StrongBoxUnavailable) => keystore.generate(alias, false, unlocked),
-        generated => generated,
-    }
-    .map_err(Error::Keystore)?;
-    if !level.secure() && !software {
-        return Err(Error::SoftwareOnly);
-    }
+) -> Result<(Record, Known), Error> {
+    let unlocked = unlocked_only(keystore);
+    let level = generate(keystore, alias, unlocked, software)?;
+    let root = epoch::make_root(dir, id, 0, keystore, software)?;
+    let pointer = epoch::pointer_to(id, alias, &root, keystore)?;
+    write_file(dir, epoch::CURRENT, &pointer).map_err(epoch::Written::error)?;
     let mut record = Record {
         level,
         unlocked,
@@ -361,18 +394,43 @@ fn make_key(
     keystore
         .mac(alias, &tag_input(id, &record), &mut record.tag)
         .map_err(Error::Keystore)?;
-    write_record(dir, &record.bytes())?;
-    Ok(record)
+    write_file(dir, RECORD, &record.bytes()).map_err(epoch::Written::error)?;
+    Ok((record, root))
+}
+
+/// Whether the keys made now work only while the device is unlocked.
+pub(crate) fn unlocked_only(keystore: &impl Keystore) -> bool {
+    keystore.api_level() >= UNLOCKED_SAFE_FROM
+}
+
+/// Makes a key under `alias`, in the secure element where the system offers one; returns where it
+/// is held. A key left by a failure is the caller's to delete.
+pub(crate) fn generate(
+    keystore: &mut impl Keystore,
+    alias: &str,
+    unlocked: bool,
+    software: bool,
+) -> Result<Level, Error> {
+    let level = match keystore.generate(alias, true, unlocked) {
+        Err(Failure::StrongBoxUnavailable) => keystore.generate(alias, false, unlocked),
+        generated => generated,
+    }
+    .map_err(Error::Keystore)?;
+    if !level.secure() && !software {
+        return Err(Error::SoftwareOnly);
+    }
+    Ok(level)
 }
 
 /// Constant time, and out of line so that the check of its machine code finds it.
 #[inline(never)]
-fn same_mac(a: &[u8; 32], b: &[u8; 32]) -> bool {
+pub(crate) fn same_mac(a: &[u8; 32], b: &[u8; 32]) -> bool {
     use ctutils::CtEq;
     a.ct_eq(b).to_bool()
 }
 
-fn alias(id: Id) -> String {
+/// The name of the chip's key of the profile `id`.
+pub(crate) fn alias(id: Id) -> String {
     format!("lethewis/{id}/chip")
 }
 
@@ -396,7 +454,7 @@ fn tag_input(id: Id, record: &Record) -> [u8; 34] {
 }
 
 /// Writes the parts one after another into `out`; their lengths add up to its length.
-fn join<const N: usize>(parts: &[&[u8]], out: &mut [u8; N]) {
+pub(crate) fn join<const N: usize>(parts: &[&[u8]], out: &mut [u8; N]) {
     for (to, from) in out
         .iter_mut()
         .zip(parts.iter().flat_map(|part| part.iter()))
@@ -405,7 +463,7 @@ fn join<const N: usize>(parts: &[&[u8]], out: &mut [u8; N]) {
     }
 }
 
-const fn level_code(level: Level) -> u8 {
+pub(crate) const fn level_code(level: Level) -> u8 {
     match level {
         Level::StrongBox => 1,
         Level::TrustedEnvironment => 2,
@@ -415,7 +473,7 @@ const fn level_code(level: Level) -> u8 {
     }
 }
 
-const fn level_of(code: u8) -> Option<Level> {
+pub(crate) const fn level_of(code: u8) -> Option<Level> {
     match code {
         1 => Some(Level::StrongBox),
         2 => Some(Level::TrustedEnvironment),
@@ -426,9 +484,13 @@ const fn level_of(code: u8) -> Option<Level> {
     }
 }
 
+pub(crate) const fn flags_of(unlocked: bool) -> u8 {
+    if unlocked { UNLOCKED } else { 0 }
+}
+
 impl Record {
     const fn flags(&self) -> u8 {
-        if self.unlocked { UNLOCKED } else { 0 }
+        flags_of(self.unlocked)
     }
 
     fn bytes(&self) -> [u8; RECORD_LEN] {
@@ -462,7 +524,12 @@ impl Record {
     }
 }
 
-fn lock(dir: &Path) -> Result<File, Error> {
+/// Fills `out` with random bytes from the system.
+pub(crate) fn fill_random(out: &mut [u8]) -> io::Result<()> {
+    File::open("/dev/urandom")?.read_exact(out)
+}
+
+pub(crate) fn lock(dir: &Path) -> Result<File, Error> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -476,20 +543,63 @@ fn lock(dir: &Path) -> Result<File, Error> {
     }
 }
 
-fn write_record(dir: &Path, bytes: &[u8]) -> io::Result<()> {
-    let temporary = dir.join(RECORD_NEW);
-    let mut file = OpenOptions::new()
+/// Marks the profile in `dir` destroyed: it then reads as not found.
+pub(crate) fn mark_destroyed(dir: &Path) -> io::Result<()> {
+    File::create(dir.join(DESTROYED))
+        .and_then(|file| file.sync_all())
+        .and_then(|()| sync_dir(dir))
+}
+
+/// Whether `path` is there; a failure to look is the file system's.
+pub(crate) fn exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Reads the file `path` into `out`, up to its length; returns how many bytes it read. A file as
+/// long as `out` or longer reads as `out.len()` bytes.
+pub(crate) fn read_file(path: &Path, out: &mut [u8]) -> io::Result<usize> {
+    let mut file = File::open(path)?;
+    let mut read = 0;
+    while let Some(rest) = out.get_mut(read..) {
+        match file.read(rest)? {
+            0 => break,
+            count => read = read.saturating_add(count),
+        }
+        if read == out.len() {
+            break;
+        }
+    }
+    Ok(read)
+}
+
+/// Writes `bytes` to the file `name` in `dir` in one step: to a file of its own first, synced, then
+/// renamed over the name, and the directory synced.
+pub(crate) fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), epoch::Written> {
+    let temporary = dir.join(format!("{name}{WRITING}"));
+    let written = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&temporary, dir.join(RECORD))?;
-    sync_dir(dir)
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&temporary, dir.join(name)));
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temporary);
+        return Err(epoch::Written::Before(error.kind()));
+    }
+    sync_dir(dir).map_err(|error| epoch::Written::After(error.kind()))
 }
 
-fn sync_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    crate::stand::sync_failure()?;
     File::open(dir)?.sync_all()
 }
 
@@ -499,151 +609,19 @@ mod proofs;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::fs::File;
     use std::io;
-    use std::ops::Deref;
-    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
-    use hmac::{Hmac, KeyInit, Mac};
-    use sha2::Sha256;
+    use lethewis_core::Erasure;
 
     use super::{
-        Error, Failure, Id, Keystore, LOCK, Level, MAGIC, Profile, RECORD, RECORD_LEN, Record,
+        DESTROYED, Error, Failure, Id, LOCK, Level, MAGIC, Profile, RECORD, RECORD_LEN, Record,
     };
-
-    /// A keystore in memory: a key is 32 bytes, each new one different.
-    struct Stand {
-        api: u32,
-        strong_box: bool,
-        level: Level,
-        keys: HashMap<String, [u8; 32]>,
-        made: u8,
-        taken: bool,
-        refuse_generate: Option<Failure>,
-        refuse_after_making: Option<Failure>,
-        /// The number of answers given before the keystore refuses, and how.
-        refuse_mac: Option<(usize, Failure)>,
-        macs: usize,
-        refuse_delete: Option<Failure>,
-        generated: Vec<(bool, bool)>,
-        deleted: Vec<String>,
-    }
-
-    impl Stand {
-        fn new() -> Self {
-            Self {
-                api: 34,
-                strong_box: true,
-                level: Level::TrustedEnvironment,
-                keys: HashMap::new(),
-                made: 0,
-                taken: false,
-                refuse_generate: None,
-                refuse_after_making: None,
-                refuse_mac: None,
-                macs: 0,
-                refuse_delete: None,
-                generated: Vec::new(),
-                deleted: Vec::new(),
-            }
-        }
-    }
-
-    impl Keystore for Stand {
-        fn api_level(&self) -> u32 {
-            self.api
-        }
-
-        fn contains(&mut self, alias: &str) -> Result<bool, Failure> {
-            Ok(self.taken || self.keys.contains_key(alias))
-        }
-
-        fn generate(
-            &mut self,
-            alias: &str,
-            strong_box: bool,
-            unlocked: bool,
-        ) -> Result<Level, Failure> {
-            self.generated.push((strong_box, unlocked));
-            if let Some(failure) = self.refuse_generate {
-                return Err(failure);
-            }
-            if strong_box && !self.strong_box {
-                return Err(Failure::StrongBoxUnavailable);
-            }
-            self.made = self.made.wrapping_add(1);
-            let level = if strong_box {
-                Level::StrongBox
-            } else {
-                self.level
-            };
-            self.keys.insert(alias.to_owned(), [self.made; 32]);
-            match self.refuse_after_making {
-                Some(failure) => Err(failure),
-                None => Ok(level),
-            }
-        }
-
-        fn mac(&mut self, alias: &str, data: &[u8], out: &mut [u8; 32]) -> Result<(), Failure> {
-            if let Some((after, failure)) = self.refuse_mac
-                && self.macs >= after
-            {
-                return Err(failure);
-            }
-            self.macs = self.macs.wrapping_add(1);
-            *out = hmac(self.keys.get(alias).ok_or(Failure::Absent)?, data);
-            Ok(())
-        }
-
-        fn delete(&mut self, alias: &str) -> Result<(), Failure> {
-            if let Some(failure) = self.refuse_delete {
-                return Err(failure);
-            }
-            self.deleted.push(alias.to_owned());
-            self.keys.remove(alias);
-            Ok(())
-        }
-    }
-
-    fn hmac(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
-        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key).unwrap();
-        mac.update(data);
-        mac.finalize().into_bytes().into()
-    }
-
-    /// An empty directory of its own for each test, removed with it.
-    struct Root(PathBuf);
-
-    impl Deref for Root {
-        type Target = Path;
-
-        fn deref(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for Root {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn root(name: &str) -> Root {
-        let root =
-            std::env::temp_dir().join(format!("lethewis-android-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        Root(root)
-    }
-
-    fn entries(dir: &Path) -> Vec<String> {
-        let mut names: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        names
-    }
+    use crate::epoch::{CURRENT, root_alias};
+    use crate::stand::{Stand, dir, entries, fail_syncs, hmac};
 
     fn alias(profile: &Profile) -> String {
         format!("lethewis/{}/chip", profile.id())
@@ -655,12 +633,12 @@ mod tests {
 
     #[test]
     fn a_created_profile_opens_and_answers_as_the_chip() {
-        let root = root("answers");
+        let root = dir("answers");
         let mut stand = Stand::new();
         let id = Profile::create(&root, &mut stand, false).unwrap().id();
         let profile = Profile::open(&root, id).unwrap();
         assert_eq!(profile.level(), Level::StrongBox);
-        assert_eq!(stand.generated, [(true, false)]);
+        assert_eq!(stand.generated, [(true, false); 2]);
         let key = stand.keys[&alias(&profile)];
         for challenge in [[0; 32], [7; 32], [0xff; 32]] {
             let mut out = [0; 32];
@@ -672,7 +650,7 @@ mod tests {
     #[test]
     fn the_record_holds_the_chips_answers_to_its_check_and_to_itself() {
         for api in [34, 35] {
-            let root = root(&format!("answers-{api}"));
+            let root = dir(&format!("answers-{api}"));
             let mut stand = Stand {
                 api,
                 ..Stand::new()
@@ -695,7 +673,7 @@ mod tests {
 
     #[test]
     fn two_profiles_have_their_own_directory_name_and_key() {
-        let root = root("two");
+        let root = dir("two");
         let mut stand = Stand::new();
         let first = Profile::create(&root, &mut stand, false).unwrap();
         let second = Profile::create(&root, &mut stand, false).unwrap();
@@ -711,7 +689,7 @@ mod tests {
 
     #[test]
     fn a_profile_open_elsewhere_is_busy_until_dropped() {
-        let root = root("busy");
+        let root = dir("busy");
         let mut stand = Stand::new();
         let created = Profile::create(&root, &mut stand, false).unwrap();
         let id = created.id();
@@ -725,19 +703,19 @@ mod tests {
 
     #[test]
     fn without_a_secure_element_the_key_goes_to_the_isolated_processor() {
-        let root = root("fallback");
+        let root = dir("fallback");
         let mut stand = Stand {
             strong_box: false,
             ..Stand::new()
         };
         let profile = Profile::create(&root, &mut stand, false).unwrap();
         assert_eq!(profile.level(), Level::TrustedEnvironment);
-        assert_eq!(stand.generated, [(true, false), (false, false)]);
+        assert_eq!(stand.generated, [(true, false), (false, false)].repeat(2));
     }
 
     #[test]
     fn another_failure_of_the_secure_element_is_no_fallback() {
-        let root = root("transient");
+        let root = dir("transient");
         let mut stand = Stand {
             refuse_generate: Some(Failure::Transient),
             ..Stand::new()
@@ -750,21 +728,21 @@ mod tests {
 
     #[test]
     fn a_key_made_before_a_failure_is_deleted() {
-        let root = root("made");
+        let root = dir("made");
         let mut stand = Stand {
             refuse_after_making: Some(Failure::Transient),
             ..Stand::new()
         };
         let created = Profile::create(&root, &mut stand, false);
         assert_eq!(created.unwrap_err(), Error::Keystore(Failure::Transient));
-        assert_eq!(stand.deleted.len(), 1);
+        assert_eq!(stand.deleted.len(), 2);
         assert!(stand.keys.is_empty());
         assert_eq!(entries(&root), [] as [String; 0]);
     }
 
     #[test]
     fn a_key_that_cannot_be_deleted_keeps_its_directory_without_a_record() {
-        let root = root("left");
+        let root = dir("left");
         let mut stand = Stand {
             refuse_mac: Some((0, Failure::Locked)),
             refuse_delete: Some(Failure::Transient),
@@ -772,7 +750,7 @@ mod tests {
         };
         let created = Profile::create(&root, &mut stand, false);
         assert_eq!(created.unwrap_err(), Error::Keystore(Failure::Locked));
-        assert_eq!(stand.keys.len(), 1);
+        assert_eq!(stand.keys.len(), 2);
         let dirs = entries(&root);
         assert_eq!(dirs.len(), 1);
         assert_eq!(entries(&root.join(&dirs[0])), [LOCK]);
@@ -783,13 +761,13 @@ mod tests {
     #[test]
     fn from_api_35_the_key_works_only_while_unlocked() {
         for (api, unlocked) in [(28, false), (34, false), (35, true), (37, true)] {
-            let root = root(&format!("unlocked-{api}"));
+            let root = dir(&format!("unlocked-{api}"));
             let mut stand = Stand {
                 api,
                 ..Stand::new()
             };
             let id = Profile::create(&root, &mut stand, false).unwrap().id();
-            assert_eq!(stand.generated, [(true, unlocked)]);
+            assert_eq!(stand.generated, [(true, unlocked); 2]);
             assert_eq!(Profile::open(&root, id).unwrap().unlocked_only(), unlocked);
         }
     }
@@ -797,7 +775,7 @@ mod tests {
     #[test]
     fn a_key_only_software_holds_needs_consent() {
         for level in [Level::Software, Level::Unknown] {
-            let root = root(&format!("software-{level:?}"));
+            let root = dir(&format!("software-{level:?}"));
             let mut stand = Stand {
                 strong_box: false,
                 level,
@@ -814,7 +792,7 @@ mod tests {
 
     #[test]
     fn a_failed_check_at_creation_leaves_nothing() {
-        let root = root("check");
+        let root = dir("check");
         let mut stand = Stand {
             refuse_mac: Some((0, Failure::Locked)),
             ..Stand::new()
@@ -827,7 +805,7 @@ mod tests {
 
     #[test]
     fn a_failed_tag_at_creation_leaves_nothing() {
-        let root = root("tag");
+        let root = dir("tag");
         let mut stand = Stand {
             refuse_mac: Some((1, Failure::Transient)),
             ..Stand::new()
@@ -841,7 +819,7 @@ mod tests {
 
     #[test]
     fn a_refusal_while_verifying_is_the_keystores_failure() {
-        let root = root("refused");
+        let root = dir("refused");
         let mut stand = Stand::new();
         let id = Profile::create(&root, &mut stand, false).unwrap().id();
         let file = root.join(id.to_string()).join(RECORD);
@@ -864,7 +842,7 @@ mod tests {
 
     #[test]
     fn a_key_name_already_taken_is_refused_and_kept() {
-        let root = root("taken");
+        let root = dir("taken");
         let mut stand = Stand {
             taken: true,
             ..Stand::new()
@@ -874,11 +852,17 @@ mod tests {
         assert_eq!(stand.generated, [] as [(bool, bool); 0]);
         assert_eq!(stand.deleted, [] as [String; 0]);
         assert_eq!(entries(&root), [] as [String; 0]);
+        stand.taken = false;
+        stand.refuse_contains = Some(Failure::Transient);
+        let created = Profile::create(&root, &mut stand, false);
+        assert_eq!(created.unwrap_err(), Error::Keystore(Failure::Transient));
+        assert_eq!(stand.generated, [] as [(bool, bool); 0]);
+        assert_eq!(entries(&root), [] as [String; 0]);
     }
 
     #[test]
     fn a_replaced_key_is_told_from_a_wrong_password() {
-        let root = root("replaced");
+        let root = dir("replaced");
         let mut stand = Stand::new();
         let profile = Profile::create(&root, &mut stand, false).unwrap();
         stand.keys.insert(alias(&profile), [0xaa; 32]);
@@ -897,7 +881,7 @@ mod tests {
 
     #[test]
     fn a_changed_record_is_damaged() {
-        let root = root("changed");
+        let root = dir("changed");
         let mut stand = Stand {
             strong_box: false,
             level: Level::Software,
@@ -925,7 +909,7 @@ mod tests {
 
     #[test]
     fn opening_never_creates() {
-        let root = root("never");
+        let root = dir("never");
         let id = Id::parse("00112233445566778899aabbccddeeff").unwrap();
         assert_eq!(Profile::open(&root, id).unwrap_err(), Error::NotFound);
         assert_eq!(entries(&root), [] as [String; 0]);
@@ -933,7 +917,7 @@ mod tests {
 
     #[test]
     fn a_failure_to_look_is_no_missing_profile() {
-        let root = root("look");
+        let root = dir("look");
         let id = Id::parse("00112233445566778899aabbccddeeff").unwrap();
         std::fs::write(root.join(id.to_string()), b"").unwrap();
         assert_eq!(Profile::open(&root, id).unwrap_err(), Error::Damaged);
@@ -947,7 +931,7 @@ mod tests {
 
     #[test]
     fn a_record_not_as_written_is_damaged() {
-        let root = root("damaged");
+        let root = dir("damaged");
         let mut stand = Stand::new();
         let id = Profile::create(&root, &mut stand, false).unwrap().id();
         let file = root.join(id.to_string()).join(RECORD);
@@ -1011,10 +995,17 @@ mod tests {
 
     #[test]
     fn the_lock_file_stays_and_no_temporary_record_is_left() {
-        let root = root("files");
+        let root = dir("files");
         let mut stand = Stand::new();
         let id = Profile::create(&root, &mut stand, false).unwrap().id();
-        assert_eq!(entries(&root.join(id.to_string())), [LOCK, RECORD]);
+        assert_eq!(
+            entries(&root.join(id.to_string())),
+            [CURRENT, LOCK, RECORD, "root-0"]
+        );
+        assert_eq!(
+            stand.names(),
+            [format!("lethewis/{id}/chip"), root_alias(id, 0)]
+        );
     }
 
     #[test]
@@ -1047,13 +1038,79 @@ mod tests {
 
     #[test]
     fn a_profile_shows_its_identifier_and_level_only() {
-        let root = root("debug");
+        let root = dir("debug");
         let mut stand = Stand::new();
         let profile = Profile::create(&root, &mut stand, false).unwrap();
         let shown = format!("{profile:?}");
         assert!(shown.contains(&profile.id().to_string()), "{shown}");
         assert!(shown.contains("StrongBox"), "{shown}");
         assert!(!shown.contains("check"), "{shown}");
+    }
+
+    #[test]
+    fn a_creation_waits_for_a_sweep_under_way() {
+        let root = dir("waits");
+        let sweeping = File::open(&*root).unwrap();
+        sweeping.lock().unwrap();
+        let (done, finished) = mpsc::channel();
+        let path = root.to_path_buf();
+        let creating = thread::spawn(move || {
+            let created = Profile::create(&path, &mut Stand::new(), false).map(|made| made.id());
+            done.send(()).unwrap();
+            created
+        });
+        assert!(finished.recv_timeout(Duration::from_millis(200)).is_err());
+        assert_eq!(entries(&root), [] as [String; 0]);
+        drop(sweeping);
+        assert!(creating.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn a_creation_that_fails_after_its_record_leaves_it_to_the_sweep() {
+        let root = dir("after-record");
+        let mut stand = Stand {
+            refuse_delete: Some(Failure::Transient),
+            ..Stand::new()
+        };
+        // Syncs of the root, of the root of epoch 0 and of the pointer pass; the record's fails.
+        fail_syncs(3, 1);
+        let created = Profile::create(&root, &mut stand, false);
+        assert_eq!(created.unwrap_err(), Error::Io(io::ErrorKind::Other));
+        // The record's check and tag were answered, so it was written.
+        assert_eq!(stand.macs, 4);
+        let left = entries(&root);
+        assert_eq!(left.len(), 1);
+        assert!(!root.join(&left[0]).join(RECORD).exists());
+        assert!(!root.join(&left[0]).join(DESTROYED).exists());
+        stand.refuse_delete = None;
+        assert_eq!(
+            crate::sweep(&root, &mut stand),
+            Ok(Some(Erasure::NotErased))
+        );
+        assert_eq!(stand.names(), [] as [&str; 0]);
+        assert_eq!(entries(&root), [] as [String; 0]);
+    }
+
+    #[test]
+    fn a_creation_whose_record_is_not_surely_removed_is_marked_destroyed() {
+        let root = dir("marked");
+        let mut stand = Stand {
+            refuse_delete: Some(Failure::Transient),
+            ..Stand::new()
+        };
+        // The record's sync fails, and so does the sync of its removal.
+        fail_syncs(3, 2);
+        let created = Profile::create(&root, &mut stand, false);
+        assert_eq!(created.unwrap_err(), Error::Io(io::ErrorKind::Other));
+        assert_eq!(stand.macs, 4);
+        let left = entries(&root);
+        assert!(root.join(&left[0]).join(DESTROYED).exists());
+        stand.refuse_delete = None;
+        assert_eq!(
+            crate::sweep(&root, &mut stand),
+            Ok(Some(Erasure::NotErased))
+        );
+        assert_eq!(stand.names(), [] as [&str; 0]);
     }
 
     #[test]
@@ -1064,6 +1121,10 @@ mod tests {
             Error::Damaged,
             Error::ChipChanged,
             Error::SoftwareOnly,
+            Error::NoEpoch,
+            Error::Changing,
+            Error::Exhausted,
+            Error::Unsettled,
             Error::Keystore(Failure::Transient),
             Error::Keystore(Failure::Locked),
             Error::Keystore(Failure::Absent),

@@ -338,7 +338,7 @@ Nothing is published while the version is below 0.1.0.
   lock only as it opens; its round is the first at its time or later.
 - Tests take a profile through a lock and its opening.
 - Crate `lethewis-android`, the platform on Android. `Profile::create` makes a profile under a
-  directory the caller keeps out of backups, with an HMAC-SHA256 key in the Android keystore.
+  directory of profiles alone, kept out of backups, with an HMAC-SHA256 key in the keystore.
 - The key goes into the secure element where the system offers one for it, which Android 9 does
   not. A key only software would hold needs the caller's consent; `Level` names where a key is.
 - `Profile::open` never creates a profile. An open profile is locked: a second opening is
@@ -348,6 +348,18 @@ Nothing is published while the version is below 0.1.0.
   `Error::Damaged`.
 - From API level 35 the key works only while the device is unlocked. `Keystore` reaches the
   keystore, and `Failure` names why it refused.
+- Each epoch of a profile has a root: a key in the keystore and random bytes beside it.
+  `Profile::epoch` reads the current one, `Profile::next_epoch` makes the next.
+- `Profile::roots` is the keeper the core commits a change of epoch through. A pointer moves in one
+  step, and the old root is erased by best effort.
+- A switch whose outcome is unknown sets `Profile::unsettled`: keep the records of both epochs
+  until `Profile::epoch` reads which is current. Then commit the change again if it is the next, or
+  abandon it.
+- What an unfinished change left is erased by a synced pointer, on reading the epoch or changing
+  it.
+- `Profile::destroy` marks a profile, then deletes its keys and files; `sweep` finishes what a
+  destruction or a creation left. A creation waits for a sweep under way.
+- `epoch_key` in the core derives the key of an epoch from a root on a device.
 - Crate `lethewis-jni`: `JniKeystore` implements `Keystore` through JNI, on the thread of the call.
   Its other half is `com.alanwisper.lethewis.Keystore`.
 - `android/`: that Java layer, built without Gradle, and `proguard.txt` for apps that shrink

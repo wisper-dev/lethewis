@@ -103,8 +103,10 @@ password and the hardware secret at each unlock, and neither alone is enough.
   does not. Code running as the app or as root asks the chip as the library does.
 - A chip's key made below Android 15 answers on a locked device too, after an update as well. One
   made on 15 or later answers only while unlocked.
-- On Android the challenge and the answer pass through the Java heap and the keystore's process.
-  Copies the runtime makes there are beyond wiping.
+- On Android every challenge to the chip and its answer pass through the Java heap and the
+  keystore's process. Copies the runtime makes there are beyond wiping.
+- On Android a deleted root is erased by best effort: no keystore confirms the overwrite. Apps
+  cannot ask for keys that resist a rollback.
 - A device unlocked since boot has its keys in memory already. No key-storage library changes
   that, and a lock screen is no defence against someone holding such a device.
 - A proof is about one named statement, not about safety. Each claim names the tool, its version,
@@ -123,7 +125,7 @@ separate crate, so the proof perimeter is visible from the directory listing.
 | `lethewis-core` | keys from derivation to destruction, two-tier access, shares, time locks with `timelock`, data in blocks; the system only through `lethewis-dit` |
 | `lethewis-dit` | data-independent timing on aarch64 where Linux, Android or an Apple system reports it; unsafe code |
 | `lethewis-timelock` | keys locked until a round of drand's quicknet, as age files `tle` opens; no network or clock |
-| `lethewis-android` | profiles on Android, and the chip's answer to the core's challenge |
+| `lethewis-android` | profiles on Android: the chip's answer to the core's challenge, roots of epochs |
 | `lethewis-jni` | the bridge to the Java layer in `android/`, through JNI; unsafe code |
 
 Claimed and proven properties: [docs/proofs.md](docs/proofs.md).

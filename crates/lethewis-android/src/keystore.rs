@@ -32,6 +32,14 @@ pub trait Keystore {
     /// The keystore's [`Failure`], and then leaves `out` as it was.
     fn mac(&mut self, alias: &str, data: &[u8], out: &mut [u8; 32]) -> Result<(), Failure>;
 
+    /// The names of the keys held that begin with `prefix`. The system reports a keystore that
+    /// fails here as holding none, or fewer.
+    ///
+    /// # Errors
+    ///
+    /// The keystore's [`Failure`].
+    fn aliases(&mut self, prefix: &str) -> Result<Vec<String>, Failure>;
+
     /// Deletes the key `alias`; a key that is not there is not a failure.
     ///
     /// # Errors

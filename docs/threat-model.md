@@ -66,6 +66,12 @@ key: a change to it or to the unlocking is found.
 
 A check written at creation tells a replaced key from a wrong password.
 
+Each epoch on Android has a root of its own: a key in the keystore and random bytes beside it. The
+core derives the epoch's key from both, so neither alone gives it.
+
+A change of epoch moves a pointer in one step, then deletes the old root. What an unfinished change
+left is erased only after the synced pointer and its root read strictly.
+
 A backup is an export under a key for transfers derived from the twelve words with a label of its
 own, so not the way in from the same words. It opens with the words alone, on any device and in any
 epoch: a guess at it is a guess at 128 bits. No backup is made under a password.
@@ -91,8 +97,14 @@ costs it only an answer of the chip.
 
 A chip's key made below Android 15 also answers while the device is locked, after an update too.
 
-On Android the challenge and the answer pass through the Java heap and the keystore's process.
-Their copies there are beyond wiping.
+On Android every challenge to the chip and its answer pass through the Java heap and the keystore's
+process. Their copies there are beyond wiping.
+
+A deleted root's key is erased by best effort: no keystore confirms that its copy is overwritten.
+The root's file is only unlinked, and its bytes may stay on the flash.
+
+Apps cannot ask for keys that resist a rollback, so a copy of the keystore's files may open it
+again. Until the old root is deleted, its pointer put back returns the old epoch.
 
 ### 2. Someone who compels the password
 

@@ -8,7 +8,7 @@ use std::ffi::CString;
 
 use jni_sys::{
     JNIEnv, JNINativeInterface_, JNINativeInterface__1_6, jbyte, jbyteArray, jclass, jint,
-    jmethodID, jsize, jstring, jvalue,
+    jmethodID, jobject, jsize, jstring, jvalue,
 };
 use lethewis_android::{Failure, Keystore, Level};
 use zeroize::Zeroize;
@@ -17,7 +17,7 @@ use crate::codes;
 
 /// The class of the Java layer.
 const CLASS: &CStr = c"com/alanwisper/lethewis/Keystore";
-/// Local references one call holds at most: a name and two arrays.
+/// Local references one call holds at most: a name and two arrays, or two strings.
 const FRAME: jint = 3;
 /// The length of an answer of HMAC-SHA256.
 const MAC_LEN: usize = 32;
@@ -40,6 +40,7 @@ struct Methods {
     contains: jmethodID,
     generate: jmethodID,
     mac: jmethodID,
+    aliases: jmethodID,
     delete: jmethodID,
 }
 
@@ -109,6 +110,7 @@ impl JniKeystore<'_> {
                 contains: ptr::null_mut(),
                 generate: ptr::null_mut(),
                 mac: ptr::null_mut(),
+                aliases: ptr::null_mut(),
                 delete: ptr::null_mut(),
             },
             _env: PhantomData,
@@ -124,6 +126,7 @@ impl JniKeystore<'_> {
             contains: keystore.method(c"contains", c"(Ljava/lang/String;)I")?,
             generate: keystore.method(c"generate", c"(Ljava/lang/String;ZZ)I")?,
             mac: keystore.method(c"mac", c"(Ljava/lang/String;[B[B)I")?,
+            aliases: keystore.method(c"aliases", c"(Ljava/lang/String;)Ljava/lang/String;")?,
             delete: keystore.method(c"delete", c"(Ljava/lang/String;)I")?,
         };
         Ok(keystore)
@@ -133,11 +136,6 @@ impl JniKeystore<'_> {
     pub(crate) fn table(&self) -> &JNINativeInterface__1_6 {
         // SAFETY: the environment is valid for the life of `self`, as its constructor required.
         unsafe { table(self.env) }
-    }
-
-    #[cfg(feature = "device-tests")]
-    pub(crate) const fn env(&self) -> *mut JNIEnv {
-        self.env
     }
 
     /// Whether an exception is pending.
@@ -217,6 +215,59 @@ impl JniKeystore<'_> {
         } else {
             Ok(result)
         }
+    }
+
+    /// Calls a static method of the layer that returns an object.
+    ///
+    /// # Safety
+    ///
+    /// `method` belongs to the class, returns an object, and `arguments` match its signature.
+    #[allow(unsafe_code)]
+    unsafe fn call_object(
+        &self,
+        method: jmethodID,
+        arguments: &[jvalue],
+    ) -> Result<jobject, Failure> {
+        // SAFETY: the environment and the class are valid, no exception is pending, and the
+        // method and its arguments are as the caller promises.
+        let result = unsafe {
+            (self.table().CallStaticObjectMethodA)(self.env, self.class, method, arguments.as_ptr())
+        };
+        if self.thrown() {
+            Err(Failure::Transient)
+        } else {
+            Ok(result)
+        }
+    }
+
+    /// The Java string `string` as UTF-8, if it is one; for ASCII the JVM's modified UTF-8 is the
+    /// same.
+    #[allow(unsafe_code)]
+    pub(crate) fn text(&self, string: jstring) -> Option<String> {
+        if string.is_null() || self.pending() {
+            return None;
+        }
+        // SAFETY: the environment is valid, no exception is pending, and `string` is a string.
+        let characters = unsafe { (self.table().GetStringLength)(self.env, string) };
+        // SAFETY: as above.
+        let length = unsafe { (self.table().GetStringUTFLength)(self.env, string) };
+        let mut bytes = vec![0_u8; usize::try_from(length).ok()?.checked_add(1)?];
+        // SAFETY: as above; `bytes` takes the modified UTF-8 of all `characters` and the NUL after
+        // it.
+        unsafe {
+            (self.table().GetStringUTFRegion)(
+                self.env,
+                string,
+                0,
+                characters,
+                bytes.as_mut_ptr().cast(),
+            );
+        }
+        if self.thrown() {
+            return None;
+        }
+        bytes.truncate(usize::try_from(length).ok()?);
+        String::from_utf8(bytes).ok()
     }
 
     /// A new Java string of `text`, which is ASCII: the same in the JVM's modified UTF-8.
@@ -387,6 +438,22 @@ impl Keystore for JniKeystore<'_> {
             });
             this.wipe(input, data.len());
             answered
+        })
+    }
+
+    #[allow(unsafe_code)]
+    fn aliases(&mut self, prefix: &str) -> Result<Vec<String>, Failure> {
+        let method = self.methods.aliases;
+        self.framed(|this| {
+            let prefix = this.string(prefix)?;
+            // SAFETY: `aliases` takes a String and returns one, or null when the keystore throws.
+            let listed = unsafe { this.call_object(method, &[jvalue { l: prefix }])? };
+            let text = this.text(listed).ok_or(Failure::Transient)?;
+            Ok(text
+                .split('\n')
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect())
         })
     }
 
