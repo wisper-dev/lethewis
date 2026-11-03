@@ -5,8 +5,9 @@
 //! for the tests has them.
 
 use core::ptr;
-use std::fs;
+use core::time::Duration;
 use std::path::Path;
+use std::{fs, thread};
 
 use jni_sys::{JNIEnv, jclass, jint, jstring};
 use lethewis_android::{Erasure, Error, Failure, Id, Keystore, Level, Profile, Root, sweep};
@@ -24,6 +25,8 @@ const KNOWN_ANSWER: [u8; 32] = [
 const KEPT: &str = "kept";
 /// The directory of profiles under the directory of the tests.
 const PROFILES: &str = "profiles";
+/// The file under the directory of the tests that tells the keystore was reached before it stops.
+const REACHED: &str = "reached";
 
 /// Runs the tests `test` under `root`, a directory of the app, on a system of API level `api`.
 /// Returns `passed` when every check holds, the first that failed otherwise, and null when the
@@ -86,8 +89,9 @@ fn check(holds: bool, what: &str) -> Result<(), String> {
     if holds { Ok(()) } else { Err(what.to_owned()) }
 }
 
-/// The tests `test`: `all` with the device unlocked, or one step of a profile kept across a lock:
-/// `before-lock`, `locked` and `after-lock`.
+/// The tests `test`: `all` with the device unlocked, or one step of a profile kept across a lock,
+/// `before-lock`, `locked` and `after-lock`, or across a keystore that stops, `before-stop`,
+/// `stopping`, `stopped`, `restarted` and `after-stop`.
 fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Result<(), String> {
     check(
         keystore.api_level() == api,
@@ -103,7 +107,7 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
             epochs(&home, keystore)?;
             remove(root)
         }
-        "before-lock" => {
+        "before-lock" | "before-stop" => {
             empty(&home)?;
             let profile = Profile::create(&home, keystore, true)
                 .map_err(|error| format!("creating: {error}"))?;
@@ -133,7 +137,45 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
                 &format!("a locked device answers: {answered:?} {root_answered:?}"),
             )
         }
-        "after-lock" => {
+        "stopping" => {
+            let profile = kept(root)?;
+            answers(&profile, keystore)?;
+            fs::write(root.join(REACHED), b"")
+                .map_err(|error| format!("telling the keystore was reached: {error}"))?;
+            stops(&profile, keystore)
+        }
+        "stopped" => {
+            let profile = kept(root)?;
+            let verified = profile.verify(keystore);
+            check(
+                matches!(
+                    verified,
+                    Err(Error::Keystore(Failure::Transient | Failure::Unknown))
+                ),
+                &format!("a keystore that stopped verifies: {verified:?}"),
+            )?;
+            let mut out = [0; 32];
+            let missing = keystore.mac("lethewis-test/missing", b"data", &mut out);
+            check(
+                matches!(missing, Err(Failure::Transient | Failure::Unknown)),
+                &format!("a keystore that stopped and a missing key: {missing:?}"),
+            )
+        }
+        "restarted" => {
+            let profile = kept(root)?;
+            let verified = profile.verify(keystore);
+            // From API 35 the keys work only while unlocked, and the keystore waits for an unlock.
+            let expected = if api >= 35 {
+                Err(Error::Keystore(Failure::Locked))
+            } else {
+                Ok(())
+            };
+            check(
+                verified == expected,
+                &format!("a keystore that started again verifies: {verified:?}"),
+            )
+        }
+        "after-lock" | "after-stop" => {
             let profile = kept(root)?;
             answers(&profile, keystore)?;
             destroyed(profile, keystore).map(|_| ())?;
@@ -176,6 +218,25 @@ fn kept(root: &Path) -> Result<Profile, String> {
         fs::read_to_string(root.join(KEPT)).map_err(|error| format!("the kept id: {error}"))?;
     let id = Id::parse(&id).ok_or("the kept id is not one")?;
     Profile::open(&root.join(PROFILES), id).map_err(|error| format!("opening: {error}"))
+}
+
+/// Verifies the profile until the keystore stops meanwhile, which reads as no lost key.
+fn stops(profile: &Profile, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
+    for _ in 0..300 {
+        match profile.verify(keystore) {
+            Ok(()) => thread::sleep(Duration::from_millis(200)),
+            Err(error) => {
+                return check(
+                    matches!(
+                        error,
+                        Error::Keystore(Failure::Transient | Failure::Unknown)
+                    ),
+                    &format!("a keystore that stops verifies: {error:?}"),
+                );
+            }
+        }
+    }
+    Err("the keystore did not stop".to_owned())
 }
 
 fn answers(profile: &Profile, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
@@ -228,6 +289,11 @@ fn keystore_alone(keystore: &mut JniKeystore<'_>) -> Result<Level, String> {
         &format!("a missing key answers: {answered:?}"),
     )?;
     check(out == [0x5a; 32], "a failed answer changed the output")?;
+    let probes = keystore.aliases("lethewis/probe");
+    check(
+        probes == Ok(Vec::new()),
+        &format!("a key left by a probe: {probes:?}"),
+    )?;
     let strong = keystore.generate(alias, true, false);
     check(
         matches!(

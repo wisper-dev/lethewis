@@ -66,6 +66,9 @@ key: a change to it or to the unlocking is found.
 
 A check written at creation tells a replaced key from a wrong password.
 
+A key reads as lost only on the system's word. Below API 31, where that word is unclear, the
+keystore must first show it works.
+
 Each epoch on Android has a root of its own: a key in the keystore and random bytes beside it. The
 core derives the epoch's key from both, so neither alone gives it.
 
@@ -99,6 +102,11 @@ A chip's key made below Android 15 also answers while the device is locked, afte
 
 On Android every challenge to the chip and its answer pass through the Java heap and the keystore's
 process. Their copies there are beyond wiping.
+
+Below API 33 the system names few failures: a damaged key then reads as unknown, not lost.
+
+From API 31 a key whose stored details lost their algorithm reads as lost: the system reports it
+alike.
 
 A deleted root's key is erased by best effort: no keystore confirms that its copy is overwritten.
 The root's file is only unlinked, and its bytes may stay on the flash.

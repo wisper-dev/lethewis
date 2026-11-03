@@ -38,11 +38,12 @@ pub(crate) fn presence(code: i32) -> Result<bool, Failure> {
 /// A code the layer does not define is a failure of unknown reason: never taken for a missing key.
 const fn failure(code: i32) -> Failure {
     match code {
+        -1 => Failure::Transient,
         -2 => Failure::Locked,
         -3 => Failure::Absent,
         -4 => Failure::Corrupted,
         -5 => Failure::StrongBoxUnavailable,
-        _ => Failure::Transient,
+        _ => Failure::Unknown,
     }
 }
 
@@ -80,6 +81,7 @@ mod tests {
             ("ABSENT", -3),
             ("CORRUPTED", -4),
             ("STRONG_BOX_UNAVAILABLE", -5),
+            ("UNKNOWN_FAILURE", -6),
         ];
         let declared = declared();
         assert_eq!(declared.len(), expected.len(), "{declared:?}");
@@ -104,6 +106,7 @@ mod tests {
             (-3, Failure::Absent),
             (-4, Failure::Corrupted),
             (-5, Failure::StrongBoxUnavailable),
+            (-6, Failure::Unknown),
         ] {
             assert_eq!(level(code), Err(failure));
             assert_eq!(status(code), Err(failure));
@@ -116,13 +119,13 @@ mod tests {
 
     #[test]
     fn a_code_not_defined_is_never_a_missing_key() {
-        for code in [i32::MIN, -6, 6, 7, 100, i32::MAX] {
-            assert_eq!(level(code), Err(Failure::Transient));
-            assert_eq!(status(code), Err(Failure::Transient));
-            assert_eq!(presence(code), Err(Failure::Transient));
+        for code in [i32::MIN, -7, 6, 7, 100, i32::MAX] {
+            assert_eq!(level(code), Err(Failure::Unknown));
+            assert_eq!(status(code), Err(Failure::Unknown));
+            assert_eq!(presence(code), Err(Failure::Unknown));
         }
-        assert_eq!(level(0), Err(Failure::Transient));
-        assert_eq!(status(1), Err(Failure::Transient));
-        assert_eq!(presence(2), Err(Failure::Transient));
+        assert_eq!(level(0), Err(Failure::Unknown));
+        assert_eq!(status(1), Err(Failure::Unknown));
+        assert_eq!(presence(2), Err(Failure::Unknown));
     }
 }

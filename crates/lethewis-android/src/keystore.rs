@@ -74,21 +74,27 @@ impl Level {
     }
 }
 
-/// Why the keystore refused.
+/// Why the keystore refused. Only the system's own word that a key is gone reads as
+/// [`Failure::Absent`]; below API 31, where that word is unclear, only once the keystore shows it
+/// works.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Failure {
-    /// Worth asking again later: the chip was busy, or the reason is not known. The system tells
-    /// few lasting failures apart, so a damaged key may come as this too.
+    /// From API 33, a failure the system marks as passing, or the keystore's internal error, a
+    /// service that died among them.
     Transient,
     /// The device has to be unlocked first.
     Locked,
-    /// No key under the name, or the system made it unusable. Below API 31 a keystore service that
-    /// is not running reads as this too.
+    /// No key under the name, or the system made it unusable. From API 31 also a key whose stored
+    /// details lost their algorithm, which the system reports alike.
     Absent,
     /// The stored form of the key is damaged.
     Corrupted,
     /// The secure element cannot hold the key.
     StrongBoxUnavailable,
+    /// The keystore, or the bridge to it, failed without saying whether it lasts. Below API 33 most
+    /// failures come as this, a damaged key among them; below API 31 so does a missing key while
+    /// the keystore cannot make one.
+    Unknown,
 }
 
 impl fmt::Display for Failure {
@@ -99,6 +105,7 @@ impl fmt::Display for Failure {
             Self::Absent => "the key is not there",
             Self::Corrupted => "the key is damaged",
             Self::StrongBoxUnavailable => "the secure element cannot hold the key",
+            Self::Unknown => "the keystore failed for a reason it does not give",
         })
     }
 }

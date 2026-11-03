@@ -14,9 +14,12 @@ import java.io.File;
 /**
  * Runs the tests of the library on a device: {@code am instrument -w -r -e api LEVEL} reports
  * {@code passed} and code -1 when they hold, LEVEL being the system's own. {@code -e test} picks
- * the tests: {@code all} by default, or one step of a profile kept across a lock of the device:
- * {@code before-lock}, {@code locked} and {@code after-lock}. With {@code -e test misuse} it breaks
- * a rule of JNI instead, and the process must not survive it.
+ * the tests: {@code all} by default, or one step of a profile kept across a lock of the device,
+ * {@code before-lock}, {@code locked} and {@code after-lock}, or across a keystore that stops,
+ * {@code before-stop}, {@code stopping}, {@code stopped}, {@code restarted} and {@code after-stop}.
+ * {@code -e test platform} checks the failures of the keystore from API 33, with the checks of
+ * hidden interfaces lifted. With {@code -e test misuse} it breaks a rule of JNI instead, and the
+ * process must not survive it.
  */
 public final class Runner extends Instrumentation {
     private Bundle arguments;
@@ -47,6 +50,9 @@ public final class Runner extends Instrumentation {
         if ("misuse".equals(test)) {
             Tests.misuse();
             return "the misuse of JNI went unnoticed";
+        }
+        if ("platform".equals(test)) {
+            return KeystoreTests.platform();
         }
         Context context = getTargetContext();
         KeyguardManager keyguard =

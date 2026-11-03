@@ -1130,6 +1130,7 @@ mod tests {
             Error::Keystore(Failure::Absent),
             Error::Keystore(Failure::Corrupted),
             Error::Keystore(Failure::StrongBoxUnavailable),
+            Error::Keystore(Failure::Unknown),
             Error::Io(io::ErrorKind::NotFound),
             Error::Io(io::ErrorKind::PermissionDenied),
         ];

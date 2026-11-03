@@ -37,8 +37,10 @@ final class Keystore {
     static final int ABSENT = -3;
     static final int CORRUPTED = -4;
     static final int STRONG_BOX_UNAVAILABLE = -5;
+    static final int UNKNOWN_FAILURE = -6;
 
     private static final String PROVIDER = "AndroidKeyStore";
+    private static final String PROBE = "lethewis/probe";
 
     private Keystore() {}
 
@@ -76,8 +78,21 @@ final class Keystore {
     }
 
     static int mac(String alias, byte[] data, byte[] out) {
+        return mac(alias, data, out, PROBE_KEY);
+    }
+
+    /** As {@link #mac(String, byte[], byte[])}, with {@code working} to confirm a missing key. */
+    static int mac(String alias, byte[] data, byte[] out, Check working) {
         try {
             Key key = store().getKey(alias, null);
+            // Below API 31 a keystore that fails reads as one without the key.
+            if (key == null && Build.VERSION.SDK_INT < 31) {
+                int absent = absent(working);
+                if (absent != ABSENT) {
+                    return absent;
+                }
+                key = store().getKey(alias, null);
+            }
             if (key == null) {
                 return ABSENT;
             }
@@ -124,6 +139,38 @@ final class Keystore {
         }
     }
 
+    /** A call that returns only from a keystore that works. */
+    interface Check {
+        void run() throws Exception;
+    }
+
+    /** A missing key, once {@code working} shows the keystore working. */
+    static int absent(Check working) {
+        try {
+            working.run();
+            return ABSENT;
+        } catch (Exception e) {
+            int failed = failure(e);
+            return failed == ABSENT ? UNKNOWN_FAILURE : failed;
+        }
+    }
+
+    /** Makes a key and deletes it; one a crash leaves holds nothing, and the next replaces it. */
+    private static final Check PROBE_KEY =
+            new Check() {
+                @Override
+                public void run() throws Exception {
+                    KeyGenerator generator =
+                            KeyGenerator.getInstance(
+                                    KeyProperties.KEY_ALGORITHM_HMAC_SHA256, PROVIDER);
+                    generator.init(
+                            new KeyGenParameterSpec.Builder(PROBE, KeyProperties.PURPOSE_SIGN)
+                                    .build());
+                    generator.generateKey();
+                    store().deleteEntry(PROBE);
+                }
+            };
+
     private static KeyStore store() throws Exception {
         KeyStore store = KeyStore.getInstance(PROVIDER);
         store.load(null);
@@ -159,8 +206,10 @@ final class Keystore {
                 return ABSENT;
             }
             // From API 31 a failure to read a key comes with its cause; one without stands for a
-            // key the system made unusable.
-            if (cause instanceof UnrecoverableKeyException && cause.getCause() == null) {
+            // key the system made unusable, or whose stored details lost their algorithm.
+            if (Build.VERSION.SDK_INT >= 31
+                    && cause instanceof UnrecoverableKeyException
+                    && cause.getCause() == null) {
                 return ABSENT;
             }
             if (Build.VERSION.SDK_INT >= 33) {
@@ -170,7 +219,7 @@ final class Keystore {
                 }
             }
         }
-        return TRANSIENT;
+        return UNKNOWN_FAILURE;
     }
 
     /** Calls that exist from API 31, apart so that older systems never load them. */
@@ -209,8 +258,11 @@ final class Keystore {
                     return ABSENT;
                 case android.security.KeyStoreException.ERROR_KEY_CORRUPTED:
                     return CORRUPTED;
-                default:
+                // The keystore's own failure, a service that died among them.
+                case android.security.KeyStoreException.ERROR_INTERNAL_SYSTEM_ERROR:
                     return TRANSIENT;
+                default:
+                    return UNKNOWN_FAILURE;
             }
         }
     }

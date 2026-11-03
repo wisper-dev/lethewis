@@ -348,6 +348,9 @@ Nothing is published while the version is below 0.1.0.
   `Error::Damaged`.
 - From API level 35 the key works only while the device is unlocked. `Keystore` reaches the
   keystore, and `Failure` names why it refused.
+- A key is `Failure::Absent` only on the system's word; below API 31 a key made and deleted confirms
+  the keystore works. `Failure::Unknown` is a failure without a reason, of the keystore or the
+  bridge.
 - Each epoch of a profile has a root: a key in the keystore and random bytes beside it.
   `Profile::epoch` reads the current one, `Profile::next_epoch` makes the next.
 - `Profile::roots` is the keeper the core commits a change of epoch through. A pointer moves in one
@@ -367,6 +370,7 @@ Nothing is published while the version is below 0.1.0.
 - Dependency of `lethewis-jni`: `jni-sys` 0.4.1 or a later compatible version, read in full.
 - Tests on emulators of Android 9 and of Android 17 with pages of 16 KiB. The Rust tests run there,
   and the tests on a device run under CheckJNI.
+- Tests on the emulators stop the keystore service under a running process and between runs.
 - The tests on a device go through the Java layer shrunk by R8, and on a locked device too. The
   shared library of `lethewis-jni` is aligned to 16 KiB for both targets.
 

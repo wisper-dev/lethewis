@@ -194,15 +194,36 @@ unlock() {
   exit 1
 }
 
-# Runs the tests named on the device; on a failure prints the report.
+# Stops or starts the keystore service, as root, and waits until the system reports it as $2, and
+# a service that runs as registered.
+keystore() {
+  local service interface _
+  service=$([ "$api" -ge 31 ] && echo keystore2 || echo keystore)
+  interface=$([ "$api" -ge 31 ] && echo android.system.keystore2.IKeystoreService/default ||
+    echo android.security.keystore)
+  adb_for 30 shell "$1" "$service"
+  for _ in $(seq 20); do
+    if [ "$(adb_for 10 shell getprop "init.svc.$service" | tr -d '\r')" = "$2" ] &&
+      { [ "$2" = stopped ] || grep -q ': found' <<<"$(adb_for 10 shell service check "$interface")"; }; then
+      return
+    fi
+    sleep 1
+  done
+  echo "android: the keystore is not $2" >&2
+  exit 1
+}
+
+# Runs the tests named $1 on the device, with the options of am instrument after it; on a failure
+# prints the report.
 instrument() {
-  local report
-  report=$(adb_for 600 shell am instrument -w -r -e test "$1" -e api "$api" "$package/.Runner" |
-    tr -d '\r') || true
+  local test=$1 report
+  shift
+  report=$(adb_for 600 shell am instrument -w -r "$@" -e test "$test" -e api "$api" \
+    "$package/.Runner" | tr -d '\r') || true
   grep -E '^INSTRUMENTATION_(RESULT|CODE)' <<<"$report" || true
   if ! grep -qx 'INSTRUMENTATION_RESULT: result=passed' <<<"$report" ||
     ! grep -qx 'INSTRUMENTATION_CODE: -1' <<<"$report"; then
-    echo "android: the tests on the device failed: $1" >&2
+    echo "android: the tests on the device failed: $test" >&2
     echo "$report" >&2
     exit 1
   fi
@@ -267,6 +288,10 @@ cargo test --workspace --all-features --locked --target x86_64-linux-android --r
 step "the tests on the device"
 adb_for 120 install -r -t "$work/tests.apk" >/dev/null
 instrument all
+# The keystore's own failures, whose class apps do not reach.
+if [ "$api" -ge 33 ]; then
+  instrument platform --no-hidden-api-checks
+fi
 
 step "the chip's key on a locked device"
 instrument before-lock
@@ -276,6 +301,30 @@ lock
 instrument locked
 unlock
 instrument after-lock
+
+step "a keystore that stopped is no lost key"
+instrument before-stop
+adb_for 60 root >/dev/null
+adb_for 60 wait-for-device
+# A process that reached the keystore before it stops, and one that starts after.
+instrument stopping &
+stopping=$!
+reached=/data/user/0/$package/no_backup/lethewis-tests/reached
+for _ in $(seq 60); do
+  adb_for 10 shell ls "$reached" >/dev/null 2>&1 && break
+  sleep 1
+done
+keystore stop stopped
+wait "$stopping" || exit 1
+instrument stopped
+keystore start running
+adb_for 60 unroot >/dev/null
+adb_for 60 wait-for-device
+# Keys that work only while the device is unlocked wait for an unlocking after a restart.
+instrument restarted
+lock
+unlock
+instrument after-stop
 adb_for 30 shell locksettings clear --old "$pin" >/dev/null
 
 step "CheckJNI stops a misuse of JNI"

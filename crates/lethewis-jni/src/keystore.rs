@@ -25,7 +25,7 @@ const MAC_LEN: usize = 32;
 /// The keystore of the device through the Java layer, on the thread whose JNI environment it holds.
 ///
 /// A call leaves no local reference and no pending exception behind, and never starts with one
-/// pending: it then fails as [`Failure::Transient`].
+/// pending: it then fails as [`Failure::Unknown`].
 pub struct JniKeystore<'env> {
     env: *mut JNIEnv,
     class: jclass,
@@ -54,7 +54,7 @@ impl JniKeystore<'_> {
     ///
     /// # Errors
     ///
-    /// [`Failure::Transient`] if the class or one of its methods is missing, the API level cannot
+    /// [`Failure::Unknown`] if the class or one of its methods is missing, the API level cannot
     /// be read, or an exception is pending.
     #[allow(unsafe_code)]
     pub unsafe fn find(env: *mut JNIEnv) -> Result<Self, Failure> {
@@ -62,14 +62,14 @@ impl JniKeystore<'_> {
         let functions = unsafe { table(env) };
         // SAFETY: as above; ExceptionCheck may be called with an exception pending.
         if unsafe { (functions.ExceptionCheck)(env) } {
-            return Err(Failure::Transient);
+            return Err(Failure::Unknown);
         }
         // SAFETY: as above, with no exception pending; the name ends in NUL.
         let class = unsafe { (functions.FindClass)(env, CLASS.as_ptr()) };
         if class.is_null() {
             // SAFETY: as above; FindClass failed and left its exception pending.
             unsafe { (functions.ExceptionClear)(env) };
-            return Err(Failure::Transient);
+            return Err(Failure::Unknown);
         }
         // SAFETY: the environment is valid for `'env`, and `class` is a local reference to the
         // class, valid until the native method under way returns.
@@ -97,7 +97,7 @@ impl JniKeystore<'_> {
     ///
     /// # Errors
     ///
-    /// [`Failure::Transient`] if one of the methods is missing, the API level cannot be read, or
+    /// [`Failure::Unknown`] if one of the methods is missing, the API level cannot be read, or
     /// an exception is pending.
     #[allow(unsafe_code)]
     pub unsafe fn with_class(env: *mut JNIEnv, class: jclass) -> Result<Self, Failure> {
@@ -116,12 +116,12 @@ impl JniKeystore<'_> {
             _env: PhantomData,
         };
         if keystore.pending() {
-            return Err(Failure::Transient);
+            return Err(Failure::Unknown);
         }
         let api_level = keystore.method(c"apiLevel", c"()I")?;
         // SAFETY: `apiLevel` belongs to the class and takes no arguments.
         let api = unsafe { keystore.call(api_level, &[])? };
-        keystore.api = u32::try_from(api).map_err(|_| Failure::Transient)?;
+        keystore.api = u32::try_from(api).map_err(|_| Failure::Unknown)?;
         keystore.methods = Methods {
             contains: keystore.method(c"contains", c"(Ljava/lang/String;)I")?,
             generate: keystore.method(c"generate", c"(Ljava/lang/String;ZZ)I")?,
@@ -170,7 +170,7 @@ impl JniKeystore<'_> {
         };
         let thrown = self.thrown();
         if method.is_null() || thrown {
-            Err(Failure::Transient)
+            Err(Failure::Unknown)
         } else {
             Ok(method)
         }
@@ -183,12 +183,12 @@ impl JniKeystore<'_> {
         work: impl FnOnce(&mut Self) -> Result<R, Failure>,
     ) -> Result<R, Failure> {
         if self.pending() {
-            return Err(Failure::Transient);
+            return Err(Failure::Unknown);
         }
         // SAFETY: the environment is valid and no exception is pending.
         if unsafe { (self.table().PushLocalFrame)(self.env, FRAME) } != 0 {
             self.thrown();
-            return Err(Failure::Transient);
+            return Err(Failure::Unknown);
         }
         let result = work(self);
         self.thrown();
@@ -211,7 +211,7 @@ impl JniKeystore<'_> {
             (self.table().CallStaticIntMethodA)(self.env, self.class, method, arguments.as_ptr())
         };
         if self.thrown() {
-            Err(Failure::Transient)
+            Err(Failure::Unknown)
         } else {
             Ok(result)
         }
@@ -234,7 +234,7 @@ impl JniKeystore<'_> {
             (self.table().CallStaticObjectMethodA)(self.env, self.class, method, arguments.as_ptr())
         };
         if self.thrown() {
-            Err(Failure::Transient)
+            Err(Failure::Unknown)
         } else {
             Ok(result)
         }
@@ -274,14 +274,14 @@ impl JniKeystore<'_> {
     #[allow(unsafe_code)]
     pub(crate) fn string(&self, text: &str) -> Result<jstring, Failure> {
         if !text.is_ascii() {
-            return Err(Failure::Transient);
+            return Err(Failure::Unknown);
         }
-        let text = CString::new(text).map_err(|_| Failure::Transient)?;
+        let text = CString::new(text).map_err(|_| Failure::Unknown)?;
         // SAFETY: the environment is valid, no exception is pending, and the string ends in NUL.
         let string = unsafe { (self.table().NewStringUTF)(self.env, text.as_ptr()) };
         let thrown = self.thrown();
         if string.is_null() || thrown {
-            Err(Failure::Transient)
+            Err(Failure::Unknown)
         } else {
             Ok(string)
         }
@@ -290,13 +290,13 @@ impl JniKeystore<'_> {
     /// A new Java array of `length` zero bytes.
     #[allow(unsafe_code)]
     fn array(&self, length: usize) -> Result<jbyteArray, Failure> {
-        let length = jsize::try_from(length).map_err(|_| Failure::Transient)?;
+        let length = jsize::try_from(length).map_err(|_| Failure::Unknown)?;
         // SAFETY: the environment is valid, no exception is pending, and the length is not
         // negative.
         let array = unsafe { (self.table().NewByteArray)(self.env, length) };
         let thrown = self.thrown();
         if array.is_null() || thrown {
-            Err(Failure::Transient)
+            Err(Failure::Unknown)
         } else {
             Ok(array)
         }
@@ -305,8 +305,8 @@ impl JniKeystore<'_> {
     /// Writes `data` into `array` from `start`.
     #[allow(unsafe_code)]
     fn write(&self, array: jbyteArray, start: usize, data: &[u8]) -> Result<(), Failure> {
-        let start = jsize::try_from(start).map_err(|_| Failure::Transient)?;
-        let length = jsize::try_from(data.len()).map_err(|_| Failure::Transient)?;
+        let start = jsize::try_from(start).map_err(|_| Failure::Unknown)?;
+        let length = jsize::try_from(data.len()).map_err(|_| Failure::Unknown)?;
         // SAFETY: the environment is valid and no exception is pending; `data` is valid for reads
         // of `length` bytes, and a byte and a jbyte have one layout. A range past the end of the
         // array throws instead of writing.
@@ -320,7 +320,7 @@ impl JniKeystore<'_> {
             );
         }
         if self.thrown() {
-            Err(Failure::Transient)
+            Err(Failure::Unknown)
         } else {
             Ok(())
         }
@@ -332,7 +332,7 @@ impl JniKeystore<'_> {
         // SAFETY: the environment is valid, no exception is pending, and `array` is an array.
         let length = unsafe { (self.table().GetArrayLength)(self.env, array) };
         if self.thrown() || usize::try_from(length) != Ok(MAC_LEN) {
-            return Err(Failure::Transient);
+            return Err(Failure::Unknown);
         }
         let mut copy = [0; MAC_LEN];
         // SAFETY: the environment is valid, no exception is pending, the array holds `MAC_LEN`
@@ -347,7 +347,7 @@ impl JniKeystore<'_> {
             );
         }
         let read = if self.thrown() {
-            Err(Failure::Transient)
+            Err(Failure::Unknown)
         } else {
             out.copy_from_slice(&copy);
             Ok(())
@@ -448,7 +448,7 @@ impl Keystore for JniKeystore<'_> {
             let prefix = this.string(prefix)?;
             // SAFETY: `aliases` takes a String and returns one, or null when the keystore throws.
             let listed = unsafe { this.call_object(method, &[jvalue { l: prefix }])? };
-            let text = this.text(listed).ok_or(Failure::Transient)?;
+            let text = this.text(listed).ok_or(Failure::Unknown)?;
             Ok(text
                 .split('\n')
                 .filter(|name| !name.is_empty())
