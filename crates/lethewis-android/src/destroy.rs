@@ -152,10 +152,8 @@ fn remove_files(dir: &Path) -> io::Result<()> {
             .and_then(|name| name.to_str())
             .is_some_and(is_profile_file)
         {
-            match fs::remove_file(&path) {
-                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-                _ => {}
-            }
+            // A file that stays makes the removal of `dir` below fail.
+            let _ = fs::remove_file(&path);
         }
     }
     fs::remove_dir(dir)
@@ -206,7 +204,7 @@ mod tests {
         let mut stand = Stand::new();
         let profile = Profile::create(&root, &mut stand, false).unwrap();
         let id = profile.id();
-        stand.refuse_delete = Some(Failure::Transient);
+        stand.refuse_delete = Some((0, Failure::Transient));
         let destroyed = profile.destroy(&mut stand);
         assert_eq!(destroyed, Err(Error::Keystore(Failure::Transient)));
         assert!(root.join(id.to_string()).join(DESTROYED).exists());
@@ -225,7 +223,7 @@ mod tests {
         let root = dir("cut");
         let mut stand = Stand {
             refuse_mac: Some((2, Failure::Locked)),
-            refuse_delete: Some(Failure::Transient),
+            refuse_delete: Some((0, Failure::Transient)),
             ..Stand::new()
         };
         let created = Profile::create(&root, &mut stand, false);
@@ -311,11 +309,12 @@ mod tests {
         let home = root.join(id.to_string());
         fs::remove_file(home.join(RECORD)).unwrap();
         fs::create_dir(home.join("kept")).unwrap();
+        fs::write(home.join("notes"), b"").unwrap();
         assert_eq!(sweep(&root, &mut stand), Ok(Some(Erasure::NotErased)));
         assert_eq!(stand.names(), [] as [&str; 0]);
         let gone = format!("{id}.gone");
         assert_eq!(entries(&root), [gone.as_str()]);
-        assert_eq!(entries(&root.join(gone)), ["kept"]);
+        assert_eq!(entries(&root.join(gone)), ["kept", "notes"]);
     }
 
     #[test]

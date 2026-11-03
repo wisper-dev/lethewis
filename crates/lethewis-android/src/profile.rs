@@ -235,7 +235,7 @@ impl Profile {
             }),
             Err(error) => {
                 // Without its record, or with the mark, the directory is left for a sweep.
-                let unrecorded = match fs::remove_file(dir.join(RECORD)) {
+                let unrecorded = match remove_record(&dir) {
                     Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
                     _ => sync_dir(&dir),
                 };
@@ -585,9 +585,6 @@ pub(crate) fn read_file(path: &Path, out: &mut [u8]) -> io::Result<usize> {
             0 => break,
             count => read = read.saturating_add(count),
         }
-        if read == out.len() {
-            break;
-        }
     }
     Ok(read)
 }
@@ -611,6 +608,13 @@ pub(crate) fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), epo
         return Err(epoch::Written::Before(error.kind()));
     }
     sync_dir(dir).map_err(|error| epoch::Written::After(error.kind()))
+}
+
+/// Removes the record of a profile whose creation failed.
+fn remove_record(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    crate::stand::removal_failure()?;
+    fs::remove_file(dir.join(RECORD))
 }
 
 pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -637,7 +641,7 @@ mod tests {
         DESTROYED, Error, Failure, Id, LOCK, Level, MAGIC, Profile, RECORD, RECORD_LEN, Record,
     };
     use crate::epoch::{CURRENT, root_alias};
-    use crate::stand::{Stand, dir, entries, fail_syncs, hmac};
+    use crate::stand::{Stand, dir, entries, fail_removal, fail_syncs, hmac};
 
     fn alias(profile: &Profile) -> String {
         format!("lethewis/{}/chip", profile.id())
@@ -788,7 +792,7 @@ mod tests {
         let root = dir("left");
         let mut stand = Stand {
             refuse_mac: Some((0, Failure::Locked)),
-            refuse_delete: Some(Failure::Transient),
+            refuse_delete: Some((0, Failure::Transient)),
             ..Stand::new()
         };
         let created = Profile::create(&root, &mut stand, false);
@@ -1112,7 +1116,7 @@ mod tests {
     fn a_creation_that_fails_after_its_record_leaves_it_to_the_sweep() {
         let root = dir("after-record");
         let mut stand = Stand {
-            refuse_delete: Some(Failure::Transient),
+            refuse_delete: Some((0, Failure::Transient)),
             ..Stand::new()
         };
         // Syncs of the root, of the root of epoch 0 and of the pointer pass; the record's fails.
@@ -1135,10 +1139,41 @@ mod tests {
     }
 
     #[test]
+    fn a_creation_that_fails_with_one_key_left_leaves_its_directory() {
+        let root = dir("key-left");
+        // The chip's key is deleted, the root's is not.
+        let mut stand = Stand {
+            refuse_delete: Some((1, Failure::Transient)),
+            ..Stand::new()
+        };
+        fail_syncs(3, 1);
+        let created = Profile::create(&root, &mut stand, false);
+        assert_eq!(created.unwrap_err(), Error::Io(io::ErrorKind::Other));
+        assert_eq!(stand.names().len(), 1);
+        assert_eq!(entries(&root).len(), 1);
+    }
+
+    #[test]
+    fn a_creation_whose_record_cannot_be_removed_is_marked_destroyed() {
+        let root = dir("unremoved");
+        let mut stand = Stand {
+            refuse_delete: Some((0, Failure::Transient)),
+            ..Stand::new()
+        };
+        fail_syncs(3, 1);
+        fail_removal();
+        let created = Profile::create(&root, &mut stand, false);
+        assert_eq!(created.unwrap_err(), Error::Io(io::ErrorKind::Other));
+        let left = entries(&root);
+        assert!(root.join(&left[0]).join(RECORD).exists());
+        assert!(root.join(&left[0]).join(DESTROYED).exists());
+    }
+
+    #[test]
     fn a_creation_whose_record_is_not_surely_removed_is_marked_destroyed() {
         let root = dir("marked");
         let mut stand = Stand {
-            refuse_delete: Some(Failure::Transient),
+            refuse_delete: Some((0, Failure::Transient)),
             ..Stand::new()
         };
         // The record's sync fails, and so does the sync of its removal.
@@ -1154,6 +1189,16 @@ mod tests {
             Ok(Some(Erasure::NotErased))
         );
         assert_eq!(stand.names(), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn a_failure_to_look_for_a_file_is_no_answer() {
+        let root = dir("look");
+        let file = root.join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(super::exists(&file).ok(), Some(true));
+        assert_eq!(super::exists(&root.join("missing")).ok(), Some(false));
+        assert!(super::exists(&file.join("under")).is_err());
     }
 
     #[test]

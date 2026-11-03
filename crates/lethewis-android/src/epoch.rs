@@ -688,23 +688,30 @@ mod tests {
 
     #[test]
     fn the_first_epoch_opens_with_the_key_of_its_root() {
-        let root = dir("first");
-        let mut stand = Stand::new();
-        let id = created(&root, &mut stand);
-        let mut profile = Profile::open(&root, id).unwrap();
-        let mut key = [0; 32];
-        let current = profile.epoch(&mut stand, &mut key).unwrap();
-        assert_eq!(current.number, 0);
-        assert_eq!(current.level, Level::StrongBox);
-        assert_eq!(current.swept, None);
-        assert_eq!(key, expected(&root, id, 0, &stand));
-        let file = fs::read(home(&root, id).join("root-0")).unwrap();
-        let tag = hmac(
-            &stand.keys[&format!("lethewis/{id}/chip")],
-            &[b"lethewis current ".as_slice(), &id.0, &[0; 8], &file[38..]].concat(),
-        );
-        let pointer = fs::read(home(&root, id).join(CURRENT)).unwrap();
-        assert_eq!(pointer, [b"LWc1".as_slice(), &[0; 8], &tag].concat());
+        // From API 35 the root records that its key works only while the device is unlocked.
+        for api in [34, 35] {
+            let root = dir(&format!("first-{api}"));
+            let mut stand = Stand {
+                api,
+                ..Stand::new()
+            };
+            let id = created(&root, &mut stand);
+            let mut profile = Profile::open(&root, id).unwrap();
+            let mut key = [0; 32];
+            let current = profile.epoch(&mut stand, &mut key).unwrap();
+            assert_eq!(current.number, 0);
+            assert_eq!(current.level, Level::StrongBox);
+            assert_eq!(current.swept, None);
+            assert_eq!(key, expected(&root, id, 0, &stand));
+            let file = fs::read(home(&root, id).join("root-0")).unwrap();
+            assert_eq!(file[5], u8::from(api >= 35));
+            let tag = hmac(
+                &stand.keys[&format!("lethewis/{id}/chip")],
+                &[b"lethewis current ".as_slice(), &id.0, &[0; 8], &file[38..]].concat(),
+            );
+            let pointer = fs::read(home(&root, id).join(CURRENT)).unwrap();
+            assert_eq!(pointer, [b"LWc1".as_slice(), &[0; 8], &tag].concat());
+        }
     }
 
     #[test]
@@ -803,7 +810,7 @@ mod tests {
         let (mut profile, _) = opened(&root, id, &mut stand);
         profile.next_epoch(&mut stand, false, &mut [0; 32]).unwrap();
         profile.roots(&mut stand).switch(1).unwrap();
-        stand.refuse_delete = Some(Failure::Transient);
+        stand.refuse_delete = Some((0, Failure::Transient));
         assert_eq!(profile.roots(&mut stand).erase(0), Erasure::NotErased);
         stand.refuse_delete = None;
         let next = profile.next_epoch(&mut stand, false, &mut [0; 32]).unwrap();
@@ -1061,10 +1068,13 @@ mod tests {
         };
         let pointer = fs::read(home.join(CURRENT)).unwrap();
         let first = fs::read(home.join("root-0")).unwrap();
-        // The number, the tag of the pointer; the level, a random byte and the tag of the root.
+        // The mark, the number and the tag of the pointer; the mark, the level, a random byte and
+        // the tag of the root.
         for (file, at) in [
+            (CURRENT, 0),
             (CURRENT, 4),
             (CURRENT, 43),
+            ("root-0", 0),
             ("root-0", 4),
             ("root-0", 6),
             ("root-0", 69),
@@ -1073,6 +1083,14 @@ mod tests {
             bytes[at] ^= 1;
             fs::write(home.join(file), &bytes).unwrap();
             assert_eq!(read(&mut stand), Err(Error::Damaged), "{file} {at}");
+            fs::write(home.join(CURRENT), &pointer).unwrap();
+            fs::write(home.join("root-0"), &first).unwrap();
+        }
+        for file in [CURRENT, "root-0"] {
+            let mut bytes = fs::read(home.join(file)).unwrap();
+            bytes.push(0);
+            fs::write(home.join(file), &bytes).unwrap();
+            assert_eq!(read(&mut stand), Err(Error::Damaged), "{file} longer");
             fs::write(home.join(CURRENT), &pointer).unwrap();
             fs::write(home.join("root-0"), &first).unwrap();
         }
@@ -1132,7 +1150,7 @@ mod tests {
         let id = created(&root, &mut stand);
         let (mut profile, _) = opened(&root, id, &mut stand);
         stand.keys.insert(root_alias(id, 1), [9; 32]);
-        stand.refuse_delete = Some(Failure::Transient);
+        stand.refuse_delete = Some((0, Failure::Transient));
         let next = profile.next_epoch(&mut stand, false, &mut [0; 32]);
         assert_eq!(next.unwrap_err(), Error::Keystore(Failure::Transient));
         assert_eq!(stand.keys[&root_alias(id, 1)], [9; 32]);
@@ -1178,7 +1196,7 @@ mod tests {
         let id = created(&root, &mut stand);
         let (mut profile, _) = opened(&root, id, &mut stand);
         profile.next_epoch(&mut stand, false, &mut [0; 32]).unwrap();
-        stand.refuse_delete = Some(Failure::Transient);
+        stand.refuse_delete = Some((0, Failure::Transient));
         assert_eq!(profile.roots(&mut stand).erase(1), Erasure::NotErased);
         assert!(stand.keys.contains_key(&root_alias(id, 1)));
         assert!(home(&root, id).join("root-1").exists());

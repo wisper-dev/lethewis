@@ -28,7 +28,8 @@ pub(crate) struct Stand {
     /// The number of answers given before the keystore refuses, and how.
     pub(crate) refuse_mac: Option<(usize, Failure)>,
     pub(crate) macs: usize,
-    pub(crate) refuse_delete: Option<Failure>,
+    /// The number of keys deleted before the keystore refuses, and how.
+    pub(crate) refuse_delete: Option<(usize, Failure)>,
     pub(crate) refuse_aliases: Option<Failure>,
     pub(crate) generated: Vec<(bool, bool)>,
     pub(crate) deleted: Vec<String>,
@@ -123,7 +124,9 @@ impl Keystore for Stand {
     }
 
     fn delete(&mut self, alias: &str) -> Result<(), Failure> {
-        if let Some(failure) = self.refuse_delete {
+        if let Some((after, failure)) = self.refuse_delete
+            && self.deleted.len() >= after
+        {
             return Err(failure);
         }
         self.deleted.push(alias.to_owned());
@@ -194,6 +197,25 @@ pub(crate) fn sync_failure() -> io::Result<()> {
             SYNCS.set((passing.saturating_sub(1), failing));
             Ok(())
         }
+    }
+}
+
+thread_local! {
+    /// Whether the next removal of a record on this thread fails.
+    static REMOVAL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the next removal of a record on this thread fail.
+pub(crate) fn fail_removal() {
+    REMOVAL.set(true);
+}
+
+/// The failure [`fail_removal`] asked for, once.
+pub(crate) fn removal_failure() -> io::Result<()> {
+    if REMOVAL.replace(false) {
+        Err(io::Error::other("a removal made to fail"))
+    } else {
+        Ok(())
     }
 }
 
