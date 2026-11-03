@@ -575,6 +575,8 @@ jobs:
             sudo tee /etc/udev/rules.d/99-kvm.rules >/dev/null
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle --timeout=60
+          ls -l /dev/kvm
           test -w /dev/kvm
 
       - name: Install the pinned toolchain with the Android targets
