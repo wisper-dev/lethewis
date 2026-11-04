@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# The native methods of the tests, bound to their symbols in lethewis-jni by name.
+-keep class com.alanwisper.lethewis.test.Tests {
+    native <methods>;
+}

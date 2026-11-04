@@ -40,11 +40,23 @@ unused-allowed-license = "allow"
 # Our own crates are AGPL and are listed by name: adding AGPL to the allow list above would also
 # admit someone else's AGPL dependency, which must stay refused.
 [[licenses.exceptions]]
+name = "lethewis-android"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
 name = "lethewis-core"
 allow = ["AGPL-3.0-only"]
 
 [[licenses.exceptions]]
 name = "lethewis-dit"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "lethewis-jni"
+allow = ["AGPL-3.0-only"]
+
+[[licenses.exceptions]]
+name = "lethewis-locked"
 allow = ["AGPL-3.0-only"]
 
 [[licenses.exceptions]]

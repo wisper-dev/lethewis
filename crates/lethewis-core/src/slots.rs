@@ -1729,7 +1729,8 @@ impl<'a> Slots<'a> {
 
     /// Abandons the epoch change: wipes the next key, and `root` erases its root so its records
     /// open no more. Returns how surely that root is gone; a set changed in this epoch stays
-    /// unsaved.
+    /// unsaved. After [`Error::RootFailed`], keep the next epoch's records while `root` cannot tell
+    /// which epoch is current.
     ///
     /// # Errors
     ///
@@ -1755,7 +1756,8 @@ impl<'a> Slots<'a> {
     /// # Errors
     ///
     /// Fails with [`Error::NoEpochChange`], [`Error::Unsaved`] or [`Error::RootFailed`], and then
-    /// changes nothing.
+    /// changes nothing. After [`Error::RootFailed`], keep the records of both epochs while `root`
+    /// cannot tell which is current.
     pub fn commit_epoch(&mut self, root: &mut (impl Root + ?Sized)) -> Result<Erasure, Error> {
         if !self.epoch.changing {
             return Err(Error::NoEpochChange);

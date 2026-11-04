@@ -240,8 +240,8 @@ impl<'a> Slots<'a> {
         self.export_chunk_on_stack(exporting, chunk, false, tags, open_with, seal_with)
     }
 
-    /// Reseals `chunk`, the last chunk of `exporting`, as [`Slots::export_chunk`] does, and ends the
-    /// block. The export goes on after it.
+    /// Reseals `chunk`, the last chunk of `exporting`, as [`Slots::export_chunk`] does, and ends
+    /// the block. The export goes on after it.
     ///
     /// Needs 25 KiB of stack, or 72 KiB when unoptimised, and wipes 24 KiB, or 64 KiB, below
     /// itself.
@@ -1501,7 +1501,7 @@ mod tests {
                     assert_eq!(
                         refused,
                         Some(Error::RecordRejected),
-                        "round {round}, byte {byte}"
+                        "round {round} of seed {seed}, byte {byte}"
                     );
                 }
                 match block {
@@ -1523,7 +1523,7 @@ mod tests {
                 assert_eq!(
                     open_block(&to, new.unwrap(), context, &local).unwrap(),
                     *data,
-                    "round {round}"
+                    "round {round} of seed {seed}"
                 );
             }
         }

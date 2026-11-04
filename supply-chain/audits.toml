@@ -1150,6 +1150,45 @@ Unsafe code, each use sound as read unless stated otherwise:
 - reserved.rs:176, 195, 246: behind block-padding, off here.
 """
 
+[[audits.jni-sys]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.4.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md, CHANGELOG.md, src/lib.rs. The archive matches
+the repository at the commit in .cargo_vcs_info.json apart from the files cargo generates.
+
+No build script (build = false), no features. no_std; the declarations of jni.h and nothing
+else. No access to the system, files, network or environment. The extern block of
+JNI_CreateJavaVM and its kin declares symbols without linking them; nothing here calls them.
+
+The 233 entries of JNINativeInterface_ before GetModule are those of jni.h of NDK r30, in its
+order, and the 8 of JNIInvokeInterface_ too. GetModule, IsVirtualThread and
+GetStringUTFLengthAsLong follow, from JNI 9, 19 and 24; Android's JVM has no such entries, and a
+call through them would read past its table.
+
+jboolean is bool, not u8: a byte other than 0 or 1 from the JVM would be undefined behaviour.
+ART returns JNI_TRUE and JNI_FALSE only.
+
+Unsafe code only in the Debug of jvalue (lib.rs:61-87), which reads every field of the union,
+bytes never written included: undefined behaviour for a jvalue made from a narrower field. Not
+reached here: nothing formats a jvalue.
+"""
+
+[[audits.jni-sys-macros]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "read-in-full"
+version = "0.4.1"
+notes = """
+Files read: Cargo.toml, Cargo.toml.orig, README.md, src/lib.rs. The archive matches the
+repository at the commit in .cargo_vcs_info.json apart from the files cargo generates.
+
+No build script (build = false). One procedural macro, jni_to_union: it turns a struct of fields
+marked with the JNI version that added them into one struct per version, later fields as
+padding, and a union of them. It reads only the tokens it is given: no access to the system,
+files, network or environment, no unsafe code.
+"""
+
 [[audits.keccak]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -1223,6 +1262,30 @@ Unsafe code read: types.rs:123, from_raw_parts over a u8 slice as c_char of the 
 sound. No Rust function body of libc runs on these paths, only the extern functions above. At
 run time the SHA-256 path calls getauxval(AT_HWCAP) on first use on aarch64 Linux and Android,
 and no libc function on Apple targets. No libc code here handles secrets.
+
+lethewis-locked depends on libc here too, on Linux and Android. It maps private anonymous memory,
+advises it out of core dumps and forks, locks it and unmaps it; its tests also call setrlimit and
+close.
+Definitions used, checked against the kernel's uapi values and the bionic and glibc prototypes:
+- mlock(*const c_void, size_t) -> c_int, mmap(*mut c_void, size_t, c_int, c_int, c_int, off_t)
+  -> *mut c_void, munmap(*mut c_void, size_t) -> c_int, close(c_int) -> c_int:
+  unix/mod.rs:1295, 1305-1312, 1317, 1153. Their link names are for macOS and for
+  gnu_file_offset_bits64, a 32-bit setting, only.
+- madvise(*mut c_void, size_t, c_int) -> c_int: unix/linux_like/linux_l4re_shared.rs:1748,
+  unix/linux_like/android/mod.rs:3562.
+- setrlimit(resource, *const rlimit) -> c_int: unix/linux_like/linux/gnu/mod.rs:945,
+  unix/linux_like/android/mod.rs:3544; rlimit of two rlim_t, unix/mod.rs:98-101; rlim_t is u64,
+  unix/linux_like/linux/gnu/b64/mod.rs:13, and c_ulong, unix/linux_like/android/mod.rs:36.
+- PROT_READ 1, PROT_WRITE 2, MAP_PRIVATE 0x2, MAP_FAILED !0, MADV_DONTFORK 10, MADV_DONTDUMP 16:
+  unix/linux_like/mod.rs:495-496, 550, 553, 606, 612.
+- MAP_ANONYMOUS 0x20: unix/linux_like/linux/gnu/b64/x86_64/mod.rs:455,
+  unix/linux_like/linux/gnu/b64/aarch64/mod.rs:364, unix/linux_like/android/mod.rs:1025.
+- RLIMIT_MEMLOCK 8: unix/linux_like/linux/arch/generic/mod.rs:137,
+  unix/linux_like/android/mod.rs:1305.
+- EPERM 1, EBADF 9, ENOMEM 12: unix/linux_like/linux_l4re_shared.rs:1362, 1370, 1373,
+  unix/linux_like/android/mod.rs:2730, 2738, 2741.
+These are plain extern "C" items and constants; no Rust function body of libc runs. The keys lie
+in the pages, which libc only maps, locks and frees.
 
 Review again by 2027-04-01 or at the next version, whichever comes first.
 """

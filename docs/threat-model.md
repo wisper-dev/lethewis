@@ -57,25 +57,72 @@ password against a lock record needs that epoch's key too.
 A key from a password can be combined with the chip's answer to a challenge derived from it: the key
 the two make needs both, so each guess at the password needs the chip of the device.
 
+On Android, `lethewis-android` gives that answer from an HMAC key in the device's keystore. The key
+is in the secure element where the system offers one, in the isolated part of the processor
+otherwise.
+
+Software holds it only with the caller's consent. The level reached is recorded under the chip's
+key: a change to it or to the unlocking is found.
+
+A check written at creation tells a replaced key from a wrong password.
+
+A profile is created and opened only where it lies under a directory named `no_backup`, as
+`Context.getNoBackupFilesDir()` is. No backup of the system takes that one: not to the cloud, to
+another device or over adb.
+
+A key reads as lost only on the system's word. Below API 31, where that word is unclear, the
+keystore must first show it works.
+
+Each epoch on Android has a root of its own: a key in the keystore and random bytes beside it. The
+core derives the epoch's key from both, so neither alone gives it.
+
+A change of epoch moves a pointer in one step, then deletes the old root. What an unfinished change
+left is erased only after the synced pointer and its root read strictly.
+
 A backup is an export under a key for transfers derived from the twelve words with a label of its
 own, so not the way in from the same words. It opens with the words alone, on any device and in any
 epoch: a guess at it is a guess at 128 bits. No backup is made under a password.
 
 #### Intended
 
-A platform layer that tunes the parameters to seconds on the target device and puts the challenge
-to the chip. After destruction, no call returns the key.
+A platform layer that tunes the parameters to seconds on the target device. After destruction, no
+call returns the key.
 
 #### Not defended
 
 A device unlocked once since boot holds keys in memory, lock screen or not.
 
-Many Android devices lack a dedicated secure element, so the password can be attacked off the
-device. A short secret then falls quickly on fast hardware.
+A chip's key only software holds leaves the device with a copy of the flash. Guesses at the password
+then run off the device, and a short secret falls quickly on fast hardware.
 
-How many such devices there are is our estimate; the library is meant to record the level reached.
+How many devices lack secure hardware is our estimate; the library records the level reached.
 
 A challenge read on its way to the chip lets guesses at the password run without the chip.
+
+Code running as the app or as root on the device asks the chip as the library does. Each guess then
+costs it only an answer of the chip.
+
+A chip's key made below Android 15 also answers while the device is locked, after an update too.
+
+On Android every challenge to the chip and its answer pass through the Java heap and the keystore's
+process. Their copies there are beyond wiping.
+
+Below API 33 the system names few failures: a damaged key then reads as unknown, not lost.
+
+From API 31 a key whose stored details lost their algorithm reads as lost: the system reports it
+alike.
+
+A deleted root's key is erased by best effort: no keystore confirms that its copy is overwritten.
+The root's file is only unlinked, and its bytes may stay on the flash.
+
+Apps cannot ask for keys that resist a rollback, so a copy of the keystore's files may open it
+again. Until the old root is deleted, its pointer put back returns the old epoch.
+
+Only the name is checked: a directory named `no_backup` elsewhere, such as among the files the
+system backs up, passes.
+
+An app's own backup agent, or a maker's transfer tool that does not follow the platform, may copy a
+profile. Without the device's keystore the copy opens nothing.
 
 ### 2. Someone who compels the password
 
@@ -188,6 +235,9 @@ Another application, possibly with elevated privileges.
 
 Keys are held only in fixed-size slots whose memory the caller provides, each a set of up to three
 keys.
+
+On Linux and Android a caller can hold that memory and the epoch in `lethewis-locked`. Its pages
+are locked in RAM, kept out of core dumps and forked processes, and wiped when dropped.
 
 A key is held in one place only, whatever its purpose. Loading a key the slots already hold, or a
 set holding one key twice, is refused.
@@ -386,8 +436,23 @@ Drop keys from memory when the device locks.
 
 #### Not defended
 
-Copies left by a value move, a buffer reallocation, a CPU register, swap or a crash dump. A set of
-slots leaked instead of dropped keeps its keys in memory.
+Copies left by a value move, a buffer reallocation or a CPU register. A set of slots leaked instead
+of dropped keeps its keys in memory.
+
+Memory outside `lethewis-locked`, and any memory off Linux and Android, may go to swap or a core
+dump. On Android swap may be written to flash, and hibernation on Linux writes locked pages too.
+
+Only the bytes of a value are locked, not what it points to. A process killed, aborted or ended
+gives its pages back unwiped.
+
+An Android app's process locks 64 KiB in all, counted in whole pages: four values where pages are
+16 KiB. Beyond that `lethewis-locked` refuses, and the caller decides what holds the keys.
+
+A native crash on Android, of any library in the process, leaves a trace the system keeps. It holds
+256 bytes near each register of the crashing thread, which may point at a key.
+
+Below API 31 it holds words of that thread's stack too. From API 31 the app reads its own trace, and
+a crash reporter in it may send it away.
 
 A system component with elevated privileges is beyond what process isolation provides.
 

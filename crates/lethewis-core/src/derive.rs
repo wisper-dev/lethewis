@@ -49,6 +49,7 @@ const FROM_SHARES: &[u8; 11] = b"from shares";
 const SHARE_CHECK: &[u8; 11] = b"share check";
 const HEDGE_TIME_LOCK: &[u8; 15] = b"hedge time lock";
 const FROM_TIME_LOCK: &[u8; 14] = b"from time lock";
+const EPOCH_ROOT: &[u8; 10] = b"epoch root";
 const COUNT_LEN: usize = 8;
 /// How many bytes twelve words, or two shares, stand for, or a time lock holds.
 pub(crate) const SECRET_LEN: usize = 16;
@@ -122,6 +123,9 @@ pub(crate) enum Branch {
         expect(dead_code, reason = "only the time lock derives under it")
     )]
     FromTimeLock,
+    /// The key of an epoch from its root on a device: stored bytes, and the chip's answer as the
+    /// salt.
+    EpochRoot,
 }
 
 #[cfg(test)]
@@ -149,7 +153,8 @@ pub(crate) const fn purpose_of(branch: Branch) -> Option<Purpose> {
         | Branch::HedgeShares
         | Branch::HedgeTimeLock
         | Branch::ShareCheck
-        | Branch::Challenge => None,
+        | Branch::Challenge
+        | Branch::EpochRoot => None,
     }
 }
 
@@ -269,6 +274,14 @@ pub(crate) fn derive_combined(
 
 pub(crate) fn derive_challenge(key: &Key, out: &mut [u8; 32]) -> Result<(), DerivationFailed> {
     derive(key, SALT, None, Branch::Challenge, out)
+}
+
+pub(crate) fn derive_epoch_root(
+    stored: &Key,
+    answer: &[u8; 32],
+    out: &mut [u8; 32],
+) -> Result<(), DerivationFailed> {
+    derive(stored, answer, None, Branch::EpochRoot, out)
 }
 
 pub(crate) fn derive_export_key(
@@ -860,7 +873,8 @@ pub(crate) mod stack {
             | Branch::DataCheck
             | Branch::DataChunk
             | Branch::CarryCheck
-            | Branch::CarryChunk => 32,
+            | Branch::CarryChunk
+            | Branch::EpochRoot => 32,
         };
         let length = u8::try_from(key.len()).unwrap();
         let (label, used) = label(purpose, length, branch, out_len).unwrap();
@@ -888,7 +902,8 @@ pub(crate) mod stack {
             .finalize();
 
         let mut secrets = std::vec![key.to_vec(), output[1..].to_vec()];
-        // An epoch key salts a wrap key and a hedge, and a key salts a combined key too.
+        // An epoch key salts a wrap key and a hedge, a key salts a combined key, and the chip's
+        // answer an epoch key.
         if matches!(
             branch,
             Branch::WrapKey
@@ -896,6 +911,7 @@ pub(crate) mod stack {
                 | Branch::HedgeWords
                 | Branch::HedgeNonce
                 | Branch::Combined
+                | Branch::EpochRoot
         ) {
             secrets.extend(salt_secrets(salt));
         }
@@ -1432,6 +1448,7 @@ fn label(
         Branch::ShareCheck => joined(head, SHARE_CHECK),
         Branch::HedgeTimeLock => joined(head, HEDGE_TIME_LOCK),
         Branch::FromTimeLock => joined(head, FROM_TIME_LOCK),
+        Branch::EpochRoot => joined(head, EPOCH_ROOT),
     }
 }
 
@@ -1464,8 +1481,8 @@ mod tests {
     use super::{
         ARCHIVE_BATCH, ARCHIVE_CHECK, ARCHIVE_ENCAPS, ARCHIVE_KEY, ARCHIVE_LAYER, ARCHIVE_SEAL,
         ARCHIVE_SEED, Branch, CARRY_CHECK, CARRY_CHUNK, CHALLENGE, COMBINED, DATA_CHECK,
-        DATA_CHUNK, DerivationFailed, EPOCH_LAYER, EXPORT_KEY, FROM_SHARES, FROM_TIME_LOCK,
-        FROM_WORDS, HEDGE_ENCAPS, HEDGE_KEY, HEDGE_NONCE, HEDGE_SALT, HEDGE_SHARES,
+        DATA_CHUNK, DerivationFailed, EPOCH_LAYER, EPOCH_ROOT, EXPORT_KEY, FROM_SHARES,
+        FROM_TIME_LOCK, FROM_WORDS, HEDGE_ENCAPS, HEDGE_KEY, HEDGE_NONCE, HEDGE_SALT, HEDGE_SHARES,
         HEDGE_TIME_LOCK, HEDGE_WORDS, Hedged, KEY_ID, KeyId, LOCK_KEY, SALT, SHARE_CHECK, WRAP_KEY,
         derive, derive_from_secret, derive_key_id, hedge, label, purpose_of,
     };
@@ -1878,6 +1895,7 @@ mod tests {
             Branch::ShareCheck,
             Branch::HedgeTimeLock,
             Branch::FromTimeLock,
+            Branch::EpochRoot,
         ] {
             let (_, used) = label(purpose_of(branch), 64, branch, 32).unwrap();
             let name = match branch {
@@ -1910,6 +1928,7 @@ mod tests {
                 Branch::ShareCheck => SHARE_CHECK.len(),
                 Branch::HedgeTimeLock => HEDGE_TIME_LOCK.len(),
                 Branch::FromTimeLock => FROM_TIME_LOCK.len(),
+                Branch::EpochRoot => EPOCH_ROOT.len(),
             };
             assert_eq!(used, 14 + name);
         }
@@ -2212,6 +2231,7 @@ pub(crate) mod proofs {
             25 => Branch::FromShares,
             26 => Branch::HedgeTimeLock,
             27 => Branch::FromTimeLock,
+            28 => Branch::EpochRoot,
             _ => Branch::ShareCheck,
         }
     }

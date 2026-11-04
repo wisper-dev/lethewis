@@ -337,5 +337,47 @@ Nothing is published while the version is below 0.1.0.
 - Kani 0.68.0 proves that a time lock is written exactly when its key loads. A key comes from a
   lock only as it opens; its round is the first at its time or later.
 - Tests take a profile through a lock and its opening.
+- Crate `lethewis-android`, the platform on Android. `Profile::create` makes a profile in a
+  directory of profiles alone, with an HMAC-SHA256 key in the keystore.
+- A profile is made and opened only under a directory named `no_backup`, as
+  `Context.getNoBackupFilesDir()` is; elsewhere `Error::BackedUp`.
+- The key goes into the secure element where the system offers one for it, which Android 9 does
+  not. A key only software would hold needs the caller's consent; `Level` names where a key is.
+- `Profile::open` never creates a profile. An open profile is locked: a second opening is
+  `Error::Busy`, in any process.
+- `Profile::answer` answers the core's challenge with the key, after `Profile::verify`. A replaced
+  key is `Error::ChipChanged`, never a wrong password; a changed level or unlocking is
+  `Error::Damaged`.
+- From API level 35 the key works only while the device is unlocked. `Keystore` reaches the
+  keystore, and `Failure` names why it refused.
+- A key is `Failure::Absent` only on the system's word; below API 31 a key made and deleted confirms
+  the keystore works. `Failure::Unknown` is a failure without a reason, of the keystore or the
+  bridge.
+- Each epoch of a profile has a root: a key in the keystore and random bytes beside it.
+  `Profile::epoch` reads the current one, `Profile::next_epoch` makes the next.
+- `Profile::roots` is the keeper the core commits a change of epoch through. A pointer moves in one
+  step, and the old root is erased by best effort.
+- A switch whose outcome is unknown sets `Profile::unsettled`: keep the records of both epochs
+  until `Profile::epoch` reads which is current. Then commit the change again if it is the next, or
+  abandon it.
+- What an unfinished change left is erased by a synced pointer, on reading the epoch or changing
+  it.
+- `Profile::destroy` marks a profile, then deletes its keys and files; `sweep` finishes what a
+  destruction or a creation left. A creation waits for a sweep under way.
+- `epoch_key` in the core derives the key of an epoch from a root on a device.
+- Crate `lethewis-jni`: `JniKeystore` implements `Keystore` through JNI, on the thread of the call.
+  Its other half is `com.alanwisper.lethewis.Keystore`.
+- `android/`: that Java layer, built without Gradle, and `proguard.txt` for apps that shrink
+  with R8.
+- Dependency of `lethewis-jni`: `jni-sys` 0.4.1 or a later compatible version, read in full.
+- Tests on emulators of Android 9 and of Android 17 with pages of 16 KiB. The Rust tests run there,
+  and the tests on a device run under CheckJNI.
+- Tests on the emulators stop the keystore service under a running process and between runs.
+- The tests on a device go through the Java layer shrunk by R8, and on a locked device too. The
+  shared library of `lethewis-jni` is aligned to 16 KiB for both targets.
+- Crate `lethewis-locked`, on Linux and Android: `Locked` holds a value in pages locked in RAM, out
+  of core dumps and forks. It wipes them when dropped; a refusal of the system is an `Error`.
+- Dependency of `lethewis-locked`: `libc` 0.2.190 or a later compatible version, without default
+  features, on Linux and Android.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

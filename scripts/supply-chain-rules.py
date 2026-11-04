@@ -27,7 +27,7 @@ DEPENDENCY_CRITERIA = {LOWERED, OWN_CRITERION}
 TESTS_ONLY = "safe-to-run"
 MEMBER_PREFIX = "lethewis-"
 TOOLCHAIN_KEYS = {"channel", "components", "targets", "profile"}
-UNSAFE_CRATE = "lethewis-dit"
+UNSAFE_CRATES = {"lethewis-dit", "lethewis-jni", "lethewis-locked"}
 UNSAFE_LINTS = {
     "rust": {"unsafe_code": "deny", "unsafe_op_in_unsafe_fn": "deny"},
     "clippy": {"multiple_unsafe_ops_per_block": "deny"},
@@ -37,9 +37,9 @@ UNSAFE_LINTS = {
 ALWAYS_READ_IN_FULL = {
     "aead", "aes", "aes-gcm-siv", "argon2", "blake2", "block-buffer", "blst", "cc", "chacha20",
     "chacha20poly1305", "cipher", "cmov", "ctr", "ctutils", "curve25519-dalek", "digest",
-    "find-msvc-tools", "hkdf", "hmac", "hybrid-array", "inout", "keccak", "ml-kem",
-    "module-lattice", "poly1305", "polyval", "sha2", "sha3", "shake", "shlex", "sponge-cursor",
-    "subtle", "universal-hash", "x25519-dalek", "zeroize", "zeroize_derive",
+    "find-msvc-tools", "hkdf", "hmac", "hybrid-array", "inout", "jni-sys", "jni-sys-macros",
+    "keccak", "ml-kem", "module-lattice", "poly1305", "polyval", "sha2", "sha3", "shake", "shlex",
+    "sponge-cursor", "subtle", "universal-hash", "x25519-dalek", "zeroize", "zeroize_derive",
 }
 
 
@@ -220,7 +220,7 @@ def git(*args: str, cwd: Path | None = None) -> str:
 
 
 def member_lints(root: Path, workspace: dict) -> list[str]:
-    """Every member of the workspace inherits its lints, but the one allowed unsafe code."""
+    """Every member of the workspace inherits its lints, but the ones allowed unsafe code."""
     problems = []
     shared = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["lints"]
     unsafe_lints = {group: {**lints, **UNSAFE_LINTS.get(group, {})}
@@ -229,7 +229,7 @@ def member_lints(root: Path, workspace: dict) -> list[str]:
         manifest = Path(package["manifest_path"])
         lints = tomllib.loads(manifest.read_text()).get("lints")
         name = manifest.relative_to(root)
-        if package["name"] == UNSAFE_CRATE:
+        if package["name"] in UNSAFE_CRATES:
             if lints != unsafe_lints:
                 problems.append(f"{name}: lints must be the workspace's, with unsafe code denied"
                                 " rather than forbidden")

@@ -1,9 +1,11 @@
 # lethewis-dit
 
-Data-independent timing on aarch64 for a piece of work: while it runs, the processor takes the same
-time for an instruction whatever data it works on, for the instructions the architecture lists.
+Data-independent timing on aarch64 for a piece of work. While it runs, the processor takes the same
+time for each instruction the architecture lists, whatever data it works on.
+
 Where the processor or the operating system does not report the feature, the work runs as it is.
-The one crate of the workspace with unsafe code.
+
+One of the three crates of the workspace with unsafe code, with lethewis-jni and lethewis-locked.
 
 Licensed under AGPL-3.0-only; the text is in the package. A commercial licence without the AGPL's
 obligations is available: <hi@alanwisper.com>.

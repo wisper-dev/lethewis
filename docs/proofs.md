@@ -27,7 +27,7 @@ All six must hold. A row missing any one of them is not written.
 | No key leak, in the clear | Only a key for external data goes out in the clear, to a call naming its purpose. | `lethewis-core` |
 | No key leak, for people | Words, shares and time locks go out once, when made; a challenge only from a key from a secret. | `lethewis-core` |
 | Two-tier access | the key of an archived batch never leaves the library; its body opens only with its archive key and its chat's key. Against a holder of the chat key, its secrecy rests on the random source when archived. Seeds open only under stored keys of the archive; records move to another chat key without the archive key | `lethewis-core` |
-| No silent substitution | when a key is lost the data either opens or is honestly marked unavailable; a replacement is never created silently | `lethewis-core` |
+| No silent substitution | when a key is lost the data either opens or is marked unavailable; a replacement is never created silently | `lethewis-core`, `lethewis-android` |
 | Handle isolation | a handle reaches only the keys of its own set: never keys loaded later into the same slot, never keys in another set of slots | `lethewis-core` |
 | One key, one place | a set of slots holds a key in one place only, whatever purpose it serves: a load or an addition that would hold it a second time is refused | `lethewis-core` |
 | Hedged randomness | All random values, time locks included, hedge the platform's bytes with the epoch key and a draw count. | `lethewis-core` |
@@ -55,11 +55,17 @@ All six must hold. A row missing any one of them is not written.
 | Time lock, locking | A key is locked to the first round published at its time or later, at most a year ahead. | `lethewis-timelock` |
 | Time lock, opening | A key leaves its lock only with the signature of the round it was locked to, under an intact header. | `lethewis-timelock` |
 | Time lock, the format | A lock is read exactly as written; bytes are read only when they are a lock as written. | `lethewis-timelock` |
+| Profile, the format | A profile's record and identifier are read exactly as written; bytes are read only when written so. | `lethewis-android` |
+| Epoch roots on Android, the format | A pointer, a root and a name's number are read exactly as written, and only bytes so written. | `lethewis-android` |
 | Time lock, keys | A key comes from a time lock only once its round's signature opens it; nothing else derives it again. | `lethewis-core` |
 
-Calls into the operating system are checked by tests and measurements on real devices, not by
-proof. Crates that make them, `lethewis-dit` among them, are in neither table; under Kani,
-`lethewis-dit` only runs its work.
+Calls into the operating system are checked by tests, not by proof. `lethewis-dit` is measured on
+real machines, `lethewis-android` and `lethewis-jni` are tested on emulators, `lethewis-locked` on
+Linux and on emulators.
+
+The crates that make those calls are in neither table, apart from the formats of a profile.
+
+Under Kani, `lethewis-dit` only runs its work, and `lethewis-locked` is empty.
 
 ## Proven
 
@@ -163,6 +169,8 @@ proof. Crates that make them, `lethewis-dit` among them, are in neither table; u
 | Time lock, decimal powers | From under ten times its power, a step leaves under the power. Powers fall tenfold to one. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
 | Time lock, decimal digits | A round is written exactly below 10^19 and read back; nineteen bytes are read exactly when digits. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any round, any nineteen bytes | as in the row above |
 | Time lock, the format | Any lock written is read back as written, for any round, body, MAC, nonce and payload. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any round of nineteen digits, any bytes | bytes of another length, refused unread; whether `tle` and this crate open each other's locks, tested on locks of each |
+| Profile, the format | Any record and identifier written is read back as written; only bytes so written are read. | `lethewis-android` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any level, flag, check, tag and identifier; any bytes up to one past a record | the files themselves; the check and the tag, which only the chip's key gives |
+| Epoch roots on Android, the format | Any pointer, root and number written is read back as written; only bytes so written are read. | `lethewis-android` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | zero stores for the wipe; any number, level, flag, bytes, tag; to one byte past a file, or 21 digits | the files; the real wipe; tags, given only by chip keys; numbers in names, unit-tested |
 | Time lock, only locks read | Any 386 bytes are read only when they are a lock as written. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
 | Time lock, time out of range | A time out of range is refused before any work. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the encryption, MAC and payload cipher answer at will: every answer is covered; which bytes the MAC covers is tested | the pairing, hashes and ChaCha20-Poly1305, tested on files of tlock; the stack wipe and timing, tested |
 | Time lock, locking | In range, the file key is encrypted to the first round published then or later, under the bytes given. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above; SHA-256 of a round stands in as its bytes, one message per round | as in the row above |
@@ -188,6 +196,7 @@ proof. Crates that make them, `lethewis-dit` among them, are in neither table; u
 | Record integrity, the trial | For any parent of its kind's purpose, associated data of up to two bytes and cipher, the parent's key is tried once, under the key derived from it, with the epoch's for a plain record, a branch to each kind. A failed derivation is `DerivationFailed`. The plaintext is kept exactly when the cipher accepts it and names that key. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | The cipher is modelled as in the row on the cipher, and in the trial and the unwrap by a stand-in that writes any bytes, accepts or rejects at will and records the key it was given. Identifiers are compared as plain equality, and unit tests check the real comparison. | unit tests check instead that the handle's key is tried, that nonce, associated data and tag reach the cipher with every changed bit refused, the real path on a million random records, and the stack wipe; the comparison's timing, beyond straight-line machine code on four targets; the revision; more than two slots; register copies |
 | Record integrity, unwrapping | For any two slots, handle, record and context of up to two bytes: an empty context, a stale handle, a parent of another purpose or level and no free slot are refused in order, before decryption. A failure changes no slot; a success only the first free slot and, for a receipt, the chain and direction of its key. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the cipher as above; contexts as in the row on wrapping; unwrapping and receiving are checked in three proofs each, as a load is | as in the row above |
 | Record integrity, admission | For any 233-byte plaintext, the set takes the first free slot exactly when one is, the bytes parse and suit their record, identifiers derive and none is held twice. Plain records hold this epoch's sets of external data, transfers, chats' archives or data; lock records stored keys; exports external data, in epoch zero. Sets without stages hold one unchanged key. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | The offsets, values and lengths are written from the layout, independently of the parser. Whether bytes parse, and the stages they state, are taken from the parser, whose rows prove what it accepts and reads. Admitting is checked in three proofs, as a load is. | as in the row above |
+| No silent substitution, in the core | A record that does not open on unwrapping or receiving changes no slot; no other key takes its place. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the three rows above, whose proofs and deliberate errors it rests on | other loads, in their own rows; the Android layer's making no key after a loss, shown by tests only |
 | Lock records, unlocking | From the same states as unwrapping, an unlock opens the outer layer once, under the key derived from the key of this epoch, and refuses it as `StaleRecord`, decrypting nothing more, unless the cipher accepts it and it names this epoch. The inner record it then opens is the one the outer layer holds. | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the cipher as above, at both layers; contexts as in the row on wrapping | what each layer holds past what the model of the cipher keeps, which unit tests check against lock records computed by an independent implementation; more than two slots; register copies |
 | Lock records, carrying | A carry changes only draw count and output, written only on success, nonce first, hedged with the next epoch's key | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | what the new layer holds past what the model of the cipher keeps, which unit tests check against a carried record computed by an independent implementation; more than two slots; register copies |
 | Lock records, carrying refusals | An empty context and no change are refused before drawing; a record not opening in this epoch, as `StaleRecord`, after | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
@@ -570,6 +579,17 @@ compile error.
 | a separator not read, or a network differing in the last byte read | `only_what_is_written_is_read` |
 | the nonce read a byte late, or the lines of the body in another order | `a_lock_is_read_as_written`, unit tests |
 | plus written as minus in base64 | `a_lock_is_read_as_written`, unit tests |
+| capitals read in a profile's identifier | `only_a_written_identifier_is_read`, unit tests |
+| a profile's identifier written low digit first | `an_identifier_is_read_as_written`, unit tests |
+| the last level of a profile written as the one before, or its unlocking read the other way | `a_record_is_read_as_written`, unit tests |
+| a profile's record one byte longer read, or a flag past the one defined | `only_a_written_record_is_read`, unit tests |
+| a profile's tag read from its check | `a_record_is_read_as_written`, unit tests |
+| a pointer's number read with its bytes the other way | `a_pointer_is_read_as_written`, unit tests |
+| a pointer of another mark read | `only_a_written_pointer_is_read` |
+| a root's stored bytes and tag read the other way | `a_root_is_read_as_written`, unit tests |
+| a root one byte longer read | `only_a_written_root_is_read` |
+| a number with a leading zero read | `a_number_is_read_exactly_when_written_so`, unit tests |
+| the key of an epoch labelled as an export key | `different_derivations_have_different_labels`, unit tests |
 | a lock for the round before, or until now | `a_key_is_locked_until_the_round_of_its_time_within_a_year`, unit tests |
 | an opening that checks the signature of the next round | `a_key_is_opened_only_with_the_signature_of_its_round_as_locked`, unit tests |
 | a key opened without its MAC | `a_key_is_opened_only_with_the_signature_of_its_round_as_locked` |

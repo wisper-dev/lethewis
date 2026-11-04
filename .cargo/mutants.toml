@@ -10,27 +10,38 @@ profile = "mutants"
 
 # A wipe on drop can be observed only through the memory of a value already dropped, which takes
 # unsafe code, and unsafe code is forbidden here. The drops call `Key::wipe` and `KeyId::wipe`,
-# which are tested.
+# which are tested, and the drop of a root's record in lethewis-android calls `zeroize`.
 # Code under cfg(kani), the modules `proofs` and `model`, inline or in files of their own, is
 # compiled only by Kani, which a mutant run does not invoke. The proofs are checked against
 # deliberate errors instead.
 # The low 4 bits of the last number of words are zero before the checksum goes in, so the `|` that
 # puts it there is a `^`. For share words, the bits each `|` puts in are zero before too. So are
-# they in the hex and base64 of a time lock.
+# they in the hex and base64 of a time lock, and in the hex of a profile's identifier, and in the
+# flags of a mapping of lethewis-locked.
+# An fsync of a directory changes nothing a test can see before a crash of the machine.
+# Linux ignores the descriptor of an anonymous mapping, so the -1 lethewis-locked passes may be any.
 # A symbol read there while exactly enough bits are held only comes one take early, so the `<`
 # that decides it is a `<=`.
 # lethewis-dit acts only on aarch64 where the system reports data-independent timing: the mutants of
 # its detection on Linux run on aarch64 Linux, the others of its aarch64 code and of its guard on
 # macOS, and those of its inert code here.
+# The JNI calls of lethewis-jni run only inside a JVM, and the mutants run on a machine without one.
+# The tests on a device check those calls, apart from the wiping of Java arrays, which no test sees.
 exclude_globs = ["crates/*/src/**/proofs.rs"]
 exclude_re = [
   '^crates/lethewis-dit/src/(lib|aarch64)\.rs:',
+  '^crates/lethewis-jni/src/(keystore|device)\.rs:',
   '^crates/lethewis-core/src/key\.rs:[0-9]+:[0-9]+: replace <impl Drop for Key>::drop with \(\)$',
   '^crates/lethewis-core/src/derive\.rs:[0-9]+:[0-9]+: replace <impl Drop for KeyId>::drop with \(\)$',
+  '^crates/lethewis-android/src/epoch\.rs:[0-9]+:[0-9]+: replace <impl Drop for RootRecord>::drop with \(\)$',
   '^crates/lethewis-[a-z]+/src/[a-z_/]+\.rs:[0-9]+:[0-9]+: .* (proofs|model)::',
   '^crates/lethewis-core/src/words\.rs:[0-9]+:[0-9]+: replace \| with \^ in numbers$',
   '^crates/lethewis-core/src/shares/words\.rs:[0-9]+:[0-9]+: replace \| with \^ in data_of$',
   '^crates/lethewis-core/src/shares/words\.rs:[0-9]+:[0-9]+: replace \| with \^ in Bits<.*>::take$',
   '^crates/lethewis-core/src/shares/words\.rs:[0-9]+:[0-9]+: replace < with <= in Bits<.*>::take$',
   '^crates/lethewis-timelock/src/age\.rs:[0-9]+:[0-9]+: replace \| with \^ in (from_hex|encode_group|decode_group)$',
+  '^crates/lethewis-android/src/profile\.rs:[0-9]+:[0-9]+: replace \| with \^ in Id::from_hex$',
+  '^crates/lethewis-locked/src/lib\.rs:[0-9]+:[0-9]+: replace \| with \^ in map$',
+  '^crates/lethewis-locked/src/lib\.rs:[0-9]+:[0-9]+: delete - in map$',
+  '^crates/lethewis-android/src/profile\.rs:[0-9]+:[0-9]+: replace sync_dir -> io::Result<\(\)> with Ok\(\(\)\)$',
 ]

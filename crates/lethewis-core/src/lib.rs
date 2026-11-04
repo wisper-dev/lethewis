@@ -59,7 +59,7 @@ mod xwing;
 
 pub use block::{BLOCK_HEADER_LEN, CHUNK_LEN, CHUNK_TAG_LEN, batch_data_len, batch_len, block_len};
 pub use entropy::{Entropy, EntropyError};
-pub use epoch::{Epoch, Erasure, Root, RootFailed};
+pub use epoch::{Epoch, Erasure, Root, RootFailed, epoch_key};
 pub use error::Error;
 pub use key::KeyLength;
 pub use keyset::Position;
