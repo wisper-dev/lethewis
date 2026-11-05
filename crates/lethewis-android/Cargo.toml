@@ -3,7 +3,7 @@
 
 [package]
 name = "lethewis-android"
-description = "The Android platform of LetheWis: profiles on the device, and the chip's answer from a key in the Android keystore."
+description = "The Android platform of LetheWis: profiles on the device, the chip's answer from a key in the Android keystore, and keys held while the app shows."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,6 +20,8 @@ include = ["src/**/*", "README.md", "LICENSE"]
 [dependencies]
 # The key of an epoch from its root, and the keeper of roots the core commits through.
 lethewis-core = { path = "../lethewis-core", version = "0.0.0" }
+# The memory the keys of an open profile are held in.
+lethewis-locked = { path = "../lethewis-locked", version = "0.0.0" }
 # Compares the chip's answers with a record in constant time.
 ctutils = { version = "0.4.5", default-features = false }
 # A root's tag covers a digest of its random bytes; `zeroize` wipes the hash state on drop.
@@ -30,6 +32,10 @@ zeroize = { version = "1.9.0", default-features = false }
 [dev-dependencies]
 # The stand-in for the keystore in the tests computes HMAC-SHA256 as the chip does.
 hmac = { version = "0.13.0", default-features = false }
+
+# Runs the unit tests of the keys through interleavings of their threads, under cfg(shuttle) alone.
+[target.'cfg(shuttle)'.dev-dependencies]
+shuttle = "0.9.9"
 
 [lints]
 workspace = true

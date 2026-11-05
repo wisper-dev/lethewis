@@ -332,6 +332,9 @@ jobs:
           cargo clippy --manifest-path checks/no-alloc/Cargo.toml --locked --target thumbv7em-none-eabihf
           # The unsafe code of lethewis-dit builds only for aarch64.
           cargo clippy -p lethewis-dit --all-targets --locked --target aarch64-unknown-linux-gnu
+          # The models of the keys build only under cfg(shuttle).
+          RUSTFLAGS="-D warnings --cfg shuttle" CARGO_TARGET_DIR=target/shuttle \
+            cargo clippy -p lethewis-android --all-targets --locked
 
       - name: Build
         run: cargo build --workspace --all-features --locked
@@ -387,6 +390,16 @@ jobs:
         env:
           LETHEWIS_RANDOM_SEED: ${{ github.run_id }}
         run: scripts/random-tests.sh
+
+      - name: The threads of the keys under the interleavings shuttle picks
+        env:
+          RUSTFLAGS: -D warnings --cfg shuttle
+          CARGO_TARGET_DIR: target/shuttle
+        # A filter that matches nothing passes too, so the count of models is checked.
+        run: |
+          cargo test -p lethewis-android --lib --locked --release keys::model |
+            tee "$RUNNER_TEMP/models.txt"
+          grep '^test result: ok\. 4 passed;' "$RUNNER_TEMP/models.txt"
 
       - name: Tests, software hashes and ciphers
         # The portable code, whose stack use differs, would otherwise go untested on these runners.

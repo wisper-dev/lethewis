@@ -7,10 +7,14 @@
 use core::ptr;
 use core::time::Duration;
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::{fs, thread};
 
-use jni_sys::{JNIEnv, jclass, jint, jstring};
-use lethewis_android::{Erasure, Error, Failure, Id, Keystore, Level, Profile, Root, sweep};
+use jni_sys::{JNIEnv, jboolean, jclass, jint, jstring};
+use lethewis_android::{
+    Erasure, Error, Failure, Id, Keys, Keystore, Level, Profile, Root, Unheld, sweep,
+};
+use lethewis_core::Purpose;
 
 use crate::keystore::JniKeystore;
 
@@ -27,6 +31,9 @@ const KEPT: &str = "kept";
 const PROFILES: &str = "profiles";
 /// The file under the directory of the tests that tells the keystore was reached before it stops.
 const REACHED: &str = "reached";
+
+/// The keys the tests of `Wiper` hold.
+static HELD: Mutex<Option<Arc<Keys<()>>>> = Mutex::new(None);
 
 /// Runs the tests `test` under `root`, a directory of the app, on a system of API level `api`.
 /// Returns `passed` when every check holds, the first that failed otherwise, and null when the
@@ -85,6 +92,68 @@ extern "system" fn Java_com_alanwisper_lethewis_test_Tests_misuse(
     keystore.thrown();
 }
 
+/// Holds keys with one key loaded, for the tests of `Wiper`, in place of any held before. Returns
+/// `passed`, what failed, or null when the bridge itself fails.
+#[allow(unsafe_code)]
+// SAFETY: no other symbol of the library has this name, and the JVM calls it with this signature.
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_alanwisper_lethewis_test_Tests_hold(
+    env: *mut JNIEnv,
+    _class: jclass,
+) -> jstring {
+    // SAFETY: the JVM calls a native method with the environment of the current thread, valid
+    // until it returns.
+    let Ok(keystore) = (unsafe { JniKeystore::find(env) }) else {
+        return ptr::null_mut();
+    };
+    let report = match hold() {
+        Ok(()) => "passed".to_owned(),
+        Err(failure) => failure.replace(|c: char| !c.is_ascii(), "?"),
+    };
+    keystore.string(&report).unwrap_or(ptr::null_mut())
+}
+
+/// Whether the keys `hold` made still answer.
+#[allow(unsafe_code)]
+// SAFETY: no other symbol of the library has this name, and the JVM calls it with this signature.
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_alanwisper_lethewis_test_Tests_held(
+    _env: *mut JNIEnv,
+    _class: jclass,
+) -> jboolean {
+    held().is_some_and(|keys| keys.call(|_, ()| ()).is_ok())
+}
+
+/// Runs a call of `millis` milliseconds on the keys `hold` made; tells whether it ran.
+#[allow(unsafe_code)]
+// SAFETY: no other symbol of the library has this name, and the JVM calls it with this signature.
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_alanwisper_lethewis_test_Tests_busy(
+    _env: *mut JNIEnv,
+    _class: jclass,
+    millis: jint,
+) -> jboolean {
+    let millis = u64::try_from(millis).unwrap_or(0);
+    held().is_some_and(|keys| {
+        keys.call(move |_, ()| thread::sleep(Duration::from_millis(millis)))
+            .is_ok()
+    })
+}
+
+fn held() -> Option<Arc<Keys<()>>> {
+    HELD.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+fn hold() -> Result<(), String> {
+    let keys =
+        Keys::start::<4>(0, &mut [7; 32], ()).map_err(|error| format!("holding: {error}"))?;
+    keys.call(|slots, ()| slots.import32(Purpose::Wrap, &mut [9; 32]).map(|_| ()))
+        .map_err(|error| format!("loading: {error}"))?
+        .map_err(|error| format!("loading: {error}"))?;
+    *HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(keys));
+    Ok(())
+}
+
 fn check(holds: bool, what: &str) -> Result<(), String> {
     if holds { Ok(()) } else { Err(what.to_owned()) }
 }
@@ -100,6 +169,12 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
     let home = root.join(PROFILES);
     match test {
         "all" => {
+            // The runner never starts `Wiper`, so no keys are held.
+            let unwatched = Keys::start::<1>(0, &mut [1; 32], ()).err();
+            check(
+                unwatched == Some(Unheld::Unwatched),
+                &format!("keys held before the screen is watched: {unwatched:?}"),
+            )?;
             empty(&home)?;
             known(keystore)?;
             let expected = keystore_alone(keystore)?;

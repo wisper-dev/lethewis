@@ -76,6 +76,9 @@ keystore must first show it works.
 Each epoch on Android has a root of its own: a key in the keystore and random bytes beside it. The
 core derives the epoch's key from both, so neither alone gives it.
 
+On Android `Keys` holds keys only on an unlocked device, while the app shows or runs its own
+foreground service. Once that ends its keys are wiped, and no new ones start.
+
 A change of epoch moves a pointer in one step, then deletes the old root. What an unfinished change
 left is erased only after the synced pointer and its root read strictly.
 
@@ -90,7 +93,19 @@ call returns the key.
 
 #### Not defended
 
-A device unlocked once since boot holds keys in memory, lock screen or not.
+A device unlocked once since boot holds the system's keys in memory, lock screen or not. Keys an
+app holds outside `Keys` stay too.
+
+A call under way when the keys are to be wiped returns first. Past four seconds of it, a device
+whose screen went off may sleep before the wipe.
+
+An app the system freezes in the background keeps the keys of a call under way until it runs again.
+
+Without `Wiper.check`, keys stay up to two seconds after a foreground service ends. So they do after
+a lock that leaves the screen on.
+
+What a call of `Keys` takes and returns passes through the heap unwiped. A screen the proximity
+sensor turns off, as in a call, counts as on.
 
 A chip's key only software holds leaves the device with a copy of the flash. Guesses at the password
 then run off the device, and a short secret falls quickly on fast hardware.

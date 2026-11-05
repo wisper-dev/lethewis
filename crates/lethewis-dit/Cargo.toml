@@ -31,6 +31,7 @@ unreachable_pub = "deny"
 unexpected_cfgs = { level = "deny", check-cfg = [
   "cfg(kani)",
   "cfg(lethewis_unoptimised)",
+  "cfg(shuttle)",
   'cfg(sha2_backend, values("soft"))',
   'cfg(aes_backend, values("soft"))',
   'cfg(polyval_backend, values("soft"))',

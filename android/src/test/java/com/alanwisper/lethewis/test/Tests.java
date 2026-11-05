@@ -34,4 +34,16 @@ final class Tests {
 
     /** Breaks a rule of JNI, for which CheckJNI must stop the process. */
     static native void misuse();
+
+    /**
+     * Holds keys with one key loaded, in place of any held before; returns {@code passed}, or why
+     * not.
+     */
+    static native String hold();
+
+    /** Whether the keys {@link #hold} made still answer. */
+    static native boolean held();
+
+    /** Runs a call of {@code millis} milliseconds on the keys {@link #hold} made. */
+    static native boolean busy(int millis);
 }

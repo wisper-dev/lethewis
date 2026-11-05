@@ -274,6 +274,16 @@ which holds the output; the compress temporaries (block.rs:81, 84, lib.rs:506); 
 by moves (lib.rs:326-327); H0 on the MemoryTooLittle return (lib.rs:362).
 """
 
+[[audits.assoc]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.1.3"
+notes = """
+Not read in full. No build script, no procedural macros. Search of src/ finds no access to files,
+network, environment or processes, apart from examples in the documentation. Reached only through
+shuttle, in the unit tests of lethewis-android under cfg(shuttle).
+"""
+
 [[audits.autocfg]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "safe-to-deploy"
@@ -311,6 +321,17 @@ here. The only target-specific code is LineEnding::default.
 No secret reaches the crate: argon2 calls it only from KeyId::from_b64 and
 AssociatedData::from_b64, which parse PHC strings, and uses base64ct::Error in its own error type.
 Argon2::new and hash_password_into_with_memory call none of them.
+"""
+
+[[audits.bitvec]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "1.1.1"
+notes = """
+Not read in full. No build script, no procedural macros. Search of src/ finds no access to files,
+network, environment or processes, apart from examples in the documentation. Its unsafe code was not
+reviewed: this criterion does not ask for it. Reached only through shuttle, in the unit tests of
+lethewis-android under cfg(shuttle).
 """
 
 [[audits.blake2]]
@@ -644,6 +665,29 @@ registers and stack temporaries. CSEL timing is architecturally data independent
 PSTATE.DIT set, and the crate does not set it.
 """
 
+[[audits.const-siphasher]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "1.0.2"
+notes = """
+Not read in full. No build script (build = false), no procedural macros. Search of src/ finds no
+access to files, network, environment or processes, apart from examples in the documentation. Its
+unsafe code was not reviewed: this criterion does not ask for it. Reached only through shuttle, in
+the unit tests of lethewis-android under cfg(shuttle).
+"""
+
+[[audits.corosensei]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.3.4"
+notes = """
+Not read in full. build.rs, read in full, returns at once unless the target is ARM; there it has
+autocfg compile probes of the registers. No procedural macros. Stacks are anonymous mappings made
+with mmap and mprotect. Search of src/ finds no access to files, network, environment or processes,
+apart from examples in the documentation. Its unsafe code was not reviewed: this criterion does not
+ask for it. Reached only through shuttle, in the unit tests of lethewis-android under cfg(shuttle).
+"""
+
 [[audits.cpubits]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -943,6 +987,27 @@ but for com.rs:101-102, which builds a slice from a null BSTR of length 0 when a
 an empty string. cc uses it for MSVC targets only.
 """
 
+[[audits.funty]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "2.0.0"
+notes = """
+Not read in full. No build script, no procedural macros. Search of src/ finds no access to files,
+network, environment or processes, apart from examples in the documentation. Reached only through
+shuttle, in the unit tests of lethewis-android under cfg(shuttle).
+"""
+
+[[audits.getrandom]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.2.17"
+notes = """
+Not read in full. No build script (build = false), no procedural macros. On Linux the getrandom
+system call, with a fallback that polls /dev/random and reads /dev/urandom; no other files, no
+network, environment or processes. Its unsafe code was not reviewed: this criterion does not ask for
+it. Reached only through shuttle, in the unit tests of lethewis-android under cfg(shuttle).
+"""
+
 [[audits.glob]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "safe-to-deploy"
@@ -961,6 +1026,16 @@ notes = """
 Read in full: Cargo.toml, src/lib.rs and src/errno.rs. No build script, no procedural macros.
 Declarations of the Hermit kernel's functions and constants, and two inline wrappers that call
 them; no other code. Built only for target_os = "hermit", through num_cpus.
+"""
+
+[[audits.hex]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.4.3"
+notes = """
+Not read in full. No build script, no procedural macros. Search of src/ finds no access to files,
+network, environment or processes, apart from examples in the documentation. Reached only through
+shuttle, in the unit tests of lethewis-android under cfg(shuttle).
 """
 
 [[audits.hkdf]]
@@ -1363,6 +1438,39 @@ cgroup's CPU quota files and /proc/cpuinfo; writes nothing, and touches no envir
 or network. Used by threadpool.
 """
 
+[[audits.once_cell]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "1.21.4"
+notes = """
+Not read in full. No build script (build = false), no procedural macros. Search of src/ finds no
+access to files, network, environment or processes, apart from examples in the documentation. Its
+unsafe code was not reviewed: this criterion does not ask for it. Reached only through shuttle, in
+the unit tests of lethewis-android under cfg(shuttle).
+"""
+
+[[audits.owo-colors]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "4.4.0"
+notes = """
+Not read in full. No build script (build = false), no procedural macros. Search of src/ finds no
+access to files, network, environment or processes, apart from examples in the documentation. The
+supports-colors feature, which reads the environment, is off. Reached only through shuttle, in the
+unit tests of lethewis-android under cfg(shuttle).
+"""
+
+[[audits.pin-project-lite]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.2.17"
+notes = """
+Not read in full. No build script (build = false), no procedural macros. Search of src/ finds no
+access to files, network, environment or processes, apart from examples in the documentation. Its
+macros are macro_rules. Its unsafe code was not reviewed: this criterion does not ask for it.
+Reached only through shuttle, in the unit tests of lethewis-android under cfg(shuttle).
+"""
+
 [[audits.poly1305]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -1466,6 +1574,17 @@ AVX2 on x86 and the crypto target feature on other aarch64 platforms; the code c
 PCLMULQDQ, and the aes target feature.
 """
 
+[[audits.ppv-lite86]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.2.21"
+notes = """
+Not read in full. No build script (build = false), no procedural macros. Search of src/ finds no
+access to files, network, environment or processes, apart from examples in the documentation. Its
+unsafe code was not reviewed: this criterion does not ask for it. Reached only through shuttle, in
+the unit tests of lethewis-android under cfg(shuttle).
+"""
+
 [[audits.proc-macro2]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "safe-to-deploy"
@@ -1489,6 +1608,51 @@ older than 1.78. No unsafe code; searched src/ for access to files, network, env
 processes and found none. Macro bodies not reviewed line by line.
 """
 
+[[audits.radium]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.7.0"
+notes = """
+Not read in full. build.rs, read in full, reads TARGET and CARGO_CFG_TARGET_ARCH and prints the cfgs
+of the atomic widths the target has. No procedural macros. Search of src/ finds no access to files,
+network, environment or processes, apart from examples in the documentation. Reached only through
+shuttle, in the unit tests of lethewis-android under cfg(shuttle).
+"""
+
+[[audits.rand]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.8.8"
+notes = """
+Not read in full. No build script (build = false), no procedural macros. Search of src/ finds no
+access to files, network, environment or processes, apart from examples in the documentation. OsRng
+and thread_rng reach the system through getrandom; on Unix thread_rng registers a pthread_atfork
+handler that reseeds it after a fork. Its unsafe code was not reviewed: this criterion does not ask
+for it. Reached only through shuttle, in the unit tests of lethewis-android under cfg(shuttle).
+"""
+
+[[audits.rand_chacha]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.3.1"
+notes = """
+Not read in full. No build script, no procedural macros. Search of src/ finds no access to files,
+network, environment or processes, apart from examples in the documentation. Its unsafe code was not
+reviewed: this criterion does not ask for it. Reached only through shuttle, in the unit tests of
+lethewis-android under cfg(shuttle).
+"""
+
+[[audits.rand_core]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.6.4"
+notes = """
+Not read in full. No build script, no procedural macros. Search of src/ finds no access to files,
+network, environment or processes, apart from examples in the documentation. OsRng reaches the
+system through getrandom. Its unsafe code was not reviewed: this criterion does not ask for it.
+Reached only through shuttle, in the unit tests of lethewis-android under cfg(shuttle).
+"""
+
 [[audits.rand_core]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -1502,6 +1666,16 @@ calls it with secrets. Not cleared: seeds moved by value, the BlockRng buffer, c
 u32 block makes next_u64_from_u32 panic.
 """
 
+[[audits.rand_pcg]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.3.1"
+notes = """
+Not read in full. No build script, no procedural macros. Search of src/ finds no access to files,
+network, environment or processes, apart from examples in the documentation. Reached only through
+shuttle, in the unit tests of lethewis-android under cfg(shuttle).
+"""
+
 [[audits.rustc_version]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "safe-to-deploy"
@@ -1510,6 +1684,28 @@ notes = """
 Not read in full. No build script. Read lib.rs in full: version_meta runs RUSTC, or rustc from PATH,
 optionally through RUSTC_WRAPPER, with -vV and parses its output. No unsafe code, no access to files
 or network, no other environment variables.
+"""
+
+[[audits.scoped-tls]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "1.0.1"
+notes = """
+Not read in full. No build script, no procedural macros. Search of src/ finds no access to files,
+network, environment or processes, apart from examples in the documentation. Its unsafe code was not
+reviewed: this criterion does not ask for it. Reached only through shuttle, in the unit tests of
+lethewis-android under cfg(shuttle).
+"""
+
+[[audits.scopeguard]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "1.2.0"
+notes = """
+Not read in full. No build script, no procedural macros. Search of src/ finds no access to files,
+network, environment or processes, apart from examples in the documentation. Its unsafe code was not
+reviewed: this criterion does not ask for it. Reached only through shuttle, in the unit tests of
+lethewis-android under cfg(shuttle).
 """
 
 [[audits.semver]]
@@ -1636,6 +1832,65 @@ drops only ASCII bytes and the quoter inserts only ASCII. cc uses only the split
 when CC_SHELL_ESCAPED_FLAGS is set.
 """
 
+[[audits.shuttle]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.9.9"
+notes = """
+Not read in full. No build script (build = false), no procedural macros. Search of src/ finds no
+access to files, network, environment or processes, apart from examples in the documentation. It re-
+exports shuttle-engine, shuttle-std and shuttle-schedulers. Its unsafe code was not reviewed: this
+criterion does not ask for it. Reached only through shuttle, in the unit tests of lethewis-android
+under cfg(shuttle).
+"""
+
+[[audits.shuttle-engine]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.1.7"
+notes = """
+Not read in full. No build script (build = false), no procedural macros. It reads the environment
+variables SHUTTLE_RANDOM_SEED, SHUTTLE_CAPTURE_BACKTRACE and SHUTTLE_SILENCE_WARNINGS. A failing
+schedule is printed; it is written to a file only when a test sets FailurePersistence::File. The
+annotation feature, which writes a file, is off. Tasks run as coroutines of corosensei. No network
+or processes. Its unsafe code was not reviewed: this criterion does not ask for it. Reached only
+through shuttle, in the unit tests of lethewis-android under cfg(shuttle).
+"""
+
+[[audits.shuttle-schedulers]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.1.1"
+notes = """
+Not read in full. No build script (build = false), no procedural macros. The random schedulers take
+their seed from OsRng or SHUTTLE_RANDOM_SEED, and write it to the file named by
+SHUTTLE_ALWAYS_PERSIST_SEED only when that is set. replay_from_file reads the file a test names. No
+network or processes, no unsafe code. Reached only through shuttle, in the unit tests of lethewis-
+android under cfg(shuttle).
+"""
+
+[[audits.shuttle-std]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.1.5"
+notes = """
+Not read in full. No build script (build = false), no procedural macros. Search of src/ finds no
+access to files, network, environment or processes, apart from examples in the documentation. Its
+unsafe code was not reviewed: this criterion does not ask for it. Reached only through shuttle, in
+the unit tests of lethewis-android under cfg(shuttle).
+"""
+
+[[audits.smallvec]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "1.16.4"
+notes = """
+Not read in full. No build script (build = false), no procedural macros. Search of src/ finds no
+access to files, network, environment or processes, apart from examples in the documentation. Its
+unsafe code was not reviewed: this criterion does not ask for it. Reached only through shuttle, in
+the unit tests of lethewis-android under cfg(shuttle).
+"""
+
 [[audits.sponge-cursor]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -1676,6 +1931,16 @@ casts in token.rs and the Send and Sync impls in thread.rs; sound. No access to 
 environment or processes in src/, found by search rather than by reading every parser module.
 """
 
+[[audits.tap]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "1.0.1"
+notes = """
+Not read in full. No build script, no procedural macros. Search of src/ finds no access to files,
+network, environment or processes, apart from examples in the documentation. Reached only through
+shuttle, in the unit tests of lethewis-android under cfg(shuttle).
+"""
+
 [[audits.threadpool]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "safe-to-deploy"
@@ -1685,6 +1950,29 @@ Read in full: Cargo.toml and src/lib.rs. No unsafe code, no build script, no pro
 Spawns threads that run boxed jobs from a channel; num_cpus gives their number when none is set.
 No files, environment, processes or network. blst uses it only to hand work to threads, which its
 no-threads feature turns off; lethewis-timelock sets that feature.
+"""
+
+[[audits.tracing]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.1.44"
+notes = """
+Not read in full. No build script (build = false). Search of src/ finds no access to files, network,
+environment or processes, apart from examples in the documentation. Default features are off but
+std, so the attributes and their procedural macros are not built; with no subscriber set, events go
+nowhere. Its unsafe code was not reviewed: this criterion does not ask for it. Reached only through
+shuttle, in the unit tests of lethewis-android under cfg(shuttle).
+"""
+
+[[audits.tracing-core]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.1.36"
+notes = """
+Not read in full. No build script (build = false), no procedural macros. Search of src/ finds no
+access to files, network, environment or processes, apart from examples in the documentation. Its
+unsafe code was not reviewed: this criterion does not ask for it. Reached only through shuttle, in
+the unit tests of lethewis-android under cfg(shuttle).
 """
 
 [[audits.typenum]]
@@ -1756,6 +2044,137 @@ leaves the computed value in a temporary. Array<u8, U16> has no Drop. polyval, t
 used here, wipes itself on drop.
 """
 
+[[audits.wasi]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.11.1+wasi-snapshot-preview1"
+notes = """
+Not read in full. Built only for WASI targets: declarations of the WASI imports and their wrappers.
+No build script (build = false), no procedural macros. Reached only through shuttle, in the unit
+tests of lethewis-android under cfg(shuttle).
+"""
+
+[[audits.windows-sys]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.59.0"
+notes = """
+Not read in full. Built only for Windows: declarations of the functions, types and constants of the
+Windows API. No build script (build = false), no procedural macros. Reached only through shuttle, in
+the unit tests of lethewis-android under cfg(shuttle).
+"""
+
+[[audits.windows-targets]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.52.6"
+notes = """
+Read in full: Cargo.toml and src/lib.rs. Built only for Windows: the link! macro names the import
+library of the target, from one of the windows_* crates. No build script (build = false), no
+procedural macros. Reached only through shuttle, in the unit tests of lethewis-android under
+cfg(shuttle).
+"""
+
+[[audits.windows_aarch64_gnullvm]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.52.6"
+notes = """
+Built only for its Windows target. build.rs, read in full, adds the crate's lib/ directory to the
+native link search path; lib/ holds one import library of Windows, not read. src/lib.rs is
+#![no_std] and empty. Reached only through shuttle, in the unit tests of lethewis-android under
+cfg(shuttle).
+"""
+
+[[audits.windows_aarch64_msvc]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.52.6"
+notes = """
+Built only for its Windows target. build.rs, read in full, adds the crate's lib/ directory to the
+native link search path; lib/ holds one import library of Windows, not read. src/lib.rs is
+#![no_std] and empty. Reached only through shuttle, in the unit tests of lethewis-android under
+cfg(shuttle).
+"""
+
+[[audits.windows_i686_gnu]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.52.6"
+notes = """
+Built only for its Windows target. build.rs, read in full, adds the crate's lib/ directory to the
+native link search path; lib/ holds one import library of Windows, not read. src/lib.rs is
+#![no_std] and empty. Reached only through shuttle, in the unit tests of lethewis-android under
+cfg(shuttle).
+"""
+
+[[audits.windows_i686_gnullvm]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.52.6"
+notes = """
+Built only for its Windows target. build.rs, read in full, adds the crate's lib/ directory to the
+native link search path; lib/ holds one import library of Windows, not read. src/lib.rs is
+#![no_std] and empty. Reached only through shuttle, in the unit tests of lethewis-android under
+cfg(shuttle).
+"""
+
+[[audits.windows_i686_msvc]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.52.6"
+notes = """
+Built only for its Windows target. build.rs, read in full, adds the crate's lib/ directory to the
+native link search path; lib/ holds one import library of Windows, not read. src/lib.rs is
+#![no_std] and empty. Reached only through shuttle, in the unit tests of lethewis-android under
+cfg(shuttle).
+"""
+
+[[audits.windows_x86_64_gnu]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.52.6"
+notes = """
+Built only for its Windows target. build.rs, read in full, adds the crate's lib/ directory to the
+native link search path; lib/ holds one import library of Windows, not read. src/lib.rs is
+#![no_std] and empty. Reached only through shuttle, in the unit tests of lethewis-android under
+cfg(shuttle).
+"""
+
+[[audits.windows_x86_64_gnullvm]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.52.6"
+notes = """
+Built only for its Windows target. build.rs, read in full, adds the crate's lib/ directory to the
+native link search path; lib/ holds one import library of Windows, not read. src/lib.rs is
+#![no_std] and empty. Reached only through shuttle, in the unit tests of lethewis-android under
+cfg(shuttle).
+"""
+
+[[audits.windows_x86_64_msvc]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.52.6"
+notes = """
+Built only for its Windows target. build.rs, read in full, adds the crate's lib/ directory to the
+native link search path; lib/ holds one import library of Windows, not read. src/lib.rs is
+#![no_std] and empty. Reached only through shuttle, in the unit tests of lethewis-android under
+cfg(shuttle).
+"""
+
+[[audits.wyz]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.5.1"
+notes = """
+Not read in full. No build script, no procedural macros. Search of src/ finds no access to files,
+network, environment or processes, apart from examples in the documentation. Its exit! macro calls
+std::process::exit where a caller expands it; neither bitvec nor shuttle does. Its unsafe code was
+not reviewed: this criterion does not ask for it. Reached only through shuttle, in the unit tests of
+lethewis-android under cfg(shuttle).
+"""
+
 [[audits.x25519-dalek]]
 who = "Alan Wisper <https://alanwisper.com>"
 criteria = "read-in-full"
@@ -1770,6 +2189,30 @@ well as for the shared secret; the Edwards path of PublicKey::from and the vecto
 reached. No branch or memory access in this crate depends on secret data. Not cleared: x25519 takes
 the secret by value and returns the result by value, and those copies stay on the stack. Low-order
 points are accepted.
+"""
+
+[[audits.zerocopy]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.8.63"
+notes = """
+Not read in full. build.rs, read in full, reads the crate's own Cargo.toml and runs $RUSTC
+--version, then prints cfgs by the version. include_bytes! appears only in a macro a caller expands.
+No procedural macros. Search of src/ finds no access to files, network, environment or processes,
+apart from examples in the documentation. Its unsafe code was not reviewed: this criterion does not
+ask for it. Reached only through shuttle, in the unit tests of lethewis-android under cfg(shuttle).
+"""
+
+[[audits.zerocopy-derive]]
+who = "Alan Wisper <https://alanwisper.com>"
+criteria = "safe-to-run"
+version = "0.8.63"
+notes = """
+Not read in full. A procedural macro, run by the compiler. No build script (build = false). Search
+of src/ finds no access to files, network, environment or processes outside output_tests, a
+#[cfg(test)] module of the crate's own tests. Its unsafe code was not reviewed: this criterion does
+not ask for it. Reached only through shuttle, in the unit tests of lethewis-android under
+cfg(shuttle).
 """
 
 [[audits.zeroize]]

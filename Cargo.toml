@@ -35,10 +35,12 @@ unsafe_code = "forbid"
 unreachable_pub = "deny"
 # Kani sets cfg(kani) when it compiles the proofs; the build script of the core sets
 # cfg(lethewis_unoptimised) when it is built without optimisation, and a build may set it itself.
+# cfg(shuttle) runs the unit tests of the keys of lethewis-android under the scheduler of shuttle.
 # The others select the portable code of the hashes and the ciphers in the dependencies.
 unexpected_cfgs = { level = "deny", check-cfg = [
   "cfg(kani)",
   "cfg(lethewis_unoptimised)",
+  "cfg(shuttle)",
   'cfg(sha2_backend, values("soft"))',
   'cfg(aes_backend, values("soft"))',
   'cfg(polyval_backend, values("soft"))',
