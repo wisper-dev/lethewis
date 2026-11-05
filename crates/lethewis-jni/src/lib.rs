@@ -13,7 +13,11 @@
 #![deny(missing_docs, unused_crate_dependencies)]
 
 mod codes;
-#[cfg(feature = "device-tests")]
+#[cfg(all(
+    feature = "device-tests",
+    any(target_os = "linux", target_os = "android"),
+    not(kani)
+))]
 mod device;
 mod keystore;
 #[cfg(all(any(target_os = "linux", target_os = "android"), not(kani)))]
@@ -21,3 +25,10 @@ mod wiper;
 
 pub use jni_sys;
 pub use keystore::JniKeystore;
+
+// The tests on a device hold keys, which exist only on Linux and Android, and not under Kani.
+#[cfg(all(
+    feature = "device-tests",
+    not(all(any(target_os = "linux", target_os = "android"), not(kani)))
+))]
+use lethewis_core as _;
