@@ -8,11 +8,26 @@ SPDX-License-Identifier: AGPL-3.0-only
 
     <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="37" />
 
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <!-- Debuggable, so that CheckJNI watches every call; libraries stay uncompressed and aligned. -->
     <application
         android:debuggable="true"
         android:extractNativeLibs="false"
-        android:hasCode="true" />
+        android:hasCode="true">
+        <activity android:name=".Shown" android:exported="true" />
+        <!-- Exported: the host starts it as a service started while the app shows nothing. -->
+        <service
+            android:name=".Kept"
+            android:exported="true"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="tests" />
+        </service>
+    </application>
 
     <instrumentation
         android:name=".Runner"

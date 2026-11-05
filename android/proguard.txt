@@ -10,3 +10,8 @@
     static java.lang.String aliases(java.lang.String);
     static int delete(java.lang.String);
 }
+
+# The JVM binds these to their symbols in lethewis-jni by the names of the class and the methods.
+-keepclasseswithmembernames class com.alanwisper.lethewis.Wiper {
+    native <methods>;
+}

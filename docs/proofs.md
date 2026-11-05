@@ -65,7 +65,8 @@ Linux and on emulators.
 
 The crates that make those calls are in neither table, apart from the formats of a profile.
 
-Under Kani, `lethewis-dit` only runs its work, and `lethewis-locked` is empty.
+Under Kani, `lethewis-dit` only runs its work, `lethewis-locked` is empty, and `lethewis-android`
+has no `Keys`.
 
 ## Proven
 

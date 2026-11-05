@@ -65,6 +65,7 @@ disk.dataPartition.size=4G
 hw.lcd.width=320
 hw.lcd.height=640
 hw.lcd.density=160
+hw.sensors.proximity=yes
 image.sysdir.1=$image/
 PlayStore.enabled=no
 EOF
@@ -138,7 +139,7 @@ aligned() {
 
 # The natives of the library a build exports, by name.
 natives() {
-  llvm-nm --dynamic --defined-only "$1" | awk '$3 ~ /^Java_/ {print $3}' | sort
+  llvm-nm --dynamic --defined-only "$1" | awk '$3 ~ /^Java_/ {print $3}' | LC_ALL=C sort
 }
 
 library() {
@@ -213,6 +214,108 @@ keystore() {
   exit 1
 }
 
+# The files the activity of the tests writes, under the app's own directory.
+shown_files=no_backup/lethewis-tests
+
+# Whether the activity of the tests wrote the file $1.
+wrote() {
+  adb_for 10 shell run-as "$package" ls "$shown_files/$1" >/dev/null 2>&1
+}
+
+# Waits up to $2 seconds for the activity of the tests to write the file $1.
+writes() {
+  local _
+  for _ in $(seq $(($2 * 5))); do
+    wrote "$1" && return
+    sleep 0.2
+  done
+  return 1
+}
+
+# Starts the activity of the tests for the test $1 and waits until it holds keys.
+show() {
+  adb_for 30 shell am force-stop "$package"
+  adb_for 30 shell run-as "$package" rm -rf "$shown_files"
+  adb_for 30 shell am start -n "$package/.Shown" --es test "$1" >/dev/null
+  if ! writes reached 30; then
+    echo "android: no keys were held for $1:" >&2
+    adb_for 10 shell run-as "$package" cat "$shown_files/failed" >&2 || true
+    exit 1
+  fi
+}
+
+# Fails if the keys are gone $2 seconds later; $1 says what should have kept them.
+kept() {
+  sleep "$2"
+  if wrote wiped; then
+    echo "android: the keys were wiped despite $1" >&2
+    exit 1
+  fi
+}
+
+# Fails unless the keys are gone within $2 seconds; $1 says what should have wiped them.
+wiped() {
+  if ! writes wiped "$2"; then
+    echo "android: the keys outlived $1" >&2
+    exit 1
+  fi
+}
+
+# Fails if keys are held again $2 seconds later, or were not refused as away; $1 says what should
+# have refused them.
+refused() {
+  local refusal
+  sleep "$2"
+  if wrote again; then
+    echo "android: keys were held again despite $1" >&2
+    exit 1
+  fi
+  refusal=$(adb_for 10 shell run-as "$package" cat "$shown_files/refusal" 2>/dev/null) || true
+  if ! grep -q 'away from the screen' <<<"$refusal"; then
+    echo "android: no refusal as away during $1: ${refusal:-none}" >&2
+    exit 1
+  fi
+}
+
+# Waits up to $1 seconds for the screen to go off.
+dark() {
+  local _ display
+  for _ in $(seq $(($1 * 2))); do
+    display=$(adb_for 30 shell dumpsys display | tr -d '\r')
+    grep -q 'mScreenState=OFF' <<<"$display" && return
+    sleep 0.5
+  done
+  return 1
+}
+
+# Fails unless keys are held again within $2 seconds; $1 says what should allow them.
+again() {
+  if ! writes again "$2"; then
+    echo "android: no keys were held again after $1" >&2
+    exit 1
+  fi
+}
+
+# Locks the device as the lockdown of the power menu does, leaving the screen on.
+lockdown() {
+  local _
+  adb_for 30 shell cmd lock_settings require-strong-auth STRONG_AUTH_REQUIRED_AFTER_USER_LOCKDOWN
+  for _ in $(seq 20); do
+    if [ "$(lock_state)" = locked ]; then
+      return
+    fi
+    sleep 1
+  done
+  echo "android: the device did not lock down" >&2
+  exit 1
+}
+
+# Turns the screen to the rotation $1, 0 for portrait or 1 for landscape.
+turn() {
+  adb_for 30 shell settings put system accelerometer_rotation 0
+  adb_for 30 shell settings put system user_rotation "$1"
+}
+
 # Runs the tests named $1 on the device, with the options of am instrument after it; on a failure
 # prints the report.
 instrument() {
@@ -231,13 +334,17 @@ instrument() {
 
 start_emulator
 
+# The natives of Wiper, which every build has.
+wiper=$'Java_com_alanwisper_lethewis_Wiper_allow\nJava_com_alanwisper_lethewis_Wiper_settle'
+
 step "the library without the tests"
 for triple in x86_64-linux-android aarch64-linux-android; do
   so=$(library "$triple")
   aligned "$so"
   exported=$(natives "$so")
-  if [ -n "$exported" ]; then
-    echo "android: $so exports natives of the tests" >&2
+  if [ "$exported" != "$wiper" ]; then
+    echo "android: $so exports other natives:" >&2
+    echo "$exported" >&2
     exit 1
   fi
 done
@@ -246,7 +353,9 @@ step "the library of the tests"
 so=$(library x86_64-linux-android --features device-tests)
 aligned "$so"
 exported=$(natives "$so")
-expected=$'Java_com_alanwisper_lethewis_test_Tests_misuse\nJava_com_alanwisper_lethewis_test_Tests_run'
+expected=$wiper$'\nJava_com_alanwisper_lethewis_test_Tests_busy'
+expected+=$'\nJava_com_alanwisper_lethewis_test_Tests_held\nJava_com_alanwisper_lethewis_test_Tests_hold'
+expected+=$'\nJava_com_alanwisper_lethewis_test_Tests_misuse\nJava_com_alanwisper_lethewis_test_Tests_run'
 if [ "$exported" != "$expected" ]; then
   echo "android: the library of the tests exports other natives:" >&2
   echo "$exported" >&2
@@ -301,6 +410,127 @@ lock
 instrument locked
 unlock
 instrument after-lock
+
+step "keys leave with the app"
+show hidden
+kept "the app on the screen" 2
+turn 1
+if ! writes turned 10; then
+  echo "android: the screen did not turn" >&2
+  exit 1
+fi
+kept "a turn of the screen" 2
+turn 0
+kept "a turn of the screen" 3
+adb_for 30 shell input keyevent KEYCODE_HOME
+wiped "leaving the screen" 5
+refused "the app off the screen" 4
+adb_for 30 shell am start-foreground-service -n "$package/.Kept" >/dev/null
+# The control of Wiper.check below: nothing looks for a service started while nothing shows.
+refused "a foreground service started while the app shows nothing, before Wiper.check" 4
+adb_for 30 shell am start-foreground-service -n "$package/.Kept" --ez check-start true >/dev/null
+again "Wiper.check at the start of a foreground service" 5
+show busy
+if ! writes busy 10; then
+  echo "android: the call of the keys did not start" >&2
+  exit 1
+fi
+lock
+if ! writes check 15; then
+  echo "android: Wiper.check did not return with the screen off" >&2
+  exit 1
+fi
+checked=$(adb_for 10 shell run-as "$package" cat "$shown_files/check")
+if ! [[ $checked =~ ^([0-9]+)\ true$ ]]; then
+  echo "android: Wiper.check was not timed during the call: ${checked:-nothing}" >&2
+  exit 1
+fi
+if [ "${BASH_REMATCH[1]}" -ge 1000 ]; then
+  echo "android: Wiper.check waited ${BASH_REMATCH[1]} ms for the wipe behind a call under way" >&2
+  exit 1
+fi
+wiped "the screen going off during a call" 10
+unlock
+again "unlocking with the app on the screen" 10
+late=$(adb_for 10 shell run-as "$package" cat "$shown_files/late")
+if ! [[ $late =~ ^[0-9]+$ ]] || [ "$late" -ge 1000 ]; then
+  echo "android: keys were held again ${late:-never} ms after the unlock" >&2
+  exit 1
+fi
+# Android 9 cannot lock from the shell with the screen on.
+if [ "$api" -gt 28 ]; then
+  show hidden
+  kept "the app on the screen" 2
+  lockdown
+  wiped "a lockdown with the app on the screen" 3
+  unlock
+  again "unlocking with the app on the screen" 10
+  show over-lock
+  kept "the app over the lock screen" 2
+  lockdown
+  wiped "a lockdown under the app over the lock screen" 4
+  unlock
+  again "unlocking under the app over the lock screen" 10
+  show service
+  adb_for 30 shell input keyevent KEYCODE_HOME
+  kept "a foreground service" 3
+  lockdown
+  wiped "a lockdown with a foreground service" 4
+  unlock
+  again "unlocking with a foreground service" 10
+fi
+show service
+adb_for 30 shell input keyevent KEYCODE_HOME
+kept "a foreground service" 5
+# Off by its timeout the device locks five seconds later: only the screen's own event wipes in time.
+adb_for 30 shell settings put secure lock_screen_lock_after_timeout 5000
+adb_for 30 shell svc power stayon false
+adb_for 30 shell settings put system screen_off_timeout 15000
+if ! dark 30; then
+  echo "android: the screen did not time out" >&2
+  exit 1
+fi
+wiped "the screen going off" 2
+adb_for 30 shell settings put system screen_off_timeout 1800000
+for _ in $(seq 20); do
+  [ "$(lock_state)" = locked ] && break
+  sleep 1
+done
+unlock
+show service
+adb_for 30 shell input keyevent KEYCODE_HOME
+kept "a foreground service" 3
+lock
+wiped "the screen going off" 3
+adb_for 30 shell input keyevent KEYCODE_WAKEUP
+refused "the lock screen" 4
+unlock
+again "unlocking with a foreground service" 10
+show service-ends
+adb_for 30 shell input keyevent KEYCODE_HOME
+kept "a foreground service" 3
+if ! writes checked 30 ||
+  [ "$(adb_for 10 shell run-as "$package" cat "$shown_files/checked")" != wiped ]; then
+  echo "android: the keys outlived Wiper.check at the end of the foreground service" >&2
+  exit 1
+fi
+show service-ends-silently
+adb_for 30 shell input keyevent KEYCODE_HOME
+kept "a foreground service" 3
+wiped "the end of the foreground service" 30
+show proximity
+adb_for 30 emu sensor set proximity 5
+sleep 1
+adb_for 30 emu sensor set proximity 0
+if ! dark 10; then
+  echo "android: the proximity sensor did not turn the screen off" >&2
+  exit 1
+fi
+kept "the screen held off by the proximity sensor" 5
+adb_for 30 emu sensor set proximity 5
+adb_for 30 shell am force-stop "$package"
+# The next step waits for a file of the same name.
+adb_for 30 shell run-as "$package" rm -rf "$shown_files"
 
 step "a keystore that stopped is no lost key"
 instrument before-stop

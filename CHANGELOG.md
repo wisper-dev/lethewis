@@ -379,5 +379,21 @@ Nothing is published while the version is below 0.1.0.
   of core dumps and forks. It wipes them when dropped; a refusal of the system is an `Error`.
 - Dependency of `lethewis-locked`: `libc` 0.2.190 or a later compatible version, without default
   features, on Linux and Android.
+- `Keys` in `lethewis-android`, on Linux and Android: slots in locked memory, held by a thread of
+  their own. `Keys::call` runs a call there; what calls keep between them, handles too, is `Kept`.
+- `Keys::wipe` and `wipe_keys` wipe the keys once the call under way returns; every later call is
+  `Unheld::Wiped`. `settle_keys` waits for the wipe to end.
+- `com.alanwisper.lethewis.Wiper`: from `Wiper.start` keys are held on an unlocked device, while
+  the app shows or runs its own foreground service. Once that ends they are wiped.
+- `Wiper.check` checks at once: as a foreground service starts while the app shows nothing, and in
+  the `onDestroy` of a foreground service.
+- On Android `Keys::start` is `Unheld::Unwatched` before `Wiper.start`, and `Unheld::Away` while no
+  keys may be held. A call from inside a call is `Unheld::Inside`.
+- With keys held, tests on the emulators leave and turn the screen, lock and unlock the device. They
+  lock down with the screen on, start and end a foreground service, and cover the proximity sensor.
+- Tests time `Wiper.check` during a call with the screen off, and the keys held again after an
+  unlock. One locks the device down under an activity shown over the lock screen.
+- Models of the threads of `Keys` run under the PCT scheduler of shuttle with `--cfg shuttle`,
+  100 000 schedules each. They race calls, starts, drops and settles against wipes.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

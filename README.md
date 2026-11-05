@@ -21,7 +21,7 @@ Suggestions for functionality not listed here are accepted as issues.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/rustc-1.99.0-orange.svg)
-![Readiness](https://img.shields.io/badge/readiness-61%25-yellow.svg)
+![Readiness](https://img.shields.io/badge/readiness-83%25-green.svg)
 
 ## How the keys relate
 
@@ -115,6 +115,14 @@ password and the hardware secret at each unlock, and neither alone is enough.
   cannot ask for keys that resist a rollback.
 - A device unlocked since boot has its keys in memory already. No key-storage library changes
   that, and a lock screen is no defence against someone holding such a device.
+- On Android `Keys` holds keys only on an unlocked device, while the app shows or runs its own
+  foreground service. Without `Wiper.check` they stay up to two seconds after such a service ends.
+- They stay as long after a lock that leaves the screen on. A screen the proximity sensor turns off,
+  as in a call, counts as on.
+- A call of `Keys` under way finishes before the wipe, and what calls take and return is not wiped.
+  Past four seconds of it, a device whose screen went off may sleep before the wipe.
+- An app the system freezes in the background keeps the keys of a call under way until it runs
+  again.
 - A proof is about one named statement, not about safety. Each claim names the tool, its version,
   the assumptions and what is not covered, and never says "formally verified" alone.
 
@@ -131,7 +139,7 @@ separate crate, so the proof perimeter is visible from the directory listing.
 | `lethewis-core` | keys from derivation to destruction, two-tier access, shares, time locks with `timelock`, data in blocks; the system only through `lethewis-dit` |
 | `lethewis-dit` | data-independent timing on aarch64 where Linux, Android or an Apple system reports it; unsafe code |
 | `lethewis-timelock` | keys locked until a round of drand's quicknet, as age files `tle` opens; no network or clock |
-| `lethewis-android` | profiles on Android: the chip's answer to the core's challenge, roots of epochs |
+| `lethewis-android` | profiles on Android: the chip's answer to the core's challenge, roots of epochs, keys held while the app shows |
 | `lethewis-jni` | the bridge to the Java layer in `android/`, through JNI; unsafe code |
 | `lethewis-locked` | memory locked in RAM, out of core dumps and forks, on Linux and Android; unsafe code |
 

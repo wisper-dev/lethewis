@@ -3,7 +3,7 @@
 
 [package]
 name = "lethewis-jni"
-description = "The bridge of LetheWis to its Java layer on Android: the keystore through JNI. One of the three crates of the workspace with unsafe code."
+description = "The bridge of LetheWis to its Java layer on Android: the keystore through JNI, and the wipe of keys. One of the three crates of the workspace with unsafe code."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,10 +19,12 @@ include = ["src/**/*", "README.md", "LICENSE"]
 
 [features]
 # Native methods of the tests on a device. Never in a build for an app.
-device-tests = []
+device-tests = ["dep:lethewis-core"]
 
 [dependencies]
 lethewis-android = { path = "../lethewis-android", version = "0.0.0" }
+# The purpose of the key the tests on a device load.
+lethewis-core = { path = "../lethewis-core", version = "0.0.0", optional = true }
 # The declarations of jni.h, nothing more.
 jni-sys = "0.4.1"
 # Default features bring in `alloc`.
@@ -38,6 +40,7 @@ unreachable_pub = "deny"
 unexpected_cfgs = { level = "deny", check-cfg = [
   "cfg(kani)",
   "cfg(lethewis_unoptimised)",
+  "cfg(shuttle)",
   'cfg(sha2_backend, values("soft"))',
   'cfg(aes_backend, values("soft"))',
   'cfg(polyval_backend, values("soft"))',

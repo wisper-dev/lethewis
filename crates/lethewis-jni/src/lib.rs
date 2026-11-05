@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The bridge of the library to its Java layer on Android, `com.alanwisper.lethewis.Keystore`:
+//! The bridge of the library to its Java layer on Android, `com.alanwisper.lethewis`:
 //! [`JniKeystore`] gives `lethewis-android` the keystore of the device through JNI, on the thread
-//! of the call.
+//! of the call, and `Wiper` reaches the keys of the process through two native methods.
 //!
 //! An app calls the library from its own native methods, where the JVM hands over a JNI
 //! environment. A thread the app starts itself is attached by the app, which then passes a global
@@ -13,9 +13,22 @@
 #![deny(missing_docs, unused_crate_dependencies)]
 
 mod codes;
-#[cfg(feature = "device-tests")]
+#[cfg(all(
+    feature = "device-tests",
+    any(target_os = "linux", target_os = "android"),
+    not(kani)
+))]
 mod device;
 mod keystore;
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(kani)))]
+mod wiper;
 
 pub use jni_sys;
 pub use keystore::JniKeystore;
+
+// The tests on a device hold keys, which exist only on Linux and Android, and not under Kani.
+#[cfg(all(
+    feature = "device-tests",
+    not(all(any(target_os = "linux", target_os = "android"), not(kani)))
+))]
+use lethewis_core as _;
