@@ -404,5 +404,8 @@ Nothing is published while the version is below 0.1.0.
 - `Error::WrongPassword`, `Error::SamePassword`, `Error::Exists`, `Error::Unsynced` and
   `Error::Core`.
 - A test on the emulators enters under duress and finds the other profile's keys gone.
+- CI proves a crate only when a pull request changes the inputs of its proofs, each part within 15
+  minutes.
+- Kani builds a proof with its own crate and what that reaches, never the rest of the workspace.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

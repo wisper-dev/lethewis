@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 # The pinned Kani: the version fixes the verifier, its nightly compiler and CBMC, whose bundle is
-# checked against the digest.
+# checked against the digest. The register of proofs names both versions.
 export KANI_VERSION=0.68.0
+export CBMC_VERSION=6.11.0
 export KANI_BUNDLE_SHA256=32e2b484d73ede0bbf64a2cf0879c4259422497d8aec4ee67d448de9ae7843d3

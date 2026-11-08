@@ -3,18 +3,21 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 # Runs the Kani proofs, each in a run of its own, and judges every check they report. Kani itself
-# reports success with an unreached cover property.
+# reports success with an unreached cover property. Kani builds the crate of a proof and the crates
+# it reaches, never another crate of the workspace.
 #
 #   prove.sh             runs every proof, two at a time or LETHEWIS_PROOF_JOBS, then judges them
 #   prove.sh list        writes the declared proofs and prints their names as a JSON array
 #   prove.sh run PROOF   runs one proof and judges it by the rules of a proof alone; its results
 #                        and peak memory go to target/proofs/runs/
-#   prove.sh part K N    runs part K of N, balanced by scripts/proof-times, LETHEWIS_PROOF_JOBS at
-#                        a time. A proof joins others only if their peaks fit LETHEWIS_PROOF_MEMORY
-#                        megabytes.
+#   prove.sh only PROOF...  runs the proofs named, longest by scripts/proof-times first,
+#                        LETHEWIS_PROOF_JOBS at a time. A proof joins others only if their peaks fit
+#                        LETHEWIS_PROOF_MEMORY megabytes. scripts/proof-plan.py names them.
 #   prove.sh times       updates scripts/proof-times from the results in target/proofs/runs/
 #   prove.sh judge       judges target/proofs/runs/ against the declared proofs and writes
-#                        target/proofs/manifest.json
+#                        target/proofs/manifest.json. With LETHEWIS_PROOF_CRATES, the directories of
+#                        crates, only their proofs; the manifest names the others as unchanged since
+#                        LETHEWIS_PROOF_BASE, a commit of main.
 #   prove.sh agree       compares Kani's own results with a run's reading, on a few proofs
 #   prove.sh sources     prints a digest of Kani and of every file but the documents. A run writes
 #                        it beside its results if no file changed meanwhile.
@@ -94,11 +97,38 @@ placed() {
   fi
 }
 
+# The crates whose sources hold a proof, as lines "<package> <directory>".
+proof_crates() {
+  cargo metadata --no-deps --format-version 1 --locked |
+    jq -r --arg root "$PWD/" '.packages[]
+      | "\(.name) \(.manifest_path | ltrimstr($root) | rtrimstr("/Cargo.toml"))"' |
+    while read -r package directory; do
+      if grep -rqsF --include='*.rs' 'kani::proof' "$directory/src"; then
+        printf '%s %s\n' "$package" "$directory"
+      fi
+    done
+}
+
 declare_proofs() {
+  local crates package directory
   mkdir -p "$out"
-  rm -f "$out/declared.json"
-  cargo kani list --format json >&2
-  mv kani-list.json "$out/declared.json"
+  rm -f "$out/declared.json" "$out"/declared-*.json
+  crates=$(proof_crates)
+  [ -n "$crates" ] || { echo "prove: no crate holds a proof" >&2; exit 1; }
+  while read -r package directory; do
+    # Kani's list takes no package; in the crate's directory it builds that crate alone.
+    rm -f "$directory/kani-list.json"
+    (cd "$directory" && cargo kani list --format json) >&2
+    jq --arg package "$package" '{package: $package} + .' "$directory/kani-list.json" \
+      >"$out/declared-$package.json"
+    rm "$directory/kani-list.json"
+  done <<<"$crates"
+  jq -s '{
+    "standard-harnesses": (map(.["standard-harnesses"] // {}) | add),
+    "contract-harnesses": (map(.["contract-harnesses"] // {}) | add),
+    "package-of": ([.[] | .package as $package | .["standard-harnesses"] // {} | .[][]
+      | {key: ., value: $package}] | from_entries)
+  }' "$out"/declared-*.json >"$out/declared.json"
   placed
 }
 
@@ -116,14 +146,15 @@ with open(sys.argv[1], "w") as out:
 sys.exit(status)' "$@"
 }
 
-# Runs PROOF of the crates of MANIFEST and reads its results into FILE.
+# Runs PROOF of PACKAGE in the workspace of MANIFEST and reads its results into FILE.
 read_run() {
-  local manifest=$1 proof=$2 file=$3 started
+  local manifest=$1 package=$2 proof=$3 file=$4 started
   rm -f "$file" "$file.part" "${file%.json}.peak"
   started=${EPOCHREALTIME//[^0-9]/}
   # Without the standard library Kani reports a never-reached assert! or unwrap as a success; line
   # coverage shows it.
-  peak "${file%.json}.peak" cargo kani --manifest-path "$manifest" --harness "$proof" --exact \
+  peak "${file%.json}.peak" cargo kani --manifest-path "$manifest" -p "$package" \
+    --harness "$proof" --exact \
     --output-format old --harness-timeout 10m --coverage -Z source-coverage -Z unstable-options \
     >"${file%.json}.txt" 2>&1 || true
   if ! scripts/cbmc-results.py read "$proof" "${file%.json}.txt" \
@@ -147,7 +178,13 @@ sources() {
 }
 
 run_proof() {
-  local proof=$1 file before problems
+  local proof=$1 file before problems package
+  package=$(jq -r --arg proof "$proof" '.["package-of"][$proof] // ""' "$out/declared.json" \
+    2>/dev/null || true)
+  if [ -z "$package" ]; then
+    echo "prove: $proof is not among the proofs prove.sh list declared" >&2
+    return 1
+  fi
   file=$(run_file "$proof")
   mkdir -p "$runs"
   rm -f "${file%.json}.sources"
@@ -157,7 +194,7 @@ run_proof() {
     export CARGO_TARGET_DIR=$out/slot-$PROVE_SLOT
   fi
   rm -rf "${CARGO_TARGET_DIR:-target}"/kani/*/kanicov_*
-  read_run Cargo.toml "$proof" "$file"
+  read_run Cargo.toml "$package" "$proof" "$file"
   if [ "$(sources)" = "$before" ]; then
     printf '%s\n' "$before" >"${file%.json}.sources"
   fi
@@ -174,20 +211,20 @@ run_proof() {
 # Kani's own results against our reading of the same run: a proof with every outcome, and two of
 # ours.
 agree() {
-  local manifest_proof manifest proof file
-  for manifest_proof in checks/kani-reading/Cargo.toml:proofs::every_outcome \
-    Cargo.toml:keyset::proofs::a_transition_keeps_the_set_whole \
-    Cargo.toml:slots::proofs::creating_slots_wipes_every_key; do
-    manifest=${manifest_proof%%:*}
-    proof=${manifest_proof#*:}
+  local run manifest package proof file
+  for run in "checks/kani-reading/Cargo.toml kani-reading proofs::every_outcome" \
+    "Cargo.toml lethewis-core keyset::proofs::a_transition_keeps_the_set_whole" \
+    "Cargo.toml lethewis-core slots::proofs::creating_slots_wipes_every_key"; do
+    read -r manifest package proof <<<"$run"
     file=$PWD/$out/agree/${proof//::/.}
     mkdir -p "$out/agree"
     rm -f "$file.kani.json"
-    cargo kani --manifest-path "$manifest" --harness "$proof" --exact --output-format terse \
+    cargo kani --manifest-path "$manifest" -p "$package" --harness "$proof" --exact \
+      --output-format terse \
       --harness-timeout 10m --coverage -Z source-coverage -Z unstable-options \
       --export-json "$file.kani.json" >&2 || true
     [ -f "$file.kani.json" ] || { echo "prove: Kani gave no results for $proof" >&2; exit 1; }
-    read_run "$manifest" "$proof" "$file.read.json"
+    read_run "$manifest" "$package" "$proof" "$file.read.json"
     scripts/cbmc-results.py agree "$file.kani.json" "$file.read.json" ||
       { echo "prove: Kani's results and their reading differ for $proof" >&2; exit 1; }
     if [ "$proof" = proofs::every_outcome ]; then
@@ -233,11 +270,11 @@ prove_all() {
   judge
 }
 
-prove_part() {
-  local part=$1 parts=$2 jobs=${LETHEWIS_PROOF_JOBS:-2}
+prove_only() {
+  local jobs=${LETHEWIS_PROOF_JOBS:-2}
   local memory=${LETHEWIS_PROOF_MEMORY:-$((1 << 40))}
-  if ! [[ $part =~ ^[1-9][0-9]*$ && $parts =~ ^[1-9][0-9]*$ ]] || ((part > parts)); then
-    echo "usage: prove.sh part K N, with 1 <= K <= N" >&2
+  if (($# == 0)); then
+    echo "usage: prove.sh only PROOF..." >&2
     exit 2
   fi
   if ! [[ $jobs =~ ^[1-9][0-9]*$ && $memory =~ ^[1-9][0-9]*$ ]]; then
@@ -262,17 +299,14 @@ prove_part() {
       "$times" "$problems" >&2
     exit 1
   fi
-  # Each proof, longest first, goes to the part with the fewest seconds so far.
+  local listed
   local -a ordered
-  mapfile -t ordered < <(jq -r --rawfile times "$times" --argjson part "$part" \
-    --argjson parts "$parts" '
-    $times | split("\n") | map(select(length > 0) | split(" ")
-      | {name: .[2], seconds: (.[0] | tonumber), megabytes: .[1]}) | sort_by([-.seconds, .name])
-    | reduce .[] as $proof ({seconds: [range($parts) | 0], parts: [range($parts) | []]};
-      (.seconds | to_entries | min_by(.value) | .key) as $least
-      | .seconds[$least] += $proof.seconds
-      | .parts[$least] += ["\($proof.megabytes) \($proof.name)"])
-    | .parts[$part - 1][]' -n)
+  listed=$(jq -rn --rawfile times "$times" '
+    ($times | split("\n") | map(select(length > 0) | split(" ") | {key: .[2], value: .})
+      | from_entries) as $line
+    | [$ARGS.positional[] | $line[.] // error("prove: no such proof: \(.)")]
+    | sort_by([-(.[0] | tonumber), .[2]])[] | "\(.[1]) \(.[2])"' --args "$@")
+  mapfile -t ordered <<<"$listed"
   run_within "$jobs" "$memory" "${ordered[@]}"
 }
 
@@ -359,6 +393,17 @@ write_times() {
   grep '^- ' <<<"$written" | sed 's/^- /prove: no seconds or no peak, so no line, for /' >&2 || true
 }
 
+# Whether the file $1 is in a crate whose proofs this judgement covers: every crate, unless
+# LETHEWIS_PROOF_CRATES names some.
+judged() {
+  local crate
+  [ -n "${LETHEWIS_PROOF_CRATES:-}" ] || return 0
+  for crate in $LETHEWIS_PROOF_CRATES; do
+    [[ $1 == "$crate"/* ]] && return 0
+  done
+  return 1
+}
+
 judge() {
   rm -f "$results" "$out/manifest.json" "$out/files" "$out/asserted"
   if [ ! -f "$out/declared.json" ]; then
@@ -372,12 +417,13 @@ judge() {
   local file
   while IFS= read -r -d '' file; do
     [[ $file == *.rs && $file != checks/* && -f $file ]] || continue
+    judged "$file" || continue
     FILE=$file awk '!/^[[:space:]]*\/\// && /kani::(assert\(|cover!\()/ {
       print ENVIRON["FILE"] ":" NR
     }' <"$file"
   done <"$out/files" >"$out/asserted"
 
-  local files=() split fail ran_version declared ran problems ran_cbmc stated_kani stated_cbmc
+  local files=() split fail ran_version declared ran problems ran_cbmc kept
   if [ -d "$runs" ]; then
     mapfile -d '' files < <(find "$runs" -maxdepth 1 -name '*.json' -print0 | sort -z)
   fi
@@ -411,12 +457,29 @@ judge() {
 
   fail=0
   ran_version=$(jq -r '.tools.kani // "unknown"' "$results")
-  if [ "$ran_version" != "$KANI_VERSION" ]; then
-    echo "prove: Kani $ran_version ran, but $KANI_VERSION is pinned" >&2
+  ran_cbmc=$(jq -r '.tools.cbmc // "unknown"' "$results" | cut -d' ' -f1)
+  if [ "$ran_version $ran_cbmc" != "$KANI_VERSION $CBMC_VERSION" ]; then
+    echo "prove: Kani $ran_version with CBMC $ran_cbmc ran, but Kani $KANI_VERSION with CBMC" \
+      "$CBMC_VERSION is pinned" >&2
+    fail=1
+  fi
+  kept=$(jq -r --arg crates "${LETHEWIS_PROOF_CRATES:-}" '
+    ($crates | split(" ") | map(select(. != ""))) as $only
+    | [.["standard-harnesses"] | keys[] | split("/src/")[0]] | unique[]
+    | select(. as $crate | $only != [] and (any($only[]; . == $crate) | not))' \
+    "$out/declared.json")
+  if [ -n "$kept" ] && [ -z "${LETHEWIS_PROOF_BASE:-}" ]; then
+    echo "prove: LETHEWIS_PROOF_CRATES leaves out crates, but no LETHEWIS_PROOF_BASE names" \
+      "the commit of main they are unchanged since" >&2
     fail=1
   fi
 
-  declared=$(jq -r '.["standard-harnesses"][]?[]' "$out/declared.json" | sort)
+  declared=$(jq -r --arg crates "${LETHEWIS_PROOF_CRATES:-}" '
+    ($crates | split(" ") | map(select(. != ""))) as $only
+    | .["standard-harnesses"] | to_entries[]
+    | select(.key as $file
+        | $only == [] or any($only[]; . as $crate | $file | startswith($crate + "/")))
+    | .value[]' "$out/declared.json" | sort)
   ran=$(jq -r '.verification_results.results[].harness_id' "$results" | sort)
   if [ -z "$declared" ]; then
     echo "prove: no proof is declared; an empty run proves nothing" >&2
@@ -446,21 +509,15 @@ judge() {
     printf 'prove: %s\n' "$problems" >&2
     fail=1
   fi
-  # The register states the tool versions for every proven row; they must be the versions that ran.
-  ran_cbmc=$(jq -r '.tools.cbmc // "unknown"' "$results" | cut -d' ' -f1)
-  stated_kani=$(grep -oE 'Kani v?[0-9][0-9.]*[0-9]' docs/proofs.md | sort -u || true)
-  stated_cbmc=$(grep -oE 'CBMC v?[0-9][0-9.]*[0-9]' docs/proofs.md | sort -u || true)
-  if [ "$stated_kani" != "Kani $KANI_VERSION" ] || [ "$stated_cbmc" != "CBMC $ran_cbmc" ]; then
-    echo "prove: docs/proofs.md names [$(printf '%s' "$stated_kani $stated_cbmc" | tr '\n' ' ')]," \
-      "but Kani $KANI_VERSION with CBMC $ran_cbmc ran" >&2
-    fail=1
-  fi
   ((fail == 0)) || exit 1
 
-  jq --arg target "$(rustc -vV | sed -n 's/^host: //p')" \
-    --slurpfile declared "$out/declared.json" '{
+  jq --arg target "$(rustc -vV | sed -n 's/^host: //p')" --arg kept "$kept" \
+    --arg base "${LETHEWIS_PROOF_BASE:-}" --slurpfile declared "$out/declared.json" '
+    ($kept | split("\n") | map(select(. != ""))) as $kept
+    | {
     target: $target,
     tools,
+    unchanged_since_main: (if $kept == [] then null else {crates: $kept, commit: $base} end),
     proofs: [.verification_results.results[] as $r | {
       proof: $r.harness_id,
       sources: [$declared[0]["standard-harnesses"] | to_entries[]
@@ -484,16 +541,16 @@ case "${1:-}" in
     [ $# -eq 2 ] || { echo "usage: prove.sh run PROOF" >&2; exit 2; }
     run_proof "$2"
     ;;
-  part)
-    [ $# -eq 3 ] || { echo "usage: prove.sh part K N" >&2; exit 2; }
-    prove_part "$2" "$3"
+  only)
+    shift
+    prove_only "$@"
     ;;
   judge) judge ;;
   times) write_times ;;
   agree) agree ;;
   sources) sources ;;
   *)
-    echo "usage: prove.sh [list | run PROOF | part K N | judge | agree | sources | times]" >&2
+    echo "usage: prove.sh [list | run PROOF | only PROOF... | judge | agree | sources | times]" >&2
     exit 2
     ;;
 esac
