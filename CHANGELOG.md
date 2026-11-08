@@ -404,6 +404,15 @@ Nothing is published while the version is below 0.1.0.
 - `Error::WrongPassword`, `Error::SamePassword`, `Error::Exists`, `Error::Unsynced` and
   `Error::Core`.
 - A test on the emulators enters under duress and finds the other profile's keys gone.
+- `Profile::judge`: the signs a profile watches, judged against the readings its owner accepted. It
+  needs the chip but no password, writes nothing, and tells what changed and what is to happen.
+- A sign with no reading accepted is told apart from one whose reading changed.
+- `Profile::set_guards`, `Profile::accept_signs` and `Profile::guards`, with the owner's password.
+  They set what every sign does, and whether one sign alone destroys the profile.
+- `Sign`, `Action`, `Readings`, `Verdict`, `SIGNS` and `SIGN_COUNT`.
+- `Error::Unread` for a sign to be watched that was given no reading to accept.
+- Every profile holds a file of the signs watched, of one size whatever it watches. It is written
+  before the profile's record at creation.
 - CI proves a crate only when a pull request changes the inputs of its proofs, each part within 15
   minutes.
 - Kani builds a proof with its own crate and what that reaches, never the rest of the workspace.

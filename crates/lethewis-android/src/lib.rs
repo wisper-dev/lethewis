@@ -22,6 +22,7 @@
 mod destroy;
 mod entry;
 mod epoch;
+mod guard;
 #[cfg(all(any(target_os = "linux", target_os = "android"), not(kani)))]
 mod keys;
 mod keystore;
@@ -31,6 +32,7 @@ mod stand;
 
 pub use destroy::sweep;
 pub use epoch::{Next, Opened, Roots};
+pub use guard::{Action, Readings, SIGN_COUNT, SIGNS, Sign, Verdict};
 #[cfg(all(any(target_os = "linux", target_os = "android"), not(kani)))]
 pub use keys::{Kept, Keys, Unheld, allow_keys, settle_keys, wipe_keys};
 pub use keystore::{Failure, Keystore, Level};

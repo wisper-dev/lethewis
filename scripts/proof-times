@@ -14,6 +14,8 @@
 1 201 epoch::proofs::a_root_is_read_as_written
 1 199 epoch::proofs::only_a_written_pointer_is_read
 2 201 epoch::proofs::only_a_written_root_is_read
+8 488 guard::proofs::only_written_signs_are_read
+6 264 guard::proofs::signs_watched_are_read_as_written
 14 473 keyset::proofs::a_parsed_set_builds_back_to_the_same_bytes
 5 305 keyset::proofs::a_transition_keeps_the_set_whole
 37 1210 keyset::proofs::building_then_parsing_gives_back_the_set

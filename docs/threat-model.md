@@ -88,6 +88,23 @@ Without the passwords and the chip they read alike, and every change writes both
 A password under duress opens the profile as the owner's does. Set to destroy, it deletes the
 library's other keys in the keystore, then marks the other profiles destroyed.
 
+For each sign the owner watches, a profile holds two tags. One is of the reading accepted, the
+other of what is to happen when a reading differs.
+
+Both tags are keyed by the chip's answer. A judgement of the signs needs the chip but no password,
+and writes nothing.
+
+It compares every action of every sign. Neither its time nor the file tells what any action is.
+
+The file is of one size and is tags alone, whatever is watched. Only the owner's password writes it
+through this library.
+
+A tag the library cannot read is refused to the owner's calls. What was changed does not become a
+setting of the owner's own.
+
+A sign destroys the profile only by two readings that differ. One does so where the owner allowed
+one alone.
+
 A backup is an export under a key for transfers derived from the twelve words with a label of its
 own, so not the way in from the same words. It opens with the words alone, on any device and in any
 epoch: a guess at it is a guess at 128 bits. No backup is made under a password.
@@ -109,6 +126,18 @@ An app the system freezes in the background keeps the keys of a call under way u
 
 Without `Wiper.check`, keys stay up to two seconds after a foreground service ends. So they do after
 a lock that leaves the screen on.
+
+Code running as the application, where the chip works, reads what each sign does and writes the
+file itself. Judging needs no password, so neither does the key of the tags.
+
+A sign is judged when the application asks, so nothing happens while it does not run. Until the
+first unlock after a start, the profile's files are out of reach.
+
+The readings are the application's. What a sign means, and whether the system tells it truly, is
+outside the library.
+
+A file of signs put back from an older copy carries the actions of that copy. Rolling back files is
+the storage layer's to prevent.
 
 A profile's directory shows that it exists; hiding it is not this library's. A destroying entry
 takes longer by the deletion of the keys, which the keystore's database shows between two images.

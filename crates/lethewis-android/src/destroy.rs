@@ -9,6 +9,7 @@ use lethewis_core::Erasure;
 
 use crate::entry::ENTRIES;
 use crate::epoch::{CURRENT, ROOT, erase_root, number_of, root_numbers, worse};
+use crate::guard::GUARDS;
 use crate::keystore::{Keystore, Level};
 use crate::profile::{
     DESTROYED, Error, Id, LOCK, Profile, RECORD, WRITING, alias, exists, lock, mark_destroyed,
@@ -163,7 +164,7 @@ fn remove_files(dir: &Path) -> io::Result<()> {
 /// Whether a profile names a file of its own `name`.
 fn is_profile_file(name: &str) -> bool {
     let name = name.strip_suffix(WRITING).unwrap_or(name);
-    [RECORD, CURRENT, LOCK, DESTROYED].contains(&name)
+    [RECORD, CURRENT, LOCK, DESTROYED, GUARDS].contains(&name)
         || [ROOT, ENTRIES].iter().any(|prefix| {
             name.strip_prefix(prefix)
                 .and_then(|digits| number_of(digits.as_bytes()))
