@@ -1057,6 +1057,41 @@ mod tests {
     }
 
     #[test]
+    fn the_file_of_a_new_profile_holds_a_salt_of_its_own() {
+        let root = dir("salt");
+        let mut stand = Stand::new();
+        let one = Profile::create(&root, &mut stand, false).unwrap();
+        let other = Profile::create(&root, &mut stand, false).unwrap();
+        let salt = |profile: &Profile| parse_guards(&file(profile)).map(|guards| guards.salt);
+        assert_ne!(salt(&one), salt(&other));
+    }
+
+    #[test]
+    fn a_sign_with_no_reading_accepted_holds_a_tag_of_its_own() {
+        let root = dir("unaccepted");
+        let mut stand = Stand::new();
+        let one = Profile::create(&root, &mut stand, false).unwrap();
+        let other = Profile::create(&root, &mut stand, false).unwrap();
+        let tags = |profile: &Profile| {
+            parse_guards(&file(profile))
+                .map(|guards| guards.signs.map(|watch| watch.accepted))
+                .unwrap()
+        };
+        // Two profiles that accepted nothing: no tag repeats, so two images of the storage do not
+        // tell which signs their owners armed.
+        let (first, second) = (tags(&one), tags(&other));
+        for (at, tag) in first.iter().enumerate() {
+            assert!(!second.contains(tag));
+            assert!(
+                !first
+                    .iter()
+                    .skip(at.saturating_add(1))
+                    .any(|later| later == tag)
+            );
+        }
+    }
+
+    #[test]
     fn a_sign_not_watched_is_not_reported() {
         let root = dir("ignored");
         let mut stand = Stand::new();
@@ -1610,6 +1645,28 @@ mod tests {
             set_guards(&made, &mut stand, OWNER, watching, false, &readings),
             Err(Error::NoKey)
         );
+    }
+
+    #[test]
+    fn the_sign_of_the_fingerprints_is_watched_where_its_key_is_there() {
+        let root = dir("watched");
+        let mut stand = Stand::new();
+        let made = copied(&root, &mut stand, Start::Plain);
+        let watching = [
+            Action::Destroy,
+            Action::Ignore,
+            Action::Ignore,
+            Action::Ignore,
+        ];
+        let mut readings = first();
+        readings[Sign::Fingerprints.at()] = Some(Watch::Kept.reading());
+        set_guards(&made, &mut stand, OWNER, watching, true, &readings).unwrap();
+        assert_eq!(guards(&made, &mut stand, OWNER).unwrap(), (watching, true));
+        assert!(!made.profile.judge(&mut stand, &readings).unwrap().destroy);
+        // The key the system threw away reads another way: the sign fires, and alone it destroys.
+        let mut thrown = readings;
+        thrown[Sign::Fingerprints.at()] = Some(Watch::Gone.reading());
+        assert!(made.profile.judge(&mut stand, &thrown).unwrap().destroy);
     }
 
     #[test]
