@@ -18,7 +18,7 @@ use lethewis_core::{
 };
 use sha2::Sha256;
 
-use crate::keystore::{Failure, Keystore, Level};
+use crate::keystore::{Failure, Keystore, Level, Watched};
 use crate::profile::{Id, Profile};
 
 /// A keystore in memory: a key is 32 bytes, each new one different.
@@ -38,6 +38,11 @@ pub(crate) struct Stand {
     /// The number of keys deleted before the keystore refuses, and how.
     pub(crate) refuse_delete: Option<(usize, Failure)>,
     pub(crate) refuse_aliases: Option<Failure>,
+    /// What the keystore says of each key of a watched sign, by its name.
+    pub(crate) watched: BTreeMap<String, Watched>,
+    pub(crate) refuse_watched: Option<Failure>,
+    /// Whether the device has no secure lock screen, so no watched key can be made.
+    pub(crate) unwatchable: bool,
     pub(crate) generated: Vec<(bool, bool)>,
     pub(crate) deleted: Vec<String>,
 }
@@ -58,9 +63,17 @@ impl Stand {
             macs: 0,
             refuse_delete: None,
             refuse_aliases: None,
+            watched: BTreeMap::new(),
+            refuse_watched: None,
+            unwatchable: false,
             generated: Vec::new(),
             deleted: Vec::new(),
         }
+    }
+
+    /// Makes the keystore say that the key `alias` of a watched sign is gone.
+    pub(crate) fn gone(&mut self, alias: &str) {
+        self.watched.insert(alias.to_owned(), Watched::Gone);
     }
 
     /// The names of the keys held, in order.
@@ -105,6 +118,25 @@ impl Keystore for Stand {
             Some(failure) => Err(failure),
             None => Ok(level),
         }
+    }
+
+    fn generate_watched(&mut self, alias: &str, strong_box: bool) -> Result<Level, Failure> {
+        if self.unwatchable {
+            return Err(Failure::Locked);
+        }
+        let level = self.generate(alias, strong_box, false)?;
+        self.watched.insert(alias.to_owned(), Watched::Kept);
+        Ok(level)
+    }
+
+    fn watched(&mut self, alias: &str) -> Result<Watched, Failure> {
+        if let Some(failure) = self.refuse_watched {
+            return Err(failure);
+        }
+        if !self.keys.contains_key(alias) {
+            return Ok(Watched::Gone);
+        }
+        Ok(self.watched.get(alias).copied().unwrap_or(Watched::Kept))
     }
 
     fn mac(&mut self, alias: &str, data: &[u8], out: &mut [u8; 32]) -> Result<(), Failure> {

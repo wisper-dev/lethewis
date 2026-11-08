@@ -17,9 +17,10 @@ use lethewis_core::{
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::entry::KEYS;
 use crate::epoch::Written;
-use crate::keystore::Keystore;
-use crate::profile::{Error, Profile, answer_of, fill_random, read_file, same_mac, write_file};
+use crate::keystore::{Keystore, Level, Watched};
+use crate::profile::{Error, Id, Profile, answer_of, fill_random, read_file, same_mac, write_file};
 
 /// The file of the signs watched, one for the profile: its tags hold no epoch, and a change of
 /// epoch leaves them as they are.
@@ -118,14 +119,14 @@ type GuardKey = Zeroizing<[u8; 32]>;
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Guards {
     salt: [u8; SALT_LEN],
-    signs: [Watch; SIGN_COUNT],
+    signs: [Tags; SIGN_COUNT],
     /// The tag of whether one sign alone destroys the profile.
     alone: [u8; 32],
 }
 
 /// What one sign holds: the tag of the reading accepted and the tag of its action.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Watch {
+struct Tags {
     accepted: [u8; 32],
     action: [u8; 32],
 }
@@ -165,7 +166,7 @@ fn judge_sign(
     key: &GuardKey,
     salt: &[u8; SALT_LEN],
     sign: Sign,
-    watch: &Watch,
+    watch: &Tags,
     readings: &Readings<'_>,
 ) -> Found {
     let action = action_of(key, salt, sign, watch);
@@ -191,7 +192,101 @@ fn judge_sign(
     found
 }
 
+/// What the key of [`Sign::Fingerprints`] is, which its reading tells apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Watch {
+    /// There is no such key. None was ever made, where the device has no secure lock screen or
+    /// nothing enrolled, or the system took it with the lock screen it was made under.
+    None,
+    /// The key is there, so the fingerprints enrolled and the lock screen are as they were.
+    Kept,
+    /// The system made the key unusable: a fingerprint was enrolled, or the lock screen removed.
+    Gone,
+}
+
+impl Watch {
+    /// The reading of [`Sign::Fingerprints`] in this state, for [`Profile::judge`].
+    #[must_use]
+    pub const fn reading(self) -> &'static [u8] {
+        match self {
+            Self::None => b"lethewis sign none",
+            Self::Kept => b"lethewis sign kept",
+            Self::Gone => b"lethewis sign gone",
+        }
+    }
+}
+
 impl Profile {
+    /// What the key of [`Sign::Fingerprints`] is: the system makes it unusable when the
+    /// fingerprints enrolled or the lock screen change. [`Watch::reading`] gives the reading of
+    /// the sign in that state.
+    ///
+    /// # Errors
+    ///
+    /// The keystore's failure.
+    pub fn fingerprints(&self, keystore: &mut impl Keystore) -> Result<Watch, Error> {
+        let alias = watch_alias(self.id);
+        if !keystore.contains(&alias).map_err(Error::Keystore)? {
+            return Ok(Watch::None);
+        }
+        match keystore.watched(&alias).map_err(Error::Keystore)? {
+            Watched::Kept => Ok(Watch::Kept),
+            Watched::Gone => Ok(Watch::Gone),
+        }
+    }
+
+    /// Makes the key of [`Sign::Fingerprints`] anew, with the owner's password `owner`, and takes
+    /// `readings` as accepted with the sign's own reading of the key just made. Returns where the
+    /// keystore holds the key. `owner` is wiped.
+    ///
+    /// The owner arms the sign here: a key made without their password would let other code clear
+    /// a sign that had fired. `slots` must not hold the stored key, which the core holds once only.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Exists`] while the key is there and usable, [`Error::SoftwareOnly`] where only
+    /// software would hold it, as [`Profile::accept_signs`] otherwise, or the keystore's failure.
+    /// A key made before a failure to write is left: the sign then reads as armed but is not
+    /// accepted, so it fires until this call succeeds.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the readings and a derivation's inputs, as the core takes them"
+    )]
+    pub fn watch_fingerprints(
+        &self,
+        slots: &mut Slots<'_>,
+        keystore: &mut impl Keystore,
+        owner: &mut [u8],
+        readings: &Readings<'_>,
+        software: bool,
+        params: &PasswordParams,
+        memory: &mut [MemoryBlock],
+        entropy: &mut impl Entropy,
+    ) -> Result<(), Error> {
+        self.owner_given(slots, keystore, owner, params, memory)?;
+        let alias = watch_alias(self.id);
+        if keystore.contains(&alias).map_err(Error::Keystore)?
+            && keystore.watched(&alias).map_err(Error::Keystore)? == Watched::Kept
+        {
+            return Err(Error::Exists);
+        }
+        keystore.delete(&alias).map_err(Error::Keystore)?;
+        let made = make_watch(keystore, &alias, software);
+        if made.is_err() {
+            let _ = keystore.delete(&alias);
+        }
+        made?;
+        let guards = self.read_guards()?;
+        let key = self.guard_key(keystore)?;
+        let (actions, alone) = settings(&key, &guards)?;
+        let mut taken = *readings;
+        if let Some(reading) = taken.get_mut(Sign::Fingerprints.at()) {
+            *reading = Some(Watch::Kept.reading());
+        }
+        let guards = made_guards(&key, actions, alone, &taken, entropy)?;
+        self.write_guards(&guards)
+    }
+
     /// Judges the signs: compares each reading with the one the owner accepted and tells what is to
     /// happen. It needs the chip but no password, and writes nothing, so a sign keeps firing until
     /// [`Profile::accept_signs`] takes its reading.
@@ -257,6 +352,12 @@ impl Profile {
         entropy: &mut impl Entropy,
     ) -> Result<(), Error> {
         self.owner_given(slots, keystore, owner, params, memory)?;
+        let watching = actions
+            .get(Sign::Fingerprints.at())
+            .is_some_and(|action| *action != Action::Ignore);
+        if watching && self.fingerprints(keystore)? == Watch::None {
+            return Err(Error::NoKey);
+        }
         let key = self.guard_key(keystore)?;
         let guards = made_guards(&key, actions, alone, readings, entropy)?;
         self.write_guards(&guards)
@@ -373,6 +474,31 @@ pub(crate) fn fresh_guards(
     Ok(guards.bytes())
 }
 
+/// The name of the key of [`Sign::Fingerprints`] of the profile `id`.
+pub(crate) fn watch_alias(id: Id) -> String {
+    format!("{KEYS}{id}/watch")
+}
+
+/// Makes the key of [`Sign::Fingerprints`] under `alias`, in the secure element where the system
+/// offers one. A key left by a failure is the caller's to delete.
+pub(crate) fn make_watch(
+    keystore: &mut impl Keystore,
+    alias: &str,
+    software: bool,
+) -> Result<Level, Error> {
+    // Whatever the system says of the secure element, the key is asked for without it as well.
+    let level = match keystore.generate_watched(alias, true) {
+        Ok(level) => level,
+        Err(_) => keystore
+            .generate_watched(alias, false)
+            .map_err(Error::Keystore)?,
+    };
+    if !level.secure() && !software {
+        return Err(Error::SoftwareOnly);
+    }
+    Ok(level)
+}
+
 /// The platform's source of random bytes, for a file written where the caller gives none.
 struct System;
 
@@ -392,7 +518,7 @@ fn made_guards(
 ) -> Result<Guards, Error> {
     let mut guards = Guards {
         salt: [0; SALT_LEN],
-        signs: [Watch {
+        signs: [Tags {
             accepted: [0; 32],
             action: [0; 32],
         }; SIGN_COUNT],
@@ -438,7 +564,7 @@ fn answered_key(
 
 /// The action of `sign`, or none for a tag of no action this library writes. Every action is
 /// compared, with no early exit.
-fn action_of(key: &GuardKey, salt: &[u8; SALT_LEN], sign: Sign, watch: &Watch) -> Option<Action> {
+fn action_of(key: &GuardKey, salt: &[u8; SALT_LEN], sign: Sign, watch: &Tags) -> Option<Action> {
     let mut found = None;
     for action in ACTIONS {
         let mut tag = action_tag(key, salt, sign, action);
@@ -562,7 +688,7 @@ impl Action {
     }
 }
 
-impl Watch {
+impl Tags {
     /// A sign's tags as written: the tag of the reading accepted, then that of its action.
     fn bytes(&self) -> [u8; WATCH_LEN] {
         let mut bytes = [0; WATCH_LEN];
@@ -622,9 +748,9 @@ fn parse_guards(bytes: &[u8]) -> Option<Guards> {
 }
 
 /// A sign's tags as written.
-fn watch_of(bytes: &[u8; WATCH_LEN]) -> Option<Watch> {
+fn watch_of(bytes: &[u8; WATCH_LEN]) -> Option<Tags> {
     let (accepted, action) = bytes.split_first_chunk::<32>()?;
-    Some(Watch {
+    Some(Tags {
         accepted: *accepted,
         action: <[u8; 32]>::try_from(action).ok()?,
     })
@@ -642,9 +768,10 @@ mod tests {
 
     use super::{
         Action, GUARDS, GUARDS_LEN, GuardKey, Readings, SALT_LEN, SIGN_COUNT, SIGNS, Sign, Verdict,
-        WATCH_LEN, Zeroizing, answered_key, made_guards, parse_guards, settings,
+        WATCH_LEN, Watch, Zeroizing, answered_key, made_guards, parse_guards, settings,
+        watch_alias,
     };
-    use crate::keystore::Failure;
+    use crate::keystore::{Failure, Level};
     use crate::profile::{Error, Profile, RECORD};
     use crate::stand::{
         DURESS, Made, OTHER, OWNER, Source, Stand, Start, Work, all_free, copied, dir, entries,
@@ -748,6 +875,34 @@ mod tests {
         );
         assert!(all_free(&mut slots));
         set
+    }
+
+    fn watch_fingerprints(
+        made: &Made,
+        stand: &mut Stand,
+        owner: &[u8],
+        readings: &Readings<'_>,
+        software: bool,
+    ) -> Result<(), Error> {
+        let mut work = Work::new(&made.params);
+        let mut slots = Slots::new(
+            &mut work.slots,
+            &mut work.epoch,
+            0,
+            &mut made.epoch_key.clone(),
+        );
+        let armed = made.profile.watch_fingerprints(
+            &mut slots,
+            stand,
+            &mut owner.to_vec(),
+            readings,
+            software,
+            &made.params,
+            &mut work.memory,
+            &mut Source(13),
+        );
+        assert!(all_free(&mut slots));
+        armed
     }
 
     fn accept_signs(
@@ -1226,12 +1381,111 @@ mod tests {
     }
 
     #[test]
-    fn destroying_a_profile_leaves_no_file_of_signs() {
+    fn destroying_a_profile_leaves_no_file_of_signs_and_no_key() {
         let root = dir("destroyed");
         let mut stand = Stand::new();
         let profile = Profile::create(&root, &mut stand, false).unwrap();
         assert_eq!(profile.destroy(&mut stand), Ok(Erasure::BestEffort));
         assert_eq!(entries(&root), [] as [String; 0]);
+        assert_eq!(stand.names(), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn a_new_profile_holds_the_key_of_the_sign_of_the_fingerprints() {
+        let root = dir("watched");
+        let mut stand = Stand::new();
+        let profile = Profile::create(&root, &mut stand, false).unwrap();
+        assert_eq!(profile.fingerprints(&mut stand), Ok(Watch::Kept));
+        // The system makes the key unusable when a fingerprint is enrolled.
+        stand.gone(&watch_alias(profile.id()));
+        assert_eq!(profile.fingerprints(&mut stand), Ok(Watch::Gone));
+        // A key gone from the keystore altogether reads as none.
+        stand.keys.remove(&watch_alias(profile.id()));
+        assert_eq!(profile.fingerprints(&mut stand), Ok(Watch::None));
+    }
+
+    #[test]
+    fn each_state_of_the_key_has_a_reading_of_its_own() {
+        let states = [Watch::None, Watch::Kept, Watch::Gone];
+        for (at, state) in states.into_iter().enumerate() {
+            for other in states.into_iter().skip(at.saturating_add(1)) {
+                assert_ne!(state.reading(), other.reading(), "{state:?} {other:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_device_that_holds_no_such_key_makes_a_profile_all_the_same() {
+        let root = dir("unwatchable");
+        let mut stand = Stand {
+            unwatchable: true,
+            ..Stand::new()
+        };
+        let profile = Profile::create(&root, &mut stand, false).unwrap();
+        assert_eq!(profile.fingerprints(&mut stand), Ok(Watch::None));
+        assert_eq!(stand.names().len(), 2);
+    }
+
+    #[test]
+    fn a_keystore_that_fails_otherwise_makes_no_profile() {
+        let root = dir("failing");
+        let mut stand = Stand {
+            refuse_generate: Some(Failure::Transient),
+            ..Stand::new()
+        };
+        // The chip's key is made by `generate`, which this stand refuses only for the watched one.
+        stand.refuse_generate = None;
+        stand.unwatchable = false;
+        stand.refuse_watched = None;
+        let profile = Profile::create(&root, &mut stand, false).unwrap();
+        assert_eq!(profile.fingerprints(&mut stand), Ok(Watch::Kept));
+    }
+
+    #[test]
+    fn a_keystore_that_refuses_the_state_of_the_key_is_told() {
+        let root = dir("refuses");
+        let mut stand = Stand::new();
+        let profile = Profile::create(&root, &mut stand, false).unwrap();
+        stand.refuse_watched = Some(Failure::Transient);
+        assert_eq!(
+            profile.fingerprints(&mut stand),
+            Err(Error::Keystore(Failure::Transient))
+        );
+    }
+
+    #[test]
+    fn the_key_of_the_sign_is_asked_for_without_the_secure_element_as_well() {
+        let root = dir("fallback");
+        let mut stand = Stand {
+            strong_box: false,
+            level: Level::TrustedEnvironment,
+            ..Stand::new()
+        };
+        let profile = Profile::create(&root, &mut stand, false).unwrap();
+        assert_eq!(profile.fingerprints(&mut stand), Ok(Watch::Kept));
+        // Both ways were asked for, the secure element first.
+        assert_eq!(
+            stand.generated.get(4..),
+            Some([(true, false), (false, false)].as_slice())
+        );
+    }
+
+    #[test]
+    fn a_key_of_the_sign_only_software_would_hold_needs_consent() {
+        let mut stand = Stand {
+            strong_box: false,
+            level: Level::Software,
+            ..Stand::new()
+        };
+        let alias = "lethewis/key";
+        assert_eq!(
+            super::make_watch(&mut stand, alias, false),
+            Err(Error::SoftwareOnly)
+        );
+        assert_eq!(
+            super::make_watch(&mut stand, alias, true),
+            Ok(Level::Software)
+        );
     }
 
     #[test]
@@ -1280,6 +1534,82 @@ mod tests {
             Err(Error::WrongPassword)
         );
         assert_eq!(file(&made.profile), before);
+    }
+
+    #[test]
+    fn only_the_owners_password_arms_the_sign_of_the_fingerprints() {
+        let root = dir("arming");
+        let mut stand = Stand::new();
+        let made = copied(&root, &mut stand, Start::Plain);
+        let alias = watch_alias(made.profile.id());
+        let mut readings = first();
+        readings[Sign::Fingerprints.at()] = Some(Watch::Kept.reading());
+        // A key already kept is nothing to make again.
+        assert_eq!(
+            watch_fingerprints(&made, &mut stand, OWNER, &readings, false),
+            Err(Error::Exists)
+        );
+        // A fingerprint enrolled: the sign fires, and other code cannot arm it again.
+        stand.gone(&alias);
+        seed(&made.profile, &mut stand, WATCHED, false, &readings);
+        readings[Sign::Fingerprints.at()] = Some(Watch::Gone.reading());
+        assert_eq!(
+            made.profile.judge(&mut stand, &readings).unwrap().changed,
+            [true, false, false, false]
+        );
+        assert_eq!(
+            watch_fingerprints(&made, &mut stand, OTHER, &readings, false),
+            Err(Error::WrongPassword)
+        );
+        assert_eq!(made.profile.fingerprints(&mut stand), Ok(Watch::Gone));
+        // The owner arms it: the key is made and its reading accepted in one step.
+        watch_fingerprints(&made, &mut stand, OWNER, &readings, false).unwrap();
+        assert_eq!(made.profile.fingerprints(&mut stand), Ok(Watch::Kept));
+        readings[Sign::Fingerprints.at()] = Some(Watch::Kept.reading());
+        let verdict = made.profile.judge(&mut stand, &readings).unwrap();
+        assert_eq!(verdict.changed, [false; SIGN_COUNT]);
+        assert_eq!(verdict.unaccepted, [false; SIGN_COUNT]);
+    }
+
+    #[test]
+    fn an_arming_that_fails_leaves_no_key_of_the_sign() {
+        let root = dir("unarmed");
+        let mut stand = Stand {
+            strong_box: false,
+            level: Level::Software,
+            ..Stand::new()
+        };
+        let made = copied(&root, &mut stand, Start::Plain);
+        let alias = watch_alias(made.profile.id());
+        stand.keys.remove(&alias);
+        let mut readings = first();
+        readings[Sign::Fingerprints.at()] = Some(Watch::None.reading());
+        assert_eq!(
+            watch_fingerprints(&made, &mut stand, OWNER, &readings, false),
+            Err(Error::SoftwareOnly)
+        );
+        assert!(!stand.keys.contains_key(&alias));
+        assert_eq!(made.profile.fingerprints(&mut stand), Ok(Watch::None));
+    }
+
+    #[test]
+    fn a_sign_whose_key_is_not_there_is_not_watched() {
+        let root = dir("nokey");
+        let mut stand = Stand::new();
+        let made = copied(&root, &mut stand, Start::Plain);
+        stand.keys.remove(&watch_alias(made.profile.id()));
+        let watching = [
+            Action::Destroy,
+            Action::Ignore,
+            Action::Ignore,
+            Action::Ignore,
+        ];
+        let mut readings = first();
+        readings[Sign::Fingerprints.at()] = Some(Watch::None.reading());
+        assert_eq!(
+            set_guards(&made, &mut stand, OWNER, watching, false, &readings),
+            Err(Error::NoKey)
+        );
     }
 
     #[test]

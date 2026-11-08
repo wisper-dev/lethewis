@@ -26,7 +26,7 @@ use crate::profile::{Error, Id, Profile, exists, mark_destroyed, read_file, same
 pub(crate) const ENTRIES: &str = "entries-";
 /// How the names of the keys of this library begin, as `profile::alias` and `epoch::root_alias`
 /// write them.
-const KEYS: &str = "lethewis/";
+pub(crate) const KEYS: &str = "lethewis/";
 
 const CONTEXT: &[u8] = b"lethewis entry";
 const TAG_KEY_LABEL: &[u8; 23] = b"lethewis entry tag key ";

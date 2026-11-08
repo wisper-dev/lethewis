@@ -10,7 +10,7 @@ use jni_sys::{
     JNIEnv, JNINativeInterface_, JNINativeInterface__1_6, jbyte, jbyteArray, jclass, jint,
     jmethodID, jobject, jsize, jstring, jvalue,
 };
-use lethewis_android::{Failure, Keystore, Level};
+use lethewis_android::{Failure, Keystore, Level, Watched};
 use zeroize::Zeroize;
 
 use crate::codes;
@@ -39,6 +39,8 @@ pub struct JniKeystore<'env> {
 struct Methods {
     contains: jmethodID,
     generate: jmethodID,
+    generate_watched: jmethodID,
+    watched: jmethodID,
     mac: jmethodID,
     aliases: jmethodID,
     delete: jmethodID,
@@ -109,6 +111,8 @@ impl JniKeystore<'_> {
             methods: Methods {
                 contains: ptr::null_mut(),
                 generate: ptr::null_mut(),
+                generate_watched: ptr::null_mut(),
+                watched: ptr::null_mut(),
                 mac: ptr::null_mut(),
                 aliases: ptr::null_mut(),
                 delete: ptr::null_mut(),
@@ -125,6 +129,8 @@ impl JniKeystore<'_> {
         keystore.methods = Methods {
             contains: keystore.method(c"contains", c"(Ljava/lang/String;)I")?,
             generate: keystore.method(c"generate", c"(Ljava/lang/String;ZZ)I")?,
+            generate_watched: keystore.method(c"generateWatched", c"(Ljava/lang/String;Z)I")?,
+            watched: keystore.method(c"watched", c"(Ljava/lang/String;)I")?,
             mac: keystore.method(c"mac", c"(Ljava/lang/String;[B[B)I")?,
             aliases: keystore.method(c"aliases", c"(Ljava/lang/String;)Ljava/lang/String;")?,
             delete: keystore.method(c"delete", c"(Ljava/lang/String;)I")?,
@@ -413,6 +419,27 @@ impl Keystore for JniKeystore<'_> {
             ];
             // SAFETY: `generate` takes a String and two booleans.
             codes::level(unsafe { this.call(method, &arguments)? })
+        })
+    }
+
+    #[allow(unsafe_code)]
+    fn generate_watched(&mut self, alias: &str, strong_box: bool) -> Result<Level, Failure> {
+        let method = self.methods.generate_watched;
+        self.framed(|this| {
+            let name = this.string(alias)?;
+            let arguments = [jvalue { l: name }, jvalue { z: strong_box }];
+            // SAFETY: `generateWatched` takes a String and a boolean.
+            codes::level(unsafe { this.call(method, &arguments)? })
+        })
+    }
+
+    #[allow(unsafe_code)]
+    fn watched(&mut self, alias: &str) -> Result<Watched, Failure> {
+        let method = self.methods.watched;
+        self.framed(|this| {
+            let name = this.string(alias)?;
+            // SAFETY: `watched` takes a String.
+            codes::watched(unsafe { this.call(method, &[jvalue { l: name }])? })
         })
     }
 

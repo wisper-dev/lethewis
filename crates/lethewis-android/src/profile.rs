@@ -124,6 +124,8 @@ pub enum Error {
     SamePassword,
     /// The ways into the profile are made already; [`Profile::change_password`] changes them.
     Exists,
+    /// The sign of the fingerprints has no key of its own, so watching it would watch nothing.
+    NoKey,
     /// A sign to be watched was given no reading to accept, so it would fire at once.
     Unread,
     /// A file of the profile is written, but the sync of its directory failed, so a crash may undo
@@ -159,6 +161,7 @@ impl fmt::Display for Error {
             Self::WrongPassword => f.write_str("no way into the profile opens with the password"),
             Self::SamePassword => f.write_str("two of the passwords are one"),
             Self::Exists => f.write_str("the ways into the profile are made already"),
+            Self::NoKey => f.write_str("the sign of the fingerprints has no key"),
             Self::Unread => f.write_str("a sign to be watched was given no reading"),
             Self::Unsynced(kind) => write!(f, "a file is written but not synced: {kind}"),
             Self::Keystore(failure) => write!(f, "the keystore refused: {failure}"),
@@ -419,6 +422,15 @@ fn make_profile(
     write_file(dir, epoch::CURRENT, &pointer).map_err(epoch::Written::error)?;
     let guards = crate::guard::fresh_guards(alias, keystore)?;
     write_file(dir, crate::guard::GUARDS, &guards).map_err(epoch::Written::error)?;
+    // A device with no secure lock screen, or nothing enrolled, holds no key of that sign; the
+    // profile is made all the same. Any other failure is the keystore's and is told.
+    let watch = crate::guard::watch_alias(id);
+    if let Err(error) = crate::guard::make_watch(keystore, &watch, software) {
+        let _ = keystore.delete(&watch);
+        if error != Error::Keystore(Failure::Locked) {
+            return Err(error);
+        }
+    }
     let mut record = Record {
         level,
         unlocked,
@@ -689,7 +701,8 @@ mod tests {
         let id = Profile::create(&root, &mut stand, false).unwrap().id();
         let profile = Profile::open(&root, id).unwrap();
         assert_eq!(profile.level(), Level::StrongBox);
-        assert_eq!(stand.generated, [(true, false); 2]);
+        // The chip, the root of epoch 0, and the key of the sign of the fingerprints.
+        assert_eq!(stand.generated, [(true, false); 3]);
         let key = stand.keys[&alias(&profile)];
         for challenge in [[0; 32], [7; 32], [0xff; 32]] {
             let mut out = [0; 32];
@@ -736,7 +749,7 @@ mod tests {
         );
         assert_eq!(Profile::open(&backed, id).err(), Some(Error::BackedUp));
         assert_eq!(entries(&backed), [id.to_string()]);
-        assert_eq!(stand.keys.len(), 2);
+        assert_eq!(stand.keys.len(), 3);
         // Only where the directory really is counts.
         std::os::unix::fs::symlink(&backed, &*root).unwrap();
         assert_eq!(Profile::open(&root, id).err(), Some(Error::BackedUp));
@@ -788,7 +801,9 @@ mod tests {
         };
         let profile = Profile::create(&root, &mut stand, false).unwrap();
         assert_eq!(profile.level(), Level::TrustedEnvironment);
-        assert_eq!(stand.generated, [(true, false), (false, false)].repeat(2));
+        // The chip, the root of epoch 0 and the key of the sign of the fingerprints, each asked
+        // of the secure element first.
+        assert_eq!(stand.generated, [(true, false), (false, false)].repeat(3));
     }
 
     #[test]
@@ -845,7 +860,12 @@ mod tests {
                 ..Stand::new()
             };
             let id = Profile::create(&root, &mut stand, false).unwrap().id();
-            assert_eq!(stand.generated, [(true, unlocked); 2]);
+            // The key of the sign of the fingerprints needs the owner at every use, which is more
+            // than an unlocked device, so it is made without that flag.
+            assert_eq!(
+                stand.generated,
+                [(true, unlocked), (true, unlocked), (true, false)]
+            );
             assert_eq!(Profile::open(&root, id).unwrap().unlocked_only(), unlocked);
         }
     }
@@ -1082,7 +1102,11 @@ mod tests {
         );
         assert_eq!(
             stand.names(),
-            [format!("lethewis/{id}/chip"), root_alias(id, 0)]
+            [
+                format!("lethewis/{id}/chip"),
+                root_alias(id, 0),
+                format!("lethewis/{id}/watch")
+            ]
         );
     }
 
@@ -1180,7 +1204,7 @@ mod tests {
         fail_syncs(4, 1);
         let created = Profile::create(&root, &mut stand, false);
         assert_eq!(created.unwrap_err(), Error::Io(io::ErrorKind::Other));
-        assert_eq!(stand.names().len(), 1);
+        assert_eq!(stand.names().len(), 2);
         assert_eq!(entries(&root).len(), 1);
     }
 
@@ -1248,6 +1272,7 @@ mod tests {
             Error::WrongPassword,
             Error::SamePassword,
             Error::Exists,
+            Error::NoKey,
             Error::Unread,
             Error::Unsynced(io::ErrorKind::NotFound),
             Error::Core(lethewis_core::Error::StaleRecord),

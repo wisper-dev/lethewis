@@ -4,10 +4,10 @@
 //! The layout of the file of the signs watched: it is read as it was written, and nothing else is
 //! read as a file of signs.
 
-use super::{GUARDS_LEN, Guards, Watch, parse_guards};
+use super::{GUARDS_LEN, Guards, Tags, parse_guards};
 
-fn any_watch() -> Watch {
-    Watch {
+fn any_tags() -> Tags {
+    Tags {
         accepted: kani::any(),
         action: kani::any(),
     }
@@ -16,7 +16,7 @@ fn any_watch() -> Watch {
 fn any_guards() -> Guards {
     Guards {
         salt: kani::any(),
-        signs: core::array::from_fn(|_| any_watch()),
+        signs: core::array::from_fn(|_| any_tags()),
         alone: kani::any(),
     }
 }

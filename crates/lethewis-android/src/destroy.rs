@@ -9,7 +9,7 @@ use lethewis_core::Erasure;
 
 use crate::entry::ENTRIES;
 use crate::epoch::{CURRENT, ROOT, erase_root, number_of, root_numbers, worse};
-use crate::guard::GUARDS;
+use crate::guard::{GUARDS, watch_alias};
 use crate::keystore::{Keystore, Level};
 use crate::profile::{
     DESTROYED, Error, Id, LOCK, Profile, RECORD, WRITING, alias, exists, lock, mark_destroyed,
@@ -120,6 +120,9 @@ fn finish(
         let (gone, failure) = erase_root(dir, id, number, None, keystore);
         erasure = worse(erasure, gone);
         failed = failed.or(failure);
+    }
+    if let Err(failure) = keystore.delete(&watch_alias(id)) {
+        failed = failed.or(Some(failure));
     }
     match keystore.delete(&alias(id)) {
         Ok(()) if level.is_some_and(Level::secure) => {}
@@ -302,7 +305,7 @@ mod tests {
         File::create(home.join(DESTROYED)).unwrap();
         fs::set_permissions(home.join(LOCK), fs::Permissions::from_mode(0o400)).unwrap();
         assert_eq!(sweep(&root, &mut stand), Ok(Some(Erasure::NotErased)));
-        assert_eq!(stand.keys.len(), 2);
+        assert_eq!(stand.keys.len(), 3);
     }
 
     #[test]

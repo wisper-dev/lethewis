@@ -1053,7 +1053,11 @@ mod tests {
         );
         assert_eq!(
             stand.names(),
-            [format!("lethewis/{id}/chip"), root_alias(id, 0)]
+            [
+                format!("lethewis/{id}/chip"),
+                root_alias(id, 0),
+                format!("lethewis/{id}/watch")
+            ]
         );
     }
 

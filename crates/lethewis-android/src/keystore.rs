@@ -25,6 +25,24 @@ pub trait Keystore {
     fn generate(&mut self, alias: &str, strong_box: bool, unlocked: bool)
     -> Result<Level, Failure>;
 
+    /// Creates an HMAC-SHA256 key under `alias` that enrolling a fingerprint, or dropping the
+    /// secure lock screen, makes unusable for good; in the secure element if `strong_box`. Using it
+    /// would need the owner to authenticate, so this library only asks after it.
+    ///
+    /// # Errors
+    ///
+    /// The keystore's [`Failure`]: [`Failure::Locked`] where the device has no secure lock screen
+    /// or nothing enrolled, so no such key can be made. A key made before a failure may be left
+    /// under `alias`.
+    fn generate_watched(&mut self, alias: &str, strong_box: bool) -> Result<Level, Failure>;
+
+    /// What the keystore says of the key `alias`, without asking the owner to authenticate.
+    ///
+    /// # Errors
+    ///
+    /// The keystore's [`Failure`].
+    fn watched(&mut self, alias: &str) -> Result<Watched, Failure>;
+
     /// Writes into `out` the HMAC-SHA256 of `data` under the key `alias`.
     ///
     /// # Errors
@@ -46,6 +64,15 @@ pub trait Keystore {
     ///
     /// The keystore's [`Failure`].
     fn delete(&mut self, alias: &str) -> Result<(), Failure>;
+}
+
+/// What the keystore says of a key whose loss tells of a change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Watched {
+    /// It is there, and usable once the owner authenticates.
+    Kept,
+    /// It is gone, or the system made it unusable for good.
+    Gone,
 }
 
 /// Where the keystore holds a key, as the system reports it at creation.
