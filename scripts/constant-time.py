@@ -40,7 +40,7 @@ TIME_LOCK_FUNCTIONS = {
         r"^(_RNv\S*17lethewis_timelock3ibe10take_first):\s*$"),
 }
 ANDROID_FUNCTIONS = {
-    "the comparison of the chip's answers with a profile's record": re.compile(
+    "the comparison of the chip's answers and of the tags of the ways in": re.compile(
         r"^(_RNv\S*16lethewis_android7profile8same_mac):\s*$"),
 }
 # A name of that shape, for the listings the rules are run on.

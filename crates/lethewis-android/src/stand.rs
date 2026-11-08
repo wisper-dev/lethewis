@@ -178,6 +178,18 @@ pub(crate) fn dir(name: &str) -> Dir {
 thread_local! {
     /// How many syncs of a directory pass on this thread, then how many fail.
     static SYNCS: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
+    /// How many tags and records of the ways in an entry has tried on this thread.
+    static TRIES: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Counts a tag or a record of a way in an entry tried.
+pub(crate) fn tried() {
+    TRIES.set(TRIES.get().saturating_add(1));
+}
+
+/// How many tags and records entries have tried on this thread, counting from zero again.
+pub(crate) fn tries() -> u32 {
+    TRIES.replace(0)
 }
 
 /// Makes the syncs of a directory on this thread fail, `failing` of them after `passing` others.

@@ -7,6 +7,7 @@ use std::path::Path;
 
 use lethewis_core::Erasure;
 
+use crate::entry::ENTRIES;
 use crate::epoch::{CURRENT, ROOT, erase_root, number_of, root_numbers, worse};
 use crate::keystore::{Keystore, Level};
 use crate::profile::{
@@ -163,10 +164,11 @@ fn remove_files(dir: &Path) -> io::Result<()> {
 fn is_profile_file(name: &str) -> bool {
     let name = name.strip_suffix(WRITING).unwrap_or(name);
     [RECORD, CURRENT, LOCK, DESTROYED].contains(&name)
-        || name
-            .strip_prefix(ROOT)
-            .and_then(|digits| number_of(digits.as_bytes()))
-            .is_some()
+        || [ROOT, ENTRIES].iter().any(|prefix| {
+            name.strip_prefix(prefix)
+                .and_then(|digits| number_of(digits.as_bytes()))
+                .is_some()
+        })
 }
 
 #[cfg(test)]
@@ -180,9 +182,10 @@ mod tests {
     use lethewis_core::Erasure;
 
     use super::sweep;
+    use crate::entry::entries_name;
     use crate::epoch::root_alias;
     use crate::keystore::{Failure, Level};
-    use crate::profile::{DESTROYED, Error, LOCK, Profile, RECORD, lock};
+    use crate::profile::{DESTROYED, Error, LOCK, Profile, RECORD, WRITING, lock};
     use crate::stand::{Stand, dir, entries};
 
     #[test]
@@ -315,6 +318,20 @@ mod tests {
         let gone = format!("{id}.gone");
         assert_eq!(entries(&root), [gone.as_str()]);
         assert_eq!(entries(&root.join(gone)), ["kept", "notes"]);
+    }
+
+    #[test]
+    fn a_sweep_removes_the_ways_in_a_crash_left() {
+        let root = dir("ways");
+        let mut stand = Stand::new();
+        let id = Profile::create(&root, &mut stand, false).unwrap().id();
+        let home = root.join(id.to_string());
+        fs::remove_file(home.join(RECORD)).unwrap();
+        for name in [entries_name(0) + WRITING, entries_name(7)] {
+            fs::write(home.join(name), b"").unwrap();
+        }
+        sweep(&root, &mut stand).unwrap();
+        assert_eq!(entries(&root), [] as [&str; 0]);
     }
 
     #[test]

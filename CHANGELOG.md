@@ -395,5 +395,14 @@ Nothing is published while the version is below 0.1.0.
   unlock. One locks the device down under an activity shown over the lock screen.
 - Models of the threads of `Keys` run under the PCT scheduler of shuttle with `--cfg shuttle`,
   100 000 schedules each. They race calls, starts, drops and settles against wipes.
+- `Profile::create_entries` and `Profile::enter`: two ways into a profile on Android, the owner's
+  and one for a password under duress or none. Entering costs the same work but when it destroys.
+- `Profile::carry_entries` carries both ways in into the next epoch during a change.
+- `Profile::set_duress` and `Profile::clear_duress`, with the owner's password. Set to destroy, a
+  password under duress deletes every other key of the library, then marks the other profiles.
+- `Profile::change_password` writes both ways in anew and keeps the password under duress given.
+- `Error::WrongPassword`, `Error::SamePassword`, `Error::Exists`, `Error::Unsynced` and
+  `Error::Core`.
+- A test on the emulators enters under duress and finds the other profile's keys gone.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

@@ -14,6 +14,9 @@ epoch erases the old root by best effort.
 On Android it holds them only on an unlocked device, while the app shows or runs its own
 foreground service. The Java layer's `Wiper` tells it when.
 
+A profile opens with the owner's password, or with a password under duress, which may destroy the
+other profiles.
+
 `lethewis-jni` reaches the keystore on a device.
 
 Licensed under AGPL-3.0-only; the text is in the package. A commercial licence without the AGPL's

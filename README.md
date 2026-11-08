@@ -21,7 +21,7 @@ Suggestions for functionality not listed here are accepted as issues.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/rustc-1.99.0-orange.svg)
-![Readiness](https://img.shields.io/badge/readiness-83%25-green.svg)
+![Readiness](https://img.shields.io/badge/readiness-85%25-green.svg)
 
 ## How the keys relate
 
@@ -123,6 +123,13 @@ password and the hardware secret at each unlock, and neither alone is enough.
   Past four seconds of it, a device whose screen went off may sleep before the wipe.
 - An app the system freezes in the background keeps the keys of a call under way until it runs
   again.
+- A password under duress opens its profile as the owner's does. Set to destroy, it deletes every
+  other key of the library in the app's keystore.
+- Nothing here hides that a profile exists: its directory shows.
+- A destroying entry takes longer by the deletion of the keys. The keystore's database shows the
+  deletion to whoever compares images of it.
+- Whoever holds the device and a password learns what that password opens, of each one typed.
+- When the ways into a profile last changed shows in their file, not what changed.
 - A proof is about one named statement, not about safety. Each claim names the tool, its version,
   the assumptions and what is not covered, and never says "formally verified" alone.
 

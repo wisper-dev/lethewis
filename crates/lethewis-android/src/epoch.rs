@@ -11,8 +11,8 @@ use zeroize::Zeroize;
 
 use crate::keystore::{Failure, Keystore, Level};
 use crate::profile::{
-    Error, Id, Profile, UNLOCKED, WRITING, fill_random, flags_of, generate, join, level_code,
-    level_of, read_file, same_mac, sync_dir, unlocked_only, write_file,
+    Error, Id, Profile, UNLOCKED, WRITING, exists, fill_random, flags_of, generate, join,
+    level_code, level_of, read_file, same_mac, sync_dir, unlocked_only, write_file,
 };
 
 /// The file that names the current epoch.
@@ -177,7 +177,8 @@ impl Profile {
     }
 
     /// Makes the root of the next epoch and writes its key into `key`, for the core's
-    /// `Slots::begin_epoch`. Roots of other epochs, left by an earlier change, are erased first.
+    /// `Slots::begin_epoch`. Roots of other epochs and ways in of the next, left by an earlier
+    /// change, are erased first.
     /// Its key goes where [`Profile::create`] puts keys, and may be lower than the current one.
     ///
     /// # Errors
@@ -205,6 +206,12 @@ impl Profile {
         keystore
             .delete(&root_alias(self.id, number))
             .map_err(Error::Keystore)?;
+        // Left there, they would pass for ways in carried to the next epoch.
+        match fs::remove_file(self.dir.join(crate::entry::entries_name(number))) {
+            Ok(()) => sync_dir(&self.dir)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         self.settled = None;
         self.previous = None;
         let made = make_root(&self.dir, self.id, number, keystore, software)?;
@@ -255,6 +262,14 @@ impl<K: Keystore> Root for Roots<'_, K> {
             return Err(RootFailed);
         };
         if profile.unsettled || prepared.number != next {
+            return Err(RootFailed);
+        }
+        // Ways into the profile not carried to the next epoch would open no more.
+        let ways = |number| exists(&profile.dir.join(crate::entry::entries_name(number)));
+        if !matches!(
+            (ways(current.number), ways(next)),
+            (Ok(false), _) | (_, Ok(true))
+        ) {
             return Err(RootFailed);
         }
         // The old pointer is made before the new one is written, so that writing it back needs no
@@ -569,6 +584,8 @@ pub(crate) fn erase_root(
     if let Err(failure) = keystore.delete(&root_alias(id, number)) {
         return (Erasure::NotErased, Some(failure));
     }
+    // The ways in of the epoch open no more without its root.
+    let _ = fs::remove_file(dir.join(crate::entry::entries_name(number)));
     if fs::remove_file(dir.join(root_name(number))).is_ok() {
         let _ = sync_dir(dir);
     }
