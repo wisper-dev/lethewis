@@ -32,6 +32,10 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUSTFLAGS: -D warnings
+  # Proofs two at once: four at once on this runner took each proof up to twice as long. Room beside
+  # the peaks for the runner itself. The plan splits the proofs by the same numbers.
+  LETHEWIS_PROOF_JOBS: 2
+  LETHEWIS_PROOF_MEMORY: 13000
 
 jobs:
   rules:
@@ -746,19 +750,59 @@ jobs:
             { echo "::error::the parts did not test each listed mutant once, all caught"; exit 1; }
           jq -sr '"\(map(.total_mutants) | add) mutants: \(map(.caught) | add) caught, \(map(.unviable) | add) unviable"' "${results[@]}"
 
-  proof-parts:
-    name: Proofs, part ${{ matrix.part }} of ${{ strategy.job-total }}
+  proof-plan:
+    name: Proofs the changes reach
     needs: [lockfile, text]
     if: >-
       ${{ !cancelled() && github.event_name == 'pull_request' && needs.lockfile.result == 'success'
       && !(needs.text.result == 'success' && needs.text.outputs.only == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      base: ${{ steps.plan.outputs.base }}
+      crates: ${{ steps.plan.outputs.crates }}
+      parts: ${{ steps.plan.outputs.parts }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The plan compares the pull request with the commit of main it is based on.
+          fetch-depth: 0
+
+      - name: The planner's own cases
+        run: scripts/proof-plan.py test
+
+      - name: The proofs whose inputs changed, in parts within the budget
+        id: plan
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          ONTO: ${{ github.event.pull_request.base.ref }}
+        # The planner of main plans: to it a changed planner is a file it does not know, so every
+        # proof runs. Every proof runs too into another branch, or before main had the planner.
+        run: |
+          if [ "$ONTO" = main ] && git merge-base --is-ancestor "$BASE" origin/main &&
+            git show "$BASE:scripts/proof-plan.py" >"$RUNNER_TEMP/proof-plan.py"; then
+            python3 "$RUNNER_TEMP/proof-plan.py" plan "$BASE"
+          else
+            scripts/proof-plan.py all
+          fi | tee -a "$GITHUB_OUTPUT"
+
+  proof-parts:
+    name: Proofs, part ${{ matrix.part }} of ${{ matrix.of }}
+    needs: [lockfile, text, proof-plan]
+    if: >-
+      ${{ !cancelled() && github.event_name == 'pull_request' && needs.lockfile.result == 'success'
+      && !(needs.text.result == 'success' && needs.text.outputs.only == 'true')
+      && needs.proof-plan.result == 'success' && needs.proof-plan.outputs.parts != '[]' }}
     runs-on: ubuntu-24.04
     # A proof that grows past its budget fails the job rather than slowing every pull request.
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        include: ${{ fromJSON(needs.proof-plan.outputs.parts) }}
     permissions:
       contents: read
     steps:
@@ -777,14 +821,11 @@ jobs:
         run: scripts/prove.sh agree
 
       - name: Every proof of this part runs
-        # Two at once: four at once on this runner took each proof up to twice as long. Room beside
-        # the peaks for the runner itself.
         env:
-          LETHEWIS_PROOF_JOBS: 2
-          LETHEWIS_PROOF_MEMORY: 13000
-          PART: ${{ matrix.part }}
-          PARTS: ${{ strategy.job-total }}
-        run: scripts/prove.sh part "$PART" "$PARTS"
+          PROOFS: ${{ matrix.proofs }}
+        run: |
+          read -ra proofs <<<"$PROOFS"
+          scripts/prove.sh only "${proofs[@]}"
 
       - name: Keep the results
         # Also after a failed proof, whose results explain it.
@@ -799,7 +840,7 @@ jobs:
 
   proofs:
     name: Proofs hold
-    needs: [proof-parts, text]
+    needs: [proof-plan, proof-parts, text]
     # Runs after a failed or cancelled part too: a required check that is skipped counts as passed.
     if: >-
       ${{ always() && github.event_name == 'pull_request'
@@ -810,24 +851,38 @@ jobs:
       contents: read
     steps:
       - name: Every part succeeded
-        if: needs.proof-parts.result != 'success'
+        if: >-
+          needs.proof-plan.result != 'success'
+          || (needs.proof-plan.outputs.parts != '[]' && needs.proof-parts.result != 'success')
         env:
+          PLAN: ${{ needs.proof-plan.result }}
           RESULT: ${{ needs.proof-parts.result }}
         run: |
-          echo "prove: a part of the proofs did not succeed: $RESULT" >&2
+          echo "prove: the plan ($PLAN) or a part of the proofs ($RESULT) did not succeed" >&2
           exit 1
 
+      - name: No proof's inputs changed
+        if: needs.proof-plan.outputs.crates == ''
+        env:
+          BASE: ${{ needs.proof-plan.outputs.base }}
+        run: |
+          echo "prove: no proof's inputs changed since $BASE, a commit of main"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.proof-plan.outputs.crates != ''
         with:
           persist-credentials: false
 
       - name: Install the pinned toolchain
+        if: needs.proof-plan.outputs.crates != ''
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Install Kani
+        if: needs.proof-plan.outputs.crates != ''
         run: scripts/install-kani.sh
 
       - name: The results of every part
+        if: needs.proof-plan.outputs.crates != ''
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: proofs-part-*
@@ -835,12 +890,16 @@ jobs:
           merge-multiple: true
 
       - name: Every proof holds and every cover property is reached
+        if: needs.proof-plan.outputs.crates != ''
+        env:
+          LETHEWIS_PROOF_CRATES: ${{ needs.proof-plan.outputs.crates }}
+          LETHEWIS_PROOF_BASE: ${{ needs.proof-plan.outputs.base }}
         run: |
           scripts/prove.sh list >/dev/null
           scripts/prove.sh judge
 
       - name: Keep the results and the manifest
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && needs.proof-plan.outputs.crates != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: proofs

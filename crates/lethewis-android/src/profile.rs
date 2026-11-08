@@ -110,15 +110,27 @@ pub enum Error {
     SoftwareOnly,
     /// The current epoch is not known yet: [`Profile::epoch`] reads it.
     NoEpoch,
-    /// The root of the next epoch is made, and neither switched to nor erased yet.
+    /// The root of the next epoch is made, and neither switched to nor erased yet, or the slots
+    /// given are in a change of epoch.
     Changing,
     /// No epoch follows the current one.
     Exhausted,
     /// A switch of epoch may or may not have been written: the profile changes no epoch until
     /// [`Profile::epoch`] reads the current one again.
     Unsettled,
+    /// No way into the profile opens with the password.
+    WrongPassword,
+    /// Two of the passwords given are one, or a new password is the owner's.
+    SamePassword,
+    /// The ways into the profile are made already; [`Profile::change_password`] changes them.
+    Exists,
+    /// The ways into the profile are written, but the sync of their directory failed, so a crash
+    /// may undo the change.
+    Unsynced(io::ErrorKind),
     /// The keystore refused.
     Keystore(Failure),
+    /// The core refused.
+    Core(lethewis_core::Error),
     /// The file system refused.
     Io(io::ErrorKind),
 }
@@ -142,7 +154,12 @@ impl fmt::Display for Error {
             Self::Changing => f.write_str("a change of epoch is under way"),
             Self::Exhausted => f.write_str("no epoch follows the current one"),
             Self::Unsettled => f.write_str("a switch of epoch was not settled"),
+            Self::WrongPassword => f.write_str("no way into the profile opens with the password"),
+            Self::SamePassword => f.write_str("two of the passwords are one"),
+            Self::Exists => f.write_str("the ways into the profile are made already"),
+            Self::Unsynced(kind) => write!(f, "the ways in are written but not synced: {kind}"),
             Self::Keystore(failure) => write!(f, "the keystore refused: {failure}"),
+            Self::Core(error) => write!(f, "the core refused: {error}"),
             Self::Io(kind) => write!(f, "the file system refused: {kind}"),
         }
     }
@@ -1214,6 +1231,11 @@ mod tests {
             Error::Changing,
             Error::Exhausted,
             Error::Unsettled,
+            Error::WrongPassword,
+            Error::SamePassword,
+            Error::Exists,
+            Error::Unsynced(io::ErrorKind::NotFound),
+            Error::Core(lethewis_core::Error::StaleRecord),
             Error::Keystore(Failure::Transient),
             Error::Keystore(Failure::Locked),
             Error::Keystore(Failure::Absent),

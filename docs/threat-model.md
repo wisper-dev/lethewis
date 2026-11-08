@@ -82,6 +82,12 @@ foreground service. Once that ends its keys are wiped, and no new ones start.
 A change of epoch moves a pointer in one step, then deletes the old root. What an unfinished change
 left is erased only after the synced pointer and its root read strictly.
 
+On Android a profile always has two ways in: the owner's, and another under duress or for nobody.
+Without the passwords and the chip they read alike, and every change writes both anew.
+
+A password under duress opens the profile as the owner's does. Set to destroy, it deletes the
+library's other keys in the keystore, then marks the other profiles destroyed.
+
 A backup is an export under a key for transfers derived from the twelve words with a label of its
 own, so not the way in from the same words. It opens with the words alone, on any device and in any
 epoch: a guess at it is a guess at 128 bits. No backup is made under a password.
@@ -103,6 +109,13 @@ An app the system freezes in the background keeps the keys of a call under way u
 
 Without `Wiper.check`, keys stay up to two seconds after a foreground service ends. So they do after
 a lock that leaves the screen on.
+
+A profile's directory shows that it exists; hiding it is not this library's. A destroying entry
+takes longer by the deletion of the keys, which the keystore's database shows between two images.
+
+Whoever holds the device and a password learns what that password opens, of each one typed.
+
+When the ways in last changed shows in their file, not what changed.
 
 What a call of `Keys` takes and returns passes through the heap unwiped. A screen the proximity
 sensor turns off, as in a call, counts as on.

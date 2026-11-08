@@ -20,6 +20,7 @@
 #![cfg_attr(kani, feature(coverage_attribute), coverage(off))]
 
 mod destroy;
+mod entry;
 mod epoch;
 #[cfg(all(any(target_os = "linux", target_os = "android"), not(kani)))]
 mod keys;

@@ -22,7 +22,7 @@ include = ["src/**/*", "README.md", "LICENSE"]
 lethewis-core = { path = "../lethewis-core", version = "0.0.0" }
 # The memory the keys of an open profile are held in.
 lethewis-locked = { path = "../lethewis-locked", version = "0.0.0" }
-# Compares the chip's answers with a record in constant time.
+# Compares the chip's answers with a record, and the tags of the ways in, in constant time.
 ctutils = { version = "0.4.5", default-features = false }
 # A root's tag covers a digest of its random bytes; `zeroize` wipes the hash state on drop.
 sha2 = { version = "0.11.0", default-features = false, features = ["zeroize"] }

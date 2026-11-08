@@ -14,7 +14,9 @@ use jni_sys::{JNIEnv, jboolean, jclass, jint, jstring};
 use lethewis_android::{
     Erasure, Error, Failure, Id, Keys, Keystore, Level, Profile, Root, Unheld, sweep,
 };
-use lethewis_core::Purpose;
+use lethewis_core::{
+    Entropy, EntropyError, Epoch, KeyLength, MemoryBlock, PasswordParams, Purpose, Slot, Slots,
+};
 
 use crate::keystore::JniKeystore;
 
@@ -180,6 +182,7 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
             let expected = keystore_alone(keystore)?;
             profiles(&home, keystore, api, expected)?;
             epochs(&home, keystore)?;
+            duress(&home, keystore)?;
             remove(root)
         }
         "before-lock" | "before-stop" => {
@@ -285,6 +288,101 @@ fn destroyed(profile: Profile, keystore: &mut JniKeystore<'_>) -> Result<Erasure
         &format!("the keys after a destruction: {listed:?}"),
     )?;
     Ok(erasure)
+}
+
+/// Other bytes on every call, the same in every run.
+struct Source(u64);
+
+impl Entropy for Source {
+    fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
+        for byte in dest {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            *byte = self.0.to_le_bytes().last().copied().unwrap_or(0);
+        }
+        Ok(())
+    }
+}
+
+/// A password under duress set to destroy opens its profile and deletes the keys of another from
+/// the keystore, where the owner's password deletes nothing.
+fn duress(home: &Path, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
+    let mut source = Source(1);
+    let mut profile =
+        Profile::create(home, keystore, true).map_err(|error| format!("creating: {error}"))?;
+    let other = Profile::create(home, keystore, true)
+        .map_err(|error| format!("creating: {error}"))?
+        .id();
+    let mut epoch_key = [0; 32];
+    let number = profile
+        .epoch(keystore, &mut epoch_key)
+        .map_err(|error| format!("reading the epoch: {error}"))?
+        .number;
+    let params = PasswordParams::new(65_536, 3, &mut source)
+        .map_err(|error| format!("the parameters: {error}"))?;
+    let mut memory = vec![MemoryBlock::new(); params.memory_blocks()];
+    let (mut slot_memory, mut epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
+    let mut slots = Slots::new(&mut slot_memory, &mut epoch, number, &mut epoch_key);
+    let stored = slots
+        .generate(Purpose::Wrap, KeyLength::Bytes64, &mut source)
+        .map_err(|error| format!("the stored key: {error}"))?;
+    profile
+        .create_entries(
+            &mut slots,
+            keystore,
+            stored,
+            &mut b"owner".to_vec(),
+            &params,
+            &mut memory,
+            &mut source,
+        )
+        .map_err(|error| format!("making the ways in: {error}"))?;
+    slots
+        .release(stored)
+        .map_err(|error| format!("releasing: {error}"))?;
+    profile
+        .set_duress(
+            &mut slots,
+            keystore,
+            &mut b"owner".to_vec(),
+            &mut b"duress".to_vec(),
+            true,
+            &params,
+            &mut memory,
+            &mut source,
+        )
+        .map_err(|error| format!("setting the password under duress: {error}"))?;
+    for (password, what, kept) in [
+        (b"owner".as_slice(), "the owner's", true),
+        (b"duress", "under duress", false),
+        (b"owner", "the owner's again", false),
+    ] {
+        let stored = profile
+            .enter(
+                &mut slots,
+                keystore,
+                &mut password.to_vec(),
+                &params,
+                &mut memory,
+            )
+            .map_err(|error| format!("entering with the password {what}: {error}"))?;
+        slots
+            .release(stored)
+            .map_err(|error| format!("releasing: {error}"))?;
+        let left = keystore.aliases(&format!("lethewis/{other}/"));
+        check(
+            left.as_ref().is_ok_and(|left| left.is_empty() != kept),
+            &format!("the keys of the other profile after the password {what}: {left:?}"),
+        )?;
+    }
+    check(
+        Profile::open(home, other).err() == Some(Error::NotFound),
+        "the other profile opens after the password under duress",
+    )?;
+    sweep(home, keystore).map_err(|error| format!("sweeping: {error}"))?;
+    destroyed(profile, keystore).map(|_| ())
 }
 
 /// The profile the step before kept.

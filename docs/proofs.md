@@ -11,8 +11,11 @@ All six must hold. A row missing any one of them is not written.
 2. The statement is exact, and about this version of the crate.
 3. The assumptions are listed, each with a written reason why the remaining inputs do not matter.
 4. What is not covered is listed.
-5. The proof runs in the build on every change. A proof too slow to run is marked unverified in
-   that run, never skipped silently.
+5. The proof runs in the build on every change to its inputs. A change that leaves them alone
+   keeps the proof as it holds on `main`.
+
+   Its inputs are its crate and what it reaches in `Cargo.lock`, the toolchain, Kani and the proof
+   scripts. A proof too slow to run is marked unverified in that run, never skipped silently.
 6. The proof has been checked with a deliberately introduced error (a flipped sign, a shifted
    bound, a changed constant) and it failed. A compile error does not count as a failure.
 
@@ -57,6 +60,7 @@ All six must hold. A row missing any one of them is not written.
 | Time lock, the format | A lock is read exactly as written; bytes are read only when they are a lock as written. | `lethewis-timelock` |
 | Profile, the format | A profile's record and identifier are read exactly as written; bytes are read only when written so. | `lethewis-android` |
 | Epoch roots on Android, the format | A pointer, a root and a name's number are read exactly as written, and only bytes so written. | `lethewis-android` |
+| Ways into a profile, the format | The two ways into a profile are read exactly as written, and only bytes so written. | `lethewis-android` |
 | Time lock, keys | A key comes from a time lock only once its round's signature opens it; nothing else derives it again. | `lethewis-core` |
 
 Calls into the operating system are checked by tests, not by proof. `lethewis-dit` is measured on
@@ -70,7 +74,7 @@ has no `Keys`.
 
 ## Proven
 
-| Property | Statement | Crate | Tool and version | Runs on every change | Assumptions | Not covered |
+| Property | Statement | Crate | Tool and version | Runs on every change to its inputs | Assumptions | Not covered |
 |---|---|---|---|---|---|---|
 | Key destruction, in slots | for any sequence of imports and releases, of any length, with any keys of 32 or 64 bytes over two slots, each holding a set of up to three keys: once a set is released its slot holds only zero bytes, in every key and every identifier, and its handle is refused by every later call, including while the slot holds a new set; until then the handle reaches exactly its own keys | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the wipe is modelled as stores of zero, because the real one ends in inline assembly the tool cannot model, and the real wipe is checked by a unit test; the proofs check one step by induction: from any state of two slots and for any handle and any position whose key the handle reaches exactly or that can never be live again because its slot is retired or past its generation, one import or one release keeps that so, a live handle stays live unless it is the one released, and a handle an import issues is a live handle of this set that reaches exactly its own key; the step is checked by four proofs, an import with the first slot free, loaded or retired, the second free, loaded or retired, and a release from any state, which together are every state; any sequence follows step by step from the moment a handle is issued, and cover properties show a released handle refused while its slot holds a new set; the row on handle isolation within a set of slots proves from any generation that every way of loading keeps the generation and a release advances it, so a slot never issues an old generation again however often it is reused; the starting states include every state the code can produce; the derivation of an identifier is modelled as in that row | more slots; generations, unwraps, wraps, additions and changes of stage within the sequence, whose rows prove what each does to the slots; copies the compiler makes in registers or on the stack; whether an optimised build keeps the wipe; the wipe when a set of slots is dropped |
 | Key destruction, on creating a set of slots | from any state of two slots, with any bytes left in any buffer, creating the set of slots wipes every key and identifier at every position, leaves no slot loaded or changed, and takes the epoch and its key, wiping the source | `lethewis-core` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the wipe is modelled as stores of zero, as above; the starting states include every state the code can produce | more than two slots; copies the compiler makes; whether an optimised build keeps the wipe |
@@ -172,6 +176,7 @@ has no `Keys`.
 | Time lock, the format | Any lock written is read back as written, for any round, body, MAC, nonce and payload. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any round of nineteen digits, any bytes | bytes of another length, refused unread; whether `tle` and this crate open each other's locks, tested on locks of each |
 | Profile, the format | Any record and identifier written is read back as written; only bytes so written are read. | `lethewis-android` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any level, flag, check, tag and identifier; any bytes up to one past a record | the files themselves; the check and the tag, which only the chip's key gives |
 | Epoch roots on Android, the format | Any pointer, root and number written is read back as written; only bytes so written are read. | `lethewis-android` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | zero stores for the wipe; any number, level, flag, bytes, tag; to one byte past a file, or 21 digits | the files; the real wipe; tags, given only by chip keys; numbers in names, unit-tested |
+| Ways into a profile, the format | Any two ways in written are read back as written, in their order; only bytes so written are read. | `lethewis-android` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | none: any records, salts and tags; any bytes up to one past the file | the file itself; what a record and a tag open, which needs the password and the chip |
 | Time lock, only locks read | Any 386 bytes are read only when they are a lock as written. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above | as in the row above |
 | Time lock, time out of range | A time out of range is refused before any work. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | the encryption, MAC and payload cipher answer at will: every answer is covered; which bytes the MAC covers is tested | the pairing, hashes and ChaCha20-Poly1305, tested on files of tlock; the stack wipe and timing, tested |
 | Time lock, locking | In range, the file key is encrypted to the first round published then or later, under the bytes given. | `lethewis-timelock` | Kani 0.68.0, CBMC 6.11.0, compiler nightly-2026-08-21 | yes | as in the row above; SHA-256 of a round stands in as its bytes, one message per round | as in the row above |
@@ -211,15 +216,23 @@ has no `Keys`.
 A proof covers one named statement under named assumptions. Keeping the claims and the proofs in one
 file is what keeps the distance between them visible.
 
-The build accepts a proof run only if the pinned Kani ran, every declared proof ran by itself and
-succeeded within 10 minutes, every proof lives in a module `proofs`, has a cover property and
-reached all of them, every proof checks this repository's code, every `kani::assert(` and
-`kani::cover!(` written out in the source is in the run, some proof reaches every region that Kani
-compiled of the code in the modules `proofs`, and Kani reported no check in this repository's code
-as unreachable. Each check is judged by itself, and an unknown status is a failure. The results are
-read from CBMC's own output as Kani reads it; on every run, the reading is compared with Kani's own
-results on a proof with every outcome, failures among them, and on two of these proofs. The build
-keeps the results and a manifest of the run with the tool versions.
+The build accepts a proof run only if:
+
+- the pinned Kani and CBMC ran;
+- every declared proof ran alone and succeeded within 10 minutes;
+- every proof lives in a module `proofs`, has a cover property and reached all of them;
+- every proof checks this repository's code;
+- every `kani::assert(` and `kani::cover!(` written out in the source is in the run;
+- some proof reaches every region that Kani compiled of the code in the modules `proofs`;
+- Kani reported no check in this repository's code as unreachable.
+
+Each check is judged by itself, and an unknown status is a failure. The results are read from
+CBMC's own output as Kani reads it.
+
+On every run, the reading is compared with Kani's own results. The comparison takes a proof with
+every outcome, failures among them, and two of these proofs.
+
+The build keeps the results and a manifest of the run with the tool versions.
 
 ## Checked against deliberate errors
 
@@ -589,6 +602,9 @@ compile error.
 | a pointer of another mark read | `only_a_written_pointer_is_read` |
 | a root's stored bytes and tag read the other way | `a_root_is_read_as_written`, unit tests |
 | a root one byte longer read | `only_a_written_root_is_read` |
+| the salt and the tag of a way in written in each other's place | `ways_in_are_read_as_written`, unit tests |
+| two ways in written in the other order | `ways_in_are_read_as_written` |
+| a file of ways in one byte longer read | `only_written_ways_in_are_read` |
 | a number with a leading zero read | `a_number_is_read_exactly_when_written_so`, unit tests |
 | the key of an epoch labelled as an export key | `different_derivations_have_different_labels`, unit tests |
 | a lock for the round before, or until now | `a_key_is_locked_until_the_round_of_its_time_within_a_year`, unit tests |
