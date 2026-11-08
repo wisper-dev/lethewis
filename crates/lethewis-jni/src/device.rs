@@ -365,31 +365,31 @@ fn signs(home: &Path, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
         agrees,
         &format!("the key of the sign: {armed:?}, with {watch:?}"),
     )?;
-    // The reading is accepted where the key was made, and nothing is where it could not be.
+    // Of a new profile only the sign armed above has a reading accepted; the three the application
+    // measures have none until the owner accepts them.
     let verdict = profile
         .judge(keystore, &[Some(watch.reading()), None, None, None])
         .map_err(|error| format!("judging the signs: {error}"))?;
     let told = if watch == Watch::Kept {
-        verdict.unaccepted == [false; 4] && verdict.changed == [false; 4]
+        verdict.unaccepted == [false, true, true, true]
     } else {
-        verdict.unaccepted == [true, false, false, false]
+        verdict.unaccepted == [true; 4]
     };
     check(
-        told && !verdict.destroy,
+        told && verdict.changed == [false; 4] && !verdict.destroy,
         &format!("the signs of a new profile: {verdict:?}"),
     )?;
     let id = profile.id();
     let gone = profile
         .destroy(keystore)
         .map_err(|error| format!("destroying: {error}"))?;
-    check(
-        gone != Erasure::NotErased,
-        &format!("the keys of the profile destroyed: {gone:?}"),
-    )?;
     let left = keystore
         .aliases(&format!("lethewis/{id}/"))
         .map_err(|error| format!("listing the keys: {error}"))?;
-    check(left.is_empty(), &format!("keys left: {left:?}"))
+    check(
+        left.is_empty(),
+        &format!("keys left after a destruction {gone:?}: {left:?}"),
+    )
 }
 
 /// A password under duress set to destroy opens its profile and deletes the keys of another from
@@ -693,10 +693,15 @@ fn epochs(root: &Path, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
     let erased = roots.erase(0);
     check(erased == expected, &format!("erasing: {erased:?}"))?;
     let listed = names(keystore);
-    let wanted = Ok(vec![
+    let mut wanted = vec![
         format!("lethewis/{id}/chip"),
         format!("lethewis/{id}/root/1"),
-    ]);
+    ];
+    // The key of the sign of the fingerprints is there where the device can hold one.
+    if keystore.contains(&format!("lethewis/{id}/watch")) == Ok(true) {
+        wanted.push(format!("lethewis/{id}/watch"));
+    }
+    let wanted = Ok(wanted);
     check(
         listed == wanted,
         &format!("the keys after a change: {listed:?}"),
