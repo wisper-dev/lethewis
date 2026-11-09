@@ -641,10 +641,11 @@ jobs:
 
   mutant-parts:
     name: Mutants, part ${{ matrix.part }} of ${{ strategy.job-total }}
-    needs: [lockfile, text]
+    needs: [lockfile, text, proof-plan]
     if: >-
       ${{ !cancelled() && github.event_name == 'pull_request' && needs.lockfile.result == 'success'
-      && !(needs.text.result == 'success' && needs.text.outputs.only == 'true') }}
+      && !(needs.text.result == 'success' && needs.text.outputs.only == 'true')
+      && needs.proof-plan.result == 'success' && needs.proof-plan.outputs.mutants != '[]' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -671,11 +672,18 @@ jobs:
         env:
           PART: ${{ strategy.job-index }}
           PARTS: ${{ strategy.job-total }}
+          MUTANTS: ${{ needs.proof-plan.outputs.mutants }}
         run: |
+          # The crates the plan names, or every crate where it names none.
+          if [ -z "$MUTANTS" ] || [ "$MUTANTS" = all ]; then
+            scope=(--workspace)
+          else
+            mapfile -t scope < <(jq -r '.[] | "--package", .' <<<"$MUTANTS")
+          fi
           echo "$PARTS" >parts
-          cargo mutants --workspace --list --json >listed.json
+          cargo mutants "${scope[@]}" --list --json >listed.json
           # Taken in turn, so that the mutants of one file spread over the parts.
-          cargo mutants --workspace --shard "$PART/$PARTS" --sharding round-robin
+          cargo mutants "${scope[@]}" --shard "$PART/$PARTS" --sharding round-robin
           # A mutant whose build fails for any reason is unviable and goes untested. Only a compiler
           # that reported errors and exited with 1 marks one that does not build.
           crashed='internal compiler error|unexpectedly panicked|unexpectedly overflowed its stack|/rust(c|doc) .*\(signal:'
@@ -707,7 +715,7 @@ jobs:
 
   mutants:
     name: Every mutant is caught
-    needs: [mutant-parts, text]
+    needs: [mutant-parts, text, proof-plan]
     # Runs after a failed or cancelled part too: a required check that is skipped counts as passed.
     if: >-
       ${{ always() && github.event_name == 'pull_request'
@@ -718,7 +726,10 @@ jobs:
       contents: read
     steps:
       - name: Every part succeeded
-        if: needs.mutant-parts.result != 'success'
+        # No part runs where the plan names no crate whose inputs changed.
+        if: >-
+          ${{ needs.mutant-parts.result != 'success' && !(needs.proof-plan.result == 'success'
+          && needs.proof-plan.outputs.mutants == '[]') }}
         env:
           RESULT: ${{ needs.mutant-parts.result }}
         run: |
@@ -726,12 +737,14 @@ jobs:
           exit 1
 
       - name: The results of every part
+        if: needs.proof-plan.outputs.mutants != '[]'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: mutants-part-*
           path: parts/
 
       - name: The parts together tested every mutant, and every mutant is caught
+        if: needs.proof-plan.outputs.mutants != '[]'
         # cargo-mutants succeeds when it finds no mutant, or when no mutant builds.
         run: |
           shopt -s nullglob
@@ -764,6 +777,7 @@ jobs:
       base: ${{ steps.plan.outputs.base }}
       crates: ${{ steps.plan.outputs.crates }}
       parts: ${{ steps.plan.outputs.parts }}
+      mutants: ${{ steps.plan.outputs.mutants }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -774,7 +788,7 @@ jobs:
       - name: The planner's own cases
         run: scripts/proof-plan.py test
 
-      - name: The proofs whose inputs changed, in parts within the budget
+      - name: The proofs whose inputs changed, in parts within the budget, and the crates of mutants
         id: plan
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
