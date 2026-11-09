@@ -5,6 +5,7 @@ use core::fmt::{self, Write as _};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use zeroize::Zeroize;
 
@@ -128,6 +129,13 @@ pub enum Error {
     NoKey,
     /// A sign to be watched was given no reading to accept, so it would fire at once.
     Unread,
+    /// The profile is locked: the owner's password opens it only with two shares.
+    Locked,
+    /// The owner's password has a way in with shares, which a new password would leave unopenable:
+    /// the change asks for new shares.
+    SharesSet,
+    /// A sign set to lock the profile, or a lock, needs a way in with shares.
+    NoWayOut,
     /// A file of the profile is written, but the sync of its directory failed, so a crash may undo
     /// the change.
     Unsynced(io::ErrorKind),
@@ -163,6 +171,9 @@ impl fmt::Display for Error {
             Self::Exists => f.write_str("the ways into the profile are made already"),
             Self::NoKey => f.write_str("the sign of the fingerprints has no key"),
             Self::Unread => f.write_str("a sign to be watched was given no reading"),
+            Self::Locked => f.write_str("the profile is locked"),
+            Self::SharesSet => f.write_str("a new password needs new shares"),
+            Self::NoWayOut => f.write_str("a lock needs a way in with shares"),
             Self::Unsynced(kind) => write!(f, "a file is written but not synced: {kind}"),
             Self::Keystore(failure) => write!(f, "the keystore refused: {failure}"),
             Self::Core(error) => write!(f, "the core refused: {error}"),
@@ -189,6 +200,8 @@ pub struct Profile {
     pub(crate) unsettled: bool,
     /// The epoch an unsettled switch was found to reach, until the switch to it is asked again.
     pub(crate) settled: Option<u64>,
+    /// Held from the reading of a file of the ways in or of the signs to its writing.
+    writing: Mutex<()>,
     _lock: File,
 }
 
@@ -254,6 +267,7 @@ impl Profile {
                 previous: None,
                 unsettled: false,
                 settled: None,
+                writing: Mutex::new(()),
                 _lock: lock,
             }),
             Err(error) => {
@@ -315,6 +329,7 @@ impl Profile {
             previous: None,
             unsettled: false,
             settled: None,
+            writing: Mutex::new(()),
             _lock: lock,
         })
     }
@@ -395,6 +410,14 @@ pub(crate) fn answer_of(
     let answered = keystore.mac(alias, &input, out).map_err(Error::Keystore);
     input.zeroize();
     answered
+}
+
+impl Profile {
+    /// Held through a change of the ways in or of the signs, so that two changes at once never
+    /// write over what the other wrote.
+    pub(crate) fn writing(&self) -> MutexGuard<'_, ()> {
+        self.writing.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl fmt::Debug for Profile {
@@ -1274,6 +1297,9 @@ mod tests {
             Error::Exists,
             Error::NoKey,
             Error::Unread,
+            Error::Locked,
+            Error::SharesSet,
+            Error::NoWayOut,
             Error::Unsynced(io::ErrorKind::NotFound),
             Error::Core(lethewis_core::Error::StaleRecord),
             Error::Keystore(Failure::Transient),

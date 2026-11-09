@@ -32,6 +32,7 @@ const READING_LABEL: &[u8; 22] = b"lethewis guard reading";
 const UNACCEPTED_LABEL: &[u8; 25] = b"lethewis guard unaccepted";
 const ACTION_LABEL: &[u8; 21] = b"lethewis guard action";
 const ALONE_LABEL: &[u8; 20] = b"lethewis guard alone";
+const SHARES_LABEL: &[u8; 21] = b"lethewis guard shares";
 const SALT_LEN: usize = 32;
 
 /// How many signs a profile can watch.
@@ -79,11 +80,19 @@ pub enum Action {
     Report,
     /// The profile is to be destroyed, as [`Verdict::destroy`] says.
     Destroy,
+    /// The profile is to be locked, as [`Verdict::lock`] says: the owner's password then opens it
+    /// only with two shares, as [`Profile::unlock_with_shares`] takes them.
+    Lock,
 }
 
 /// Every action, so that a judgement compares them all. An action added needs a code in
 /// [`Action::code`], which fails to compile without one.
-const ACTIONS: [Action; 3] = [Action::Ignore, Action::Report, Action::Destroy];
+const ACTIONS: [Action; 4] = [
+    Action::Ignore,
+    Action::Report,
+    Action::Destroy,
+    Action::Lock,
+];
 
 /// What the readings of the signs say, in the order of [`SIGNS`]: for each sign the bytes the
 /// caller measured, of any length, or none for a sign it could not read at all.
@@ -107,6 +116,9 @@ pub struct Verdict {
     /// Whether the profile is to be destroyed: two signs of [`Action::Destroy`] changed, or one
     /// where the owner allowed one alone.
     pub destroy: bool,
+    /// Whether the profile is to be locked, as [`Profile::lock`] does: a sign of [`Action::Lock`]
+    /// changed, or the file was changed.
+    pub lock: bool,
     /// Whether the file holds a tag of no action this library writes: it was changed, and the signs
     /// of it are judged as [`Action::Ignore`].
     pub damaged: bool,
@@ -144,6 +156,8 @@ struct Found {
     report: bool,
     /// It changed and is to destroy the profile, if enough signs are.
     destroying: bool,
+    /// It changed and is to lock the profile.
+    locking: bool,
     /// Its action is a tag of none this library writes.
     damaged: bool,
 }
@@ -156,6 +170,7 @@ impl Found {
             unread: false,
             report: false,
             destroying: false,
+            locking: false,
             damaged: false,
         }
     }
@@ -186,6 +201,7 @@ fn judge_sign(
             tag.zeroize();
             found.report = found.changed && action == Action::Report;
             found.destroying = found.changed && action == Action::Destroy;
+            found.locking = found.changed && action == Action::Lock;
         }
         None => found.unread = action != Action::Ignore,
     }
@@ -263,6 +279,7 @@ impl Profile {
         memory: &mut [MemoryBlock],
         entropy: &mut impl Entropy,
     ) -> Result<(), Error> {
+        let _writing = self.writing();
         self.owner_given(slots, keystore, owner, params, memory)?;
         let alias = watch_alias(self.id);
         if keystore.contains(&alias).map_err(Error::Keystore)?
@@ -289,14 +306,14 @@ impl Profile {
 
     /// Judges the signs: compares each reading with the one the owner accepted and tells what is to
     /// happen. It needs the chip but no password, and writes nothing, so a sign keeps firing until
-    /// [`Profile::accept_signs`] takes its reading.
+    /// [`Profile::accept_signs`] takes its reading. A file of another length, none, or one that
+    /// cannot be read is judged changed: nothing is read of it, and the profile is to be locked.
     ///
     /// The work does not tell what any action is: every action of every sign is compared.
     ///
     /// # Errors
     ///
-    /// [`Error::Damaged`] for a file of another length, as [`Profile::verify`] for the chip, or the
-    /// file system's failure.
+    /// As [`Profile::verify`] for the chip, or the file system's failure.
     pub fn judge(
         &self,
         keystore: &mut impl Keystore,
@@ -304,20 +321,36 @@ impl Profile {
     ) -> Result<Verdict, Error> {
         // The chip first: a replaced key is told, whatever the file holds.
         let key = self.guard_key(keystore)?;
-        let guards = self.read_guards()?;
+        let guards = match self.read_guards() {
+            Ok(guards) => guards,
+            Err(Error::Damaged | Error::Io(_)) => {
+                return Ok(Verdict {
+                    changed: [false; SIGN_COUNT],
+                    unaccepted: [false; SIGN_COUNT],
+                    unread: [false; SIGN_COUNT],
+                    report: [false; SIGN_COUNT],
+                    destroy: false,
+                    lock: true,
+                    damaged: true,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let mut judged = [Found::nothing(); SIGN_COUNT];
         for ((found, sign), watch) in judged.iter_mut().zip(SIGNS).zip(&guards.signs) {
             *found = judge_sign(&key, &guards.salt, sign, watch, readings);
         }
         let alone = alone_of(&key, &guards);
         let destroying = judged.iter().filter(|found| found.destroying).count();
+        let damaged = alone.is_none() || judged.iter().any(|found| found.damaged);
         Ok(Verdict {
             changed: judged.map(|found| found.changed),
             unaccepted: judged.map(|found| found.unaccepted),
             unread: judged.map(|found| found.unread),
             report: judged.map(|found| found.report),
             destroy: destroying >= 2 || (destroying == 1 && alone == Some(true)),
-            damaged: alone.is_none() || judged.iter().any(|found| found.damaged),
+            lock: damaged || judged.iter().any(|found| found.locking),
+            damaged,
         })
     }
 
@@ -333,8 +366,9 @@ impl Profile {
     /// # Errors
     ///
     /// [`Error::WrongPassword`], [`Error::Unread`] for a sign watched and given no reading,
-    /// [`Error::NoEpoch`], or the core's refusal, the keystore's or the file system's; the file
-    /// then stays as it was. [`Error::Unsynced`] when it changed, but a crash may undo it.
+    /// [`Error::NoWayOut`] for a sign of [`Action::Lock`] while the owner's password has no way in
+    /// with shares, [`Error::NoEpoch`], or the core's refusal, the keystore's or the file system's;
+    /// the file then stays as it was. [`Error::Unsynced`] when it changed, but a crash may undo it.
     #[expect(
         clippy::too_many_arguments,
         reason = "what the signs do, the readings and a derivation's inputs"
@@ -351,7 +385,11 @@ impl Profile {
         memory: &mut [MemoryBlock],
         entropy: &mut impl Entropy,
     ) -> Result<(), Error> {
-        self.owner_given(slots, keystore, owner, params, memory)?;
+        let _writing = self.writing();
+        let shared = self.owner_given(slots, keystore, owner, params, memory)?;
+        if actions.contains(&Action::Lock) && !shared {
+            return Err(Error::NoWayOut);
+        }
         let watching = actions
             .get(Sign::Fingerprints.at())
             .is_some_and(|action| *action != Action::Ignore);
@@ -386,6 +424,7 @@ impl Profile {
         memory: &mut [MemoryBlock],
         entropy: &mut impl Entropy,
     ) -> Result<(), Error> {
+        let _writing = self.writing();
         self.owner_given(slots, keystore, owner, params, memory)?;
         let guards = self.read_guards()?;
         let key = self.guard_key(keystore)?;
@@ -415,7 +454,8 @@ impl Profile {
         settings(&key, &guards)
     }
 
-    /// Checks `owner` against the owner's way in, and wipes it.
+    /// Checks `owner` against the owner's way in, and wipes it. Tells whether it has a way in with
+    /// shares.
     fn owner_given(
         &self,
         slots: &mut Slots<'_>,
@@ -423,10 +463,74 @@ impl Profile {
         owner: &mut [u8],
         params: &PasswordParams,
         memory: &mut [MemoryBlock],
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let opened = self.owner_only(slots, keystore, owner, params, memory);
         owner.zeroize();
         opened
+    }
+
+    /// Whether a sign reads as set to [`Action::Lock`]; a sign of another tag does not count. Every
+    /// sign is read.
+    pub(crate) fn locks(&self, keystore: &mut impl Keystore) -> Result<bool, Error> {
+        let key = self.guard_key(keystore)?;
+        let guards = self.read_guards()?;
+        let locking = SIGNS
+            .iter()
+            .zip(&guards.signs)
+            .filter(|&(&sign, watch)| {
+                action_of(&key, &guards.salt, sign, watch) == Some(Action::Lock)
+            })
+            .count();
+        Ok(locking > 0)
+    }
+
+    /// The mark of the file of the ways in of whether a way in with shares is set, bound to the
+    /// salt and the tag of the way in its place. It needs the chip but no password.
+    pub(crate) fn shares_mark(
+        &self,
+        keystore: &mut impl Keystore,
+        set: bool,
+        salt: &[u8; 32],
+        tag: &[u8; 32],
+    ) -> Result<[u8; 32], Error> {
+        let key = self.guard_key(keystore)?;
+        Ok(Sha256::new()
+            .chain_update(key.as_slice())
+            .chain_update(SHARES_LABEL)
+            .chain_update(salt)
+            .chain_update(tag)
+            .chain_update([u8::from(set)])
+            .finalize()
+            .into())
+    }
+
+    /// Takes `readings` as accepted, for a caller that checked the owner's password and holds
+    /// [`Profile::writing`]. What each
+    /// sign does is kept where its tag reads; a tag of no setting becomes [`Action::Ignore`], and
+    /// one of neither answer about one sign alone becomes `false`.
+    pub(crate) fn accept_anew(
+        &self,
+        keystore: &mut impl Keystore,
+        readings: &Readings<'_>,
+        entropy: &mut impl Entropy,
+    ) -> Result<(), Error> {
+        let key = self.guard_key(keystore)?;
+        let (actions, alone) = match self.read_guards() {
+            Ok(guards) => (
+                SIGNS.map(|sign| {
+                    guards
+                        .signs
+                        .get(sign.at())
+                        .and_then(|watch| action_of(&key, &guards.salt, sign, watch))
+                        .unwrap_or_default()
+                }),
+                alone_of(&key, &guards).unwrap_or(false),
+            ),
+            Err(Error::Damaged) => ([Action::Ignore; SIGN_COUNT], false),
+            Err(error) => return Err(error),
+        };
+        let guards = made_guards(&key, actions, alone, readings, entropy)?;
+        self.write_guards(&guards)
     }
 
     /// The key of the tags, after [`Profile::verify`].
@@ -684,6 +788,7 @@ impl Action {
             Self::Ignore => 1,
             Self::Report => 2,
             Self::Destroy => 3,
+            Self::Lock => 4,
         }
     }
 }
@@ -970,6 +1075,7 @@ mod tests {
                 unread: [false; SIGN_COUNT],
                 report: [false; SIGN_COUNT],
                 destroy: false,
+                lock: false,
                 damaged: false,
             }
         );
@@ -1234,31 +1340,52 @@ mod tests {
         }
     }
 
+    /// What a file of the signs that cannot be read at all is judged: changed, and to lock.
+    const CHANGED: Verdict = Verdict {
+        changed: [false; SIGN_COUNT],
+        unaccepted: [false; SIGN_COUNT],
+        unread: [false; SIGN_COUNT],
+        report: [false; SIGN_COUNT],
+        destroy: false,
+        lock: true,
+        damaged: true,
+    };
+
     #[test]
-    fn a_file_of_signs_of_another_length_is_damaged() {
+    fn a_file_of_signs_of_another_length_locks() {
         let root = dir("length");
         let mut stand = Stand::new();
         let profile = Profile::create(&root, &mut stand, false).unwrap();
         let whole = file(&profile);
         for length in [0, GUARDS_LEN.saturating_sub(1)] {
             written(&profile, whole.get(..length).unwrap());
-            assert_eq!(profile.judge(&mut stand, &first()), Err(Error::Damaged));
+            assert_eq!(profile.judge(&mut stand, &first()), Ok(CHANGED));
         }
         let mut longer = whole.clone();
         longer.push(0);
         written(&profile, &longer);
-        assert_eq!(profile.judge(&mut stand, &first()), Err(Error::Damaged));
+        assert_eq!(profile.judge(&mut stand, &first()), Ok(CHANGED));
         written(&profile, &whole);
-        assert!(profile.judge(&mut stand, &first()).is_ok());
+        assert!(!profile.judge(&mut stand, &first()).unwrap().lock);
     }
 
     #[test]
-    fn a_file_of_signs_gone_is_damaged() {
+    fn a_file_of_signs_that_cannot_be_read_locks() {
+        let root = dir("unreadable");
+        let mut stand = Stand::new();
+        let profile = Profile::create(&root, &mut stand, false).unwrap();
+        fs::remove_file(profile.dir.join(GUARDS)).unwrap();
+        fs::create_dir(profile.dir.join(GUARDS)).unwrap();
+        assert_eq!(profile.judge(&mut stand, &first()), Ok(CHANGED));
+    }
+
+    #[test]
+    fn a_file_of_signs_gone_locks() {
         let root = dir("gone");
         let mut stand = Stand::new();
         let profile = Profile::create(&root, &mut stand, false).unwrap();
         fs::remove_file(profile.dir.join(GUARDS)).unwrap();
-        assert_eq!(profile.judge(&mut stand, &first()), Err(Error::Damaged));
+        assert_eq!(profile.judge(&mut stand, &first()), Ok(CHANGED));
     }
 
     #[test]
@@ -1270,7 +1397,7 @@ mod tests {
         Source(13).fill(&mut bytes).unwrap();
         written(&profile, &bytes);
         let verdict = profile.judge(&mut stand, &first()).unwrap();
-        assert!(verdict.damaged);
+        assert!(verdict.damaged && verdict.lock);
         assert_eq!(verdict.changed, [true; SIGN_COUNT]);
         assert!(!verdict.destroy);
     }

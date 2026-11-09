@@ -12,10 +12,12 @@ use std::{fs, thread};
 
 use jni_sys::{JNIEnv, jboolean, jclass, jint, jstring};
 use lethewis_android::{
-    Erasure, Error, Failure, Id, Keys, Keystore, Level, Profile, Root, Unheld, Watch, sweep,
+    Action, Erasure, Error, Failure, Id, Keys, Keystore, Level, Profile, Readings, Root, Unheld,
+    Watch, sweep,
 };
 use lethewis_core::{
-    Entropy, EntropyError, Epoch, KeyLength, MemoryBlock, PasswordParams, Purpose, Slot, Slots,
+    Entropy, EntropyError, Epoch, KeyLength, MemoryBlock, PasswordParams, Purpose, SHARE_COUNT,
+    SHARE_LEN, Share, Slot, Slots,
 };
 
 use crate::keystore::JniKeystore;
@@ -184,6 +186,7 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
             epochs(&home, keystore)?;
             duress(&home, keystore)?;
             signs(&home, keystore)?;
+            locked(&home, keystore)?;
             remove(root)
         }
         "before-lock" | "before-stop" => {
@@ -390,6 +393,149 @@ fn signs(home: &Path, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
         left.is_empty(),
         &format!("keys left after a destruction {gone:?}: {left:?}"),
     )
+}
+
+/// A sign set to lock, once it fires, leaves the owner's password alone opening nothing, and two
+/// shares with it open the profile again.
+fn locked(home: &Path, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
+    let mut source = Source(9);
+    let mut profile =
+        Profile::create(home, keystore, true).map_err(|error| format!("creating: {error}"))?;
+    let mut epoch_key = [0; 32];
+    let number = profile
+        .epoch(keystore, &mut epoch_key)
+        .map_err(|error| format!("reading the epoch: {error}"))?
+        .number;
+    let params = PasswordParams::new(65_536, 3, &mut source)
+        .map_err(|error| format!("the parameters: {error}"))?;
+    let mut memory = vec![MemoryBlock::new(); params.memory_blocks()];
+    let (mut slot_memory, mut epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
+    let mut slots = Slots::new(&mut slot_memory, &mut epoch, number, &mut epoch_key);
+    let stored = slots
+        .generate(Purpose::Wrap, KeyLength::Bytes64, &mut source)
+        .map_err(|error| format!("the stored key: {error}"))?;
+    profile
+        .create_entries(
+            &mut slots,
+            keystore,
+            stored,
+            &mut b"owner".to_vec(),
+            &params,
+            &mut memory,
+            &mut source,
+        )
+        .map_err(|error| format!("making the ways in: {error}"))?;
+    slots
+        .release(stored)
+        .map_err(|error| format!("releasing: {error}"))?;
+    let mut shares = [[0; SHARE_LEN]; SHARE_COUNT];
+    profile
+        .set_shares(
+            &mut slots,
+            keystore,
+            &mut b"owner".to_vec(),
+            &params,
+            &mut memory,
+            &mut source,
+            &mut shares,
+        )
+        .map_err(|error| format!("making the shares: {error}"))?;
+    let started: Readings<'_> = [None, Some(b"1"), None, None];
+    let restarted: Readings<'_> = [None, Some(b"2"), None, None];
+    profile
+        .set_guards(
+            &mut slots,
+            keystore,
+            &mut b"owner".to_vec(),
+            [Action::Ignore, Action::Lock, Action::Ignore, Action::Ignore],
+            false,
+            &started,
+            &params,
+            &mut memory,
+            &mut source,
+        )
+        .map_err(|error| format!("setting the sign: {error}"))?;
+    let verdict = profile
+        .judge(keystore, &restarted)
+        .map_err(|error| format!("judging the signs: {error}"))?;
+    check(verdict.lock, &format!("a lock not told: {verdict:?}"))?;
+    profile
+        .lock(&mut slots, keystore, &mut source)
+        .map_err(|error| format!("locking: {error}"))?;
+    let entered = profile.enter(
+        &mut slots,
+        keystore,
+        &mut b"owner".to_vec(),
+        &params,
+        &mut memory,
+    );
+    let told = match entered {
+        Ok(stored) => {
+            let _ = slots.release(stored);
+            None
+        }
+        Err(error) => Some(error),
+    };
+    check(
+        told == Some(Error::Locked),
+        &format!("the password alone, locked: {told:?}"),
+    )?;
+    let [mut first, _, mut third] = shares;
+    unlocked(
+        &profile,
+        &mut slots,
+        keystore,
+        (&mut first, &mut third),
+        &restarted,
+        &params,
+        &mut memory,
+        &mut source,
+    )?;
+    destroyed(profile, keystore).map(|_| ())
+}
+
+/// Unlocks `profile` with two shares, then finds its owner's password alone opening it and the sign
+/// that locked it quiet.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shares, the readings and a derivation's inputs"
+)]
+fn unlocked(
+    profile: &Profile,
+    slots: &mut Slots<'_>,
+    keystore: &mut JniKeystore<'_>,
+    (first, third): (&mut Share, &mut Share),
+    restarted: &Readings<'_>,
+    params: &PasswordParams,
+    memory: &mut [MemoryBlock],
+    source: &mut Source,
+) -> Result<(), String> {
+    let unlocked = profile
+        .unlock_with_shares(
+            slots,
+            keystore,
+            &mut b"owner".to_vec(),
+            first,
+            third,
+            restarted,
+            params,
+            memory,
+            source,
+        )
+        .map_err(|error| format!("unlocking: {error}"))?;
+    slots
+        .release(unlocked)
+        .map_err(|error| format!("releasing: {error}"))?;
+    let entered = profile
+        .enter(slots, keystore, &mut b"owner".to_vec(), params, memory)
+        .map_err(|error| format!("the password alone, unlocked: {error}"))?;
+    slots
+        .release(entered)
+        .map_err(|error| format!("releasing: {error}"))?;
+    let verdict = profile
+        .judge(keystore, restarted)
+        .map_err(|error| format!("judging the signs again: {error}"))?;
+    check(!verdict.lock, &format!("a lock told again: {verdict:?}"))
 }
 
 /// A password under duress set to destroy opens its profile and deletes the keys of another from
