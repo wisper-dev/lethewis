@@ -124,8 +124,12 @@ pub enum Error {
     SamePassword,
     /// The ways into the profile are made already; [`Profile::change_password`] changes them.
     Exists,
-    /// The ways into the profile are written, but the sync of their directory failed, so a crash
-    /// may undo the change.
+    /// The sign of the fingerprints has no key of its own, so watching it would watch nothing.
+    NoKey,
+    /// A sign to be watched was given no reading to accept, so it would fire at once.
+    Unread,
+    /// A file of the profile is written, but the sync of its directory failed, so a crash may undo
+    /// the change.
     Unsynced(io::ErrorKind),
     /// The keystore refused.
     Keystore(Failure),
@@ -157,7 +161,9 @@ impl fmt::Display for Error {
             Self::WrongPassword => f.write_str("no way into the profile opens with the password"),
             Self::SamePassword => f.write_str("two of the passwords are one"),
             Self::Exists => f.write_str("the ways into the profile are made already"),
-            Self::Unsynced(kind) => write!(f, "the ways in are written but not synced: {kind}"),
+            Self::NoKey => f.write_str("the sign of the fingerprints has no key"),
+            Self::Unread => f.write_str("a sign to be watched was given no reading"),
+            Self::Unsynced(kind) => write!(f, "a file is written but not synced: {kind}"),
             Self::Keystore(failure) => write!(f, "the keystore refused: {failure}"),
             Self::Core(error) => write!(f, "the core refused: {error}"),
             Self::Io(kind) => write!(f, "the file system refused: {kind}"),
@@ -372,14 +378,23 @@ impl Profile {
         out: &mut [u8; 32],
     ) -> Result<(), Error> {
         self.verify(keystore)?;
-        let mut input = [0; 48];
-        join(&[ANSWER_LABEL.as_slice(), challenge], &mut input);
-        let answered = keystore
-            .mac(&self.alias, &input, out)
-            .map_err(Error::Keystore);
-        input.zeroize();
-        answered
+        answer_of(&self.alias, keystore, challenge, out)
     }
+}
+
+/// Writes into `out` the answer of the chip's key `alias` to `challenge`, which
+/// [`Profile::answer`] gives after [`Profile::verify`].
+pub(crate) fn answer_of(
+    alias: &str,
+    keystore: &mut impl Keystore,
+    challenge: &[u8; 32],
+    out: &mut [u8; 32],
+) -> Result<(), Error> {
+    let mut input = [0; 48];
+    join(&[ANSWER_LABEL.as_slice(), challenge], &mut input);
+    let answered = keystore.mac(alias, &input, out).map_err(Error::Keystore);
+    input.zeroize();
+    answered
 }
 
 impl fmt::Debug for Profile {
@@ -405,6 +420,17 @@ fn make_profile(
     let root = epoch::make_root(dir, id, 0, keystore, software)?;
     let pointer = epoch::pointer_to(id, alias, &root, keystore)?;
     write_file(dir, epoch::CURRENT, &pointer).map_err(epoch::Written::error)?;
+    let guards = crate::guard::fresh_guards(alias, keystore)?;
+    write_file(dir, crate::guard::GUARDS, &guards).map_err(epoch::Written::error)?;
+    // A device with no secure lock screen, or nothing enrolled, holds no key of that sign; the
+    // profile is made all the same. Any other failure is the keystore's and is told.
+    let watch = crate::guard::watch_alias(id);
+    if let Err(error) = crate::guard::make_watch(keystore, &watch, software) {
+        let _ = keystore.delete(&watch);
+        if error != Error::Keystore(Failure::Locked) {
+            return Err(error);
+        }
+    }
     let mut record = Record {
         level,
         unlocked,
@@ -675,7 +701,8 @@ mod tests {
         let id = Profile::create(&root, &mut stand, false).unwrap().id();
         let profile = Profile::open(&root, id).unwrap();
         assert_eq!(profile.level(), Level::StrongBox);
-        assert_eq!(stand.generated, [(true, false); 2]);
+        // The chip, the root of epoch 0, and the key of the sign of the fingerprints.
+        assert_eq!(stand.generated, [(true, false); 3]);
         let key = stand.keys[&alias(&profile)];
         for challenge in [[0; 32], [7; 32], [0xff; 32]] {
             let mut out = [0; 32];
@@ -722,7 +749,7 @@ mod tests {
         );
         assert_eq!(Profile::open(&backed, id).err(), Some(Error::BackedUp));
         assert_eq!(entries(&backed), [id.to_string()]);
-        assert_eq!(stand.keys.len(), 2);
+        assert_eq!(stand.keys.len(), 3);
         // Only where the directory really is counts.
         std::os::unix::fs::symlink(&backed, &*root).unwrap();
         assert_eq!(Profile::open(&root, id).err(), Some(Error::BackedUp));
@@ -774,7 +801,9 @@ mod tests {
         };
         let profile = Profile::create(&root, &mut stand, false).unwrap();
         assert_eq!(profile.level(), Level::TrustedEnvironment);
-        assert_eq!(stand.generated, [(true, false), (false, false)].repeat(2));
+        // The chip, the root of epoch 0 and the key of the sign of the fingerprints, each asked
+        // of the secure element first.
+        assert_eq!(stand.generated, [(true, false), (false, false)].repeat(3));
     }
 
     #[test]
@@ -831,7 +860,12 @@ mod tests {
                 ..Stand::new()
             };
             let id = Profile::create(&root, &mut stand, false).unwrap().id();
-            assert_eq!(stand.generated, [(true, unlocked); 2]);
+            // The key of the sign of the fingerprints needs the owner at every use, which is more
+            // than an unlocked device, so it is made without that flag.
+            assert_eq!(
+                stand.generated,
+                [(true, unlocked), (true, unlocked), (true, false)]
+            );
             assert_eq!(Profile::open(&root, id).unwrap().unlocked_only(), unlocked);
         }
     }
@@ -1064,11 +1098,15 @@ mod tests {
         let id = Profile::create(&root, &mut stand, false).unwrap().id();
         assert_eq!(
             entries(&root.join(id.to_string())),
-            [CURRENT, LOCK, RECORD, "root-0"]
+            [CURRENT, crate::guard::GUARDS, LOCK, RECORD, "root-0"]
         );
         assert_eq!(
             stand.names(),
-            [format!("lethewis/{id}/chip"), root_alias(id, 0)]
+            [
+                format!("lethewis/{id}/chip"),
+                root_alias(id, 0),
+                format!("lethewis/{id}/watch")
+            ]
         );
     }
 
@@ -1136,12 +1174,12 @@ mod tests {
             refuse_delete: Some((0, Failure::Transient)),
             ..Stand::new()
         };
-        // Syncs of the root, of the root of epoch 0 and of the pointer pass; the record's fails.
-        fail_syncs(3, 1);
+        // Syncs up to that of the signs watched pass; the record's fails.
+        fail_syncs(4, 1);
         let created = Profile::create(&root, &mut stand, false);
         assert_eq!(created.unwrap_err(), Error::Io(io::ErrorKind::Other));
         // The record's check and tag were answered, so it was written.
-        assert_eq!(stand.macs, 4);
+        assert_eq!(stand.macs, 5);
         let left = entries(&root);
         assert_eq!(left.len(), 1);
         assert!(!root.join(&left[0]).join(RECORD).exists());
@@ -1163,10 +1201,10 @@ mod tests {
             refuse_delete: Some((1, Failure::Transient)),
             ..Stand::new()
         };
-        fail_syncs(3, 1);
+        fail_syncs(4, 1);
         let created = Profile::create(&root, &mut stand, false);
         assert_eq!(created.unwrap_err(), Error::Io(io::ErrorKind::Other));
-        assert_eq!(stand.names().len(), 1);
+        assert_eq!(stand.names().len(), 2);
         assert_eq!(entries(&root).len(), 1);
     }
 
@@ -1177,7 +1215,7 @@ mod tests {
             refuse_delete: Some((0, Failure::Transient)),
             ..Stand::new()
         };
-        fail_syncs(3, 1);
+        fail_syncs(4, 1);
         fail_removal();
         let created = Profile::create(&root, &mut stand, false);
         assert_eq!(created.unwrap_err(), Error::Io(io::ErrorKind::Other));
@@ -1194,10 +1232,10 @@ mod tests {
             ..Stand::new()
         };
         // The record's sync fails, and so does the sync of its removal.
-        fail_syncs(3, 2);
+        fail_syncs(4, 2);
         let created = Profile::create(&root, &mut stand, false);
         assert_eq!(created.unwrap_err(), Error::Io(io::ErrorKind::Other));
-        assert_eq!(stand.macs, 4);
+        assert_eq!(stand.macs, 5);
         let left = entries(&root);
         assert!(root.join(&left[0]).join(DESTROYED).exists());
         stand.refuse_delete = None;
@@ -1234,6 +1272,8 @@ mod tests {
             Error::WrongPassword,
             Error::SamePassword,
             Error::Exists,
+            Error::NoKey,
+            Error::Unread,
             Error::Unsynced(io::ErrorKind::NotFound),
             Error::Core(lethewis_core::Error::StaleRecord),
             Error::Keystore(Failure::Transient),

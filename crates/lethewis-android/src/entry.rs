@@ -26,7 +26,7 @@ use crate::profile::{Error, Id, Profile, exists, mark_destroyed, read_file, same
 pub(crate) const ENTRIES: &str = "entries-";
 /// How the names of the keys of this library begin, as `profile::alias` and `epoch::root_alias`
 /// write them.
-const KEYS: &str = "lethewis/";
+pub(crate) const KEYS: &str = "lethewis/";
 
 const CONTEXT: &[u8] = b"lethewis entry";
 const TAG_KEY_LABEL: &[u8; 23] = b"lethewis entry tag key ";
@@ -491,6 +491,27 @@ impl Profile {
         }
     }
 
+    /// Checks `password` against the owner's way in, and releases what it opened. `slots` must not
+    /// hold the stored key, which the core holds once only.
+    pub(crate) fn owner_only(
+        &self,
+        slots: &mut Slots<'_>,
+        keystore: &mut impl Keystore,
+        password: &mut [u8],
+        params: &PasswordParams,
+        memory: &mut [MemoryBlock],
+    ) -> Result<(), Error> {
+        let number = self
+            .current
+            .map(|current| current.number)
+            .ok_or(Error::NoEpoch)?;
+        let ways = self.read_ways(number)?;
+        let opened = self.owner(slots, keystore, password, params, memory, &ways)?;
+        release(slots, opened.key);
+        release(slots, opened.stored);
+        Ok(())
+    }
+
     /// The key from `password` and the chip's answer to it, combined as the core does, and the key
     /// of the tags, from the answer.
     fn key_from_password<'a>(
@@ -780,185 +801,23 @@ mod proofs;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::ffi::OsString;
     use std::fs;
-    use std::path::Path;
-    use std::sync::OnceLock;
 
     use lethewis_core::{
-        Entropy, EntropyError, Epoch, Error as CoreError, Handle, KeyLength, LOCK_RECORD_LEN,
-        MemoryBlock, PasswordParams, Position, Purpose, RECORD_LEN, Slot, Slots,
+        Error as CoreError, Handle, KeyLength, LOCK_RECORD_LEN, Position, Purpose, RECORD_LEN,
+        Slots,
     };
     use sha2::{Digest, Sha256};
 
     use zeroize::Zeroizing;
 
     use super::{ROLES, Role, SALT_LEN, TAG_KEY_LABEL, TagKey, WAY_LEN, entries_name, is_tag};
-    use crate::profile::{DESTROYED, Error, Id, Profile};
-    use crate::stand::{Stand, dir, fail_syncs, hmac, tries};
+    use crate::profile::{DESTROYED, Error, Profile};
+    use crate::stand::{
+        DURESS, Made, OTHER, OWNER, Source, Stand, Start, Work, all_free, copied, dir, fail_syncs,
+        hmac, made, tries,
+    };
     use crate::sweep;
-
-    const OWNER: &[u8] = b"correct horse";
-    const DURESS: &[u8] = b"battery staple";
-    const OTHER: &[u8] = b"wrong guess";
-
-    /// Other bytes on every call, the same in every run.
-    struct Source(u64);
-
-    impl Entropy for Source {
-        fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
-            for byte in dest {
-                self.0 = self
-                    .0
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1);
-                *byte = self.0.to_le_bytes()[7];
-            }
-            Ok(())
-        }
-    }
-
-    /// A profile whose owner's password is OWNER, its epoch read, with a key of external data its
-    /// stored key wraps.
-    struct Made {
-        profile: Profile,
-        params: PasswordParams,
-        epoch_key: [u8; 32],
-        wrapped: [u8; RECORD_LEN],
-        data: [u8; 32],
-    }
-
-    /// The slots of `made`'s epoch, and memory for a derivation.
-    struct Work {
-        memory: Vec<MemoryBlock>,
-        slots: [Slot; 6],
-        epoch: Epoch,
-    }
-
-    impl Work {
-        fn new(params: &PasswordParams) -> Self {
-            Self {
-                memory: vec![MemoryBlock::new(); params.memory_blocks()],
-                slots: [const { Slot::empty() }; 6],
-                epoch: Epoch::empty(),
-            }
-        }
-    }
-
-    fn made(root: &Path, stand: &mut Stand, seed: u64) -> Made {
-        let mut source = Source(seed);
-        let mut profile = Profile::create(root, stand, false).unwrap();
-        let mut epoch_key = [0; 32];
-        profile.epoch(stand, &mut epoch_key).unwrap();
-        let params = PasswordParams::new(65_536, 3, &mut source).unwrap();
-        let mut work = Work::new(&params);
-        let mut slots = Slots::new(&mut work.slots, &mut work.epoch, 0, &mut epoch_key.clone());
-        let stored = slots
-            .generate(Purpose::Wrap, KeyLength::Bytes64, &mut source)
-            .unwrap();
-        let created = slots
-            .generate(Purpose::ExternalData, KeyLength::Bytes32, &mut source)
-            .unwrap();
-        let mut wrapped = [0; RECORD_LEN];
-        slots
-            .wrap(created, stored, b"data", &mut source, &mut wrapped)
-            .unwrap();
-        let mut data = [0; 32];
-        slots
-            .reveal32(created, Position::First, Purpose::ExternalData, &mut data)
-            .unwrap();
-        profile
-            .create_entries(
-                &mut slots,
-                stand,
-                stored,
-                &mut OWNER.to_vec(),
-                &params,
-                &mut work.memory,
-                &mut source,
-            )
-            .unwrap();
-        Made {
-            profile,
-            params,
-            epoch_key,
-            wrapped,
-            data,
-        }
-    }
-
-    /// Where a test's profile starts: without a password under duress, with DURESS, or with DURESS
-    /// set to destroy.
-    #[derive(Clone, Copy)]
-    enum Start {
-        Plain,
-        Duress,
-        Destroy,
-    }
-
-    /// A profile made once for all the tests that start from it: its files and its keys.
-    struct Template {
-        id: Id,
-        files: Vec<(OsString, Vec<u8>)>,
-        keys: BTreeMap<String, [u8; 32]>,
-        keys_made: u8,
-        params: PasswordParams,
-        wrapped: [u8; RECORD_LEN],
-        data: [u8; 32],
-    }
-
-    fn template(start: Start) -> &'static Template {
-        static TEMPLATES: [OnceLock<Template>; 3] = [const { OnceLock::new() }; 3];
-        TEMPLATES[start as usize].get_or_init(|| {
-            let root = dir(&format!("template-{}", start as usize));
-            let mut stand = Stand::new();
-            let made = made(&root, &mut stand, 100);
-            if let Start::Duress | Start::Destroy = start {
-                let destroy = matches!(start, Start::Destroy);
-                set_duress(&made, &mut stand, OWNER, DURESS, destroy).unwrap();
-            }
-            let files = fs::read_dir(&made.profile.dir)
-                .unwrap()
-                .map(|entry| {
-                    let entry = entry.unwrap();
-                    (entry.file_name(), fs::read(entry.path()).unwrap())
-                })
-                .collect();
-            Template {
-                id: made.profile.id(),
-                files,
-                keys: stand.keys.clone(),
-                keys_made: stand.made,
-                params: made.params,
-                wrapped: made.wrapped,
-                data: made.data,
-            }
-        })
-    }
-
-    /// A copy under `root` of the profile `start` names, its keys in `stand`: its passwords are not
-    /// derived again, which takes seconds in an unoptimised build.
-    fn copied(root: &Path, stand: &mut Stand, start: Start) -> Made {
-        let template = template(start);
-        let home = root.join(template.id.to_string());
-        fs::create_dir(&home).unwrap();
-        for (name, bytes) in &template.files {
-            fs::write(home.join(name), bytes).unwrap();
-        }
-        stand.keys.extend(template.keys.clone());
-        stand.made = stand.made.max(template.keys_made);
-        let mut profile = Profile::open(root, template.id).unwrap();
-        let mut epoch_key = [0; 32];
-        profile.epoch(stand, &mut epoch_key).unwrap();
-        Made {
-            profile,
-            params: template.params,
-            epoch_key,
-            wrapped: template.wrapped,
-            data: template.data,
-        }
-    }
 
     /// The key of external data `stored` wraps, by which the same stored key is told.
     fn data_of<'a>(
@@ -974,23 +833,6 @@ mod tests {
         slots.release(data).unwrap();
         slots.release(stored).unwrap();
         key
-    }
-
-    /// Whether every one of the six slots is free: nothing an operation left behind holds one.
-    fn all_free(slots: &mut Slots<'_>) -> bool {
-        let mut source = Source(77);
-        let taken: Vec<_> = (0..6)
-            .map_while(|_| {
-                slots
-                    .generate(Purpose::Wrap, KeyLength::Bytes32, &mut source)
-                    .ok()
-            })
-            .collect();
-        let free = taken.len() == 6;
-        for handle in taken {
-            slots.release(handle).unwrap();
-        }
-        free
     }
 
     /// Enters `made` with `password`: what it opened as and the key of external data, or the error.

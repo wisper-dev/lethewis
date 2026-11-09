@@ -10,6 +10,7 @@ import android.security.keystore.KeyPermanentlyInvalidatedException;
 import android.security.keystore.KeyProperties;
 import android.security.keystore.StrongBoxUnavailableException;
 import android.security.keystore.UserNotAuthenticatedException;
+import java.security.InvalidAlgorithmParameterException;
 import java.security.Key;
 import java.security.KeyStore;
 import java.security.UnrecoverableKeyException;
@@ -32,6 +33,8 @@ final class Keystore {
     static final int UNKNOWN_SECURE = 3;
     static final int SOFTWARE = 4;
     static final int UNKNOWN = 5;
+    static final int KEPT = 6;
+    static final int GONE = 7;
     static final int TRANSIENT = -1;
     static final int LOCKED = -2;
     static final int ABSENT = -3;
@@ -74,6 +77,64 @@ final class Keystore {
             return level(generator.generateKey(), strongBox);
         } catch (Exception e) {
             return failure(e);
+        }
+    }
+
+    /**
+     * Creates a key under {@code alias} that enrolling a fingerprint, or removing the secure lock
+     * screen, makes unusable for good. It is never used, only asked after.
+     */
+    static int generateWatched(String alias, boolean strongBox) {
+        // Android 9 ignores a request for the secure element on keys of this kind.
+        if (strongBox && Build.VERSION.SDK_INT < 29) {
+            return STRONG_BOX_UNAVAILABLE;
+        }
+        try {
+            KeyGenParameterSpec spec =
+                    new KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
+                            .setIsStrongBoxBacked(strongBox)
+                            .setUserAuthenticationRequired(true)
+                            .setInvalidatedByBiometricEnrollment(true)
+                            .build();
+            KeyGenerator generator =
+                    KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_HMAC_SHA256, PROVIDER);
+            generator.init(spec);
+            return level(generator.generateKey(), strongBox);
+        } catch (InvalidAlgorithmParameterException e) {
+            // The system refuses the specification on a device with no secure lock screen, or
+            // nothing enrolled for the key to be invalidated by.
+            return LOCKED;
+        } catch (Exception e) {
+            return failure(e);
+        }
+    }
+
+    /**
+     * {@link #KEPT} while the key {@code alias} would work once the owner authenticates,
+     * {@link #GONE} once it is gone or the system has made it unusable, or a failure. A keystore
+     * that says neither is a failure: a key of unknown state is never reported as kept.
+     */
+    static int watched(String alias) {
+        try {
+            Key key = store().getKey(alias, null);
+            // Below API 31 a keystore that fails reads as one without the key.
+            if (key == null && Build.VERSION.SDK_INT < 31) {
+                int absent = absent(PROBE_KEY);
+                return absent == ABSENT ? GONE : absent;
+            }
+            if (key == null) {
+                return GONE;
+            }
+            Mac mac = Mac.getInstance(KeyProperties.KEY_ALGORITHM_HMAC_SHA256);
+            mac.init(key);
+            return KEPT;
+        } catch (UserNotAuthenticatedException e) {
+            // This key asks for the owner at every use, and only a key the system still accepts
+            // gets that far.
+            return KEPT;
+        } catch (Exception e) {
+            int code = failure(e);
+            return code == ABSENT ? GONE : code;
         }
     }
 

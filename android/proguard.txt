@@ -6,6 +6,8 @@
     static int apiLevel();
     static int contains(java.lang.String);
     static int generate(java.lang.String, boolean, boolean);
+    static int generateWatched(java.lang.String, boolean);
+    static int watched(java.lang.String);
     static int mac(java.lang.String, byte[], byte[]);
     static java.lang.String aliases(java.lang.String);
     static int delete(java.lang.String);

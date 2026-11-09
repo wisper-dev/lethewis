@@ -12,7 +12,7 @@ use std::{fs, thread};
 
 use jni_sys::{JNIEnv, jboolean, jclass, jint, jstring};
 use lethewis_android::{
-    Erasure, Error, Failure, Id, Keys, Keystore, Level, Profile, Root, Unheld, sweep,
+    Erasure, Error, Failure, Id, Keys, Keystore, Level, Profile, Root, Unheld, Watch, sweep,
 };
 use lethewis_core::{
     Entropy, EntropyError, Epoch, KeyLength, MemoryBlock, PasswordParams, Purpose, Slot, Slots,
@@ -183,6 +183,7 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
             profiles(&home, keystore, api, expected)?;
             epochs(&home, keystore)?;
             duress(&home, keystore)?;
+            signs(&home, keystore)?;
             remove(root)
         }
         "before-lock" | "before-stop" => {
@@ -304,6 +305,91 @@ impl Entropy for Source {
         }
         Ok(())
     }
+}
+
+/// The key of the sign of the fingerprints, as the keystore of the device holds it. A device with
+/// no secure lock screen, or nothing enrolled, holds none and says so; destroying the profile
+/// takes the key with it.
+fn signs(home: &Path, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
+    let mut source = Source(5);
+    let mut profile =
+        Profile::create(home, keystore, true).map_err(|error| format!("creating: {error}"))?;
+    let watch = profile
+        .fingerprints(keystore)
+        .map_err(|error| format!("the key of the sign: {error}"))?;
+    let mut epoch_key = [0; 32];
+    let number = profile
+        .epoch(keystore, &mut epoch_key)
+        .map_err(|error| format!("reading the epoch: {error}"))?
+        .number;
+    let params = PasswordParams::new(65_536, 3, &mut source)
+        .map_err(|error| format!("the parameters: {error}"))?;
+    let mut memory = vec![MemoryBlock::new(); params.memory_blocks()];
+    let (mut slot_memory, mut epoch) = ([const { Slot::empty() }; 6], Epoch::empty());
+    let mut slots = Slots::new(&mut slot_memory, &mut epoch, number, &mut epoch_key);
+    let stored = slots
+        .generate(Purpose::Wrap, KeyLength::Bytes64, &mut source)
+        .map_err(|error| format!("the stored key: {error}"))?;
+    profile
+        .create_entries(
+            &mut slots,
+            keystore,
+            stored,
+            &mut b"owner".to_vec(),
+            &params,
+            &mut memory,
+            &mut source,
+        )
+        .map_err(|error| format!("making the ways in: {error}"))?;
+    slots
+        .release(stored)
+        .map_err(|error| format!("releasing: {error}"))?;
+    // Arming the sign takes the owner's password, and a key the device can hold. The emulators
+    // have no secure lock screen, so there the system refuses one.
+    let armed = profile.watch_fingerprints(
+        &mut slots,
+        keystore,
+        &mut b"owner".to_vec(),
+        &[Some(watch.reading()), None, None, None],
+        true,
+        &params,
+        &mut memory,
+        &mut source,
+    );
+    let agrees = match armed {
+        Ok(()) | Err(Error::Exists) => watch == Watch::Kept,
+        Err(Error::Keystore(Failure::Locked)) => watch == Watch::None,
+        Err(_) => false,
+    };
+    check(
+        agrees,
+        &format!("the key of the sign: {armed:?}, with {watch:?}"),
+    )?;
+    // Of a new profile only the sign armed above has a reading accepted; the three the application
+    // measures have none until the owner accepts them.
+    let verdict = profile
+        .judge(keystore, &[Some(watch.reading()), None, None, None])
+        .map_err(|error| format!("judging the signs: {error}"))?;
+    let told = if watch == Watch::Kept {
+        verdict.unaccepted == [false, true, true, true]
+    } else {
+        verdict.unaccepted == [true; 4]
+    };
+    check(
+        told && verdict.changed == [false; 4] && !verdict.destroy,
+        &format!("the signs of a new profile: {verdict:?}"),
+    )?;
+    let id = profile.id();
+    let gone = profile
+        .destroy(keystore)
+        .map_err(|error| format!("destroying: {error}"))?;
+    let left = keystore
+        .aliases(&format!("lethewis/{id}/"))
+        .map_err(|error| format!("listing the keys: {error}"))?;
+    check(
+        left.is_empty(),
+        &format!("keys left after a destruction {gone:?}: {left:?}"),
+    )
 }
 
 /// A password under duress set to destroy opens its profile and deletes the keys of another from
@@ -607,10 +693,15 @@ fn epochs(root: &Path, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
     let erased = roots.erase(0);
     check(erased == expected, &format!("erasing: {erased:?}"))?;
     let listed = names(keystore);
-    let wanted = Ok(vec![
+    let mut wanted = vec![
         format!("lethewis/{id}/chip"),
         format!("lethewis/{id}/root/1"),
-    ]);
+    ];
+    // The key of the sign of the fingerprints is there where the device can hold one.
+    if keystore.contains(&format!("lethewis/{id}/watch")) == Ok(true) {
+        wanted.push(format!("lethewis/{id}/watch"));
+    }
+    let wanted = Ok(wanted);
     check(
         listed == wanted,
         &format!("the keys after a change: {listed:?}"),

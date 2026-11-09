@@ -21,7 +21,7 @@ Suggestions for functionality not listed here are accepted as issues.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/rustc-1.99.0-orange.svg)
-![Readiness](https://img.shields.io/badge/readiness-85%25-green.svg)
+![Readiness](https://img.shields.io/badge/readiness-86%25-green.svg)
 
 ## How the keys relate
 
@@ -125,6 +125,12 @@ password and the hardware secret at each unlock, and neither alone is enough.
   again.
 - A password under duress opens its profile as the owner's does. Set to destroy, it deletes every
   other key of the library in the app's keystore.
+- Code that reaches the chip reads what each sign watched does, and writes the file of the signs
+  itself. Judging the signs needs no password, so neither does its key.
+- A sign is judged when the app asks, so nothing happens while it does not run. The files of a
+  profile are out of reach until the first unlock after a start.
+- The key of the sign of the fingerprints needs a secure lock screen and something enrolled.
+  Without that key the sign watches nothing.
 - Nothing here hides that a profile exists: its directory shows.
 - A destroying entry takes longer by the deletion of the keys. The keystore's database shows the
   deletion to whoever compares images of it.

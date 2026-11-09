@@ -5,14 +5,21 @@
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use hmac::{Hmac, KeyInit, Mac};
+use lethewis_core::{
+    Entropy, EntropyError, Epoch, KeyLength, MemoryBlock, PasswordParams, Position, Purpose,
+    RECORD_LEN, Slot, Slots,
+};
 use sha2::Sha256;
 
-use crate::keystore::{Failure, Keystore, Level};
+use crate::keystore::{Failure, Keystore, Level, Watched};
+use crate::profile::{Id, Profile};
 
 /// A keystore in memory: a key is 32 bytes, each new one different.
 pub(crate) struct Stand {
@@ -31,6 +38,11 @@ pub(crate) struct Stand {
     /// The number of keys deleted before the keystore refuses, and how.
     pub(crate) refuse_delete: Option<(usize, Failure)>,
     pub(crate) refuse_aliases: Option<Failure>,
+    /// What the keystore says of each key of a watched sign, by its name.
+    pub(crate) watched: BTreeMap<String, Watched>,
+    pub(crate) refuse_watched: Option<Failure>,
+    /// Whether the device has no secure lock screen, so no watched key can be made.
+    pub(crate) unwatchable: bool,
     pub(crate) generated: Vec<(bool, bool)>,
     pub(crate) deleted: Vec<String>,
 }
@@ -51,9 +63,17 @@ impl Stand {
             macs: 0,
             refuse_delete: None,
             refuse_aliases: None,
+            watched: BTreeMap::new(),
+            refuse_watched: None,
+            unwatchable: false,
             generated: Vec::new(),
             deleted: Vec::new(),
         }
+    }
+
+    /// Makes the keystore say that the key `alias` of a watched sign is gone.
+    pub(crate) fn gone(&mut self, alias: &str) {
+        self.watched.insert(alias.to_owned(), Watched::Gone);
     }
 
     /// The names of the keys held, in order.
@@ -98,6 +118,25 @@ impl Keystore for Stand {
             Some(failure) => Err(failure),
             None => Ok(level),
         }
+    }
+
+    fn generate_watched(&mut self, alias: &str, strong_box: bool) -> Result<Level, Failure> {
+        if self.unwatchable {
+            return Err(Failure::Locked);
+        }
+        let level = self.generate(alias, strong_box, false)?;
+        self.watched.insert(alias.to_owned(), Watched::Kept);
+        Ok(level)
+    }
+
+    fn watched(&mut self, alias: &str) -> Result<Watched, Failure> {
+        if let Some(failure) = self.refuse_watched {
+            return Err(failure);
+        }
+        if !self.keys.contains_key(alias) {
+            return Ok(Watched::Gone);
+        }
+        Ok(self.watched.get(alias).copied().unwrap_or(Watched::Kept))
     }
 
     fn mac(&mut self, alias: &str, data: &[u8], out: &mut [u8; 32]) -> Result<(), Failure> {
@@ -229,6 +268,201 @@ pub(crate) fn removal_failure() -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+pub(crate) const OWNER: &[u8] = b"correct horse";
+pub(crate) const DURESS: &[u8] = b"battery staple";
+pub(crate) const OTHER: &[u8] = b"wrong guess";
+
+/// Other bytes on every call, the same in every run.
+pub(crate) struct Source(pub(crate) u64);
+
+impl Entropy for Source {
+    fn fill(&mut self, dest: &mut [u8]) -> Result<(), EntropyError> {
+        for byte in dest {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            *byte = self.0.to_le_bytes()[7];
+        }
+        Ok(())
+    }
+}
+
+/// A profile whose owner's password is [`OWNER`], its epoch read, with a key of external data its
+/// stored key wraps.
+pub(crate) struct Made {
+    pub(crate) profile: Profile,
+    pub(crate) params: PasswordParams,
+    pub(crate) epoch_key: [u8; 32],
+    pub(crate) wrapped: [u8; RECORD_LEN],
+    pub(crate) data: [u8; 32],
+}
+
+/// The slots of a [`Made`]'s epoch, and memory for a derivation.
+pub(crate) struct Work {
+    pub(crate) memory: Vec<MemoryBlock>,
+    pub(crate) slots: [Slot; 6],
+    pub(crate) epoch: Epoch,
+}
+
+impl Work {
+    pub(crate) fn new(params: &PasswordParams) -> Self {
+        Self {
+            memory: vec![MemoryBlock::new(); params.memory_blocks()],
+            slots: [const { Slot::empty() }; 6],
+            epoch: Epoch::empty(),
+        }
+    }
+}
+
+pub(crate) fn made(root: &Path, stand: &mut Stand, seed: u64) -> Made {
+    let mut source = Source(seed);
+    let mut profile = Profile::create(root, stand, false).unwrap();
+    let mut epoch_key = [0; 32];
+    profile.epoch(stand, &mut epoch_key).unwrap();
+    let params = PasswordParams::new(65_536, 3, &mut source).unwrap();
+    let mut work = Work::new(&params);
+    let mut slots = Slots::new(&mut work.slots, &mut work.epoch, 0, &mut epoch_key.clone());
+    let stored = slots
+        .generate(Purpose::Wrap, KeyLength::Bytes64, &mut source)
+        .unwrap();
+    let created = slots
+        .generate(Purpose::ExternalData, KeyLength::Bytes32, &mut source)
+        .unwrap();
+    let mut wrapped = [0; RECORD_LEN];
+    slots
+        .wrap(created, stored, b"data", &mut source, &mut wrapped)
+        .unwrap();
+    let mut data = [0; 32];
+    slots
+        .reveal32(created, Position::First, Purpose::ExternalData, &mut data)
+        .unwrap();
+    profile
+        .create_entries(
+            &mut slots,
+            stand,
+            stored,
+            &mut OWNER.to_vec(),
+            &params,
+            &mut work.memory,
+            &mut source,
+        )
+        .unwrap();
+    Made {
+        profile,
+        params,
+        epoch_key,
+        wrapped,
+        data,
+    }
+}
+
+/// Where a test's profile starts: without a password under duress, with [`DURESS`], or with
+/// [`DURESS`] set to destroy.
+#[derive(Clone, Copy)]
+pub(crate) enum Start {
+    Plain,
+    Duress,
+    Destroy,
+}
+
+/// A profile made once for all the tests that start from it: its files and its keys.
+pub(crate) struct Template {
+    id: Id,
+    files: Vec<(OsString, Vec<u8>)>,
+    keys: BTreeMap<String, [u8; 32]>,
+    keys_made: u8,
+    params: PasswordParams,
+    wrapped: [u8; RECORD_LEN],
+    data: [u8; 32],
+}
+
+fn template(start: Start) -> &'static Template {
+    static TEMPLATES: [OnceLock<Template>; 3] = [const { OnceLock::new() }; 3];
+    TEMPLATES[start as usize].get_or_init(|| {
+        let root = dir(&format!("template-{}", start as usize));
+        let mut stand = Stand::new();
+        let made = made(&root, &mut stand, 100);
+        if let Start::Duress | Start::Destroy = start {
+            let mut work = Work::new(&made.params);
+            let mut slots = Slots::new(
+                &mut work.slots,
+                &mut work.epoch,
+                0,
+                &mut made.epoch_key.clone(),
+            );
+            made.profile
+                .set_duress(
+                    &mut slots,
+                    &mut stand,
+                    &mut OWNER.to_vec(),
+                    &mut DURESS.to_vec(),
+                    matches!(start, Start::Destroy),
+                    &made.params,
+                    &mut work.memory,
+                    &mut Source(99),
+                )
+                .unwrap();
+        }
+        let files = std::fs::read_dir(&made.profile.dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect();
+        Template {
+            id: made.profile.id(),
+            files,
+            keys: stand.keys.clone(),
+            keys_made: stand.made,
+            params: made.params,
+            wrapped: made.wrapped,
+            data: made.data,
+        }
+    })
+}
+
+/// A copy under `root` of the profile `start` names, its keys in `stand`: its passwords are not
+/// derived again, which takes seconds in an unoptimised build.
+pub(crate) fn copied(root: &Path, stand: &mut Stand, start: Start) -> Made {
+    let template = template(start);
+    let home = root.join(template.id.to_string());
+    std::fs::create_dir(&home).unwrap();
+    for (name, bytes) in &template.files {
+        std::fs::write(home.join(name), bytes).unwrap();
+    }
+    stand.keys.extend(template.keys.clone());
+    stand.made = stand.made.max(template.keys_made);
+    let mut profile = Profile::open(root, template.id).unwrap();
+    let mut epoch_key = [0; 32];
+    profile.epoch(stand, &mut epoch_key).unwrap();
+    Made {
+        profile,
+        params: template.params,
+        epoch_key,
+        wrapped: template.wrapped,
+        data: template.data,
+    }
+}
+
+/// Whether every one of the six slots is free: nothing an operation left behind holds one.
+pub(crate) fn all_free(slots: &mut Slots<'_>) -> bool {
+    let mut source = Source(77);
+    let taken: Vec<_> = (0..6)
+        .map_while(|_| {
+            slots
+                .generate(Purpose::Wrap, KeyLength::Bytes32, &mut source)
+                .ok()
+        })
+        .collect();
+    let free = taken.len() == 6;
+    for handle in taken {
+        slots.release(handle).unwrap();
+    }
+    free
 }
 
 /// The names in `dir`, in order.

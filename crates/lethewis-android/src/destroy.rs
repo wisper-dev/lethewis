@@ -9,6 +9,7 @@ use lethewis_core::Erasure;
 
 use crate::entry::ENTRIES;
 use crate::epoch::{CURRENT, ROOT, erase_root, number_of, root_numbers, worse};
+use crate::guard::{GUARDS, watch_alias};
 use crate::keystore::{Keystore, Level};
 use crate::profile::{
     DESTROYED, Error, Id, LOCK, Profile, RECORD, WRITING, alias, exists, lock, mark_destroyed,
@@ -120,6 +121,9 @@ fn finish(
         erasure = worse(erasure, gone);
         failed = failed.or(failure);
     }
+    if let Err(failure) = keystore.delete(&watch_alias(id)) {
+        failed = failed.or(Some(failure));
+    }
     match keystore.delete(&alias(id)) {
         Ok(()) if level.is_some_and(Level::secure) => {}
         Ok(()) => erasure = Erasure::NotErased,
@@ -163,7 +167,7 @@ fn remove_files(dir: &Path) -> io::Result<()> {
 /// Whether a profile names a file of its own `name`.
 fn is_profile_file(name: &str) -> bool {
     let name = name.strip_suffix(WRITING).unwrap_or(name);
-    [RECORD, CURRENT, LOCK, DESTROYED].contains(&name)
+    [RECORD, CURRENT, LOCK, DESTROYED, GUARDS].contains(&name)
         || [ROOT, ENTRIES].iter().any(|prefix| {
             name.strip_prefix(prefix)
                 .and_then(|digits| number_of(digits.as_bytes()))
@@ -301,7 +305,7 @@ mod tests {
         File::create(home.join(DESTROYED)).unwrap();
         fs::set_permissions(home.join(LOCK), fs::Permissions::from_mode(0o400)).unwrap();
         assert_eq!(sweep(&root, &mut stand), Ok(Some(Erasure::NotErased)));
-        assert_eq!(stand.keys.len(), 2);
+        assert_eq!(stand.keys.len(), 3);
     }
 
     #[test]

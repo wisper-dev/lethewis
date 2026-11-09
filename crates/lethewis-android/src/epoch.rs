@@ -1047,10 +1047,17 @@ mod tests {
         assert_eq!((current.number, key), (0, first));
         // The roots of 7 and 9 have a key or a file alone, so their level is not known.
         assert_eq!(current.swept, Some(Erasure::NotErased));
-        assert_eq!(entries(&home), ["current", "lock", "profile", "root-0"]);
+        assert_eq!(
+            entries(&home),
+            ["current", "guards", "lock", "profile", "root-0"]
+        );
         assert_eq!(
             stand.names(),
-            [format!("lethewis/{id}/chip"), root_alias(id, 0)]
+            [
+                format!("lethewis/{id}/chip"),
+                root_alias(id, 0),
+                format!("lethewis/{id}/watch")
+            ]
         );
     }
 
