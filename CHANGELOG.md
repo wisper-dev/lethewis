@@ -395,12 +395,13 @@ Nothing is published while the version is below 0.1.0.
   unlock. One locks the device down under an activity shown over the lock screen.
 - Models of the threads of `Keys` run under the PCT scheduler of shuttle with `--cfg shuttle`,
   100 000 schedules each. They race calls, starts, drops and settles against wipes.
-- `Profile::create_entries` and `Profile::enter`: two ways into a profile on Android, the owner's
-  and one for a password under duress or none. Entering costs the same work but when it destroys.
-- `Profile::carry_entries` carries both ways in into the next epoch during a change.
+- `Profile::create_entries` and `Profile::enter`: ways into a profile on Android, the owner's and
+  one for a password under duress or none. Entering costs the same work but when it destroys.
+- `Profile::carry_entries` carries the ways in into the next epoch during a change.
 - `Profile::set_duress` and `Profile::clear_duress`, with the owner's password. Set to destroy, a
   password under duress deletes every other key of the library, then marks the other profiles.
-- `Profile::change_password` writes both ways in anew and keeps the password under duress given.
+- `Profile::change_password` writes the ways of both passwords anew and keeps the password under
+  duress given.
 - `Error::WrongPassword`, `Error::SamePassword`, `Error::Exists`, `Error::Unsynced` and
   `Error::Core`.
 - A test on the emulators enters under duress and finds the other profile's keys gone.
@@ -429,5 +430,24 @@ Nothing is published while the version is below 0.1.0.
 - CI tests the mutants of a crate only when a pull request changes what its tests read. That is its
   files, the crates and locked packages it reaches, and the settings of the mutants.
 - Kani builds a proof with its own crate and what that reaches, never the rest of the workspace.
+- A third way into a profile: the owner's password with two of three shares. Each way has its own
+  place, and a change keeps the bytes of those it does not set.
+- `Profile::set_shares` and `Profile::clear_shares`, with the owner's password. Setting writes three
+  shares to give to people the owner trusts.
+- `Profile::lock`, with no password: the records of the passwords open nothing more, and each
+  password reads as the profile locked. A mark in the file of the ways tells it a way out is set.
+- `Profile::unlock_with_shares` opens a profile with the owner's password and two shares. It makes
+  the owner's way anew and accepts the signs' readings.
+- `Action::Lock` and `Verdict::lock`: one sign is enough to lock, and so is a file of the signs
+  changed or gone. A sign locks only with a way in by shares set, which stays while it does.
+- `Profile::change_password` takes new shares for a way in with shares, and refuses without them.
+- `Error::Locked`, `Error::SharesSet` and `Error::NoWayOut`. A password and two shares that open
+  nothing read alike, whichever is wrong.
+- A fourth way into a profile, with the owner's password and a time lock of drand, under the
+  `timelock` feature. `Profile::set_time_lock` is the owner's check-in, which moves the round on.
+- `Profile::unlock_with_round`, which spends the round. `Profile::clear_time_lock` and
+  `Profile::time_lock_round`, which needs the chip alone, are built without the feature too.
+- `Error::TimeLockSet` refuses a new password while a time lock is set.
+- Changes of the ways in and of the signs of one profile wait for one another.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

@@ -29,6 +29,10 @@ sha2 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
 # Default features bring in `alloc`.
 zeroize = { version = "1.9.0", default-features = false }
 
+[features]
+# The way into a profile with a time lock, which needs the time lock of the core.
+timelock = ["lethewis-core/timelock"]
+
 [dev-dependencies]
 # The stand-in for the keystore in the tests computes HMAC-SHA256 as the chip does.
 hmac = { version = "0.13.0", default-features = false }
