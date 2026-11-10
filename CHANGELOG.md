@@ -426,6 +426,8 @@ Nothing is published while the version is below 0.1.0.
   before the profile's record at creation.
 - CI proves a crate only when a pull request changes the inputs of its proofs, each part within 15
   minutes.
+- CI tests the mutants of a crate only when a pull request changes what its tests read. That is its
+  files, the crates and locked packages it reaches, and the settings of the mutants.
 - Kani builds a proof with its own crate and what that reaches, never the rest of the workspace.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Which proofs a pull request must run, and in how many parts, each within the budget.
+"""Which proofs a pull request must run, and in how many parts, each within the budget; and the
+crates whose mutants it must test.
 
 `main` is proven whole: a branch merges only up to date and with every proof holding. Kani builds
 the crate of a proof and what it reaches in Cargo.lock, nothing else. The proofs of a crate run when
@@ -13,10 +14,14 @@ these scripts included. Their proofs then go, longest first, to the part with th
 far, into as few parts as keep the slowest part within the budget on a runner slower than the one
 that recorded the times.
 
+The mutants of a crate are tested by its own tests alone, so they run when the changes touch a file
+of a crate it reaches, a locked package those crates use, the settings of the mutants, or anything
+neither a crate's file nor known to leave the mutants alone.
+
 Every plan also checks that docs/proofs.md states the pinned Kani and CBMC.
 
 Usage:
-  proof-plan.py plan BASE   prints crates=, base= and parts= lines for $GITHUB_OUTPUT
+  proof-plan.py plan BASE   prints crates=, base=, parts= and mutants= lines for $GITHUB_OUTPUT
   proof-plan.py all         the same for every proof, with no base
   proof-plan.py test        runs the planner's own cases on repositories it makes
 """
@@ -30,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 # A part's job may run 15 minutes.
@@ -61,6 +67,12 @@ PIN = "scripts/kani-pin.sh"
 WORKFLOW = ".github/workflows/ci.yml"
 # What of the workflow the proofs depend on: its settings for every job, and the jobs of the proofs.
 PROOF_JOBS = ("proof-plan", "proof-parts", "proofs")
+# Files no mutant's test reads: documents, the Java layer, and checks and scripts beside the tests.
+MUTANT_IGNORED_FILES = (IGNORED_FILES - {".cargo/mutants.toml"}) | {
+    "scripts/cbmc-results.py", "scripts/install-kani.sh", "scripts/kani-pin.sh", "scripts/prove.sh",
+}
+# The plan of the mutants is the planner's, so its job is theirs too.
+MUTANT_JOBS = ("proof-plan", "mutant-parts", "mutants")
 ANCHOR = re.compile(r"(?m)(?::|^\s*-)\s+&[\w-]+(?:\s|$)|<<:")
 
 
@@ -154,9 +166,9 @@ def without_lints(text: str | None) -> dict | None:
     return manifest
 
 
-def proof_workflow(text: str | None) -> str | None:
-    """The top-level settings of the workflow and its proof jobs; all of it if a job is missing or
-    if an anchor lets one job take text from another."""
+def workflow_of(text: str | None, wanted: tuple[str, ...]) -> str | None:
+    """The top-level settings of the workflow and the jobs `wanted`; all of it if a job is missing
+    or if an anchor lets one job take text from another."""
     if text is None or ANCHOR.search(text):
         return text
     kept, jobs, current = [], {}, None
@@ -170,9 +182,9 @@ def proof_workflow(text: str | None) -> str | None:
             kept.append(line)
         elif current is not None:
             jobs.setdefault(current, []).append(line)
-    if not all(job in jobs for job in PROOF_JOBS):
+    if not all(job in jobs for job in wanted):
         return text
-    return "\n".join(kept + [line for job in PROOF_JOBS for line in jobs[job]])
+    return "\n".join(kept + [line for job in wanted for line in jobs[job]])
 
 
 def proof_crates(root: Path, names: dict[str, str]) -> dict[str, list[Path]]:
@@ -186,10 +198,24 @@ def proof_crates(root: Path, names: dict[str, str]) -> dict[str, list[Path]]:
     return found
 
 
-def touched(root: Path, base: str) -> set[str] | None:
-    """The crates with proofs whose inputs the changes since `base` touch; None for all of them."""
+@dataclass(frozen=True)
+class Inputs:
+    """What a kind of check reads: the files it leaves alone and its jobs of the workflow."""
+    prefixes: tuple[str, ...]
+    files: frozenset[str] | set[str]
+    jobs: tuple[str, ...]
+    proving: bool
+
+
+PROOFS = Inputs(IGNORED_PREFIXES, IGNORED_FILES, PROOF_JOBS, proving=True)
+MUTANTS = Inputs(IGNORED_PREFIXES, MUTANT_IGNORED_FILES, MUTANT_JOBS, proving=False)
+
+
+def touched(root: Path, base: str, inputs: Inputs = PROOFS) -> set[str] | None:
+    """The crates whose inputs the changes since `base` touch, of those with proofs for the
+    proofs and of every crate for the mutants; None for all of them."""
     names = members(root)
-    proving = proof_crates(root, names)
+    proving = set(proof_crates(root, names)) if inputs.proving else set(names)
     lock = (root / "Cargo.lock").read_text()
     reaching = {name: reached(lock, name, names) for name in proving}
     if any(crates is None for crates in reaching.values()):
@@ -200,7 +226,7 @@ def touched(root: Path, base: str) -> set[str] | None:
         if path.endswith(".md"):
             if not named(root, path):
                 continue
-        elif path.startswith(IGNORED_PREFIXES) or path in IGNORED_FILES:
+        elif path.startswith(inputs.prefixes) or path in inputs.files:
             continue
         if path == "Cargo.lock":
             before, after = shown(root, base, path), (root / path).read_text()
@@ -208,7 +234,7 @@ def touched(root: Path, base: str) -> set[str] | None:
             continue
         if path == WORKFLOW:
             after = (root / path).read_text() if (root / path).exists() else None
-            if proof_workflow(shown(root, base, path)) == proof_workflow(after):
+            if workflow_of(shown(root, base, path), inputs.jobs) == workflow_of(after, inputs.jobs):
                 continue
         if PurePosixPath(path).name == "Cargo.toml":
             after = (root / path).read_text() if (root / path).exists() else None
@@ -307,8 +333,10 @@ def plan(root: Path, base: str | None) -> list[str]:
     parts = partition([t for t in times if owner[t[2]] in running])
     entries = [{"part": number, "of": len(parts), "proofs": " ".join(sorted(p[2] for p in part))}
                for number, part in enumerate(parts, 1)]
+    mutating = None if base is None else touched(root, base, MUTANTS)
+    mutants = "all" if mutating is None else json.dumps(sorted(mutating))
     return [f"crates={' '.join(sorted(names[c] for c in running))}", f"base={commit}",
-            f"parts={json.dumps(entries)}"]
+            f"parts={json.dumps(entries)}", f"mutants={mutants}"]
 
 
 def test() -> None:
@@ -353,7 +381,9 @@ def test() -> None:
         REGISTER: "Kani 1.0.0, CBMC 2.0.0\n",
         WORKFLOW: "on: pull_request\nenv:\n  A: 1\njobs:\n  build:\n    steps:\n      - run: build\n"
                   "  proof-plan:\n    steps:\n      - run: plan\n  proof-parts:\n    steps:\n"
-                  "      - run: prove\n  proofs:\n    steps:\n      - run: judge\n",
+                  "      - run: prove\n  proofs:\n    steps:\n      - run: judge\n"
+                  "  mutant-parts:\n    steps:\n      - run: mutate\n  mutants:\n    steps:\n"
+                  "      - run: tally\n",
         "scripts/proof-times": "10 100 a_holds\n",
     }
     anchored = start[WORKFLOW].replace("- run: build", "- &shared\n        run: build").replace(
@@ -410,6 +440,24 @@ def test() -> None:
             "Cargo.lock": lock + '[[package]]\nname = "inner"\nversion = "0.1.0"\n'},
             {"crates/b/inner/src/lib.rs": "fn inner() {}\n"}], set()),
     ]
+    mutant_cases = [
+        ("a file of a crate apart", {"crates/c/src/lib.rs": "fn c() {}\n"}, {"c"}),
+        ("a file of a crate under another", {"crates/b/src/lib.rs": "fn b() {}\n"}, {"a", "b"}),
+        ("a document", {"crates/a/README.md": "words\n", "docs/x.md": "words\n"}, set()),
+        ("a proof script", {"scripts/prove.sh": "changed\n"}, set()),
+        ("the settings of the mutants", {".cargo/mutants.toml": "timeout = 1\n"}, None),
+        ("a job of the mutants", {WORKFLOW: start[WORKFLOW].replace(
+            "run: mutate", "run: mutate twice")}, None),
+        ("the planner's job", {WORKFLOW: start[WORKFLOW].replace("run: plan", "run: plan twice")},
+         None),
+        ("a job of the proofs", {WORKFLOW: start[WORKFLOW].replace(
+            "run: prove", "run: prove twice")}, set()),
+        ("a locked package of a crate apart", {"Cargo.lock": lock.replace(
+            'name = "y"\nversion = "1.0.0"', 'name = "y"\nversion = "1.0.1"')}, {"c"}),
+        ("a file no mutant's test reads", {"scripts/android.sh": "changed\n",
+                                          "android/A.java": "x\n"}, set()),
+        ("a file nobody listed", {"rust-toolchain.toml": "[toolchain]\n"}, None),
+    ]
     failed = []
 
     Edits = dict[str, str | None]
@@ -431,16 +479,23 @@ def test() -> None:
             got = touched(Path(directory), "main~1")
             if got != expected:
                 failed.append(f"{name}: {got} rather than {expected}")
+    for name, edits, expected in mutant_cases:
+        with made(edits) as directory:
+            got = touched(Path(directory), "main~1", MUTANTS)
+            if got != expected:
+                failed.append(f"mutants, {name}: {got} rather than {expected}")
     more = start["crates/a/src/lib.rs"] + "fn more() {}\n"
     with made({"crates/a/src/lib.rs": more}) as directory:
         root = Path(directory)
         part = '[{"part": 1, "of": 1, "proofs": "a_holds"}]'
         if plan(root, "main~1")[0::2] != ["crates=crates/a", f"parts={part}"]:
             failed.append(f"plan: {plan(root, 'main~1')}")
-        if plan(root, None) != ["crates=crates/a", "base=", f"parts={part}"]:
+        if plan(root, "main~1")[3] != 'mutants=["a"]':
+            failed.append(f"plan of the mutants: {plan(root, 'main~1')}")
+        if plan(root, None) != ["crates=crates/a", "base=", f"parts={part}", "mutants=all"]:
             failed.append(f"plan of every proof: {plan(root, None)}")
         write(root, {"scripts/proof-times": ""})
-        if plan(root, None)[0::2] != ["crates=crates/a", "parts=[]"]:
+        if plan(root, None)[0:3:2] != ["crates=crates/a", "parts=[]"]:
             failed.append("plan: a crate without times left out of every proof")
         write(root, {REGISTER: "Kani 1.0.1, CBMC 2.0.0\n"})
         try:
@@ -477,7 +532,7 @@ def test() -> None:
         pass
     if failed:
         raise SystemExit("proof-plan: " + "\n".join(failed))
-    print(f"proof-plan: {len(cases) + 10} cases hold")
+    print(f"proof-plan: {len(cases) + len(mutant_cases) + 11} cases hold")
 
 
 def main() -> None:
