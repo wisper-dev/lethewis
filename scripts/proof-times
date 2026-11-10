@@ -7,8 +7,8 @@
 5 347 decimal::proofs::a_decimal_is_read_exactly_as_written
 1 163 decimal::proofs::a_step_takes_the_digit_of_its_power
 12 781 derive::proofs::different_derivations_have_different_labels
-22 985 entry::proofs::only_written_ways_in_are_read
-12 544 entry::proofs::ways_in_are_read_as_written
+33 1900 entry::proofs::only_written_ways_in_are_read
+18 839 entry::proofs::ways_in_are_read_as_written
 32 515 epoch::proofs::a_number_is_read_exactly_when_written_so
 1 198 epoch::proofs::a_pointer_is_read_as_written
 1 201 epoch::proofs::a_root_is_read_as_written

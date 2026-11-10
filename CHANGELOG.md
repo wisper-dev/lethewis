@@ -443,6 +443,11 @@ Nothing is published while the version is below 0.1.0.
 - `Profile::change_password` takes new shares for a way in with shares, and refuses without them.
 - `Error::Locked`, `Error::SharesSet` and `Error::NoWayOut`. A password and two shares that open
   nothing read alike, whichever is wrong.
+- A fourth way into a profile, with the owner's password and a time lock of drand, under the
+  `timelock` feature. `Profile::set_time_lock` is the owner's check-in, which moves the round on.
+- `Profile::unlock_with_round`, which spends the round. `Profile::clear_time_lock` and
+  `Profile::time_lock_round`, which needs the chip alone, are built without the feature too.
+- `Error::TimeLockSet` refuses a new password while a time lock is set.
 - Changes of the ways in and of the signs of one profile wait for one another.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

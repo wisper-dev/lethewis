@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use super::{FILE_LEN, Way, parse_ways, ways_bytes};
+use super::{FILE_LEN, Tail, Way, parse_ways, ways_bytes};
 
 fn any_way() -> Way {
     Way {
@@ -13,14 +13,17 @@ fn any_way() -> Way {
 
 #[kani::proof]
 fn ways_in_are_read_as_written() {
-    let ways = [any_way(), any_way(), any_way()];
-    let mark = kani::any();
+    let ways = [any_way(), any_way(), any_way(), any_way()];
+    let tail = Tail {
+        timed: kani::any(),
+        mark: kani::any(),
+    };
     kani::assert(
-        parse_ways(&ways_bytes(&ways, &mark)) == Some((ways, mark)),
+        parse_ways(&ways_bytes(&ways, &tail)) == Some((ways, tail)),
         "ways in are read as written",
     );
-    let [own, _, shares] = ways;
-    kani::cover!(own == shares, "two ways in alike");
+    let [own, _, _, timed] = ways;
+    kani::cover!(own == timed, "two ways in alike");
 }
 
 #[kani::proof]
@@ -31,13 +34,13 @@ fn only_written_ways_in_are_read() {
     let Some(read) = bytes.get(..length) else {
         return;
     };
-    let Some((ways, mark)) = parse_ways(read) else {
+    let Some((ways, tail)) = parse_ways(read) else {
         return;
     };
     kani::assert(
-        ways_bytes(&ways, &mark).as_slice() == read,
+        ways_bytes(&ways, &tail).as_slice() == read,
         "only written ways in are read",
     );
-    let [own, _, shares] = ways;
-    kani::cover!(own.tag == shares.tag, "two ways in of one tag");
+    let [own, _, _, timed] = ways;
+    kani::cover!(own.tag == timed.tag, "two ways in of one tag");
 }

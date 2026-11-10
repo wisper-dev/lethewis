@@ -129,13 +129,17 @@ pub enum Error {
     NoKey,
     /// A sign to be watched was given no reading to accept, so it would fire at once.
     Unread,
-    /// The profile is locked: the owner's password opens it only with two shares.
+    /// The profile is locked: the owner's password opens it only with two shares or the signature
+    /// of a round.
     Locked,
     /// The owner's password has a way in with shares, which a new password would leave unopenable:
     /// the change asks for new shares.
     SharesSet,
-    /// A sign set to lock the profile, or a lock, needs a way in with shares.
+    /// A sign set to lock the profile, or a lock, needs a way in with shares or a time lock.
     NoWayOut,
+    /// The owner's password has a way in with a time lock, which a new password would leave
+    /// unopenable: it is cleared before the change and made again after.
+    TimeLockSet,
     /// A file of the profile is written, but the sync of its directory failed, so a crash may undo
     /// the change.
     Unsynced(io::ErrorKind),
@@ -173,7 +177,8 @@ impl fmt::Display for Error {
             Self::Unread => f.write_str("a sign to be watched was given no reading"),
             Self::Locked => f.write_str("the profile is locked"),
             Self::SharesSet => f.write_str("a new password needs new shares"),
-            Self::NoWayOut => f.write_str("a lock needs a way in with shares"),
+            Self::NoWayOut => f.write_str("a lock needs a way in with shares or a time lock"),
+            Self::TimeLockSet => f.write_str("a new password needs the time lock made again"),
             Self::Unsynced(kind) => write!(f, "a file is written but not synced: {kind}"),
             Self::Keystore(failure) => write!(f, "the keystore refused: {failure}"),
             Self::Core(error) => write!(f, "the core refused: {error}"),
@@ -1300,6 +1305,7 @@ mod tests {
             Error::Locked,
             Error::SharesSet,
             Error::NoWayOut,
+            Error::TimeLockSet,
             Error::Unsynced(io::ErrorKind::NotFound),
             Error::Core(lethewis_core::Error::StaleRecord),
             Error::Keystore(Failure::Transient),

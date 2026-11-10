@@ -125,11 +125,14 @@ password and the hardware secret at each unlock, and neither alone is enough.
   again.
 - A password under duress opens its profile as the owner's does. Set to destroy, it deletes every
   other key of the library in the app's keystore.
-- A locked profile opens only with the owner's password and two shares. Its ways copied before the
-  lock, or their old bytes on the flash, open with the passwords of then.
+- A locked profile opens only with the owner's password and two shares, or its round's signature.
+  Its ways copied before the lock, or their old bytes on the flash, open with the passwords of then.
 - A lock empties the way of the password under duress, which reads as locked until set again. Two
   shares tell the owner's password from it: only the owner's opens with them.
-- A new owner's password makes the shares anew, and the ones given before open no more.
+- A new owner's password makes the shares anew, and the ones given before open no more. A time
+  lock set refuses it until cleared, and is made again after.
+- The way with a time lock is built with the `timelock` feature. When a missed check-in locks the
+  profile is the app's to tell; the library keeps no clock.
 - A lock that fails, as where the app's files cannot be written, leaves the profile open. The app is
   to enter it only once a lock succeeds.
 - Judging the signs and locking need the chip's key, which from Android 15 answers only on an

@@ -33,6 +33,7 @@ const UNACCEPTED_LABEL: &[u8; 25] = b"lethewis guard unaccepted";
 const ACTION_LABEL: &[u8; 21] = b"lethewis guard action";
 const ALONE_LABEL: &[u8; 20] = b"lethewis guard alone";
 const SHARES_LABEL: &[u8; 21] = b"lethewis guard shares";
+const TIME_LABEL: &[u8; 24] = b"lethewis guard time lock";
 const SALT_LEN: usize = 32;
 
 /// How many signs a profile can watch.
@@ -81,7 +82,8 @@ pub enum Action {
     /// The profile is to be destroyed, as [`Verdict::destroy`] says.
     Destroy,
     /// The profile is to be locked, as [`Verdict::lock`] says: the owner's password then opens it
-    /// only with two shares, as [`Profile::unlock_with_shares`] takes them.
+    /// only with two shares or the signature of a round, as [`Profile::unlock_with_shares`] and
+    /// `Profile::unlock_with_round` take them.
     Lock,
 }
 
@@ -367,8 +369,9 @@ impl Profile {
     ///
     /// [`Error::WrongPassword`], [`Error::Unread`] for a sign watched and given no reading,
     /// [`Error::NoWayOut`] for a sign of [`Action::Lock`] while the owner's password has no way in
-    /// with shares, [`Error::NoEpoch`], or the core's refusal, the keystore's or the file system's;
-    /// the file then stays as it was. [`Error::Unsynced`] when it changed, but a crash may undo it.
+    /// with shares or a time lock, [`Error::NoEpoch`], or the core's refusal, the keystore's or the
+    /// file system's; the file then stays as it was. [`Error::Unsynced`] when it changed, but a
+    /// crash may undo it.
     #[expect(
         clippy::too_many_arguments,
         reason = "what the signs do, the readings and a derivation's inputs"
@@ -484,24 +487,48 @@ impl Profile {
         Ok(locking > 0)
     }
 
-    /// The mark of the file of the ways in of whether a way in with shares is set, bound to the
-    /// salt and the tag of the way in its place. It needs the chip but no password.
+    /// The mark of the file of the ways in of whether a way with a second factor is set, bound to
+    /// the salt and the tag of the way with shares and to the digest of the time lock. It needs the
+    /// chip but no password.
     pub(crate) fn shares_mark(
         &self,
         keystore: &mut impl Keystore,
         set: bool,
-        salt: &[u8; 32],
-        tag: &[u8; 32],
+        binding: &[[u8; 32]; 3],
     ) -> Result<[u8; 32], Error> {
         let key = self.guard_key(keystore)?;
         Ok(Sha256::new()
             .chain_update(key.as_slice())
             .chain_update(SHARES_LABEL)
-            .chain_update(salt)
-            .chain_update(tag)
+            .chain_update(binding.as_flattened())
             .chain_update([u8::from(set)])
             .finalize()
             .into())
+    }
+
+    /// Hides `bytes` under a pad keyed by the chip and `salt`, or shows them again: the same call
+    /// does both. It needs no password.
+    pub(crate) fn time_pad(
+        &self,
+        keystore: &mut impl Keystore,
+        salt: &[u8; 32],
+        bytes: &mut [u8],
+    ) -> Result<(), Error> {
+        let key = self.guard_key(keystore)?;
+        for (block, chunk) in (0_u8..).zip(bytes.chunks_mut(32)) {
+            let mut pad: [u8; 32] = Sha256::new()
+                .chain_update(key.as_slice())
+                .chain_update(TIME_LABEL)
+                .chain_update(salt)
+                .chain_update([block])
+                .finalize()
+                .into();
+            for (byte, mask) in chunk.iter_mut().zip(&pad) {
+                *byte ^= mask;
+            }
+            pad.zeroize();
+        }
+        Ok(())
     }
 
     /// Takes `readings` as accepted, for a caller that checked the owner's password and holds
