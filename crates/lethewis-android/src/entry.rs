@@ -16,7 +16,7 @@ use std::io;
 
 use lethewis_core::{
     Entropy, Error as CoreError, Handle, KeyLength, LOCK_RECORD_LEN, MemoryBlock, PasswordParams,
-    Purpose, SHARE_COUNT, SHARE_LEN, Share, Shares, Slots,
+    Purpose, Share, Shares, Slots,
 };
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
@@ -399,7 +399,7 @@ impl Profile {
         entropy: &mut impl Entropy,
     ) -> Result<(), Error> {
         let _writing = self.writing();
-        let mut made_shares = no_shares();
+        let mut made_shares = Zeroizing::<Shares>::default();
         let asked = shares.is_some();
         let changed = self.settled_ways().and_then(|(number, ways, tail)| {
             outside_change(slots, entropy)?;
@@ -533,7 +533,7 @@ impl Profile {
         shares: &mut Shares,
     ) -> Result<(), Error> {
         let _writing = self.writing();
-        let mut made_shares = no_shares();
+        let mut made_shares = Zeroizing::<Shares>::default();
         let set = self.settled_ways().and_then(|(number, ways, tail)| {
             outside_change(slots, entropy)?;
             let opened = self.owner(slots, keystore, owner, params, memory, &ways, &tail)?;
@@ -1603,11 +1603,6 @@ fn timed_way<'a>(
     way
 }
 
-/// Room for shares, wiped when dropped.
-fn no_shares() -> Zeroizing<Shares> {
-    Zeroizing::new([[0; SHARE_LEN]; SHARE_COUNT])
-}
-
 /// `ways` with the owner's way `own` and the other password's `other` in their places.
 const fn with_passwords(ways: &[Way; WAYS], own: &Way, other: &Way) -> [Way; WAYS] {
     let [_, _, split, timed] = ways;
@@ -1699,7 +1694,7 @@ mod tests {
     use super::TIMED_LEN;
     use super::{
         FILE_LEN, MARK_LEN, ROLES, Role, SALT_LEN, TAG_KEY_LABEL, TagKey, WAY_LEN, entries_name,
-        is_tag, no_shares, tag,
+        is_tag, tag,
     };
     use crate::guard::{Action, Readings, SIGN_COUNT, Sign};
     use crate::profile::{DESTROYED, Error, Profile, WRITING};
@@ -1843,7 +1838,7 @@ mod tests {
             0,
             &mut made.epoch_key.clone(),
         );
-        let mut shares = *no_shares();
+        let mut shares = Shares::default();
         let set = made.profile.set_shares(
             &mut slots,
             stand,
@@ -2350,6 +2345,8 @@ mod tests {
         let mut stand = Stand::new();
         let made = copied(&root, &mut stand, Start::Duress);
         let [one, two, three] = set_shares(&made, &mut stand, OWNER, 1).unwrap();
+        // A mark left as before the shares would read as changed.
+        assert_eq!(made.profile.time_lock_round(&mut stand), Ok(None));
         for (first, second) in [(one, two), (two, three), (three, one), (two, one)] {
             assert_eq!(
                 unlock(&made, &mut stand, OWNER, &first, &second),
@@ -2440,8 +2437,9 @@ mod tests {
             Err(Error::SharesSet)
         );
         assert_eq!(file(&made, 0), before);
-        let mut shares = *no_shares();
+        let mut shares = Shares::default();
         change(&made, &mut stand, OWNER, OTHER, None, Some(&mut shares)).unwrap();
+        assert_eq!(made.profile.time_lock_round(&mut stand), Ok(None));
         let [one, _, three] = shares;
         assert_eq!(
             unlock(&made, &mut stand, OTHER, &one, &three),
@@ -2469,7 +2467,7 @@ mod tests {
             0,
             &mut made.epoch_key.clone(),
         );
-        let mut shares = *no_shares();
+        let mut shares = Shares::default();
         let refused = made.profile.set_shares(
             &mut slots,
             &mut stand,
@@ -2480,7 +2478,7 @@ mod tests {
             &mut shares,
         );
         assert_eq!(refused, Err(Error::WrongPassword));
-        assert_eq!(shares, *no_shares());
+        assert_eq!(shares, Shares::default());
         // A directory where the file is first written: the ways stay as they were.
         let blocked = made.profile.dir.join(entries_name(0) + WRITING);
         fs::create_dir(&blocked).unwrap();
@@ -2494,18 +2492,18 @@ mod tests {
             &mut shares,
         );
         assert!(matches!(unwritten, Err(Error::Io(_))), "{unwritten:?}");
-        assert_eq!(shares, *no_shares());
+        assert_eq!(shares, Shares::default());
         fs::remove_dir(&blocked).unwrap();
         let [one, two, _] = set_shares(&made, &mut stand, OWNER, 5).unwrap();
         fs::create_dir(&blocked).unwrap();
-        let mut renewed = *no_shares();
+        let mut renewed = Shares::default();
         let changed = change(&made, &mut stand, OWNER, OTHER, None, Some(&mut renewed));
         fs::remove_dir(&blocked).unwrap();
         assert!(matches!(changed, Err(Error::Io(_))), "{changed:?}");
-        assert_eq!(renewed, *no_shares());
+        assert_eq!(renewed, Shares::default());
         assert_eq!(unlock(&made, &mut stand, OWNER, &one, &two), Ok(made.data));
         fail_syncs(0, 1);
-        let mut renewed = *no_shares();
+        let mut renewed = Shares::default();
         let changed = change(&made, &mut stand, OWNER, OTHER, None, Some(&mut renewed));
         fail_syncs(0, 0);
         assert!(matches!(changed, Err(Error::Unsynced(_))), "{changed:?}");
@@ -2717,7 +2715,7 @@ mod tests {
                     set_duress(&made, &mut stand, password, OTHER, false),
                     Err(expected)
                 );
-                let mut shares = *no_shares();
+                let mut shares = Shares::default();
                 assert_eq!(
                     change(&made, &mut stand, password, OTHER, None, Some(&mut shares)),
                     Err(expected)
@@ -2915,7 +2913,7 @@ mod tests {
         drop(made.profile);
         made.profile = Profile::open(&root, id).unwrap();
         made.profile.epoch(&mut stand, &mut [0; 32]).unwrap();
-        let mut shares = *no_shares();
+        let mut shares = Shares::default();
         let set = made.profile.set_shares(
             &mut slots,
             &mut stand,
@@ -3300,7 +3298,7 @@ mod tests {
         let made = copied(&root, &mut stand, Start::Plain);
         set_time_lock(&made, &mut stand, OWNER).unwrap();
         let before = file(&made, 0);
-        let mut shares = *no_shares();
+        let mut shares = Shares::default();
         assert_eq!(
             change(&made, &mut stand, OWNER, OTHER, None, Some(&mut shares)),
             Err(Error::TimeLockSet)
