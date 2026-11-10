@@ -97,30 +97,35 @@ strip = "symbols"
 panic = "abort"
 overflow-checks = true
 
-[profile.mutants]
-# Every mutant is a build of its own. The derivation from a password, the lattice, hash and curve
-# code of X-Wing and the pairing of the time lock, the slowest tests by far, run optimised; the
-# other dependencies are built as for the tests, whose stack depths depend on them.
+[profile.fast-deps]
+# The derivation from a password, the lattice, hash and curve code of X-Wing and the pairing of the
+# time lock, the slowest tests by far, run optimised; the other dependencies are built as for the
+# tests, whose stack depths depend on them. The tests of lethewis-android run here: they derive
+# from passwords many times and measure no stack.
 inherits = "test"
+
+[profile.fast-deps.package.argon2]
+opt-level = 3
+
+[profile.fast-deps.package.blake2]
+opt-level = 3
+
+[profile.fast-deps.package.ml-kem]
+opt-level = 3
+
+[profile.fast-deps.package.module-lattice]
+opt-level = 3
+
+[profile.fast-deps.package.keccak]
+opt-level = 3
+
+[profile.fast-deps.package.curve25519-dalek]
+opt-level = 3
+
+[profile.fast-deps.package.blst]
+opt-level = 3
+
+[profile.mutants]
+# Every mutant is a build of its own.
+inherits = "fast-deps"
 debug = "none"
-
-[profile.mutants.package.argon2]
-opt-level = 3
-
-[profile.mutants.package.blake2]
-opt-level = 3
-
-[profile.mutants.package.ml-kem]
-opt-level = 3
-
-[profile.mutants.package.module-lattice]
-opt-level = 3
-
-[profile.mutants.package.keccak]
-opt-level = 3
-
-[profile.mutants.package.curve25519-dalek]
-opt-level = 3
-
-[profile.mutants.package.blst]
-opt-level = 3
