@@ -383,7 +383,9 @@ jobs:
           done
 
       - name: Tests
-        run: cargo test --workspace --all-features --locked
+        run: |
+          cargo test --workspace --exclude lethewis-android --all-features --locked
+          cargo test -p lethewis-android --all-features --locked --profile fast-deps
 
       - name: Tests, optimised build
         # The stack the hash and the cipher leave behind differs between the two builds.
@@ -411,7 +413,8 @@ jobs:
           RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft" --cfg chacha20_backend="soft" --cfg poly1305_backend="soft"'
           LETHEWIS_BACK_ENDS: portable
         run: |
-          cargo test --workspace --all-features --locked
+          cargo test --workspace --exclude lethewis-android --all-features --locked
+          cargo test -p lethewis-android --all-features --locked --profile fast-deps
           cargo test --workspace --all-features --locked --release
 
       - name: Core tests at the other levels of optimisation
@@ -456,7 +459,8 @@ jobs:
 
       - name: Tests
         run: |
-          cargo test --workspace --all-features --locked
+          cargo test --workspace --exclude lethewis-android --all-features --locked
+          cargo test -p lethewis-android --all-features --locked --profile fast-deps
           cargo test --workspace --all-features --locked --release
 
       - name: Long random tests
@@ -469,7 +473,8 @@ jobs:
           RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft" --cfg chacha20_backend="soft" --cfg poly1305_backend="soft"'
           LETHEWIS_BACK_ENDS: portable
         run: |
-          cargo test --workspace --all-features --locked
+          cargo test --workspace --exclude lethewis-android --all-features --locked
+          cargo test -p lethewis-android --all-features --locked --profile fast-deps
           cargo test --workspace --all-features --locked --release
 
       - name: Long random tests, software hashes and ciphers
@@ -537,7 +542,8 @@ jobs:
 
       - name: Tests
         run: |
-          cargo test --workspace --all-features --locked
+          cargo test --workspace --exclude lethewis-android --all-features --locked
+          cargo test -p lethewis-android --all-features --locked --profile fast-deps
           cargo test --workspace --all-features --locked --release
 
       - name: Tests, software hashes and ciphers
@@ -545,7 +551,8 @@ jobs:
           RUSTFLAGS: '-D warnings --cfg sha2_backend="soft" --cfg aes_backend="soft" --cfg polyval_backend="soft" --cfg keccak_backend="soft" --cfg chacha20_backend="soft" --cfg poly1305_backend="soft"'
           LETHEWIS_BACK_ENDS: portable
         run: |
-          cargo test --workspace --all-features --locked
+          cargo test --workspace --exclude lethewis-android --all-features --locked
+          cargo test -p lethewis-android --all-features --locked --profile fast-deps
           cargo test --workspace --all-features --locked --release
 
       - name: Lints of the code for Apple's systems
@@ -650,8 +657,9 @@ jobs:
     timeout-minutes: 20
     strategy:
       fail-fast: false
+      # Parts enough for every mutant of the workspace within 15 minutes each.
       matrix:
-        part: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        part: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
     permissions:
       contents: read
     env:

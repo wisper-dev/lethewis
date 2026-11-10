@@ -429,6 +429,8 @@ Nothing is published while the version is below 0.1.0.
   minutes.
 - CI tests the mutants of a crate only when a pull request changes what its tests read. That is its
   files, the crates and locked packages it reaches, and the settings of the mutants.
+- The tests of lethewis-android build their slowest dependencies optimised. The core's tests do not:
+  they measure the stack.
 - Kani builds a proof with its own crate and what that reaches, never the rest of the workspace.
 - A third way into a profile: the owner's password with two of three shares. Each way has its own
   place, and a change keeps the bytes of those it does not set.
