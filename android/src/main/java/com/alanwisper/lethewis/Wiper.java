@@ -75,6 +75,7 @@ public final class Wiper {
         // A missing native library fails here, before anything is registered.
         allow(false);
         Application app = (Application) context.getApplicationContext();
+        Keystore.use(app);
         HandlerThread thread = new HandlerThread("lethewis-wiper");
         thread.start();
         Handler work = new Handler(thread.getLooper());

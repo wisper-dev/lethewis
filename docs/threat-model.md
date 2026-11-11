@@ -114,8 +114,10 @@ one alone.
 One sign is the library's own, carried by a key of the chip. The system makes that key unusable
 once a fingerprint is enrolled, or the lock screen changes.
 
-That key is never used, only asked after, so watching it asks nothing of the owner. A device
-without a secure lock screen, or with nothing enrolled, holds no such key and says so.
+That key is never used, only asked after, so watching it asks nothing of the owner.
+
+A device without a secure lock screen or a biometric strong enough holds no such key. The library
+tells which, unless the device does not answer.
 
 Making that key anew takes the owner's password, and accepts the sign's reading in the same step.
 Other code cannot clear a sign that has fired.

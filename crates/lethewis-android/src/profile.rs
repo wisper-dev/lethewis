@@ -10,7 +10,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use zeroize::Zeroize;
 
 use crate::epoch::{self, Known, root_alias};
-use crate::keystore::{Failure, Keystore, Level};
+use crate::keystore::{Failure, Keystore, Level, Unwatchable};
 
 /// The file that describes a profile, written last at creation.
 pub(crate) const RECORD: &str = "profile";
@@ -109,6 +109,13 @@ pub enum Error {
     /// Only software of the operating system would hold the chip's key. Below API 31 the system
     /// may make it in software after a failure of the secure hardware, so a later try may succeed.
     SoftwareOnly,
+    /// The system refused the key of [`Sign::Fingerprints`](crate::Sign::Fingerprints), for the
+    /// reason the device gives.
+    Unwatchable(Unwatchable),
+    /// The system refused the key of [`Sign::Fingerprints`](crate::Sign::Fingerprints), and asking
+    /// the device why failed, as where the app gave no context through `Wiper.start` or lacks the
+    /// permission to ask.
+    Unexplained(Failure),
     /// The current epoch is not known yet: [`Profile::epoch`] reads it.
     NoEpoch,
     /// The root of the next epoch is made, and neither switched to nor erased yet, or the slots
@@ -166,6 +173,13 @@ impl fmt::Display for Error {
             Self::Damaged => f.write_str("the files of the profile are damaged"),
             Self::ChipChanged => f.write_str("the chip's key was replaced"),
             Self::SoftwareOnly => f.write_str("only software would hold the chip's key"),
+            Self::Unwatchable(why) => write!(f, "the device holds no key of the sign: {why}"),
+            Self::Unexplained(failure) => {
+                write!(
+                    f,
+                    "the device holds no key of the sign and does not say why: {failure}"
+                )
+            }
             Self::NoEpoch => f.write_str("the current epoch was not read"),
             Self::Changing => f.write_str("a change of epoch is under way"),
             Self::Exhausted => f.write_str("no epoch follows the current one"),
@@ -450,12 +464,12 @@ fn make_profile(
     write_file(dir, epoch::CURRENT, &pointer).map_err(epoch::Written::error)?;
     let guards = crate::guard::fresh_guards(alias, keystore)?;
     write_file(dir, crate::guard::GUARDS, &guards).map_err(epoch::Written::error)?;
-    // A device with no secure lock screen, or nothing enrolled, holds no key of that sign; the
-    // profile is made all the same. Any other failure is the keystore's and is told.
+    // A device that holds no key of that sign makes the profile all the same. Any other failure
+    // is the keystore's and is told.
     let watch = crate::guard::watch_alias(id);
     if let Err(error) = crate::guard::make_watch(keystore, &watch, software) {
         let _ = keystore.delete(&watch);
-        if error != Error::Keystore(Failure::Locked) {
+        if !matches!(error, Error::Unwatchable(_) | Error::Unexplained(_)) {
             return Err(error);
         }
     }
@@ -710,6 +724,7 @@ mod tests {
 
     use super::{
         DESTROYED, Error, Failure, Id, LOCK, Level, MAGIC, Profile, RECORD, RECORD_LEN, Record,
+        Unwatchable,
     };
     use crate::epoch::{CURRENT, root_alias};
     use crate::stand::{Stand, dir, entries, fail_removal, fail_syncs, hmac};
@@ -1293,6 +1308,12 @@ mod tests {
             Error::Damaged,
             Error::ChipChanged,
             Error::SoftwareOnly,
+            Error::Unwatchable(Unwatchable::NoLockScreen),
+            Error::Unwatchable(Unwatchable::NothingEnrolled),
+            Error::Unwatchable(Unwatchable::NotNow),
+            Error::Unwatchable(Unwatchable::Never),
+            Error::Unexplained(Failure::Unknown),
+            Error::Unexplained(Failure::Transient),
             Error::NoEpoch,
             Error::Changing,
             Error::Exhausted,

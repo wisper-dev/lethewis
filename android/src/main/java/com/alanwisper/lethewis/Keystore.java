@@ -3,6 +3,10 @@
 
 package com.alanwisper.lethewis;
 
+import android.app.KeyguardManager;
+import android.content.Context;
+import android.content.pm.PackageManager;
+import android.hardware.biometrics.BiometricManager;
 import android.os.Build;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyInfo;
@@ -35,6 +39,12 @@ final class Keystore {
     static final int UNKNOWN = 5;
     static final int KEPT = 6;
     static final int GONE = 7;
+    static final int READY = 8;
+    static final int NO_LOCK_SCREEN = 9;
+    static final int NOTHING_ENROLLED = 10;
+    static final int NOT_NOW = 11;
+    static final int NEVER = 12;
+    static final int REFUSED = 13;
     static final int TRANSIENT = -1;
     static final int LOCKED = -2;
     static final int ABSENT = -3;
@@ -45,7 +55,14 @@ final class Keystore {
     private static final String PROVIDER = "AndroidKeyStore";
     private static final String PROBE = "lethewis/probe";
 
+    /** The application, which {@link Wiper#start} gives, for what the keystore does not answer. */
+    private static volatile Context app;
+
     private Keystore() {}
+
+    static void use(Context context) {
+        app = context;
+    }
 
     static int apiLevel() {
         return Build.VERSION.SDK_INT;
@@ -82,7 +99,8 @@ final class Keystore {
 
     /**
      * Creates a key under {@code alias} that enrolling a fingerprint, or removing the secure lock
-     * screen, makes unusable for good. It is never used, only asked after.
+     * screen, makes unusable for good. It is never used, only asked after. Returns its level, or
+     * {@link #REFUSED} where the system refuses such a key on this device.
      */
     static int generateWatched(String alias, boolean strongBox) {
         // Android 9 ignores a request for the secure element on keys of this kind.
@@ -101,12 +119,108 @@ final class Keystore {
             generator.init(spec);
             return level(generator.generateKey(), strongBox);
         } catch (InvalidAlgorithmParameterException e) {
-            // The system refuses the specification on a device with no secure lock screen, or
-            // nothing enrolled for the key to be invalidated by.
-            return LOCKED;
+            // The system refuses the specification on a device with no secure lock screen, or no
+            // biometric enrolled strong enough to invalidate the key.
+            return REFUSED;
         } catch (Exception e) {
             return failure(e);
         }
+    }
+
+    /**
+     * What the device lacks for a key {@link #generateWatched} would make, or {@link #READY} where
+     * it lacks nothing. Only the making decides. Asking needs the context {@link Wiper#start}
+     * gives; without the app's permission USE_BIOMETRIC the sensor does not answer.
+     */
+    static int unwatchable() {
+        final Context context = app;
+        if (context == null) {
+            return UNKNOWN_FAILURE;
+        }
+        try {
+            KeyguardManager keyguard =
+                    (KeyguardManager) context.getSystemService(Context.KEYGUARD_SERVICE);
+            final int sensors = sensors(context.getPackageManager());
+            return lacking(
+                    sensors > 0,
+                    keyguard.isDeviceSecure(),
+                    new Sensor() {
+                        @Override
+                        public int ask() throws Exception {
+                            return sensor(context, sensors == 1);
+                        }
+                    });
+        } catch (Exception e) {
+            return failure(e);
+        }
+    }
+
+    /** What the sensor answers of such a key. */
+    interface Sensor {
+        int ask() throws Exception;
+    }
+
+    /**
+     * What the device lacks, in the order its owner would mend it: a sensor, a secure lock screen,
+     * then what the sensor says. A sensor that fails to answer leaves the rest told.
+     */
+    static int lacking(boolean sensed, boolean secure, Sensor sensor) {
+        if (!sensed) {
+            return NEVER;
+        }
+        int answer;
+        try {
+            answer = sensor.ask();
+        } catch (Exception e) {
+            answer = failure(e);
+        }
+        if (answer == NEVER) {
+            return NEVER;
+        }
+        return secure ? answer : NO_LOCK_SCREEN;
+    }
+
+    private static int sensor(Context context, boolean alone) throws Exception {
+        if (Build.VERSION.SDK_INT >= 30) {
+            return Api30.sensor(context, alone);
+        }
+        if (Build.VERSION.SDK_INT >= 29) {
+            return Api29.sensor(context);
+        }
+        return fingerprints(context);
+    }
+
+    /**
+     * How many kinds of sensor such a key may be bound to the device has: a fingerprint's alone on
+     * Android 9, a face's and an iris's as well from Android 10.
+     */
+    private static int sensors(PackageManager features) {
+        int sensors = features.hasSystemFeature(PackageManager.FEATURE_FINGERPRINT) ? 1 : 0;
+        if (Build.VERSION.SDK_INT >= 29) {
+            if (features.hasSystemFeature(PackageManager.FEATURE_FACE)) {
+                sensors++;
+            }
+            if (features.hasSystemFeature(PackageManager.FEATURE_IRIS)) {
+                sensors++;
+            }
+        }
+        return sensors;
+    }
+
+    /**
+     * Android 9 binds such a key to fingerprints alone. Its FingerprintManager is gone from the SDK
+     * this builds with, so it is reached by name.
+     */
+    private static int fingerprints(Context context) throws Exception {
+        Object sensor = context.getSystemService("fingerprint");
+        if (sensor == null || !asked(sensor, "isHardwareDetected")) {
+            return NOT_NOW;
+        }
+        return asked(sensor, "hasEnrolledFingerprints") ? READY : NOTHING_ENROLLED;
+    }
+
+    private static boolean asked(Object sensor, String method) throws Exception {
+        return (Boolean) sensor.getClass().getMethod(method).invoke(sensor);
     }
 
     /**
@@ -281,6 +395,60 @@ final class Keystore {
             }
         }
         return UNKNOWN_FAILURE;
+    }
+
+    /** The answer of a BiometricManager; its constants are compiled in, so any level runs it. */
+    static int answer(int code) {
+        switch (code) {
+            case BiometricManager.BIOMETRIC_SUCCESS:
+                return READY;
+            case BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED:
+                return NOTHING_ENROLLED;
+            // A sensor unusable now, none the system knows yet, one awaiting an update, or a code
+            // of a later system.
+            default:
+                return NOT_NOW;
+        }
+    }
+
+    /**
+     * The answers of a BiometricManager from API 30, for a strong biometric and for a weak one. No
+     * strong sensor is for good only beside a weak one the system knows, on a device {@code alone}
+     * with one kind of sensor: the system tells of the first sensor it cannot use, and of none
+     * while its sensors start.
+     */
+    static int answer(int strong, int weak, boolean alone) {
+        if (alone
+                && strong == BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE
+                && weak != BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE) {
+            return NEVER;
+        }
+        return answer(strong);
+    }
+
+    /** Calls that exist from API 29, apart so that older systems never load them. */
+    private static final class Api29 {
+        // Android 10 binds such a key to any fingerprint or face, as this asks.
+        @SuppressWarnings("deprecation")
+        static int sensor(Context context) {
+            BiometricManager biometrics = context.getSystemService(BiometricManager.class);
+            return biometrics == null ? NOT_NOW : answer(biometrics.canAuthenticate());
+        }
+    }
+
+    /** Calls that exist from API 30, apart so that older systems never load them. */
+    private static final class Api30 {
+        // From Android 11 such a key needs a strong biometric, as the keystore checks.
+        static int sensor(Context context, boolean alone) {
+            BiometricManager biometrics = context.getSystemService(BiometricManager.class);
+            if (biometrics == null) {
+                return NOT_NOW;
+            }
+            return answer(
+                    biometrics.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG),
+                    biometrics.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK),
+                    alone);
+        }
     }
 
     /** Calls that exist from API 31, apart so that older systems never load them. */

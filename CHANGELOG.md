@@ -415,8 +415,8 @@ Nothing is published while the version is below 0.1.0.
 - A sign with no key of its own is refused: watching it would watch nothing.
 - A profile is made with such a key where the device allows one, whether or not the sign is
   watched. Destroying the profile deletes it.
-- `Keystore::generate_watched` and `Keystore::watched`, over `Keystore.generateWatched` and
-  `Keystore.watched` of the Java layer.
+- `Keystore::generate_watched`, which returns `None` where the system refuses the key, and
+  `Keystore::watched`, over `Keystore.generateWatched` and `Keystore.watched` of the Java layer.
 - A test on the emulators makes the key, reads it and finds it gone with the profile.
 - `Profile::set_guards`, `Profile::accept_signs` and `Profile::guards`, with the owner's password.
   They set what every sign does, and whether one sign alone destroys the profile.
@@ -451,5 +451,8 @@ Nothing is published while the version is below 0.1.0.
   `Profile::time_lock_round`, which needs the chip alone, are built without the feature too.
 - `Error::TimeLockSet` refuses a new password while a time lock is set.
 - Changes of the ways in and of the signs of one profile wait for one another.
+- `Keystore::unwatchable` with `Unwatchable`: what the device lacks for the key of the sign of the
+  fingerprints. `Profile::watch_fingerprints` gives it in `Error::Unwatchable` where the system
+  refuses the key, or `Error::Unexplained` where asking fails.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

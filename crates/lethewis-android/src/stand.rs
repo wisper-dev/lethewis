@@ -18,7 +18,7 @@ use lethewis_core::{
 };
 use sha2::Sha256;
 
-use crate::keystore::{Failure, Keystore, Level, Watched};
+use crate::keystore::{Failure, Keystore, Level, Unwatchable, Watched};
 use crate::profile::{Id, Profile};
 
 /// A keystore in memory: a key is 32 bytes, each new one different.
@@ -41,8 +41,14 @@ pub(crate) struct Stand {
     /// What the keystore says of each key of a watched sign, by its name.
     pub(crate) watched: BTreeMap<String, Watched>,
     pub(crate) refuse_watched: Option<Failure>,
-    /// Whether the device has no secure lock screen, so no watched key can be made.
-    pub(crate) unwatchable: bool,
+    /// What the device lacks for a watched key, which the system refuses unless it lacks nothing.
+    pub(crate) unwatchable: Option<Unwatchable>,
+    /// Where the system refuses a watched key even though the device lacks nothing.
+    pub(crate) refuses_watched_key: Option<Refusal>,
+    /// How the keystore fails to make a watched key.
+    pub(crate) refuse_watched_key: Option<Failure>,
+    /// How the device fails to tell what it lacks.
+    pub(crate) refuse_unwatchable: Option<Failure>,
     pub(crate) generated: Vec<(bool, bool)>,
     pub(crate) deleted: Vec<String>,
 }
@@ -65,7 +71,10 @@ impl Stand {
             refuse_aliases: None,
             watched: BTreeMap::new(),
             refuse_watched: None,
-            unwatchable: false,
+            unwatchable: None,
+            refuses_watched_key: None,
+            refuse_watched_key: None,
+            refuse_unwatchable: None,
             generated: Vec::new(),
             deleted: Vec::new(),
         }
@@ -120,13 +129,29 @@ impl Keystore for Stand {
         }
     }
 
-    fn generate_watched(&mut self, alias: &str, strong_box: bool) -> Result<Level, Failure> {
-        if self.unwatchable {
-            return Err(Failure::Locked);
+    fn generate_watched(
+        &mut self,
+        alias: &str,
+        strong_box: bool,
+    ) -> Result<Option<Level>, Failure> {
+        if let Some(failure) = self.refuse_watched_key {
+            return Err(failure);
+        }
+        let refused = match self.refuses_watched_key {
+            Some(Refusal::Anywhere) => true,
+            Some(Refusal::InStrongBox) => strong_box,
+            None => false,
+        };
+        if refused || self.unwatchable.is_some() {
+            return Ok(None);
         }
         let level = self.generate(alias, strong_box, false)?;
         self.watched.insert(alias.to_owned(), Watched::Kept);
-        Ok(level)
+        Ok(Some(level))
+    }
+
+    fn unwatchable(&mut self) -> Result<Option<Unwatchable>, Failure> {
+        self.refuse_unwatchable.map_or(Ok(self.unwatchable), Err)
     }
 
     fn watched(&mut self, alias: &str) -> Result<Watched, Failure> {
@@ -357,6 +382,13 @@ pub(crate) fn made(root: &Path, stand: &mut Stand, seed: u64) -> Made {
         wrapped,
         data,
     }
+}
+
+/// Where the system refuses a watched key: in the secure element alone, or anywhere.
+#[derive(Clone, Copy)]
+pub(crate) enum Refusal {
+    InStrongBox,
+    Anywhere,
 }
 
 /// Where a test's profile starts: without a password under duress, with [`DURESS`], or with

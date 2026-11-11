@@ -27,14 +27,25 @@ pub trait Keystore {
 
     /// Creates an HMAC-SHA256 key under `alias` that enrolling a fingerprint, or dropping the
     /// secure lock screen, makes unusable for good; in the secure element if `strong_box`. Using it
-    /// would need the owner to authenticate, so this library only asks after it.
+    /// would need the owner to authenticate, so this library only asks after it. Returns where the
+    /// keystore holds it, or `None` where the system refuses such a key on this device, which
+    /// [`Keystore::unwatchable`] explains.
     ///
     /// # Errors
     ///
-    /// The keystore's [`Failure`]: [`Failure::Locked`] where the device has no secure lock screen
-    /// or nothing enrolled, so no such key can be made. A key made before a failure may be left
-    /// under `alias`.
-    fn generate_watched(&mut self, alias: &str, strong_box: bool) -> Result<Level, Failure>;
+    /// The keystore's [`Failure`]. A key made before a failure may be left under `alias`.
+    fn generate_watched(&mut self, alias: &str, strong_box: bool)
+    -> Result<Option<Level>, Failure>;
+
+    /// What the device lacks for a key [`Keystore::generate_watched`] would make, or `None` where
+    /// it lacks nothing. Only the making decides: this explains a refusal.
+    ///
+    /// # Errors
+    ///
+    /// The keystore's [`Failure`]: [`Failure::Unknown`] also where the app gave no context through
+    /// `Wiper.start`, or lacks the permission to ask the sensor of a device with a secure lock
+    /// screen.
+    fn unwatchable(&mut self) -> Result<Option<Unwatchable>, Failure>;
 
     /// What the keystore says of the key `alias`, without asking the owner to authenticate.
     ///
@@ -73,6 +84,32 @@ pub enum Watched {
     Kept,
     /// It is gone, or the system made it unusable for good.
     Gone,
+}
+
+/// What a device lacks for a key that a new biometric, or dropping the secure lock screen, makes
+/// unusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unwatchable {
+    /// There is no secure lock screen, which enrolling a biometric needs first.
+    NoLockScreen,
+    /// No biometric strong enough is enrolled.
+    NothingEnrolled,
+    /// The sensor cannot be used now, or the system refused though the device lacks nothing; any
+    /// other answer of the device reads so as well.
+    NotNow,
+    /// The device has no sensor strong enough.
+    Never,
+}
+
+impl fmt::Display for Unwatchable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NoLockScreen => "there is no secure lock screen",
+            Self::NothingEnrolled => "no biometric strong enough is enrolled",
+            Self::NotNow => "the sensor cannot be used now",
+            Self::Never => "the device has no sensor strong enough",
+        })
+    }
 }
 
 /// Where the keystore holds a key, as the system reports it at creation.
