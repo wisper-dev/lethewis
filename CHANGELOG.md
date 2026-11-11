@@ -461,5 +461,9 @@ Nothing is published while the version is below 0.1.0.
 - `Profile::unlock_with_shares` and `Profile::unlock_with_round` take either password of the
   profile, so that a locked profile tells one from another no more.
 - The password that unlocks keeps its way, and the other reads as locked until it unlocks in turn.
+- `Profile::set_time_lock` takes either password of the profile. Both check in to the same round,
+  so a check-in under coercion tells one from another no more.
+- A password under duress set to destroy destroys on every call that takes a password. The calls
+  of the owner's own are among them.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

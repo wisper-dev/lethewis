@@ -678,9 +678,9 @@ impl Profile {
     /// [`Verdict::damaged`](crate::Verdict) tells, what no longer reads becomes
     /// [`Action::Ignore`](crate::Action::Ignore). The other
     /// password reads the profile as locked until it unlocks it in turn, or the owner sets it
-    /// again. Returns the stored key. The password is derived twice, as the key of the second
-    /// factor opens the way with the shares and the password's own locks its way. `owner` and both
-    /// shares are wiped.
+    /// again, and as [`Error::Damaged`] while no way with a second factor is left. Returns the
+    /// stored key. The password is derived twice, as the key of the second factor opens the way
+    /// with the shares and the password's own locks its way. `owner` and both shares are wiped.
     ///
     /// # Errors
     ///
@@ -917,20 +917,24 @@ impl Profile {
         way
     }
 
-    /// Makes the way in with the owner's password `owner` and a time lock of `network` until
-    /// `until`, the first round signed at or after it; `now` is the time it is made. Both are in
-    /// seconds since the Unix epoch. Made at each check-in of the owner, it moves the round on; the
-    /// application locks the profile when a check-in is missed. Once the profile is locked, the
-    /// password with the signature of that round opens it, as
+    /// Makes the way in with a password of the profile, `owner`, and a time lock of `network`
+    /// until `until`, the first round signed at or after it; `now` is the time it is made. Both
+    /// are in seconds since the Unix epoch. Made at each check-in of the owner, it moves the round
+    /// on; the application locks the profile when a check-in is missed. Once the profile is
+    /// locked, a password with the signature of that round opens it, as
     /// [`Profile::unlock_with_round`] takes it. It replaces any made before. `owner` is wiped.
+    ///
+    /// A password under duress checks in as the owner's does, down to the round it moves to, so
+    /// that a check-in under coercion tells one password from another no more.
     /// `slots` must not hold the stored key, which the core holds once only.
     ///
     /// With the `timelock` feature only.
     ///
     /// # Errors
     ///
-    /// As [`Profile::set_shares`], and the core's [`Error::Core`] of
-    /// [`lethewis_core::Error::InvalidTime`] for an `until` the network cannot lock to.
+    /// As [`Profile::set_shares`], save that a password under duress is taken, and the core's
+    /// [`Error::Core`] of [`lethewis_core::Error::InvalidTime`] for an `until` the network cannot
+    /// lock to.
     #[cfg(feature = "timelock")]
     #[expect(
         clippy::too_many_arguments,
@@ -954,8 +958,9 @@ impl Profile {
             let round = network
                 .round_for(now, until)
                 .map_err(|_| Error::Core(CoreError::InvalidTime))?;
-            let opened = self.owner(slots, keystore, owner, params, memory, &ways, &tail)?;
-            let factor = held_factor(&opened.tags, &ways, &tail, None);
+            let (opened, role) =
+                self.either_password(slots, keystore, owner, params, memory, &ways, &tail)?;
+            let factor = held_factor(&opened.tags, &ways, &tail, Some(role));
             release(slots, opened.key);
             let mut timed = [0; TIMED_LEN];
             let way = timed_way(
@@ -1369,6 +1374,72 @@ impl Profile {
         made
     }
 
+    /// The way in of the password `password`, the owner's or the one under duress, as it opens
+    /// it: both open the stored key, so the work and the answer tell one from another no more. A
+    /// record a lock replaced reads as [`Error::Locked`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a derivation's inputs, as the core takes them"
+    )]
+    fn either_password<'a>(
+        &self,
+        slots: &mut Slots<'a>,
+        keystore: &mut impl Keystore,
+        password: &mut [u8],
+        params: &PasswordParams,
+        memory: &mut [MemoryBlock],
+        ways: &[Way; WAYS],
+        tail: &Tail,
+    ) -> Result<(Owner<'a>, Role), Error> {
+        let (key, tags) = self.key_from_password(slots, keystore, password, params, memory)?;
+        let [own, other, shared, timed] = ways;
+        let role = password_role(&tags, ways);
+        // Every password goes the same way, so the answer tells none from another.
+        if role == Some(Role::Destroy) {
+            self.destroy_others(keystore);
+        }
+        let opens = |slots: &mut Slots<'a>, way: &Way| slots.unlock(key, CONTEXT, &way.record).ok();
+        let mine = match role {
+            Some(Role::Duress | Role::Destroy) => other,
+            _ => own,
+        };
+        let opened = match role {
+            None => Err(Error::WrongPassword),
+            Some(role) => match slots.unlock(key, CONTEXT, &mine.record) {
+                Ok(stored) => Ok((stored, role)),
+                // Its record lies in another place, or a lock replaced it.
+                Err(CoreError::RecordRejected) => match opens(slots, own)
+                    .or_else(|| opens(slots, other))
+                    .or_else(|| opens(slots, shared))
+                    .or_else(|| opens(slots, timed))
+                {
+                    Some(stored) => {
+                        release(slots, stored);
+                        Err(Error::Damaged)
+                    }
+                    None => Err(Error::Locked),
+                },
+                Err(error) => Err(Error::Core(error)),
+            },
+        };
+        // Without a way in with a second factor set, nothing locked it: the record was changed.
+        let opened = match opened {
+            Err(Error::Locked) => match self.unset(keystore, ways, tail) {
+                Ok(true) => Err(Error::Damaged),
+                Ok(false) => Err(Error::Locked),
+                Err(error) => Err(error),
+            },
+            opened => opened,
+        };
+        match opened {
+            Ok((stored, role)) => Ok((Owner { stored, key, tags }, role)),
+            Err(error) => {
+                release(slots, key);
+                Err(error)
+            }
+        }
+    }
+
     /// The owner's way in as `owner` opens it. A record a lock replaced, of the owner's way or of
     /// one under duress, reads as [`Error::Locked`].
     #[expect(
@@ -1387,9 +1458,14 @@ impl Profile {
     ) -> Result<Owner<'a>, Error> {
         let (key, tags) = self.key_from_password(slots, keystore, owner, params, memory)?;
         let [own, other, shared, timed] = ways;
+        let role = password_role(&tags, ways);
+        // One under duress set to destroy destroys here as it does where it opens the profile.
+        if role == Some(Role::Destroy) {
+            self.destroy_others(keystore);
+        }
         let opens = |slots: &mut Slots<'a>, way: &Way| slots.unlock(key, CONTEXT, &way.record).ok();
-        let opened = if is_tag(&tags, own, Role::Owner) {
-            match slots.unlock(key, CONTEXT, &own.record) {
+        let opened = match role {
+            Some(Role::Owner) => match slots.unlock(key, CONTEXT, &own.record) {
                 Ok(stored) => Ok(stored),
                 Err(CoreError::RecordRejected) => {
                     // Its record lies in another place, or a lock replaced it.
@@ -1405,21 +1481,16 @@ impl Profile {
                     }
                 }
                 Err(error) => Err(Error::Core(error)),
-            }
-        } else if [Role::Duress, Role::Destroy]
-            .into_iter()
-            .any(|role| is_tag(&tags, other, role))
-        {
+            },
             // A password under duress opens nothing here, whether or not the profile is locked.
-            match opens(slots, other) {
+            Some(Role::Duress | Role::Destroy) => match opens(slots, other) {
                 Some(stored) => {
                     release(slots, stored);
                     Err(Error::WrongPassword)
                 }
                 None => Err(Error::Locked),
-            }
-        } else {
-            Err(Error::WrongPassword)
+            },
+            _ => Err(Error::WrongPassword),
         };
         // Without a way in with shares set, nothing locked it: the record was changed.
         let opened = match opened {
@@ -2032,8 +2103,8 @@ mod tests {
     #[cfg(feature = "timelock")]
     use super::TIMED_LEN;
     use super::{
-        COPIES, FACTOR_LEN, FILE_LEN, MARK_LEN, ROLES, Role, SALT_LEN, TAG_KEY_LABEL, TagKey,
-        WAY_LEN, entries_name, is_tag, tag,
+        COPIES, FACTOR_LEN, FILE_LEN, Factor, MARK_LEN, ROLES, Role, SALT_LEN, TAG_KEY_LABEL,
+        TagKey, WAY_LEN, WAYS, entries_name, held_factor, is_tag, tag,
     };
     use crate::guard::{Action, Readings, SIGN_COUNT, Sign};
     use crate::profile::{DESTROYED, Error, Profile, WRITING};
@@ -2453,6 +2524,79 @@ mod tests {
         );
     }
 
+    /// The key of the second factor, as the password `password` in `role` reaches it.
+    fn factor_of(made: &Made, stand: &Stand, password: &[u8], role: Option<Role>) -> Factor {
+        let tags = keyed(&answer_of(made, stand, password).1);
+        let (_, ways, tail) = made.profile.settled_ways().unwrap();
+        held_factor(&tags, &ways, &tail, role)
+    }
+
+    #[test]
+    fn both_passwords_reach_one_key_of_the_factor_until_either_is_set_anew() {
+        let root = dir("factorkey");
+        let mut stand = Stand::new();
+        let made = copied(&root, &mut stand, Start::Plain);
+        set_duress(&made, &mut stand, OWNER, DURESS, false).unwrap();
+        let owners = factor_of(&made, &stand, OWNER, None);
+        assert_eq!(
+            *factor_of(&made, &stand, DURESS, Some(Role::Duress)),
+            *owners
+        );
+        // A password of another profile reaches the key of neither.
+        assert_ne!(*factor_of(&made, &stand, OTHER, None), *owners);
+        // Removed, the password under duress holds a key that is no longer the profile's.
+        let held = factor_of(&made, &stand, DURESS, Some(Role::Duress));
+        clear_duress(&made, &mut stand, OWNER).unwrap();
+        assert_ne!(*factor_of(&made, &stand, OWNER, None), *held);
+    }
+
+    /// Which places of the file of the ways in differ: the record, then the salt with the tag,
+    /// of each way; then the time lock, the mark and each copy of the key of the second factor.
+    fn places(before: &[u8], after: &[u8]) -> Vec<bool> {
+        let mut edges = Vec::new();
+        for way in 0..WAYS {
+            edges.push(way * WAY_LEN + LOCK_RECORD_LEN);
+            edges.push((way + 1) * WAY_LEN);
+        }
+        edges.push(WAYS * WAY_LEN + TIMED_LEN);
+        edges.push(WAYS * WAY_LEN + TIMED_LEN + MARK_LEN);
+        edges.push(FILE_LEN - FACTOR_LEN);
+        edges.push(FILE_LEN);
+        let mut places = Vec::new();
+        let mut from = 0;
+        for to in edges {
+            places.push(before[from..to] != after[from..to]);
+            from = to;
+        }
+        places
+    }
+
+    #[test]
+    fn an_unlock_writes_the_ways_of_both_passwords_alike() {
+        let changed = |password: &[u8], name: &str| {
+            let root = dir(name);
+            let mut stand = Stand::new();
+            let made = copied(&root, &mut stand, Start::Duress);
+            let [one, two, _] = set_shares(&made, &mut stand, OWNER, 1).unwrap();
+            lock(&made, &mut stand).unwrap();
+            let before = file(&made, 0);
+            assert_eq!(
+                unlock(&made, &mut stand, password, &one, &two),
+                Ok(made.data)
+            );
+            places(&before, &file(&made, 0))
+        };
+        let owners = changed(OWNER, "unlockowner");
+        assert_eq!(changed(DURESS, "unlockduress"), owners);
+        // The records of both passwords, and nothing else.
+        assert_eq!(
+            owners,
+            [
+                true, false, true, false, false, false, false, false, false, false, false, false
+            ]
+        );
+    }
+
     #[test]
     fn a_password_not_set_has_a_copy_of_the_factors_key_of_its_own() {
         let root = dir("unsetcopy");
@@ -2498,6 +2642,22 @@ mod tests {
         clear_duress(&made, &mut stand, OWNER).unwrap();
         assert_eq!(shares(&made), before.0);
         assert_ne!(copies(&made), between);
+    }
+
+    #[test]
+    fn the_owners_calls_destroy_under_a_password_set_to_destroy() {
+        let root = dir("callsdestroy");
+        let mut stand = Stand::new();
+        let made = copied(&root, &mut stand, Start::Destroy);
+        let other = self::made(&root, &mut stand, 61).profile.id();
+        let destroyed = root.join(other.to_string()).join(DESTROYED);
+        assert!(!destroyed.exists());
+        // A call of the owner's refuses the password under duress and destroys all the same.
+        assert_eq!(
+            set_shares(&made, &mut stand, DURESS, 1),
+            Err(Error::WrongPassword)
+        );
+        assert!(destroyed.exists());
     }
 
     #[test]
@@ -3677,7 +3837,7 @@ mod tests {
 
     #[cfg(feature = "timelock")]
     #[test]
-    fn a_locked_profile_opens_with_the_owners_password_and_the_round() {
+    fn a_locked_profile_opens_with_either_password_and_the_round() {
         let root = dir("round");
         let mut stand = Stand::new();
         let made = copied(&root, &mut stand, Start::Destroy);
@@ -3706,6 +3866,22 @@ mod tests {
         let other = self::made(&root, &mut stand, 58).profile.id();
         assert!(unlock_round(&made, &mut stand, DURESS, &forged).is_err());
         assert!(root.join(other.to_string()).join(DESTROYED).exists());
+        // The password under duress opens the profile as the owner's does, and keeps its role.
+        assert_eq!(
+            unlock_round(&made, &mut stand, DURESS, &signature()),
+            Ok(made.data)
+        );
+        assert_eq!(
+            enter(&made, &mut stand, DURESS),
+            Ok((Role::Destroy, made.data))
+        );
+        // The round is spent and no way out is left, so the way the unlock emptied reads as
+        // changed, which it was.
+        assert_eq!(enter(&made, &mut stand, OWNER), Err(Error::Damaged));
+        // A check-in under the password that opened the profile arms a round again, and that
+        // round opens the owner's way in turn.
+        set_time_lock(&made, &mut stand, DURESS).unwrap();
+        lock(&made, &mut stand).unwrap();
         assert_eq!(
             unlock_round(&made, &mut stand, OWNER, &signature()),
             Ok(made.data)
@@ -3720,6 +3896,45 @@ mod tests {
     }
 
     #[cfg(feature = "timelock")]
+    #[test]
+    fn a_check_in_under_either_password_is_alike() {
+        let root = dir("checkin");
+        let mut stand = Stand::new();
+        let made = copied(&root, &mut stand, Start::Duress);
+        let before = file(&made, 0);
+        set_time_lock(&made, &mut stand, OWNER).unwrap();
+        let owners = file(&made, 0);
+        assert_ne!(owners, before);
+        assert_eq!(made.profile.time_lock_round(&mut stand), Ok(Some(ROUND)));
+        set_time_lock(&made, &mut stand, DURESS).unwrap();
+        // Byte for byte the same file: the test draws the same bytes for either password, and
+        // nothing of the password itself goes into the way with a time lock.
+        assert_eq!(file(&made, 0), owners);
+        assert_eq!(made.profile.time_lock_round(&mut stand), Ok(Some(ROUND)));
+        // The way the check-in under duress made opens to the owner as its own would.
+        lock(&made, &mut stand).unwrap();
+        assert_eq!(
+            unlock_round(&made, &mut stand, OWNER, &signature()),
+            Ok(made.data)
+        );
+        assert_eq!(
+            enter(&made, &mut stand, OWNER),
+            Ok((Role::Owner, made.data))
+        );
+    }
+
+    #[test]
+    fn a_check_in_destroys_under_a_password_set_to_destroy() {
+        let root = dir("checkindestroy");
+        let mut stand = Stand::new();
+        let made = copied(&root, &mut stand, Start::Destroy);
+        let other = self::made(&root, &mut stand, 62).profile.id();
+        let destroyed = root.join(other.to_string()).join(DESTROYED);
+        set_time_lock(&made, &mut stand, DURESS).unwrap();
+        assert!(destroyed.exists());
+        assert_eq!(made.profile.time_lock_round(&mut stand), Ok(Some(ROUND)));
+    }
+
     #[test]
     fn a_time_lock_changed_or_another_mark_is_told() {
         let root = dir("roundchanged");

@@ -94,8 +94,11 @@ comes the key those ways are locked under, once under a pad of each password.
 Code that reaches the chip reads the time lock and the mark, the round included. Reading that key
 takes a password of the profile as well.
 
-A password under duress opens the profile as the owner's does. Set to destroy, it deletes the
-library's other keys in the keystore, then marks the other profiles destroyed.
+A password under duress opens the profile as the owner's does. It checks in to a time lock the
+same way.
+
+Set to destroy, it deletes the library's other keys in the keystore, then marks the other
+profiles destroyed. It does so on every call that takes a password, the owner's own among them.
 
 For each sign the owner watches, a profile holds two tags. One is of the reading accepted, the
 other of what is to happen when a reading differs.
@@ -230,8 +233,14 @@ the signature of the round of its time lock, which the unlock spends.
 An unlock writes the record of the password that opened the profile and empties the other. That
 other then reads as locked until it unlocks in turn, or is set anew.
 
+Where no way out is left, that emptied way reads as changed instead, which it was. Either password
+reads the other's alike.
+
 A changed sign set to lock calls for a lock, as does a file of the signs changed or gone. A lock
 needs the mark of a way in with shares.
+
+The owner's other calls refuse a password under duress. A coercer who asks for one of those
+tells it from the owner's; entering, checking in and unlocking do not.
 
 A sign locks only with a way in by shares, which stays while a sign locks. A password under duress
 set to destroy still destroys once the profile is locked.
