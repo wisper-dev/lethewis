@@ -64,7 +64,7 @@ public final class KeystoreTests {
     /**
      * The answers of a BiometricManager: success and nothing enrolled, then a sensor unusable now,
      * none the system knows, one awaiting an update, and a code no system defines. From API 30 no
-     * strong sensor is for good only beside a weak one the system knows.
+     * strong sensor is for good only beside a weak one the system knows, with one kind of sensor.
      */
     private static String answers() {
         int[] codes = {0, 11, 1, 12, 15, 99};
@@ -81,18 +81,19 @@ public final class KeystoreTests {
                 return "the biometric answer " + codes[i] + " read as " + Keystore.answer(codes[i]);
             }
         }
-        // A strong answer, a weak one, and how the two read.
+        // A strong answer, a weak one, 1 for one kind of sensor, and how they read.
         int[][] paired = {
-            {12, 11, Keystore.NEVER},
-            {12, 0, Keystore.NEVER},
-            {12, 1, Keystore.NEVER},
-            {12, 12, Keystore.NOT_NOW},
-            {11, 0, Keystore.NOTHING_ENROLLED},
-            {0, 0, Keystore.READY},
+            {12, 11, 1, Keystore.NEVER},
+            {12, 0, 1, Keystore.NEVER},
+            {12, 1, 1, Keystore.NEVER},
+            {12, 11, 0, Keystore.NOT_NOW},
+            {12, 12, 1, Keystore.NOT_NOW},
+            {11, 0, 1, Keystore.NOTHING_ENROLLED},
+            {0, 0, 0, Keystore.READY},
         };
         for (int[] pair : paired) {
-            int answer = Keystore.answer(pair[0], pair[1]);
-            if (answer != pair[2]) {
+            int answer = Keystore.answer(pair[0], pair[1], pair[2] == 1);
+            if (answer != pair[3]) {
                 return "the biometric answers " + pair[0] + ", " + pair[1] + " read as " + answer;
             }
         }

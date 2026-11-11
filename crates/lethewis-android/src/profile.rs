@@ -110,7 +110,8 @@ pub enum Error {
     /// may make it in software after a failure of the secure hardware, so a later try may succeed.
     SoftwareOnly,
     /// The system refused the key of [`Sign::Fingerprints`](crate::Sign::Fingerprints), for the
-    /// reason the device gives.
+    /// reason the device gives. Never [`Watchable::Ready`]: a device that reads so though refused
+    /// is so for now.
     Unwatchable(Watchable),
     /// The system refused the key of [`Sign::Fingerprints`](crate::Sign::Fingerprints), and asking
     /// the device why failed, as where the app gave no context through `Wiper.start` or lacks the

@@ -213,8 +213,9 @@ fn judge_sign(
 /// What the key of [`Sign::Fingerprints`] is, which its reading tells apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Watch {
-    /// There is no such key. None was ever made, where the device has no secure lock screen or
-    /// nothing enrolled, or the system took it with the lock screen it was made under.
+    /// There is no such key. None was ever made, where the system refused it, as
+    /// [`Error::Unwatchable`] and [`Error::Unexplained`] tell, or the system took it with the lock
+    /// screen it was made under.
     None,
     /// The key is there, so the fingerprints enrolled and the lock screen are as they were.
     Kept,

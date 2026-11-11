@@ -139,13 +139,14 @@ final class Keystore {
         try {
             KeyguardManager keyguard =
                     (KeyguardManager) context.getSystemService(Context.KEYGUARD_SERVICE);
+            final int sensors = sensors(context.getPackageManager());
             return lacking(
-                    sensed(context.getPackageManager()),
+                    sensors > 0,
                     keyguard.isDeviceSecure(),
                     new Sensor() {
                         @Override
                         public int ask() throws Exception {
-                            return sensor(context);
+                            return sensor(context, sensors == 1);
                         }
                     });
         } catch (Exception e) {
@@ -178,9 +179,9 @@ final class Keystore {
         return secure ? answer : NO_LOCK_SCREEN;
     }
 
-    private static int sensor(Context context) throws Exception {
+    private static int sensor(Context context, boolean alone) throws Exception {
         if (Build.VERSION.SDK_INT >= 30) {
-            return Api30.watchable(context);
+            return Api30.watchable(context, alone);
         }
         if (Build.VERSION.SDK_INT >= 29) {
             return Api29.watchable(context);
@@ -189,16 +190,20 @@ final class Keystore {
     }
 
     /**
-     * Whether the device has a sensor such a key may be bound to: a fingerprint's alone on
-     * Android 9, a face or an iris as well from Android 10.
+     * How many kinds of sensor such a key may be bound to the device has: a fingerprint's alone on
+     * Android 9, a face's and an iris's as well from Android 10.
      */
-    private static boolean sensed(PackageManager features) {
-        if (features.hasSystemFeature(PackageManager.FEATURE_FINGERPRINT)) {
-            return true;
+    private static int sensors(PackageManager features) {
+        int sensors = features.hasSystemFeature(PackageManager.FEATURE_FINGERPRINT) ? 1 : 0;
+        if (Build.VERSION.SDK_INT >= 29) {
+            if (features.hasSystemFeature(PackageManager.FEATURE_FACE)) {
+                sensors++;
+            }
+            if (features.hasSystemFeature(PackageManager.FEATURE_IRIS)) {
+                sensors++;
+            }
         }
-        return Build.VERSION.SDK_INT >= 29
-                && (features.hasSystemFeature(PackageManager.FEATURE_FACE)
-                        || features.hasSystemFeature(PackageManager.FEATURE_IRIS));
+        return sensors;
     }
 
     /**
@@ -407,11 +412,13 @@ final class Keystore {
 
     /**
      * The answers of a BiometricManager from API 30, for a strong biometric and for a weak one. No
-     * strong sensor is for good only beside a weak one the system knows: a sensor it knows nothing
-     * of may still be starting.
+     * strong sensor is for good only beside a weak one the system knows, on a device {@code alone}
+     * with one kind of sensor: the system tells of the first sensor it cannot use, and of none
+     * while its sensors start.
      */
-    static int answer(int strong, int weak) {
-        if (strong == BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE
+    static int answer(int strong, int weak, boolean alone) {
+        if (alone
+                && strong == BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE
                 && weak != BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE) {
             return NEVER;
         }
@@ -431,14 +438,15 @@ final class Keystore {
     /** Calls that exist from API 30, apart so that older systems never load them. */
     private static final class Api30 {
         // From Android 11 such a key needs a strong biometric, as the keystore checks.
-        static int watchable(Context context) {
+        static int watchable(Context context, boolean alone) {
             BiometricManager biometrics = context.getSystemService(BiometricManager.class);
             if (biometrics == null) {
                 return NOT_NOW;
             }
             return answer(
                     biometrics.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG),
-                    biometrics.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK));
+                    biometrics.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK),
+                    alone);
         }
     }
 

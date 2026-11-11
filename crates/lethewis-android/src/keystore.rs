@@ -42,7 +42,8 @@ pub trait Keystore {
     /// # Errors
     ///
     /// The keystore's [`Failure`]: [`Failure::Unknown`] also where the app gave no context through
-    /// `Wiper.start`, or lacks the permission to ask the sensor.
+    /// `Wiper.start`, or lacks the permission to ask the sensor of a device with a secure lock
+    /// screen.
     fn watchable(&mut self) -> Result<Watchable, Failure>;
 
     /// What the keystore says of the key `alias`, without asking the owner to authenticate.
