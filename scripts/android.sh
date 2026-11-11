@@ -397,6 +397,7 @@ cargo test --workspace --all-features --locked --target x86_64-linux-android --r
 step "the tests on the device"
 adb_for 120 install -r -t "$work/tests.apk" >/dev/null
 instrument all
+instrument context
 # The keystore's own failures, whose class apps do not reach.
 if [ "$api" -ge 33 ]; then
   instrument platform --no-hidden-api-checks

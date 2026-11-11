@@ -16,6 +16,11 @@ import java.security.UnrecoverableKeyException;
 public final class KeystoreTests {
     private KeystoreTests() {}
 
+    /** Gives the keystore the application, as {@code Wiper.start} does, without watching. */
+    public static void use(android.content.Context context) {
+        Keystore.use(context.getApplicationContext());
+    }
+
     /** Returns {@code passed}, or the first exception named wrong. */
     public static String run() throws Exception {
         Throwable[] thrown = {
@@ -45,7 +50,88 @@ public final class KeystoreTests {
         if (!"passed".equals(absent)) {
             return absent;
         }
+        String answers = answers();
+        if (!"passed".equals(answers)) {
+            return answers;
+        }
+        String lacking = lacking();
+        if (!"passed".equals(lacking)) {
+            return lacking;
+        }
         return Build.VERSION.SDK_INT >= 31 ? "passed" : missing();
+    }
+
+    /**
+     * The answers of a BiometricManager: success and nothing enrolled, then a sensor unusable now,
+     * none the system knows, one awaiting an update, and a code no system defines. From API 30 no
+     * strong sensor is for good only beside a weak one the system knows.
+     */
+    private static String answers() {
+        int[] codes = {0, 11, 1, 12, 15, 99};
+        int[] read = {
+            Keystore.READY,
+            Keystore.NOTHING_ENROLLED,
+            Keystore.NOT_NOW,
+            Keystore.NOT_NOW,
+            Keystore.NOT_NOW,
+            Keystore.NOT_NOW,
+        };
+        for (int i = 0; i < codes.length; i++) {
+            if (Keystore.answer(codes[i]) != read[i]) {
+                return "the biometric answer " + codes[i] + " read as " + Keystore.answer(codes[i]);
+            }
+        }
+        // A strong answer, a weak one, and how the two read.
+        int[][] paired = {
+            {12, 11, Keystore.NEVER},
+            {12, 0, Keystore.NEVER},
+            {12, 1, Keystore.NEVER},
+            {12, 12, Keystore.NOT_NOW},
+            {11, 0, Keystore.NOTHING_ENROLLED},
+            {0, 0, Keystore.READY},
+        };
+        for (int[] pair : paired) {
+            int answer = Keystore.answer(pair[0], pair[1]);
+            if (answer != pair[2]) {
+                return "the biometric answers " + pair[0] + ", " + pair[1] + " read as " + answer;
+            }
+        }
+        return "passed";
+    }
+
+    /**
+     * What the device lacks, in the order its owner would mend it: a sensor, a secure lock screen,
+     * then what the sensor says. A sensor that fails to answer leaves the rest told.
+     */
+    private static String lacking() {
+        Exception denied = new SecurityException("USE_BIOMETRIC");
+        boolean[] sensed = {false, true, true, true, true, true, true};
+        boolean[] secure = {true, false, false, false, true, true, true};
+        Keystore.Sensor[] sensors = {
+            sensor(Keystore.READY, null),
+            sensor(Keystore.NEVER, null),
+            sensor(Keystore.NOTHING_ENROLLED, null),
+            sensor(Keystore.READY, denied),
+            sensor(Keystore.READY, denied),
+            sensor(Keystore.NOTHING_ENROLLED, null),
+            sensor(Keystore.READY, null),
+        };
+        int[] read = {
+            Keystore.NEVER,
+            Keystore.NEVER,
+            Keystore.NO_LOCK_SCREEN,
+            Keystore.NO_LOCK_SCREEN,
+            Keystore.UNKNOWN_FAILURE,
+            Keystore.NOTHING_ENROLLED,
+            Keystore.READY,
+        };
+        for (int i = 0; i < read.length; i++) {
+            int lacking = Keystore.lacking(sensed[i], secure[i], sensors[i]);
+            if (lacking != read[i]) {
+                return "the device's case " + i + " read as " + lacking;
+            }
+        }
+        return "passed";
     }
 
     /**
@@ -116,6 +202,19 @@ public final class KeystoreTests {
                 if (Keystore.generate(alias, false, false) < 0) {
                     throw new IllegalStateException("the key was not made");
                 }
+            }
+        };
+    }
+
+    /** A sensor that answers {@code answer}, or throws {@code thrown} if it is not null. */
+    private static Keystore.Sensor sensor(final int answer, final Exception thrown) {
+        return new Keystore.Sensor() {
+            @Override
+            public int ask() throws Exception {
+                if (thrown != null) {
+                    throw thrown;
+                }
+                return answer;
             }
         };
     }

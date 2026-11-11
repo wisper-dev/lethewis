@@ -18,7 +18,7 @@ use lethewis_core::{
 };
 use sha2::Sha256;
 
-use crate::keystore::{Failure, Keystore, Level, Watched};
+use crate::keystore::{Failure, Keystore, Level, Watchable, Watched};
 use crate::profile::{Id, Profile};
 
 /// A keystore in memory: a key is 32 bytes, each new one different.
@@ -41,8 +41,12 @@ pub(crate) struct Stand {
     /// What the keystore says of each key of a watched sign, by its name.
     pub(crate) watched: BTreeMap<String, Watched>,
     pub(crate) refuse_watched: Option<Failure>,
-    /// Whether the device has no secure lock screen, so no watched key can be made.
-    pub(crate) unwatchable: bool,
+    /// What the device answers of a watched key, which the keystore refuses unless ready.
+    pub(crate) watchable: Watchable,
+    /// How the keystore refuses a watched key, whatever the device answers.
+    pub(crate) refuse_watched_key: Option<Failure>,
+    /// How the device fails to answer of a watched key.
+    pub(crate) refuse_watchable: Option<Failure>,
     pub(crate) generated: Vec<(bool, bool)>,
     pub(crate) deleted: Vec<String>,
 }
@@ -65,7 +69,9 @@ impl Stand {
             refuse_aliases: None,
             watched: BTreeMap::new(),
             refuse_watched: None,
-            unwatchable: false,
+            watchable: Watchable::Ready,
+            refuse_watched_key: None,
+            refuse_watchable: None,
             generated: Vec::new(),
             deleted: Vec::new(),
         }
@@ -121,12 +127,19 @@ impl Keystore for Stand {
     }
 
     fn generate_watched(&mut self, alias: &str, strong_box: bool) -> Result<Level, Failure> {
-        if self.unwatchable {
-            return Err(Failure::Locked);
+        if let Some(failure) = self.refuse_watched_key {
+            return Err(failure);
+        }
+        if self.watchable != Watchable::Ready {
+            return Err(Failure::Refused);
         }
         let level = self.generate(alias, strong_box, false)?;
         self.watched.insert(alias.to_owned(), Watched::Kept);
         Ok(level)
+    }
+
+    fn watchable(&mut self) -> Result<Watchable, Failure> {
+        self.refuse_watchable.map_or(Ok(self.watchable), Err)
     }
 
     fn watched(&mut self, alias: &str) -> Result<Watched, Failure> {

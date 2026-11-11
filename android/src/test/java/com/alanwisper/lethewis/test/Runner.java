@@ -9,6 +9,7 @@ import android.app.KeyguardManager;
 import android.content.Context;
 import android.os.Bundle;
 import com.alanwisper.lethewis.KeystoreTests;
+import com.alanwisper.lethewis.Wiper;
 import java.io.File;
 
 /**
@@ -17,6 +18,7 @@ import java.io.File;
  * the tests: {@code all} by default, or one step of a profile kept across a lock of the device,
  * {@code before-lock}, {@code locked} and {@code after-lock}, or across a keystore that stops,
  * {@code before-stop}, {@code stopping}, {@code stopped}, {@code restarted} and {@code after-stop}.
+ * {@code -e test context} asks the device through the context {@code Wiper.start} gives.
  * {@code -e test platform} checks the failures of the keystore from API 33, with the checks of
  * hidden interfaces lifted. With {@code -e test misuse} it breaks a rule of JNI instead, and the
  * process must not survive it.
@@ -55,6 +57,12 @@ public final class Runner extends Instrumentation {
             return KeystoreTests.platform();
         }
         Context context = getTargetContext();
+        // The other tests give the keystore the context without watching the screen.
+        if ("context".equals(test)) {
+            Wiper.start(context);
+        } else {
+            KeystoreTests.use(context);
+        }
         KeyguardManager keyguard =
                 (KeyguardManager) context.getSystemService(Context.KEYGUARD_SERVICE);
         boolean locked = "locked".equals(test);

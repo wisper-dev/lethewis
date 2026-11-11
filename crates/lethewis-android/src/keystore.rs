@@ -31,10 +31,19 @@ pub trait Keystore {
     ///
     /// # Errors
     ///
-    /// The keystore's [`Failure`]: [`Failure::Locked`] where the device has no secure lock screen
-    /// or nothing enrolled, so no such key can be made. A key made before a failure may be left
+    /// The keystore's [`Failure`]: [`Failure::Refused`] where the system refuses such a key on this
+    /// device, which [`Keystore::watchable`] explains. A key made before a failure may be left
     /// under `alias`.
     fn generate_watched(&mut self, alias: &str, strong_box: bool) -> Result<Level, Failure>;
+
+    /// What the device says of a key [`Keystore::generate_watched`] would make. Only the making
+    /// decides: this explains a refusal.
+    ///
+    /// # Errors
+    ///
+    /// The keystore's [`Failure`]: [`Failure::Unknown`] also where the app gave no context through
+    /// `Wiper.start`, or lacks the permission to ask the sensor.
+    fn watchable(&mut self) -> Result<Watchable, Failure>;
 
     /// What the keystore says of the key `alias`, without asking the owner to authenticate.
     ///
@@ -73,6 +82,34 @@ pub enum Watched {
     Kept,
     /// It is gone, or the system made it unusable for good.
     Gone,
+}
+
+/// What the device says of a key that a new biometric, or dropping the secure lock screen, makes
+/// unusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Watchable {
+    /// Such a key can be made.
+    Ready,
+    /// There is no secure lock screen, which enrolling a biometric needs first.
+    NoLockScreen,
+    /// No biometric strong enough is enrolled; enrolling one makes the device ready.
+    NothingEnrolled,
+    /// The sensor cannot be used now; any other answer of the device reads so as well.
+    NotNow,
+    /// The device has no sensor strong enough.
+    Never,
+}
+
+impl fmt::Display for Watchable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Ready => "such a key can be made",
+            Self::NoLockScreen => "there is no secure lock screen",
+            Self::NothingEnrolled => "no biometric strong enough is enrolled",
+            Self::NotNow => "the sensor cannot be used now",
+            Self::Never => "the device has no sensor strong enough",
+        })
+    }
 }
 
 /// Where the keystore holds a key, as the system reports it at creation.
@@ -118,6 +155,8 @@ pub enum Failure {
     Corrupted,
     /// The secure element cannot hold the key.
     StrongBoxUnavailable,
+    /// The system refuses a key that a new biometric makes unusable on this device as it is.
+    Refused,
     /// The keystore, or the bridge to it, failed without saying whether it lasts. Below API 33 most
     /// failures come as this, a damaged key among them; below API 31 so does a missing key while
     /// the keystore cannot make one.
@@ -132,6 +171,7 @@ impl fmt::Display for Failure {
             Self::Absent => "the key is not there",
             Self::Corrupted => "the key is damaged",
             Self::StrongBoxUnavailable => "the secure element cannot hold the key",
+            Self::Refused => "the system refuses such a key on this device",
             Self::Unknown => "the keystore failed for a reason it does not give",
         })
     }

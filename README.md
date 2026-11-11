@@ -141,8 +141,10 @@ password and the hardware secret at each unlock, and neither alone is enough.
   itself. Judging the signs needs no password, so neither does its key.
 - A sign is judged when the app asks, so nothing happens while it does not run. The files of a
   profile are out of reach until the first unlock after a start.
-- The key of the sign of the fingerprints needs a secure lock screen and something enrolled.
-  Without that key the sign watches nothing.
+- The key of the sign of the fingerprints needs a secure lock screen and a biometric strong enough
+  enrolled. Without it the sign watches nothing, and `Profile::watch_fingerprints` tells why.
+- Telling why needs the context `Wiper.start` gives; the sensor answers only with the app's
+  permission `USE_BIOMETRIC`. Without them `Error::Unexplained` may come instead.
 - Nothing here hides that a profile exists: its directory shows.
 - A destroying entry takes longer by the deletion of the keys. The keystore's database shows the
   deletion to whoever compares images of it.

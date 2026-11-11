@@ -19,7 +19,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::entry::KEYS;
 use crate::epoch::Written;
-use crate::keystore::{Keystore, Level, Watched};
+use crate::keystore::{Failure, Keystore, Level, Watchable, Watched};
 use crate::profile::{Error, Id, Profile, answer_of, fill_random, read_file, same_mac, write_file};
 
 /// The file of the signs watched, one for the profile: its tags hold no epoch, and a change of
@@ -263,7 +263,9 @@ impl Profile {
     /// # Errors
     ///
     /// [`Error::Exists`] while the key is there and usable, [`Error::SoftwareOnly`] where only
-    /// software would hold it, as [`Profile::accept_signs`] otherwise, or the keystore's failure.
+    /// software would hold it, [`Error::Unwatchable`] where the system refuses it, or
+    /// [`Error::Unexplained`] where the device then does not say why, as [`Profile::accept_signs`]
+    /// otherwise, or the keystore's failure.
     /// A key made before a failure to write is left: the sign then reads as armed but is not
     /// accepted, so it fires until this call succeeds.
     #[expect(
@@ -620,14 +622,26 @@ pub(crate) fn make_watch(
     // Whatever the system says of the secure element, the key is asked for without it as well.
     let level = match keystore.generate_watched(alias, true) {
         Ok(level) => level,
-        Err(_) => keystore
-            .generate_watched(alias, false)
-            .map_err(Error::Keystore)?,
+        Err(_) => match keystore.generate_watched(alias, false) {
+            Ok(level) => level,
+            Err(Failure::Refused) => return Err(refused(keystore)),
+            Err(failure) => return Err(Error::Keystore(failure)),
+        },
     };
     if !level.secure() && !software {
         return Err(Error::SoftwareOnly);
     }
     Ok(level)
+}
+
+/// Why the system refused the key of [`Sign::Fingerprints`], as the device tells. A device that
+/// reads as ready though refused is so for now.
+fn refused(keystore: &mut impl Keystore) -> Error {
+    match keystore.watchable() {
+        Ok(Watchable::Ready) => Error::Unwatchable(Watchable::NotNow),
+        Ok(why) => Error::Unwatchable(why),
+        Err(failure) => Error::Unexplained(failure),
+    }
 }
 
 /// The platform's source of random bytes, for a file written where the caller gives none.
@@ -903,7 +917,7 @@ mod tests {
         WATCH_LEN, Watch, Zeroizing, answered_key, made_guards, parse_guards, settings,
         watch_alias,
     };
-    use crate::keystore::{Failure, Level};
+    use crate::keystore::{Failure, Level, Watchable};
     use crate::profile::{Error, Profile, RECORD};
     use crate::stand::{
         DURESS, Made, OTHER, OWNER, Source, Stand, Start, Work, all_free, copied, dir, entries,
@@ -1605,29 +1619,84 @@ mod tests {
 
     #[test]
     fn a_device_that_holds_no_such_key_makes_a_profile_all_the_same() {
-        let root = dir("unwatchable");
+        for why in [
+            Watchable::NoLockScreen,
+            Watchable::NothingEnrolled,
+            Watchable::NotNow,
+            Watchable::Never,
+        ] {
+            let root = dir("unwatchable");
+            let mut stand = Stand {
+                watchable: why,
+                ..Stand::new()
+            };
+            let profile = Profile::create(&root, &mut stand, false).unwrap();
+            assert_eq!(profile.fingerprints(&mut stand), Ok(Watch::None));
+            assert_eq!(stand.names().len(), 2);
+        }
+    }
+
+    #[test]
+    fn a_refused_key_of_the_sign_is_told_with_the_devices_reason() {
+        let alias = "lethewis/key";
+        for why in [
+            Watchable::NoLockScreen,
+            Watchable::NothingEnrolled,
+            Watchable::NotNow,
+            Watchable::Never,
+        ] {
+            let mut stand = Stand {
+                watchable: why,
+                ..Stand::new()
+            };
+            assert_eq!(
+                super::make_watch(&mut stand, alias, false),
+                Err(Error::Unwatchable(why))
+            );
+        }
+        // A device that reads as ready and is refused all the same is so for now.
         let mut stand = Stand {
-            unwatchable: true,
+            refuse_watched_key: Some(Failure::Refused),
             ..Stand::new()
         };
-        let profile = Profile::create(&root, &mut stand, false).unwrap();
-        assert_eq!(profile.fingerprints(&mut stand), Ok(Watch::None));
-        assert_eq!(stand.names().len(), 2);
+        assert_eq!(
+            super::make_watch(&mut stand, alias, false),
+            Err(Error::Unwatchable(Watchable::NotNow))
+        );
+        // One that does not answer is told with its failure.
+        stand.refuse_watchable = Some(Failure::Unknown);
+        assert_eq!(
+            super::make_watch(&mut stand, alias, false),
+            Err(Error::Unexplained(Failure::Unknown))
+        );
     }
 
     #[test]
     fn a_keystore_that_fails_otherwise_makes_no_profile() {
         let root = dir("failing");
         let mut stand = Stand {
-            refuse_generate: Some(Failure::Transient),
+            refuse_watched_key: Some(Failure::Transient),
             ..Stand::new()
         };
-        // The chip's key is made by `generate`, which this stand refuses only for the watched one.
-        stand.refuse_generate = None;
-        stand.unwatchable = false;
-        stand.refuse_watched = None;
+        assert_eq!(
+            Profile::create(&root, &mut stand, false).unwrap_err(),
+            Error::Keystore(Failure::Transient)
+        );
+        assert_eq!(stand.names(), [] as [&str; 0]);
+        assert_eq!(entries(&root), [] as [String; 0]);
+    }
+
+    #[test]
+    fn a_device_that_does_not_answer_makes_a_profile_all_the_same() {
+        let root = dir("unanswered");
+        let mut stand = Stand {
+            watchable: Watchable::NothingEnrolled,
+            refuse_watchable: Some(Failure::Unknown),
+            ..Stand::new()
+        };
         let profile = Profile::create(&root, &mut stand, false).unwrap();
-        assert_eq!(profile.fingerprints(&mut stand), Ok(Watch::Kept));
+        assert_eq!(profile.fingerprints(&mut stand), Ok(Watch::None));
+        assert_eq!(stand.names().len(), 2);
     }
 
     #[test]

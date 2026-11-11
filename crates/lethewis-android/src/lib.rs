@@ -35,7 +35,7 @@ pub use epoch::{Next, Opened, Roots};
 pub use guard::{Action, Readings, SIGN_COUNT, SIGNS, Sign, Verdict, Watch};
 #[cfg(all(any(target_os = "linux", target_os = "android"), not(kani)))]
 pub use keys::{Kept, Keys, Unheld, allow_keys, settle_keys, wipe_keys};
-pub use keystore::{Failure, Keystore, Level, Watched};
+pub use keystore::{Failure, Keystore, Level, Watchable, Watched};
 pub use lethewis_core::{Erasure, Root};
 pub use profile::{Error, Id, Profile};
 

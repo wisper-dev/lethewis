@@ -13,7 +13,7 @@ use std::{fs, thread};
 use jni_sys::{JNIEnv, jboolean, jclass, jint, jstring};
 use lethewis_android::{
     Action, Erasure, Error, Failure, Id, Keys, Keystore, Level, Profile, Readings, Root, Unheld,
-    Watch, sweep,
+    Watch, Watchable, sweep,
 };
 use lethewis_core::{
     Entropy, EntropyError, Epoch, KeyLength, MemoryBlock, PasswordParams, Purpose, SHARE_COUNT,
@@ -185,7 +185,7 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
             profiles(&home, keystore, api, expected)?;
             epochs(&home, keystore)?;
             duress(&home, keystore)?;
-            signs(&home, keystore)?;
+            signs(&home, keystore, false)?;
             locked(&home, keystore)?;
             remove(root)
         }
@@ -257,14 +257,27 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
                 &format!("a keystore that started again verifies: {verified:?}"),
             )
         }
+        "context" => context(keystore),
         "after-lock" | "after-stop" => {
             let profile = kept(root)?;
             answers(&profile, keystore)?;
             destroyed(profile, keystore).map(|_| ())?;
+            if test == "after-lock" {
+                signs(&home, keystore, true)?;
+            }
             remove(root)
         }
         other => Err(format!("no tests named {other}")),
     }
+}
+
+/// The keystore asks the device through the context of `Wiper.start`, as in an app.
+fn context(keystore: &mut JniKeystore<'_>) -> Result<(), String> {
+    let answer = keystore.watchable();
+    check(
+        answer == Ok(Watchable::NoLockScreen),
+        &format!("the device asked through the watch's context: {answer:?}"),
+    )
 }
 
 fn empty(root: &Path) -> Result<(), String> {
@@ -311,9 +324,9 @@ impl Entropy for Source {
 }
 
 /// The key of the sign of the fingerprints, as the keystore of the device holds it. A device with
-/// no secure lock screen, or nothing enrolled, holds none and says so; destroying the profile
-/// takes the key with it.
-fn signs(home: &Path, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
+/// no secure lock screen, or nothing enrolled, holds none and says which; destroying the profile
+/// takes the key with it. `pin` tells that a PIN is set, and nothing enrolled.
+fn signs(home: &Path, keystore: &mut JniKeystore<'_>, pin: bool) -> Result<(), String> {
     let mut source = Source(5);
     let mut profile =
         Profile::create(home, keystore, true).map_err(|error| format!("creating: {error}"))?;
@@ -348,7 +361,7 @@ fn signs(home: &Path, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
         .release(stored)
         .map_err(|error| format!("releasing: {error}"))?;
     // Arming the sign takes the owner's password, and a key the device can hold. The emulators
-    // have no secure lock screen, so there the system refuses one.
+    // have no secure lock screen until a PIN is set, and nothing enrolled.
     let armed = profile.watch_fingerprints(
         &mut slots,
         keystore,
@@ -361,7 +374,14 @@ fn signs(home: &Path, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
     );
     let agrees = match armed {
         Ok(()) | Err(Error::Exists) => watch == Watch::Kept,
-        Err(Error::Keystore(Failure::Locked)) => watch == Watch::None,
+        Err(Error::Unwatchable(why)) => {
+            let lacking = if pin {
+                Watchable::NothingEnrolled
+            } else {
+                Watchable::NoLockScreen
+            };
+            watch == Watch::None && why == lacking && keystore.watchable() == Ok(why)
+        }
         Err(_) => false,
     };
     check(

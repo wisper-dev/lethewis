@@ -451,5 +451,8 @@ Nothing is published while the version is below 0.1.0.
   `Profile::time_lock_round`, which needs the chip alone, are built without the feature too.
 - `Error::TimeLockSet` refuses a new password while a time lock is set.
 - Changes of the ways in and of the signs of one profile wait for one another.
+- `Keystore::watchable` with `Watchable`: what the device lacks for the key of the sign of the
+  fingerprints. `Profile::watch_fingerprints` gives it in `Error::Unwatchable` where the system
+  refuses the key, which `Failure::Refused` tells, or `Error::Unexplained` where asking fails.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main
