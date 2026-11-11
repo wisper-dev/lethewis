@@ -601,6 +601,7 @@ fn duress(home: &Path, keystore: &mut JniKeystore<'_>) -> Result<(), String> {
             &mut b"owner".to_vec(),
             &mut b"duress".to_vec(),
             true,
+            None,
             &params,
             &mut memory,
             &mut source,

@@ -454,5 +454,9 @@ Nothing is published while the version is below 0.1.0.
 - `Keystore::unwatchable` with `Unwatchable`: what the device lacks for the key of the sign of the
   fingerprints. `Profile::watch_fingerprints` gives it in `Error::Unwatchable` where the system
   refuses the key, or `Error::Unexplained` where asking fails.
+- The ways with a second factor are locked under a key of the file. Every password of the profile
+  reaches it with the chip.
+- `Profile::set_duress` and `Profile::clear_duress` draw that key anew. They take the shares they
+  make again, and refuse while a time lock is set.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main
