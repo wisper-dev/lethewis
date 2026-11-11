@@ -669,15 +669,18 @@ impl Profile {
         self.write_ways(number, &ways, &tail)
     }
 
-    /// Opens the profile with the owner's password `owner` and two shares [`Profile::set_shares`]
-    /// wrote, `first` and `second` in either order, whether it is locked or not, and makes the
-    /// owner's way anew: the password alone opens the profile again. It takes `readings` as
-    /// accepted, as [`Profile::accept_signs`] does, so the sign that locked the profile fires no
-    /// more. In a file of the signs that was changed, as [`Verdict::damaged`](crate::Verdict)
-    /// tells, what no longer reads becomes [`Action::Ignore`](crate::Action::Ignore). A password
-    /// under duress the lock emptied is gone, and [`Profile::set_duress`] sets one again. Returns
-    /// the stored key. The password is derived twice, as the key from it opens the way with the
-    /// shares and then locks the owner's. `owner` and both shares are wiped.
+    /// Opens the profile with a password of it, `owner`, and two shares [`Profile::set_shares`]
+    /// wrote, `first` and `second` in either order, whether it is locked or not, and makes the way
+    /// of that password anew: it alone opens the profile again. A password under duress opens the
+    /// profile as [`Profile::enter`] tells, so that a lock tells no password from another. It
+    /// takes `readings` as accepted, as [`Profile::accept_signs`] does, so the sign that locked
+    /// the profile fires no more. In a file of the signs that was changed, as
+    /// [`Verdict::damaged`](crate::Verdict) tells, what no longer reads becomes
+    /// [`Action::Ignore`](crate::Action::Ignore). The other
+    /// password reads the profile as locked until it unlocks it in turn, or the owner sets it
+    /// again. Returns the stored key. The password is derived twice, as the key of the second
+    /// factor opens the way with the shares and the password's own locks its way. `owner` and both
+    /// shares are wiped.
     ///
     /// # Errors
     ///
@@ -752,16 +755,19 @@ impl Profile {
         let made = self
             .key_from_password(slots, keystore, again, params, memory)
             .and_then(|(key, tags)| {
-                let [before, other, shared, _] = ways;
+                let [own, other, shared, _] = ways;
+                let role = password_role(&tags, ways);
                 let shares_set = is_tag(
-                    &factor_tags(&held_factor(&tags, ways, tail, None)),
+                    &factor_tags(&held_factor(&tags, ways, tail, role)),
                     shared,
                     Role::Shares,
                 );
                 drop(tags);
-                // The owner's record opens to the stored key, held already, where the profile is
-                // not locked: the records of the passwords then stay as they are.
-                let open = match slots.unlock(key, CONTEXT, &before.record) {
+                let duress = matches!(role, Some(Role::Duress | Role::Destroy));
+                let (mine, theirs) = if duress { (other, own) } else { (own, other) };
+                // The record of the password opens to the stored key, held already, where the
+                // profile is not locked: the records then stay as they are.
+                let open = match slots.unlock(key, CONTEXT, &mine.record) {
                     Ok(again) => {
                         release(slots, again);
                         true
@@ -770,10 +776,16 @@ impl Profile {
                     Err(_) => false,
                 };
                 let made = if open {
-                    Ok((*before, *other))
+                    Ok((*own, *other))
                 } else {
-                    relocked(slots, before, stored, key, entropy)
-                        .and_then(|own| Ok((own, emptied(slots, other, entropy)?)))
+                    relocked(slots, mine, stored, key, entropy).and_then(|mine| {
+                        let theirs = emptied(slots, theirs, entropy)?;
+                        Ok(if duress {
+                            (theirs, mine)
+                        } else {
+                            (mine, theirs)
+                        })
+                    })
                 };
                 release(slots, key);
                 let (own, other) = made?;
@@ -838,13 +850,14 @@ impl Profile {
         tail: &Tail,
     ) -> Result<Handle<'a>, Error> {
         let (password, tags) = self.key_from_password(slots, keystore, owner, params, memory)?;
-        let [_, other, shared, _] = ways;
+        let [_, _, shared, _] = ways;
+        let role = password_role(&tags, ways);
         // Every password goes the same way, so the answer tells none from another; one under
         // duress set to destroy destroys whatever the shares.
-        if is_tag(&tags, other, Role::Destroy) {
+        if role == Some(Role::Destroy) {
             self.destroy_others(keystore);
         }
-        let factor = held_factor(&tags, ways, tail, None);
+        let factor = held_factor(&tags, ways, tail, role);
         drop(tags);
         release(slots, password);
         let from_shares = match slots.derive_from_shares(first, second) {
@@ -1051,10 +1064,10 @@ impl Profile {
         Ok(round)
     }
 
-    /// Opens the profile with the owner's password `owner` and `signature`, the signature of the
-    /// round [`Profile::time_lock_round`] names, whether it is locked or not, and makes the owner's
-    /// way anew, as [`Profile::unlock_with_shares`] does with shares. The round is spent, and the
-    /// way with a time lock emptied: the owner checks in again. `owner` is wiped.
+    /// Opens the profile with a password of it, `owner`, and `signature`, the signature of the
+    /// round [`Profile::time_lock_round`] names, whether it is locked or not, and makes the way of
+    /// that password anew, as [`Profile::unlock_with_shares`] does with shares. The round is
+    /// spent, and the way with a time lock emptied: the owner checks in again. `owner` is wiped.
     ///
     /// With the `timelock` feature only.
     ///
@@ -1155,13 +1168,14 @@ impl Profile {
         tail: &Tail,
     ) -> Result<Handle<'a>, Error> {
         let (password, tags) = self.key_from_password(slots, keystore, owner, params, memory)?;
-        let [_, other, _, timed_way] = ways;
+        let [_, _, _, timed_way] = ways;
+        let role = password_role(&tags, ways);
         // Every password goes the same way, so the answer tells none from another; one under
         // duress set to destroy destroys whatever the signature.
-        if is_tag(&tags, other, Role::Destroy) {
+        if role == Some(Role::Destroy) {
             self.destroy_others(keystore);
         }
-        let factor = held_factor(&tags, ways, tail, None);
+        let factor = held_factor(&tags, ways, tail, role);
         drop(tags);
         release(slots, password);
         let mut timed = tail.timed;
@@ -1228,8 +1242,8 @@ impl Profile {
     }
 
     /// Locks the profile: the ways of the passwords keep their tags, under records nothing opens,
-    /// and the ways with a second factor are kept. Each password then reads as the profile locked;
-    /// the owner's opens it only with two shares or the signature of a round, as
+    /// and the ways with a second factor are kept. Each password then reads as the profile locked
+    /// and opens it only with two shares or the signature of a round, as
     /// [`Profile::unlock_with_shares`] and `Profile::unlock_with_round` take them. One under duress
     /// set to destroy still destroys. It needs no password: `slots` of the current
     /// epoch, from its key alone, are enough. The records replaced are overwritten in the file, not
@@ -1614,6 +1628,23 @@ fn locked_way<'a>(
         .map_err(Error::Core)?;
     way.tag = tag(tags, &way.salt, role);
     Ok(way)
+}
+
+/// The role of the password whose key of the tags is `tags`, by the tag in the place of that
+/// role, or none where no place holds it. Every place is read, whatever matched.
+fn password_role(tags: &TagKey, ways: &[Way; WAYS]) -> Option<Role> {
+    let [own, other, ..] = ways;
+    let mut found = None;
+    for (way, role) in [
+        (own, Role::Owner),
+        (other, Role::Duress),
+        (other, Role::Destroy),
+    ] {
+        if is_tag(tags, way, role) {
+            found = found.or(Some(role));
+        }
+    }
+    found
 }
 
 /// Whether `way` holds the tag of `role` under `tags`.
@@ -2800,17 +2831,19 @@ mod tests {
     }
 
     #[test]
-    fn shares_open_nothing_without_the_owners_password() {
+    fn shares_open_nothing_without_a_password_of_the_profile() {
         let root = dir("sharesalone");
         let mut stand = Stand::new();
         let made = copied(&root, &mut stand, Start::Duress);
         let [one, two, _] = set_shares(&made, &mut stand, OWNER, 1).unwrap();
-        for password in [DURESS, OTHER] {
-            assert_eq!(
-                unlock(&made, &mut stand, password, &one, &two),
-                Err(Error::WrongPassword)
-            );
-        }
+        assert_eq!(
+            unlock(&made, &mut stand, OTHER, &one, &two),
+            Err(Error::WrongPassword)
+        );
+        // A profile not locked keeps its ways, whichever of its passwords opens it with shares.
+        let before = file(&made, 0);
+        assert_eq!(unlock(&made, &mut stand, DURESS, &one, &two), Ok(made.data));
+        assert_eq!(file(&made, 0), before);
     }
 
     #[test]
@@ -2999,7 +3032,7 @@ mod tests {
     }
 
     #[test]
-    fn a_locked_profile_opens_only_with_the_owners_password_and_two_shares() {
+    fn a_locked_profile_opens_with_either_password_and_two_shares() {
         let root = dir("locked");
         let mut stand = Stand::new();
         let made = copied(&root, &mut stand, Start::Duress);
@@ -3009,19 +3042,27 @@ mod tests {
         let shared = file(&made, 0).split_off(2 * WAY_LEN);
         lock(&made, &mut stand).unwrap();
         assert_eq!(file(&made, 0).split_off(2 * WAY_LEN), shared);
-        // Each password reads the same; only the owner's opens it with shares.
+        // Each password of the profile reads the same, and no other opens it.
         for password in [OWNER, DURESS] {
             assert_eq!(enter(&made, &mut stand, password), Err(Error::Locked));
         }
         assert_eq!(enter(&made, &mut stand, OTHER), Err(Error::WrongPassword));
-        for password in [DURESS, OTHER] {
-            assert_eq!(
-                unlock(&made, &mut stand, password, &one, &two),
-                Err(Error::WrongPassword)
-            );
-        }
-        // Unlocked, the password alone opens it again and the sign that locked it fires no more;
-        // the other password reads the profile as locked until it is set anew.
+        assert_eq!(
+            unlock(&made, &mut stand, OTHER, &one, &two),
+            Err(Error::WrongPassword)
+        );
+        // The password under duress unlocks as the owner's does, and then opens the profile alone
+        // while the owner's reads it as locked.
+        assert_eq!(
+            unlock_in(&made, &mut stand, 0, DURESS, (&one, &two), &BOOTED),
+            Ok(made.data)
+        );
+        assert_eq!(
+            enter(&made, &mut stand, DURESS),
+            Ok((Role::Duress, made.data))
+        );
+        assert_eq!(enter(&made, &mut stand, OWNER), Err(Error::Locked));
+        // The owner unlocks in turn, and the sign that locked the profile fires no more.
         assert_eq!(
             unlock_in(&made, &mut stand, 0, OWNER, (&three, &one), &BOOTED),
             Ok(made.data)
