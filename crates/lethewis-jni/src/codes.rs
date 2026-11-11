@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Alan Wisper <https://alanwisper.com>
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The results of the Java layer: a level of storage is positive, a failure negative, as the
-//! constants of `Keystore.java` define them.
+//! The results of the Java layer: a level of storage or an answer is positive, a failure negative,
+//! as the constants of `Keystore.java` define them.
 
-use lethewis_android::{Failure, Level, Watchable, Watched};
+use lethewis_android::{Failure, Level, Unwatchable, Watched};
 
 const OK: i32 = 0;
 
@@ -35,13 +35,21 @@ pub(crate) fn watched(code: i32) -> Result<Watched, Failure> {
     }
 }
 
-pub(crate) fn watchable(code: i32) -> Result<Watchable, Failure> {
+/// A watched key's level, or none where the system refuses such a key.
+pub(crate) fn made(code: i32) -> Result<Option<Level>, Failure> {
     match code {
-        8 => Ok(Watchable::Ready),
-        9 => Ok(Watchable::NoLockScreen),
-        10 => Ok(Watchable::NothingEnrolled),
-        11 => Ok(Watchable::NotNow),
-        12 => Ok(Watchable::Never),
+        13 => Ok(None),
+        other => level(other).map(Some),
+    }
+}
+
+pub(crate) fn unwatchable(code: i32) -> Result<Option<Unwatchable>, Failure> {
+    match code {
+        8 => Ok(None),
+        9 => Ok(Some(Unwatchable::NoLockScreen)),
+        10 => Ok(Some(Unwatchable::NothingEnrolled)),
+        11 => Ok(Some(Unwatchable::NotNow)),
+        12 => Ok(Some(Unwatchable::Never)),
         other => Err(failure(other)),
     }
 }
@@ -62,16 +70,15 @@ const fn failure(code: i32) -> Failure {
         -3 => Failure::Absent,
         -4 => Failure::Corrupted,
         -5 => Failure::StrongBoxUnavailable,
-        -7 => Failure::Refused,
         _ => Failure::Unknown,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use lethewis_android::{Failure, Level, Watchable};
+    use lethewis_android::{Failure, Level, Unwatchable};
 
-    use super::{level, presence, status, watchable, watched};
+    use super::{level, made, presence, status, unwatchable, watched};
 
     /// The constants as the Java layer declares them.
     fn declared() -> Vec<(String, i32)> {
@@ -103,13 +110,13 @@ mod tests {
             ("NOTHING_ENROLLED", 10),
             ("NOT_NOW", 11),
             ("NEVER", 12),
+            ("REFUSED", 13),
             ("TRANSIENT", -1),
             ("LOCKED", -2),
             ("ABSENT", -3),
             ("CORRUPTED", -4),
             ("STRONG_BOX_UNAVAILABLE", -5),
             ("UNKNOWN_FAILURE", -6),
-            ("REFUSED", -7),
         ];
         let declared = declared();
         assert_eq!(declared.len(), expected.len(), "{declared:?}");
@@ -135,21 +142,24 @@ mod tests {
             (-4, Failure::Corrupted),
             (-5, Failure::StrongBoxUnavailable),
             (-6, Failure::Unknown),
-            (-7, Failure::Refused),
         ] {
             assert_eq!(level(code), Err(failure));
+            assert_eq!(made(code), Err(failure));
             assert_eq!(status(code), Err(failure));
             assert_eq!(presence(code), Err(failure));
-            assert_eq!(watchable(code), Err(failure));
+            assert_eq!(unwatchable(code), Err(failure));
         }
-        for (code, answer) in [
-            (8, Watchable::Ready),
-            (9, Watchable::NoLockScreen),
-            (10, Watchable::NothingEnrolled),
-            (11, Watchable::NotNow),
-            (12, Watchable::Never),
+        assert_eq!(made(1), Ok(Some(Level::StrongBox)));
+        assert_eq!(made(4), Ok(Some(Level::Software)));
+        assert_eq!(made(13), Ok(None));
+        for (code, lacking) in [
+            (8, None),
+            (9, Some(Unwatchable::NoLockScreen)),
+            (10, Some(Unwatchable::NothingEnrolled)),
+            (11, Some(Unwatchable::NotNow)),
+            (12, Some(Unwatchable::Never)),
         ] {
-            assert_eq!(watchable(code), Ok(answer));
+            assert_eq!(unwatchable(code), Ok(lacking));
         }
         assert_eq!(watched(6), Ok(lethewis_android::Watched::Kept));
         assert_eq!(watched(7), Ok(lethewis_android::Watched::Gone));
@@ -160,7 +170,7 @@ mod tests {
 
     #[test]
     fn a_code_not_defined_is_never_a_missing_key() {
-        for code in [i32::MIN, -8, 6, 7, 8, 12, 100, i32::MAX] {
+        for code in [i32::MIN, -8, -7, 6, 7, 8, 12, 13, 100, i32::MAX] {
             assert_eq!(level(code), Err(Failure::Unknown));
             assert_eq!(status(code), Err(Failure::Unknown));
             assert_eq!(presence(code), Err(Failure::Unknown));
@@ -168,8 +178,11 @@ mod tests {
         for code in [i32::MIN, -8, 0, 1, 5, 8, 100, i32::MAX] {
             assert_eq!(watched(code), Err(Failure::Unknown));
         }
-        for code in [i32::MIN, -8, 0, 1, 7, 13, 100, i32::MAX] {
-            assert_eq!(watchable(code), Err(Failure::Unknown));
+        for code in [i32::MIN, -8, -7, 0, 1, 7, 13, 100, i32::MAX] {
+            assert_eq!(unwatchable(code), Err(Failure::Unknown));
+        }
+        for code in [i32::MIN, -8, -7, 0, 6, 8, 12, 14, i32::MAX] {
+            assert_eq!(made(code), Err(Failure::Unknown));
         }
         assert_eq!(level(0), Err(Failure::Unknown));
         assert_eq!(status(1), Err(Failure::Unknown));

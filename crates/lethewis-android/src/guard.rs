@@ -19,7 +19,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::entry::KEYS;
 use crate::epoch::Written;
-use crate::keystore::{Failure, Keystore, Level, Watchable, Watched};
+use crate::keystore::{Keystore, Level, Unwatchable, Watched};
 use crate::profile::{Error, Id, Profile, answer_of, fill_random, read_file, same_mac, write_file};
 
 /// The file of the signs watched, one for the profile: its tags hold no epoch, and a change of
@@ -621,13 +621,14 @@ pub(crate) fn make_watch(
     software: bool,
 ) -> Result<Level, Error> {
     // Whatever the system says of the secure element, the key is asked for without it as well.
-    let level = match keystore.generate_watched(alias, true) {
-        Ok(level) => level,
-        Err(_) => match keystore.generate_watched(alias, false) {
-            Ok(level) => level,
-            Err(Failure::Refused) => return Err(refused(keystore)),
-            Err(failure) => return Err(Error::Keystore(failure)),
-        },
+    let made = match keystore.generate_watched(alias, true) {
+        Ok(Some(level)) => Some(level),
+        _ => keystore
+            .generate_watched(alias, false)
+            .map_err(Error::Keystore)?,
+    };
+    let Some(level) = made else {
+        return Err(refused(keystore));
     };
     if !level.secure() && !software {
         return Err(Error::SoftwareOnly);
@@ -636,11 +637,11 @@ pub(crate) fn make_watch(
 }
 
 /// Why the system refused the key of [`Sign::Fingerprints`], as the device tells. A device that
-/// reads as ready though refused is so for now.
+/// lacks nothing though refused is so for now.
 fn refused(keystore: &mut impl Keystore) -> Error {
-    match keystore.watchable() {
-        Ok(Watchable::Ready) => Error::Unwatchable(Watchable::NotNow),
-        Ok(why) => Error::Unwatchable(why),
+    match keystore.unwatchable() {
+        Ok(Some(why)) => Error::Unwatchable(why),
+        Ok(None) => Error::Unwatchable(Unwatchable::NotNow),
         Err(failure) => Error::Unexplained(failure),
     }
 }
@@ -918,11 +919,11 @@ mod tests {
         WATCH_LEN, Watch, Zeroizing, answered_key, made_guards, parse_guards, settings,
         watch_alias,
     };
-    use crate::keystore::{Failure, Level, Watchable};
+    use crate::keystore::{Failure, Level, Unwatchable};
     use crate::profile::{Error, Profile, RECORD};
     use crate::stand::{
-        DURESS, Made, OTHER, OWNER, Source, Stand, Start, Work, all_free, copied, dir, entries,
-        fail_syncs,
+        DURESS, Made, OTHER, OWNER, Refusal, Source, Stand, Start, Work, all_free, copied, dir,
+        entries, fail_syncs,
     };
     use crate::sweep;
 
@@ -1621,14 +1622,14 @@ mod tests {
     #[test]
     fn a_device_that_holds_no_such_key_makes_a_profile_all_the_same() {
         for why in [
-            Watchable::NoLockScreen,
-            Watchable::NothingEnrolled,
-            Watchable::NotNow,
-            Watchable::Never,
+            Unwatchable::NoLockScreen,
+            Unwatchable::NothingEnrolled,
+            Unwatchable::NotNow,
+            Unwatchable::Never,
         ] {
             let root = dir("unwatchable");
             let mut stand = Stand {
-                watchable: why,
+                unwatchable: Some(why),
                 ..Stand::new()
             };
             let profile = Profile::create(&root, &mut stand, false).unwrap();
@@ -1638,16 +1639,29 @@ mod tests {
     }
 
     #[test]
+    fn a_key_of_the_sign_the_secure_element_refuses_is_made_without_it() {
+        let mut stand = Stand {
+            strong_box: true,
+            refuses_watched_key: Some(Refusal::InStrongBox),
+            ..Stand::new()
+        };
+        assert_eq!(
+            super::make_watch(&mut stand, "lethewis/key", false),
+            Ok(Level::TrustedEnvironment)
+        );
+    }
+
+    #[test]
     fn a_refused_key_of_the_sign_is_told_with_the_devices_reason() {
         let alias = "lethewis/key";
         for why in [
-            Watchable::NoLockScreen,
-            Watchable::NothingEnrolled,
-            Watchable::NotNow,
-            Watchable::Never,
+            Unwatchable::NoLockScreen,
+            Unwatchable::NothingEnrolled,
+            Unwatchable::NotNow,
+            Unwatchable::Never,
         ] {
             let mut stand = Stand {
-                watchable: why,
+                unwatchable: Some(why),
                 ..Stand::new()
             };
             assert_eq!(
@@ -1655,17 +1669,17 @@ mod tests {
                 Err(Error::Unwatchable(why))
             );
         }
-        // A device that reads as ready and is refused all the same is so for now.
+        // A device that lacks nothing and is refused all the same is so for now.
         let mut stand = Stand {
-            refuse_watched_key: Some(Failure::Refused),
+            refuses_watched_key: Some(Refusal::Anywhere),
             ..Stand::new()
         };
         assert_eq!(
             super::make_watch(&mut stand, alias, false),
-            Err(Error::Unwatchable(Watchable::NotNow))
+            Err(Error::Unwatchable(Unwatchable::NotNow))
         );
         // One that does not answer is told with its failure.
-        stand.refuse_watchable = Some(Failure::Unknown);
+        stand.refuse_unwatchable = Some(Failure::Unknown);
         assert_eq!(
             super::make_watch(&mut stand, alias, false),
             Err(Error::Unexplained(Failure::Unknown))
@@ -1691,8 +1705,8 @@ mod tests {
     fn a_device_that_does_not_answer_makes_a_profile_all_the_same() {
         let root = dir("unanswered");
         let mut stand = Stand {
-            watchable: Watchable::NothingEnrolled,
-            refuse_watchable: Some(Failure::Unknown),
+            unwatchable: Some(Unwatchable::NothingEnrolled),
+            refuse_unwatchable: Some(Failure::Unknown),
             ..Stand::new()
         };
         let profile = Profile::create(&root, &mut stand, false).unwrap();

@@ -10,7 +10,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use zeroize::Zeroize;
 
 use crate::epoch::{self, Known, root_alias};
-use crate::keystore::{Failure, Keystore, Level, Watchable};
+use crate::keystore::{Failure, Keystore, Level, Unwatchable};
 
 /// The file that describes a profile, written last at creation.
 pub(crate) const RECORD: &str = "profile";
@@ -110,9 +110,8 @@ pub enum Error {
     /// may make it in software after a failure of the secure hardware, so a later try may succeed.
     SoftwareOnly,
     /// The system refused the key of [`Sign::Fingerprints`](crate::Sign::Fingerprints), for the
-    /// reason the device gives. Never [`Watchable::Ready`]: a device that reads so though refused
-    /// is so for now.
-    Unwatchable(Watchable),
+    /// reason the device gives.
+    Unwatchable(Unwatchable),
     /// The system refused the key of [`Sign::Fingerprints`](crate::Sign::Fingerprints), and asking
     /// the device why failed, as where the app gave no context through `Wiper.start` or lacks the
     /// permission to ask.
@@ -725,7 +724,7 @@ mod tests {
 
     use super::{
         DESTROYED, Error, Failure, Id, LOCK, Level, MAGIC, Profile, RECORD, RECORD_LEN, Record,
-        Watchable,
+        Unwatchable,
     };
     use crate::epoch::{CURRENT, root_alias};
     use crate::stand::{Stand, dir, entries, fail_removal, fail_syncs, hmac};
@@ -1309,11 +1308,10 @@ mod tests {
             Error::Damaged,
             Error::ChipChanged,
             Error::SoftwareOnly,
-            Error::Unwatchable(Watchable::Ready),
-            Error::Unwatchable(Watchable::NoLockScreen),
-            Error::Unwatchable(Watchable::NothingEnrolled),
-            Error::Unwatchable(Watchable::NotNow),
-            Error::Unwatchable(Watchable::Never),
+            Error::Unwatchable(Unwatchable::NoLockScreen),
+            Error::Unwatchable(Unwatchable::NothingEnrolled),
+            Error::Unwatchable(Unwatchable::NotNow),
+            Error::Unwatchable(Unwatchable::Never),
             Error::Unexplained(Failure::Unknown),
             Error::Unexplained(Failure::Transient),
             Error::NoEpoch,
@@ -1336,7 +1334,6 @@ mod tests {
             Error::Keystore(Failure::Absent),
             Error::Keystore(Failure::Corrupted),
             Error::Keystore(Failure::StrongBoxUnavailable),
-            Error::Keystore(Failure::Refused),
             Error::Keystore(Failure::Unknown),
             Error::Io(io::ErrorKind::NotFound),
             Error::Io(io::ErrorKind::PermissionDenied),

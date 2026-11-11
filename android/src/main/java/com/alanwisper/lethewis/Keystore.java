@@ -44,13 +44,13 @@ final class Keystore {
     static final int NOTHING_ENROLLED = 10;
     static final int NOT_NOW = 11;
     static final int NEVER = 12;
+    static final int REFUSED = 13;
     static final int TRANSIENT = -1;
     static final int LOCKED = -2;
     static final int ABSENT = -3;
     static final int CORRUPTED = -4;
     static final int STRONG_BOX_UNAVAILABLE = -5;
     static final int UNKNOWN_FAILURE = -6;
-    static final int REFUSED = -7;
 
     private static final String PROVIDER = "AndroidKeyStore";
     private static final String PROBE = "lethewis/probe";
@@ -99,7 +99,8 @@ final class Keystore {
 
     /**
      * Creates a key under {@code alias} that enrolling a fingerprint, or removing the secure lock
-     * screen, makes unusable for good. It is never used, only asked after.
+     * screen, makes unusable for good. It is never used, only asked after. Returns its level, or
+     * {@link #REFUSED} where the system refuses such a key on this device.
      */
     static int generateWatched(String alias, boolean strongBox) {
         // Android 9 ignores a request for the secure element on keys of this kind.
@@ -127,11 +128,11 @@ final class Keystore {
     }
 
     /**
-     * What the device says of a key {@link #generateWatched} would make: {@link #READY}, or why the
-     * system would refuse it. Only the making decides. Asking needs the context {@link Wiper#start}
+     * What the device lacks for a key {@link #generateWatched} would make, or {@link #READY} where
+     * it lacks nothing. Only the making decides. Asking needs the context {@link Wiper#start}
      * gives; without the app's permission USE_BIOMETRIC the sensor does not answer.
      */
-    static int watchable() {
+    static int unwatchable() {
         final Context context = app;
         if (context == null) {
             return UNKNOWN_FAILURE;
@@ -181,10 +182,10 @@ final class Keystore {
 
     private static int sensor(Context context, boolean alone) throws Exception {
         if (Build.VERSION.SDK_INT >= 30) {
-            return Api30.watchable(context, alone);
+            return Api30.sensor(context, alone);
         }
         if (Build.VERSION.SDK_INT >= 29) {
-            return Api29.watchable(context);
+            return Api29.sensor(context);
         }
         return fingerprints(context);
     }
@@ -429,7 +430,7 @@ final class Keystore {
     private static final class Api29 {
         // Android 10 binds such a key to any fingerprint or face, as this asks.
         @SuppressWarnings("deprecation")
-        static int watchable(Context context) {
+        static int sensor(Context context) {
             BiometricManager biometrics = context.getSystemService(BiometricManager.class);
             return biometrics == null ? NOT_NOW : answer(biometrics.canAuthenticate());
         }
@@ -438,7 +439,7 @@ final class Keystore {
     /** Calls that exist from API 30, apart so that older systems never load them. */
     private static final class Api30 {
         // From Android 11 such a key needs a strong biometric, as the keystore checks.
-        static int watchable(Context context, boolean alone) {
+        static int sensor(Context context, boolean alone) {
             BiometricManager biometrics = context.getSystemService(BiometricManager.class);
             if (biometrics == null) {
                 return NOT_NOW;

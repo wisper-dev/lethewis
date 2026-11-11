@@ -13,7 +13,7 @@ use std::{fs, thread};
 use jni_sys::{JNIEnv, jboolean, jclass, jint, jstring};
 use lethewis_android::{
     Action, Erasure, Error, Failure, Id, Keys, Keystore, Level, Profile, Readings, Root, Unheld,
-    Watch, Watchable, sweep,
+    Unwatchable, Watch, sweep,
 };
 use lethewis_core::{
     Entropy, EntropyError, Epoch, KeyLength, MemoryBlock, PasswordParams, Purpose, SHARE_COUNT,
@@ -273,9 +273,9 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
 
 /// The keystore asks the device through the context of `Wiper.start`, as in an app.
 fn context(keystore: &mut JniKeystore<'_>) -> Result<(), String> {
-    let answer = keystore.watchable();
+    let answer = keystore.unwatchable();
     check(
-        answer == Ok(Watchable::NoLockScreen),
+        answer == Ok(Some(Unwatchable::NoLockScreen)),
         &format!("the device asked through the watch's context: {answer:?}"),
     )
 }
@@ -376,11 +376,11 @@ fn signs(home: &Path, keystore: &mut JniKeystore<'_>, pin: bool) -> Result<(), S
         Ok(()) | Err(Error::Exists) => watch == Watch::Kept,
         Err(Error::Unwatchable(why)) => {
             let lacking = if pin {
-                Watchable::NothingEnrolled
+                Unwatchable::NothingEnrolled
             } else {
-                Watchable::NoLockScreen
+                Unwatchable::NoLockScreen
             };
-            watch == Watch::None && why == lacking && keystore.watchable() == Ok(why)
+            watch == Watch::None && why == lacking && keystore.unwatchable() == Ok(Some(why))
         }
         Err(_) => false,
     };
