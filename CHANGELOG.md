@@ -432,7 +432,7 @@ Nothing is published while the version is below 0.1.0.
 - The tests of lethewis-android build their slowest dependencies optimised. The core's tests do not:
   they measure the stack.
 - Kani builds a proof with its own crate and what that reaches, never the rest of the workspace.
-- A third way into a profile: the owner's password with two of three shares. Each way has its own
+- A third way into a profile: a password of it with two of three shares. Each way has its own
   place, and a change keeps the bytes of those it does not set.
 - `Profile::set_shares` and `Profile::clear_shares`, with the owner's password. Setting writes three
   shares to give to people the owner trusts.
@@ -445,8 +445,8 @@ Nothing is published while the version is below 0.1.0.
 - `Profile::change_password` takes new shares for a way in with shares, and refuses without them.
 - `Error::Locked`, `Error::SharesSet` and `Error::NoWayOut`. A password and two shares that open
   nothing read alike, whichever is wrong.
-- A fourth way into a profile, with the owner's password and a time lock of drand, under the
-  `timelock` feature. `Profile::set_time_lock` is the owner's check-in, which moves the round on.
+- A fourth way into a profile, with a password of it and a time lock of drand, under the
+  `timelock` feature. `Profile::set_time_lock` is the check-in, which moves the round on.
 - `Profile::unlock_with_round`, which spends the round. `Profile::clear_time_lock` and
   `Profile::time_lock_round`, which needs the chip alone, are built without the feature too.
 - `Error::TimeLockSet` refuses a new password while a time lock is set.

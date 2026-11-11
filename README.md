@@ -125,18 +125,21 @@ password and the hardware secret at each unlock, and neither alone is enough.
   again.
 - A password under duress opens its profile as the owner's does. Set to destroy, it deletes every
   other key of the library in the app's keystore.
-- A locked profile opens only with the owner's password and two shares, or its round's signature.
-  Its ways copied before the lock, or their old bytes on the flash, open with the passwords of then.
-- A lock empties the way of the password under duress, which reads as locked until set again. Two
-  shares tell the owner's password from it: only the owner's opens with them.
-- A new owner's password makes the shares anew, and the ones given before open no more. A time
-  lock set refuses it until cleared, and is made again after.
+- A locked profile opens only with a password of it and two shares, or its round's signature.
+- Its ways copied before the lock, or their old bytes on the flash, open with the passwords of then.
+- Either password opens it that way, and checks in to a time lock. So a lock tells one password
+  from another no more.
+- An unlock empties the way of the other password, which then reads as locked.
+- A password that once opened the profile holds the key of its second factors. Setting, changing or
+  removing a password draws that key anew.
+- Those calls therefore make the shares anew, and the ones given before open no more. A time lock
+  set refuses them until cleared, and is made again after.
 - The way with a time lock is built with the `timelock` feature. When a missed check-in locks the
   profile is the app's to tell; the library keeps no clock.
 - A lock that fails, as where the app's files cannot be written, leaves the profile open. The app is
   to enter it only once a lock succeeds.
 - Judging the signs and locking need the chip's key, which from Android 15 answers only on an
-  unlocked device. Code that reaches the chip tells whether a way in with shares is set.
+  unlocked device. Code that reaches the chip tells whether a way in with a second factor is set.
 - Code that reaches the chip reads what each sign watched does, and writes the file of the signs
   itself. Judging the signs needs no password, so neither does its key.
 - A sign is judged when the app asks, so nothing happens while it does not run. The files of a

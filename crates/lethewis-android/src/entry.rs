@@ -3,7 +3,8 @@
 
 //! The ways into a profile, four in one file per epoch, each in a place of its own: lock records
 //! of the core, opened by the owner's password, by a password under duress, by the owner's
-//! password with two shares, and by it with a time lock. A way not set is one nothing opens. After
+//! password with two shares, and by it with a time lock. Either password of the profile opens the
+//! last two. A way not set is one nothing opens. After
 //! them lie the time lock, hidden under the chip; a mark, keyed by the chip with no password, of
 //! whether a way with a second factor is set, which a lock needs; and the key the ways with a
 //! second factor are locked under, once under a pad of each password. Beside each
@@ -186,16 +187,12 @@ impl Profile {
             .fill(&mut timed)
             .map_err(|_| Error::Core(CoreError::EntropyFailed))?;
         let copies = [own.copy, *fresh_factor(entropy)?];
-        let mark = self.mark(keystore, false, &ways, &timed)?;
-        self.write_ways(
-            number,
-            &ways,
-            &Tail {
-                timed,
-                mark,
-                copies,
-            },
-        )
+        let tail = Tail {
+            timed,
+            mark: [0; MARK_LEN],
+            copies,
+        };
+        self.write_ways(number, &ways, &self.sealed(keystore, false, &ways, &tail)?)
     }
 
     /// Opens the profile with `password` and the chip: returns its stored key. The work does not
@@ -253,6 +250,10 @@ impl Profile {
                 }
             }
         }
+        // One under duress set to destroy destroys whatever the answer, as elsewhere.
+        if matches!(matched, Some((_, Role::Destroy))) {
+            self.destroy_others(keystore);
+        }
         // The ways with a second factor are tagged under the key the passwords share.
         let factor = held_factor(&tags, &ways, &tail, matched.map(|(_, role)| role));
         drop(tags);
@@ -289,7 +290,7 @@ impl Profile {
             // A tag in its place whose record nothing opens: the profile is locked.
             (None, Some(_), (None, _)) => Err(Error::Locked),
             (None, Some((place, role)), (Some(at), None))
-                if at == place && role != Role::Shares =>
+                if at == place && !matches!(role, Role::Shares | Role::Time) =>
             {
                 opened
                     .get_mut(place)
@@ -304,17 +305,10 @@ impl Profile {
                 release(slots, stored);
             }
         }
-        let entered = match entered {
-            Err(Error::Locked) if self.unset(keystore, &ways, &tail)? => Err(Error::Damaged),
+        match entered {
+            Err(Error::Locked) if !self.marked(keystore, &ways, &tail)? => Err(Error::Damaged),
             entered => entered,
-        };
-        // A profile locked destroys under duress as one opened does.
-        if matches!(matched, Some((_, Role::Destroy)))
-            && matches!(entered, Ok(_) | Err(Error::Locked))
-        {
-            self.destroy_others(keystore);
         }
-        entered
     }
 
     /// Sets the password under duress to `duress`, with the owner's `owner`: it opens the profile
@@ -325,9 +319,17 @@ impl Profile {
     ///
     /// # Errors
     ///
+    /// With `shares`, the way in with shares is made anew under the key drawn, and its three new
+    /// shares written there, whether or not one was set before: the ones given before open no
+    /// more.
+    ///
+    /// # Errors
+    ///
     /// [`Error::WrongPassword`] when `owner` is not the owner's, [`Error::SamePassword`] when
-    /// `duress` is, [`Error::NoEpoch`], [`Error::Changing`], [`Error::Unsettled`], or the core's
-    /// refusal, the keystore's or the file system's; the ways in then stay as they were.
+    /// `duress` is, [`Error::TimeLockSet`] while a way with a time lock is set,
+    /// [`Error::SharesSet`] without `shares` while one with shares is, [`Error::NoEpoch`],
+    /// [`Error::Changing`], [`Error::Unsettled`], or the core's refusal, the keystore's or the
+    /// file system's; the ways in then stay as they were.
     /// [`Error::Unsynced`] when they changed, but a crash may undo it; `shares` holds the new ones
     /// then too.
     #[expect(
@@ -354,26 +356,25 @@ impl Profile {
             outside_change(slots, entropy)?;
             let opened = self.owner(slots, keystore, owner, params, memory, &ways, &tail)?;
             let held = held_factor(&opened.tags, &ways, &tail, None);
-            let made = self
-                .renewed_factor(
-                    slots,
-                    opened.stored,
-                    &held,
-                    &ways,
-                    asked.then_some(&mut *made_shares),
-                    entropy,
-                )
-                .and_then(|(factor, split)| {
-                    let made = self.duress_ways(
-                        slots, keystore, &opened, duress, role, &factor, params, memory, entropy,
-                    )?;
-                    Ok((split, made))
-                });
+            let made = Self::renewed_factor(
+                slots,
+                opened.stored,
+                &held,
+                &ways,
+                asked.then_some(&mut *made_shares),
+                entropy,
+            )
+            .and_then(|(factor, split)| {
+                let made = self.duress_ways(
+                    slots, keystore, &opened, duress, role, &factor, params, memory, entropy,
+                )?;
+                Ok((split, made))
+            });
             release(slots, opened.key);
             release(slots, opened.stored);
             let (split, (own, other)) = made?;
             let (ways, tail) = with_passwords(&ways, &tail, &own, &other);
-            let (ways, tail) = self.with_shares(keystore, ways, tail, split)?;
+            let (ways, tail) = self.with_shares(keystore, &ways, &tail, split.as_ref())?;
             Ok((number, ways, tail))
         });
         owner.zeroize();
@@ -392,10 +393,12 @@ impl Profile {
     ///
     /// # Errors
     ///
-    /// [`Error::WrongPassword`] when `owner` is not the owner's, [`Error::NoEpoch`],
-    /// [`Error::Changing`], [`Error::Unsettled`], or the core's refusal, the keystore's or the file
-    /// system's; the ways in then stay as they were. [`Error::Unsynced`] when they changed, but a
-    /// crash may undo it; `shares` holds the new ones then too.
+    /// [`Error::WrongPassword`] when `owner` is not the owner's, [`Error::TimeLockSet`] while a
+    /// way with a time lock is set, [`Error::SharesSet`] without `shares` while one with shares
+    /// is, [`Error::NoEpoch`], [`Error::Changing`], [`Error::Unsettled`], or the core's refusal,
+    /// the keystore's or the file system's; the ways in then stay as they were.
+    /// [`Error::Unsynced`] when they changed, but a crash may undo it; `shares` holds the new ones
+    /// then too.
     #[expect(
         clippy::too_many_arguments,
         reason = "a derivation's inputs, as the core takes them"
@@ -417,32 +420,31 @@ impl Profile {
             outside_change(slots, entropy)?;
             let opened = self.owner(slots, keystore, owner, params, memory, &ways, &tail)?;
             let held = held_factor(&opened.tags, &ways, &tail, None);
-            let made = self
-                .renewed_factor(
+            let made = Self::renewed_factor(
+                slots,
+                opened.stored,
+                &held,
+                &ways,
+                asked.then_some(&mut *made_shares),
+                entropy,
+            )
+            .and_then(|(factor, split)| {
+                let own = keyed_way(
                     slots,
                     opened.stored,
-                    &held,
-                    &ways,
-                    asked.then_some(&mut *made_shares),
+                    opened.key,
+                    &opened.tags,
+                    Role::Owner,
+                    &factor,
                     entropy,
-                )
-                .and_then(|(factor, split)| {
-                    let own = keyed_way(
-                        slots,
-                        opened.stored,
-                        opened.key,
-                        &opened.tags,
-                        Role::Owner,
-                        &factor,
-                        entropy,
-                    )?;
-                    Ok((split, own, unopenable_keyed(slots, entropy)?))
-                });
+                )?;
+                Ok((split, own, unopenable_keyed(slots, entropy)?))
+            });
             release(slots, opened.key);
             release(slots, opened.stored);
             let (split, own, other) = made?;
             let (ways, tail) = with_passwords(&ways, &tail, &own, &other);
-            let (ways, tail) = self.with_shares(keystore, ways, tail, split)?;
+            let (ways, tail) = self.with_shares(keystore, &ways, &tail, split.as_ref())?;
             Ok((number, ways, tail))
         });
         owner.zeroize();
@@ -492,7 +494,7 @@ impl Profile {
             outside_change(slots, entropy)?;
             let opened = self.owner(slots, keystore, owner, params, memory, &ways, &tail)?;
             let held = held_factor(&opened.tags, &ways, &tail, None);
-            let renewed = self.renewed_factor(
+            let renewed = Self::renewed_factor(
                 slots,
                 opened.stored,
                 &held,
@@ -525,7 +527,7 @@ impl Profile {
             release(slots, opened.stored);
             let (split, (own, other)) = made?;
             let (ways, tail) = with_passwords(&ways, &tail, &own, &other);
-            let (ways, tail) = self.with_shares(keystore, ways, tail, split)?;
+            let (ways, tail) = self.with_shares(keystore, &ways, &tail, split.as_ref())?;
             Ok((number, ways, tail))
         });
         owner.zeroize();
@@ -619,8 +621,7 @@ impl Profile {
             release(slots, opened.stored);
             let [own, other, _, timed] = ways;
             let ways = [own, other, split?, timed];
-            let mark = self.mark(keystore, true, &ways, &tail.timed)?;
-            Ok((number, ways, Tail { mark, ..tail }))
+            Ok((number, ways, self.sealed(keystore, true, &ways, &tail)?))
         });
         owner.zeroize();
         let (number, ways, tail) = set?;
@@ -661,8 +662,11 @@ impl Profile {
                 return Err(Error::NoWayOut);
             }
             let ways = [own, other, unopenable(slots, entropy)?, timed];
-            let mark = self.mark(keystore, timed_set, &ways, &tail.timed)?;
-            Ok((number, ways, Tail { mark, ..tail }))
+            Ok((
+                number,
+                ways,
+                self.sealed(keystore, timed_set, &ways, &tail)?,
+            ))
         });
         owner.zeroize();
         let (number, ways, tail) = cleared?;
@@ -677,8 +681,10 @@ impl Profile {
     /// the profile fires no more. In a file of the signs that was changed, as
     /// [`Verdict::damaged`](crate::Verdict) tells, what no longer reads becomes
     /// [`Action::Ignore`](crate::Action::Ignore). The other
-    /// password reads the profile as locked until it unlocks it in turn, or the owner sets it
-    /// again, and as [`Error::Damaged`] while no way with a second factor is left. Returns the
+    /// password reads the profile as locked until it unlocks it in turn, and as
+    /// [`Error::Damaged`] while no way with a second factor is left. The owner sets one under
+    /// duress anew; a way of the owner's that a password under duress emptied comes back only
+    /// through a second factor. Returns the
     /// stored key. The password is derived twice, as the key of the second factor opens the way
     /// with the shares and the password's own locks its way. `owner` and both shares are wiped.
     ///
@@ -979,16 +985,8 @@ impl Profile {
             self.time_pad(keystore, &way.salt, &mut timed)?;
             let [own, other, shared, _] = ways;
             let ways = [own, other, shared, way];
-            let mark = self.mark(keystore, true, &ways, &timed)?;
-            Ok((
-                number,
-                ways,
-                Tail {
-                    timed,
-                    mark,
-                    ..tail
-                },
-            ))
+            let tail = Tail { timed, ..tail };
+            Ok((number, ways, self.sealed(keystore, true, &ways, &tail)?))
         });
         owner.zeroize();
         let (number, ways, tail) = set?;
@@ -1027,15 +1025,11 @@ impl Profile {
             entropy
                 .fill(&mut timed)
                 .map_err(|_| Error::Core(CoreError::EntropyFailed))?;
-            let mark = self.mark(keystore, shares_set, &ways, &timed)?;
+            let tail = Tail { timed, ..tail };
             Ok((
                 number,
                 ways,
-                Tail {
-                    timed,
-                    mark,
-                    ..tail
-                },
+                self.sealed(keystore, shares_set, &ways, &tail)?,
             ))
         });
         owner.zeroize();
@@ -1054,11 +1048,8 @@ impl Profile {
     pub fn time_lock_round(&self, keystore: &mut impl Keystore) -> Result<Option<u64>, Error> {
         let number = self.current.ok_or(Error::NoEpoch)?.number;
         let (ways, tail) = self.read_ways(number)?;
-        if self.unset(keystore, &ways, &tail)? {
+        if !self.marked(keystore, &ways, &tail)? {
             return Ok(None);
-        }
-        if !same_mac(&tail.mark, &self.mark(keystore, true, &ways, &tail.timed)?) {
-            return Err(Error::Damaged);
         }
         let [_, _, _, timed_way] = ways;
         let mut timed = tail.timed;
@@ -1143,15 +1134,8 @@ impl Profile {
         entropy
             .fill(&mut timed)
             .map_err(|_| Error::Core(CoreError::EntropyFailed))?;
-        let mark = self.mark(keystore, shares_set, &ways, &timed)?;
-        Ok((
-            ways,
-            Tail {
-                timed,
-                mark,
-                ..*tail
-            },
-        ))
+        let tail = Tail { timed, ..*tail };
+        Ok((ways, self.sealed(keystore, shares_set, &ways, &tail)?))
     }
 
     /// The stored key, as the owner's password `owner` with the signature `signature` opens it.
@@ -1191,10 +1175,7 @@ impl Profile {
                 .open_time_lock(network, lock, signature)
                 .map_err(Error::Core)
         });
-        let from_lock = match from_lock {
-            Ok(from_lock) => from_lock,
-            Err(error) => return Err(error),
-        };
+        let from_lock = from_lock?;
         let key = match factor_key(slots, &factor) {
             Ok(key) => key,
             Err(error) => {
@@ -1270,9 +1251,11 @@ impl Profile {
         let _writing = self.writing();
         let (number, ways, tail) = self.settled_ways()?;
         outside_change(slots, entropy)?;
-        // A mark changed locks too.
-        if self.unset(keystore, &ways, &tail)? {
-            return Err(Error::NoWayOut);
+        // A mark that reads neither way locks too: whoever changed it does not stop a lock.
+        match self.marked(keystore, &ways, &tail) {
+            Ok(false) => return Err(Error::NoWayOut),
+            Ok(true) | Err(Error::Damaged) => {}
+            Err(error) => return Err(error),
         }
         let [own, other, shared, timed] = ways;
         let ways = [
@@ -1292,7 +1275,6 @@ impl Profile {
     /// [`Error::TimeLockSet`] while a way with a time lock is set, [`Error::SharesSet`] without
     /// `shares` while one with shares is, or the core's refusal.
     fn renewed_factor<'a>(
-        &self,
         slots: &mut Slots<'a>,
         stored: Handle<'a>,
         factor: &Factor,
@@ -1300,12 +1282,12 @@ impl Profile {
         shares: Option<&mut Shares>,
         entropy: &mut impl Entropy,
     ) -> Result<(Factor, Option<Way>), Error> {
-        let [_, _, shared, timed] = ways;
+        let [_, _, kept, timed] = ways;
         let tags = factor_tags(factor);
         if is_tag(&tags, timed, Role::Time) {
             return Err(Error::TimeLockSet);
         }
-        let set = is_tag(&tags, shared, Role::Shares);
+        let set = is_tag(&tags, kept, Role::Shares);
         drop(tags);
         let fresh = fresh_factor(entropy)?;
         match shares {
@@ -1323,17 +1305,16 @@ impl Profile {
     fn with_shares(
         &self,
         keystore: &mut impl Keystore,
-        ways: [Way; WAYS],
-        tail: Tail,
-        split: Option<Way>,
+        ways: &[Way; WAYS],
+        tail: &Tail,
+        split: Option<&Way>,
     ) -> Result<([Way; WAYS], Tail), Error> {
-        let Some(split) = split else {
-            return Ok((ways, tail));
-        };
-        let [own, other, _, timed] = ways;
-        let ways = [own, other, split, timed];
-        let mark = self.mark(keystore, true, &ways, &tail.timed)?;
-        Ok((ways, Tail { mark, ..tail }))
+        // The copies of the key of the second factor moved, so the mark is written anew; a way
+        // with a time lock is refused before this, so the way with shares tells it all.
+        let set = split.is_some();
+        let [own, other, shared, timed] = *ways;
+        let ways = [own, other, split.copied().unwrap_or(shared), timed];
+        Ok((ways, self.sealed(keystore, set, &ways, tail)?))
     }
 
     /// The owner's way, written anew, and the way for the password under duress `duress` in
@@ -1377,6 +1358,7 @@ impl Profile {
     /// The way in of the password `password`, the owner's or the one under duress, as it opens
     /// it: both open the stored key, so the work and the answer tell one from another no more. A
     /// record a lock replaced reads as [`Error::Locked`].
+    #[cfg(feature = "timelock")]
     #[expect(
         clippy::too_many_arguments,
         reason = "a derivation's inputs, as the core takes them"
@@ -1424,9 +1406,9 @@ impl Profile {
         };
         // Without a way in with a second factor set, nothing locked it: the record was changed.
         let opened = match opened {
-            Err(Error::Locked) => match self.unset(keystore, ways, tail) {
-                Ok(true) => Err(Error::Damaged),
-                Ok(false) => Err(Error::Locked),
+            Err(Error::Locked) => match self.marked(keystore, ways, tail) {
+                Ok(true) => Err(Error::Locked),
+                Ok(false) => Err(Error::Damaged),
                 Err(error) => Err(error),
             },
             opened => opened,
@@ -1494,9 +1476,9 @@ impl Profile {
         };
         // Without a way in with shares set, nothing locked it: the record was changed.
         let opened = match opened {
-            Err(Error::Locked) => match self.unset(keystore, ways, tail) {
-                Ok(true) => Err(Error::Damaged),
-                Ok(false) => Err(Error::Locked),
+            Err(Error::Locked) => match self.marked(keystore, ways, tail) {
+                Ok(true) => Err(Error::Locked),
+                Ok(false) => Err(Error::Damaged),
                 Err(error) => Err(error),
             },
             opened => opened,
@@ -1794,31 +1776,61 @@ fn parse_ways(bytes: &[u8]) -> Option<([Way; WAYS], Tail)> {
 }
 
 impl Profile {
-    /// The mark of whether a way with a second factor is set, for the way with shares of `ways` and
-    /// the hidden time lock `timed`, which a way with one is written with.
+    /// The mark of whether a way with a second factor is set, over the ways with one and what a
+    /// password needs to open them: their salts and tags, the hidden time lock and the copies of
+    /// the key of that factor.
     fn mark(
         &self,
         keystore: &mut impl Keystore,
         set: bool,
         ways: &[Way; WAYS],
-        timed: &[u8; TIMED_LEN],
+        tail: &Tail,
     ) -> Result<Mark, Error> {
-        let [_, _, shared, _] = ways;
-        let lock: [u8; 32] = Sha256::digest(timed).into();
-        self.shares_mark(keystore, set, &[shared.salt, shared.tag, lock])
+        let [_, _, shared, timed] = ways;
+        let [owners, others] = &tail.copies;
+        let factors: [u8; 32] = Sha256::new()
+            .chain_update(tail.timed)
+            .chain_update(timed.salt)
+            .chain_update(timed.tag)
+            .chain_update(owners)
+            .chain_update(others)
+            .finalize()
+            .into();
+        self.shares_mark(keystore, set, &[shared.salt, shared.tag, factors])
     }
 
-    /// Whether the mark of `tail` reads as no way with a second factor set, for `ways`.
-    fn unset(
+    /// `tail` with the mark of `ways`, which `set` says hold a way with a second factor.
+    fn sealed(
+        &self,
+        keystore: &mut impl Keystore,
+        set: bool,
+        ways: &[Way; WAYS],
+        tail: &Tail,
+    ) -> Result<Tail, Error> {
+        Ok(Tail {
+            mark: self.mark(keystore, set, ways, tail)?,
+            ..*tail
+        })
+    }
+
+    /// Whether a way with a second factor is set, as the mark of `tail` tells.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Damaged`] for a mark that reads neither way: the ways with a second factor, the
+    /// time lock or the copies of its key were changed since it was written.
+    fn marked(
         &self,
         keystore: &mut impl Keystore,
         ways: &[Way; WAYS],
         tail: &Tail,
     ) -> Result<bool, Error> {
-        Ok(same_mac(
-            &tail.mark,
-            &self.mark(keystore, false, ways, &tail.timed)?,
-        ))
+        for set in [true, false] {
+            if same_mac(&tail.mark, &self.mark(keystore, set, ways, tail)?) {
+                return Ok(set);
+            }
+        }
+        Err(Error::Damaged)
     }
 }
 
@@ -2100,11 +2112,10 @@ mod tests {
 
     use zeroize::Zeroizing;
 
-    #[cfg(feature = "timelock")]
     use super::TIMED_LEN;
     use super::{
         COPIES, FACTOR_LEN, FILE_LEN, Factor, MARK_LEN, ROLES, Role, SALT_LEN, TAG_KEY_LABEL,
-        TagKey, WAY_LEN, WAYS, entries_name, held_factor, is_tag, tag,
+        TagKey, WAY_LEN, entries_name, held_factor, is_tag, tag,
     };
     use crate::guard::{Action, Readings, SIGN_COUNT, Sign};
     use crate::profile::{DESTROYED, Error, Profile, WRITING};
@@ -2553,18 +2564,24 @@ mod tests {
     /// Which places of the file of the ways in differ: the record, then the salt with the tag,
     /// of each way; then the time lock, the mark and each copy of the key of the second factor.
     fn places(before: &[u8], after: &[u8]) -> Vec<bool> {
-        let mut edges = Vec::new();
-        for way in 0..WAYS {
-            edges.push(way * WAY_LEN + LOCK_RECORD_LEN);
-            edges.push((way + 1) * WAY_LEN);
-        }
-        edges.push(WAYS * WAY_LEN + TIMED_LEN);
-        edges.push(WAYS * WAY_LEN + TIMED_LEN + MARK_LEN);
-        edges.push(FILE_LEN - FACTOR_LEN);
-        edges.push(FILE_LEN);
+        const RECORD: usize = LOCK_RECORD_LEN;
+        const EDGES: [usize; 12] = [
+            RECORD,
+            WAY_LEN,
+            WAY_LEN + RECORD,
+            2 * WAY_LEN,
+            2 * WAY_LEN + RECORD,
+            3 * WAY_LEN,
+            3 * WAY_LEN + RECORD,
+            4 * WAY_LEN,
+            4 * WAY_LEN + TIMED_LEN,
+            4 * WAY_LEN + TIMED_LEN + MARK_LEN,
+            FILE_LEN - FACTOR_LEN,
+            FILE_LEN,
+        ];
         let mut places = Vec::new();
         let mut from = 0;
-        for to in edges {
+        for to in EDGES {
             places.push(before[from..to] != after[from..to]);
             from = to;
         }
@@ -2626,10 +2643,11 @@ mod tests {
         let root = dir("kept");
         let mut stand = Stand::new();
         let made = copied(&root, &mut stand, Start::Plain);
-        // The ways with a second factor, the time lock and the mark, up to the copies of its key.
+        // The ways with a second factor and the time lock; the mark covers the copies of the key
+        // of that factor, which are drawn anew, so it is written anew as well.
         let shares = |made: &Made| {
             let mut bytes = file(made, 0).split_off(2 * WAY_LEN);
-            bytes.truncate(2 * WAY_LEN + TIMED_LEN + MARK_LEN);
+            bytes.truncate(2 * WAY_LEN + TIMED_LEN);
             bytes
         };
         let copies = |made: &Made| file(made, 0).split_off(FILE_LEN - COPIES * FACTOR_LEN);
@@ -2642,6 +2660,44 @@ mod tests {
         clear_duress(&made, &mut stand, OWNER).unwrap();
         assert_eq!(shares(&made), before.0);
         assert_ne!(copies(&made), between);
+    }
+
+    #[test]
+    fn a_password_set_to_destroy_destroys_whatever_the_answer() {
+        let root = dir("destroyanswer");
+        let mut stand = Stand::new();
+        let made = copied(&root, &mut stand, Start::Destroy);
+        let [one, two, _] = set_shares(&made, &mut stand, OWNER, 1).unwrap();
+        lock(&made, &mut stand).unwrap();
+        unlock(&made, &mut stand, OWNER, &one, &two).unwrap();
+        clear_shares(&made, &mut stand, OWNER).unwrap();
+        let other = self::made(&root, &mut stand, 63).profile.id();
+        let destroyed = root.join(other.to_string()).join(DESTROYED);
+        // The way under duress was emptied and no way out is left, so entering tells it was
+        // changed; the other profiles are destroyed all the same.
+        assert_eq!(enter(&made, &mut stand, DURESS), Err(Error::Damaged));
+        assert!(destroyed.exists());
+    }
+
+    #[test]
+    fn a_changed_copy_of_the_key_of_the_factor_is_told() {
+        let root = dir("copychanged");
+        let mut stand = Stand::new();
+        let made = copied(&root, &mut stand, Start::Plain);
+        set_shares(&made, &mut stand, OWNER, 1).unwrap();
+        let ways = made.profile.dir.join(entries_name(0));
+        let mut bytes = fs::read(&ways).unwrap();
+        let copy = FILE_LEN - COPIES * FACTOR_LEN;
+        bytes[copy] ^= 1;
+        fs::write(&ways, &bytes).unwrap();
+        // The mark covers the copies of the key, so a way out that no password could open reads
+        // as changed, and a lock is made all the same.
+        assert_eq!(
+            made.profile.time_lock_round(&mut stand),
+            Err(Error::Damaged)
+        );
+        lock(&made, &mut stand).unwrap();
+        assert_eq!(enter(&made, &mut stand, OWNER), Err(Error::Damaged));
     }
 
     #[test]
@@ -3297,7 +3353,7 @@ mod tests {
         lock(&made, &mut stand).unwrap();
         assert_eq!(enter(&made, &mut stand, OWNER), Err(Error::Locked));
         unlock(&made, &mut stand, OWNER, &one, &two).unwrap();
-        // A mark that no longer reads as unset locks too.
+        // A mark that reads neither way locks too, and tells the owner that it was changed.
         clear_shares(&made, &mut stand, OWNER).unwrap();
         let ways = made.profile.dir.join(entries_name(0));
         let mut bytes = fs::read(&ways).unwrap();
@@ -3305,7 +3361,7 @@ mod tests {
         bytes[last] ^= 1;
         fs::write(&ways, &bytes).unwrap();
         lock(&made, &mut stand).unwrap();
-        assert_eq!(enter(&made, &mut stand, OWNER), Err(Error::Locked));
+        assert_eq!(enter(&made, &mut stand, OWNER), Err(Error::Damaged));
     }
 
     #[test]
@@ -3679,6 +3735,13 @@ mod tests {
             .write_ways(0, &[nobody, nobody, shared, nobody], &tail)
             .unwrap();
         assert_eq!(enter(&made, &mut stand, OWNER), Err(Error::Damaged));
+        // The same in the place of the way with a time lock.
+        let mut timed = own;
+        timed.tag = tag(&tags, &timed.salt, Role::Time);
+        made.profile
+            .write_ways(0, &[nobody, nobody, nobody, timed], &tail)
+            .unwrap();
+        assert_eq!(enter(&made, &mut stand, OWNER), Err(Error::Damaged));
     }
 
     #[test]
@@ -3898,6 +3961,7 @@ mod tests {
     #[cfg(feature = "timelock")]
     #[test]
     fn a_check_in_under_either_password_is_alike() {
+        // The gate of this test and of the two after it.
         let root = dir("checkin");
         let mut stand = Stand::new();
         let made = copied(&root, &mut stand, Start::Duress);
@@ -3923,6 +3987,39 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "timelock")]
+    #[test]
+    fn a_changed_way_with_a_time_lock_is_told() {
+        let root = dir("timedchanged");
+        let mut stand = Stand::new();
+        let made = copied(&root, &mut stand, Start::Plain);
+        set_time_lock(&made, &mut stand, OWNER).unwrap();
+        let ways = made.profile.dir.join(entries_name(0));
+        let mut bytes = fs::read(&ways).unwrap();
+        // The salt of the way with a time lock, under which the lock and its round are hidden.
+        bytes[3 * WAY_LEN + LOCK_RECORD_LEN] ^= 1;
+        fs::write(&ways, &bytes).unwrap();
+        assert_eq!(
+            made.profile.time_lock_round(&mut stand),
+            Err(Error::Damaged)
+        );
+    }
+
+    #[cfg(feature = "timelock")]
+    #[test]
+    fn a_check_in_on_a_record_replaced_tells_it_was_changed() {
+        let root = dir("checkinchanged");
+        let mut stand = Stand::new();
+        let made = copied(&root, &mut stand, Start::Plain);
+        let mut bytes = file(&made, 0);
+        // The record of the way no password opens, under the owner's tag, and no way out set.
+        let nobody = bytes[WAY_LEN..WAY_LEN + LOCK_RECORD_LEN].to_vec();
+        bytes[..LOCK_RECORD_LEN].copy_from_slice(&nobody);
+        fs::write(made.profile.dir.join(entries_name(0)), &bytes).unwrap();
+        assert_eq!(set_time_lock(&made, &mut stand, OWNER), Err(Error::Damaged));
+    }
+
+    #[cfg(feature = "timelock")]
     #[test]
     fn a_check_in_destroys_under_a_password_set_to_destroy() {
         let root = dir("checkindestroy");
@@ -3935,6 +4032,7 @@ mod tests {
         assert_eq!(made.profile.time_lock_round(&mut stand), Ok(Some(ROUND)));
     }
 
+    #[cfg(feature = "timelock")]
     #[test]
     fn a_time_lock_changed_or_another_mark_is_told() {
         let root = dir("roundchanged");

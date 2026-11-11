@@ -83,7 +83,9 @@ A change of epoch moves a pointer in one step, then deletes the old root. What a
 left is erased only after the synced pointer and its root read strictly.
 
 On Android a profile has four ways in, each in its place. The owner's comes first, then one under
-duress, then the owner's with shares, then with a time lock.
+duress, then one with shares, then one with a time lock.
+
+Either password of the profile opens the last two, each with its second factor.
 
 Without the passwords and the chip they read alike. A change writes anew only the ways it sets, so
 two images of the file show which changed.
@@ -96,6 +98,9 @@ takes a password of the profile as well.
 
 A password under duress opens the profile as the owner's does. It checks in to a time lock the
 same way.
+
+So a coercer who holds that password puts the deadline off as the owner would. A time lock
+protects against a missed check-in, not against coercion.
 
 Set to destroy, it deletes the library's other keys in the keystore, then marks the other
 profiles destroyed. It does so on every call that takes a password, the owner's own among them.
