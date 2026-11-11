@@ -391,8 +391,10 @@ step "the emulator boots"
 booted
 
 step "the Rust tests on the emulator"
-cargo test --workspace --all-features --locked --target x86_64-linux-android
-cargo test --workspace --all-features --locked --target x86_64-linux-android --release
+x86=(--all-features --locked --target x86_64-linux-android)
+cargo test --workspace --exclude lethewis-android "${x86[@]}"
+cargo test -p lethewis-android --profile fast-deps "${x86[@]}"
+cargo test --workspace --release "${x86[@]}"
 
 step "the tests on the device"
 adb_for 120 install -r -t "$work/tests.apk" >/dev/null
