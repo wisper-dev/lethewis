@@ -4063,6 +4063,35 @@ mod tests {
         assert_eq!(enter(&made, &mut stand, OWNER), Err(Error::Locked));
     }
 
+    #[test]
+    fn the_tag_of_a_way_with_a_second_factor_is_keyed_by_its_key() {
+        let root = dir("factortag");
+        let mut stand = Stand::new();
+        let made = copied(&root, &mut stand, Start::Plain);
+        set_shares(&made, &mut stand, OWNER, 1).unwrap();
+        let (_, [_, _, shared, _], _) = made.profile.settled_ways().unwrap();
+        // Nobody reads that tag without the key of the second factor, the owner's password and
+        // the chip among them.
+        let nothing: TagKey = Zeroizing::new([0; 32]);
+        assert_ne!(shared.tag, tag(&nothing, &shared.salt, Role::Shares));
+        let tags = keyed(&answer_of(&made, &stand, OWNER).1);
+        assert_ne!(shared.tag, tag(&tags, &shared.salt, Role::Shares));
+    }
+
+    #[test]
+    fn an_unlock_by_the_owner_destroys_nothing() {
+        let root = dir("ownerunlock");
+        let mut stand = Stand::new();
+        let made = copied(&root, &mut stand, Start::Destroy);
+        let other = self::made(&root, &mut stand, 64).profile.id();
+        let destroyed = root.join(other.to_string()).join(DESTROYED);
+        let [one, two, _] = set_shares(&made, &mut stand, OWNER, 1).unwrap();
+        lock(&made, &mut stand).unwrap();
+        assert_eq!(unlock(&made, &mut stand, OWNER, &one, &two), Ok(made.data));
+        assert!(!destroyed.exists());
+        assert_eq!(stand.deleted, Vec::<String>::new());
+    }
+
     #[cfg(feature = "timelock")]
     #[test]
     fn a_time_lock_cleared_names_no_round_and_is_no_way_out() {
@@ -4077,7 +4106,11 @@ mod tests {
             Err(Error::NoWayOut)
         );
         set_shares(&made, &mut stand, OWNER, 1).unwrap();
+        let timed = |made: &Made| file(made, 0)[4 * WAY_LEN..4 * WAY_LEN + TIMED_LEN].to_vec();
+        let locked = timed(&made);
         clear_time_lock(&made, &mut stand, OWNER).unwrap();
+        // The lock is drawn over, not left in the file.
+        assert_ne!(timed(&made), locked);
         assert_eq!(made.profile.time_lock_round(&mut stand), Ok(None));
         assert!(unlock_round(&made, &mut stand, OWNER, &signature()).is_err());
         assert_eq!(clear_shares(&made, &mut stand, OWNER), Err(Error::NoWayOut));
