@@ -3930,10 +3930,14 @@ mod tests {
         assert!(unlock_round(&made, &mut stand, DURESS, &forged).is_err());
         assert!(root.join(other.to_string()).join(DESTROYED).exists());
         // The password under duress opens the profile as the owner's does, and keeps its role.
+        let timed = |made: &Made| file(made, 0)[4 * WAY_LEN..4 * WAY_LEN + TIMED_LEN].to_vec();
+        let locked = timed(&made);
         assert_eq!(
             unlock_round(&made, &mut stand, DURESS, &signature()),
             Ok(made.data)
         );
+        // The lock of the round spent is drawn over, not left in the file.
+        assert_ne!(timed(&made), locked);
         assert_eq!(
             enter(&made, &mut stand, DURESS),
             Ok((Role::Destroy, made.data))
