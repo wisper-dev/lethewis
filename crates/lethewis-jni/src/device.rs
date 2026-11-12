@@ -13,7 +13,7 @@ use std::{fs, thread};
 use jni_sys::{JNIEnv, jboolean, jclass, jint, jstring};
 use lethewis_android::{
     Action, Erasure, Error, Failure, Id, Keys, Keystore, Level, Profile, Readings, Root, Unheld,
-    Unwatchable, Watch, sweep,
+    Unwatchable, Watch, Watched, sweep,
 };
 use lethewis_core::{
     Entropy, EntropyError, Epoch, KeyLength, MemoryBlock, PasswordParams, Purpose, SHARE_COUNT,
@@ -197,28 +197,7 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
                 .map_err(|error| format!("keeping the profile: {error}"))?;
             answers(&profile, keystore)
         }
-        "locked" => {
-            let profile = kept(root)?;
-            let mut out = [0; 32];
-            let answered = profile.answer(keystore, &[1; 32], &mut out);
-            let root_answered = keystore
-                .mac(
-                    &format!("lethewis/{}/root/0", profile.id()),
-                    b"data",
-                    &mut out,
-                )
-                .map_err(Error::Keystore);
-            // Below API 35 the keys are not bound to the lock screen, so they answer.
-            let expected = if api >= 35 {
-                Err(Error::Keystore(Failure::Locked))
-            } else {
-                Ok(())
-            };
-            check(
-                answered == expected && root_answered == expected,
-                &format!("a locked device answers: {answered:?} {root_answered:?}"),
-            )
-        }
+        "locked" => locked_device(root, keystore, api),
         "stopping" => {
             let profile = kept(root)?;
             answers(&profile, keystore)?;
@@ -228,19 +207,24 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
         }
         "stopped" => {
             let profile = kept(root)?;
+            // A keystore that cannot make a key of its own has stopped for now, on any version.
             let verified = profile.verify(keystore);
             check(
-                matches!(
-                    verified,
-                    Err(Error::Keystore(Failure::Transient | Failure::Unknown))
-                ),
+                verified == Err(Error::Keystore(Failure::Transient)),
                 &format!("a keystore that stopped verifies: {verified:?}"),
             )?;
             let mut out = [0; 32];
             let missing = keystore.mac("lethewis-test/missing", b"data", &mut out);
             check(
-                matches!(missing, Err(Failure::Transient | Failure::Unknown)),
+                missing == Err(Failure::Transient),
                 &format!("a keystore that stopped and a missing key: {missing:?}"),
+            )?;
+            // The platform reads a keystore that stopped as one without the key, so the sign of
+            // the fingerprints must not read as watching nothing.
+            let watch = profile.fingerprints(keystore);
+            check(
+                watch == Err(Error::Keystore(Failure::Transient)),
+                &format!("a keystore that stopped and the sign of the fingerprints: {watch:?}"),
             )
         }
         "restarted" => {
@@ -269,6 +253,42 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
         }
         other => Err(format!("no tests named {other}")),
     }
+}
+
+/// What the keys of a profile answer on a locked device.
+fn locked_device(root: &Path, keystore: &mut JniKeystore<'_>, api: u32) -> Result<(), String> {
+    let profile = kept(root)?;
+    let mut out = [0; 32];
+    let answered = profile.answer(keystore, &[1; 32], &mut out);
+    let root_answered = keystore
+        .mac(
+            &format!("lethewis/{}/root/0", profile.id()),
+            b"data",
+            &mut out,
+        )
+        .map_err(Error::Keystore);
+    // Below API 35 the keys are not bound to the lock screen, so they answer.
+    let expected = if api >= 35 {
+        Err(Error::Keystore(Failure::Locked))
+    } else {
+        Ok(())
+    };
+    check(
+        answered == expected && root_answered == expected,
+        &format!("a locked device answers: {answered:?} {root_answered:?}"),
+    )?;
+    // Below API 31 a locked device hides a key the owner authenticates for, so a key that is not
+    // there must read as locked and never as taken by the system.
+    let watched = keystore.watched("lethewis-test/missing");
+    let told = if api < 31 {
+        Err(Failure::Locked)
+    } else {
+        Ok(Watched::Gone)
+    };
+    check(
+        watched == told,
+        &format!("a locked device and a key of a sign: {watched:?}"),
+    )
 }
 
 /// The keystore asks the device through the context of `Wiper.start`, as in an app.

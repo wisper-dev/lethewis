@@ -58,6 +58,14 @@ public final class KeystoreTests {
         if (!"passed".equals(lacking)) {
             return lacking;
         }
+        String explained = explained();
+        if (!"passed".equals(explained)) {
+            return explained;
+        }
+        String nothing = nothing();
+        if (!"passed".equals(nothing)) {
+            return nothing;
+        }
         return Build.VERSION.SDK_INT >= 31 ? "passed" : missing();
     }
 
@@ -96,6 +104,48 @@ public final class KeystoreTests {
             if (answer != pair[3]) {
                 return "the biometric answers " + pair[0] + ", " + pair[1] + " read as " + answer;
             }
+        }
+        return "passed";
+    }
+
+    /**
+     * What a failure without a cause is, by what a key of the keystore's own answered: a keystore
+     * that cannot make one has stopped for now, one that can leaves the failure unexplained, and
+     * a cause the system named stands whatever the key.
+     */
+    private static String explained() {
+        // The code of the failure, the code of the key of the keystore's own, and what they read.
+        int[][] cases = {
+            {Keystore.ABSENT, Keystore.OK, Keystore.ABSENT},
+            {Keystore.ABSENT, Keystore.UNKNOWN_FAILURE, Keystore.ABSENT},
+            {Keystore.TRANSIENT, Keystore.OK, Keystore.TRANSIENT},
+            {Keystore.UNKNOWN_FAILURE, Keystore.OK, Keystore.UNKNOWN_FAILURE},
+            {Keystore.UNKNOWN_FAILURE, Keystore.UNKNOWN_FAILURE, Keystore.TRANSIENT},
+            {Keystore.UNKNOWN_FAILURE, Keystore.ABSENT, Keystore.TRANSIENT},
+            {Keystore.UNKNOWN_FAILURE, Keystore.LOCKED, Keystore.LOCKED},
+            // The loss of the key of the keystore's own says nothing of another key.
+            {Keystore.UNKNOWN_FAILURE, Keystore.CORRUPTED, Keystore.TRANSIENT},
+            {Keystore.UNKNOWN_FAILURE, Keystore.STRONG_BOX_UNAVAILABLE, Keystore.TRANSIENT},
+        };
+        for (int[] read : cases) {
+            int explained = Keystore.explained(read[0], read[1]);
+            if (explained != read[2]) {
+                return "the failure " + read[0] + " with the key " + read[1] + ": " + explained;
+            }
+        }
+        // A failure the system names takes no key of the keystore's own; one it does not, does.
+        Counted counted = new Counted();
+        int named = Keystore.failure(new StrongBoxUnavailableException(), counted);
+        if (named != Keystore.STRONG_BOX_UNAVAILABLE || counted.runs != 0) {
+            return "a failure the system named: " + named + " with " + counted.runs + " keys";
+        }
+        int unknown = Keystore.failure(new ProviderException("other"), counted);
+        Exception down = new ProviderException("down");
+        int stopped = Keystore.failure(new ProviderException("other"), failing(down));
+        if (unknown != Keystore.UNKNOWN_FAILURE || counted.runs != 1
+                || stopped != Keystore.TRANSIENT) {
+            return "a failure with a key of the keystore's own: " + unknown + " " + stopped
+                    + " with " + counted.runs + " keys";
         }
         return "passed";
     }
@@ -146,21 +196,30 @@ public final class KeystoreTests {
         int failing = Keystore.mac(alias, new byte[1], out, failing(new ProviderException("down")));
         int found = Keystore.mac(alias, new byte[1], out, making(alias));
         int deleted = Keystore.delete(alias);
-        if (failing != Keystore.UNKNOWN_FAILURE || found != Keystore.OK || deleted != Keystore.OK) {
+        if (failing != Keystore.TRANSIENT || found != Keystore.OK || deleted != Keystore.OK) {
             return "a key not found below API 31: " + failing + " " + found + " " + deleted;
         }
         return "passed";
     }
 
-    /** A missing key is one only while the keystore shows it works, however its check fails. */
+    /**
+     * A missing key is one only while the keystore shows it works. A keystore that cannot make a
+     * key of its own has stopped for now, however its own failure reads; one that fails for a
+     * cause of its own gives that cause.
+     */
     private static String absent() {
         int working = Keystore.absent(failing(null));
         int failing = Keystore.absent(failing(new ProviderException("not running")));
         int invalidated = Keystore.absent(failing(new KeyPermanentlyInvalidatedException()));
+        InvalidKeyException init = new InvalidKeyException("init");
+        init.initCause(new UserNotAuthenticatedException());
+        int locked = Keystore.absent(failing(init));
         if (working != Keystore.ABSENT
-                || failing != Keystore.UNKNOWN_FAILURE
-                || invalidated != Keystore.UNKNOWN_FAILURE) {
-            return "a missing key with its check: " + working + " " + failing + " " + invalidated;
+                || failing != Keystore.TRANSIENT
+                || invalidated != Keystore.TRANSIENT
+                || locked != Keystore.LOCKED) {
+            return "a missing key with its check: " + working + " " + failing + " " + invalidated
+                    + " " + locked;
         }
         return "passed";
     }
@@ -192,6 +251,18 @@ public final class KeystoreTests {
                 return "the keystore's code " + code[0] + " named " + failure;
             }
         }
+        // A code of the keystore this library has no name for stands as it is: the system said the
+        // call would not pass, so no key of the keystore's own is made.
+        Throwable unnamed =
+                caused(
+                        new UnrecoverableKeyException("failed"),
+                        (Throwable) make.newInstance(-33, "made by the tests"));
+        Counted counted = new Counted();
+        int stands = Keystore.failure(unnamed, counted);
+        if (stands != Keystore.UNKNOWN_FAILURE || counted.runs != 0) {
+            return "a code of the keystore without a name: " + stands + " with " + counted.runs
+                    + " keys";
+        }
         return "passed";
     }
 
@@ -218,6 +289,27 @@ public final class KeystoreTests {
                 return answer;
             }
         };
+    }
+
+    /** No key of a name just drawn is there, and a keystore that failed says nothing of one. */
+    private static String nothing() {
+        String alias = "lethewis-test/nothing/" + System.nanoTime();
+        int nothing = Keystore.contains(alias, failing(null));
+        int stopped = Keystore.contains(alias, failing(new ProviderException("down")));
+        if (nothing != 0 || stopped != Keystore.TRANSIENT) {
+            return "a name no key has: " + nothing + " " + stopped;
+        }
+        return "passed";
+    }
+
+    /** A check that returns, and counts how often it was asked for a key of the keystore's own. */
+    private static final class Counted implements Keystore.Check {
+        private int runs;
+
+        @Override
+        public void run() {
+            runs++;
+        }
     }
 
     /** A check that throws {@code thrown}, or returns if it is null. */

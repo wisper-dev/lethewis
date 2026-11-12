@@ -69,10 +69,22 @@ final class Keystore {
     }
 
     static int contains(String alias) {
+        return contains(alias, PROBE_KEY);
+    }
+
+    /**
+     * As {@link #contains(String)}, with {@code working} to confirm that there is no such key: the
+     * platform reads a keystore that failed as one without the key, and says nothing of it.
+     */
+    static int contains(String alias, Check working) {
         try {
-            return store().containsAlias(alias) ? 1 : 0;
+            if (store().containsAlias(alias)) {
+                return 1;
+            }
+            int probe = probed(working);
+            return probe == OK ? 0 : explained(UNKNOWN_FAILURE, probe);
         } catch (Exception e) {
-            return failure(e);
+            return failure(e, working);
         }
     }
 
@@ -93,7 +105,7 @@ final class Keystore {
             generator.init(spec.build());
             return level(generator.generateKey(), strongBox);
         } catch (Exception e) {
-            return failure(e);
+            return failure(e, PROBE_KEY);
         }
     }
 
@@ -123,7 +135,7 @@ final class Keystore {
             // biometric enrolled strong enough to invalidate the key.
             return REFUSED;
         } catch (Exception e) {
-            return failure(e);
+            return failure(e, PROBE_KEY);
         }
     }
 
@@ -231,8 +243,12 @@ final class Keystore {
     static int watched(String alias) {
         try {
             Key key = store().getKey(alias, null);
-            // Below API 31 a keystore that fails reads as one without the key.
+            // Below API 31 a keystore that fails reads as one without the key, and so does a
+            // locked device for a key the owner authenticates for: it must never read as gone.
             if (key == null && Build.VERSION.SDK_INT < 31) {
+                if (locked()) {
+                    return LOCKED;
+                }
                 int absent = absent(PROBE_KEY);
                 return absent == ABSENT ? GONE : absent;
             }
@@ -247,7 +263,7 @@ final class Keystore {
             // gets that far.
             return KEPT;
         } catch (Exception e) {
-            int code = failure(e);
+            int code = failure(e, PROBE_KEY);
             return code == ABSENT ? GONE : code;
         }
     }
@@ -282,7 +298,7 @@ final class Keystore {
             }
             return OK;
         } catch (Exception e) {
-            return failure(e);
+            return failure(e, working);
         }
     }
 
@@ -310,24 +326,62 @@ final class Keystore {
             store().deleteEntry(alias);
             return OK;
         } catch (Exception e) {
+            // No key of its own here: a destruction lists the names first, and one made after
+            // would stay behind it.
             return failure(e);
         }
     }
 
-    /** A call that returns only from a keystore that works. */
+    /** A call that returns only from a keystore that works, and reaches no call of this class. */
     interface Check {
         void run() throws Exception;
     }
 
     /** A missing key, once {@code working} shows the keystore working. */
     static int absent(Check working) {
+        int probe = probed(working);
+        return probe == OK ? ABSENT : explained(UNKNOWN_FAILURE, probe);
+    }
+
+    /**
+     * Whether the device is locked, which a key the owner authenticates for needs it not to be.
+     * Without the context {@link Wiper#start} gives it answers that it is: a key of that kind is
+     * then never called gone.
+     */
+    private static boolean locked() {
+        Context context = app;
+        if (context == null) {
+            return true;
+        }
+        KeyguardManager keyguard =
+                (KeyguardManager) context.getSystemService(Context.KEYGUARD_SERVICE);
+        return keyguard == null || keyguard.isDeviceLocked();
+    }
+
+    /** {@link #OK} where {@code working} returns, or what its failure is. */
+    private static int probed(Check working) {
         try {
             working.run();
-            return ABSENT;
+            return OK;
         } catch (Exception e) {
-            int failed = failure(e);
-            return failed == ABSENT ? UNKNOWN_FAILURE : failed;
+            return failure(e);
         }
+    }
+
+    /**
+     * What a failure of the code {@code code} is, by {@code probe}, what a key of the keystore's
+     * own answered: {@link #OK} where it was made. A keystore that cannot make such a key has not
+     * served the request, so trying later may work. Only the device being locked is of the
+     * keystore and not of that key; the key's own loss says nothing of another's.
+     *
+     * <p>A keystore that works leaves a failure unexplained: a loss and a race look alike, and
+     * only the system tells them apart.
+     */
+    static int explained(int code, int probe) {
+        if (code != UNKNOWN_FAILURE || probe == OK) {
+            return code;
+        }
+        return probe == LOCKED ? LOCKED : TRANSIENT;
     }
 
     /** Makes a key and deletes it; one a crash leaves holds nothing, and the next replaces it. */
@@ -367,6 +421,32 @@ final class Keystore {
             return SOFTWARE;
         }
         return strongBox ? STRONG_BOX : TRUSTED_ENVIRONMENT;
+    }
+
+    /**
+     * As {@link #failure(Throwable)}, with a key of the keystore's own to ask where the system
+     * named nothing. A failure the system named stands as it is, even where this library has no
+     * code for it: the system said it would not pass.
+     */
+    static int failure(Throwable thrown, Check working) {
+        int code = failure(thrown);
+        if (code != UNKNOWN_FAILURE || named(thrown)) {
+            return code;
+        }
+        return explained(code, probed(working));
+    }
+
+    /** Whether the system named this failure, as it does from API 33 with its own exception. */
+    private static boolean named(Throwable thrown) {
+        if (Build.VERSION.SDK_INT < 33) {
+            return false;
+        }
+        for (Throwable cause = thrown; cause != null; cause = cause.getCause()) {
+            if (Api33.named(cause)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static int failure(Throwable thrown) {
@@ -471,6 +551,10 @@ final class Keystore {
 
     /** Calls that exist from API 33, apart so that older systems never load them. */
     private static final class Api33 {
+        static boolean named(Throwable cause) {
+            return cause instanceof android.security.KeyStoreException;
+        }
+
         static int code(Throwable cause) {
             if (!(cause instanceof android.security.KeyStoreException)) {
                 return OK;

@@ -56,6 +56,8 @@ password and the hardware secret at each unlock, and neither alone is enough.
   does not reach them; destroying the profile key it opens does.
 - A keystore failure the system does not name is asked about with a key of the keystore's own. One
   that cannot be made says the keystore stopped for now.
+- The platform reads a keystore that failed as one without the key. A name that holds no key is
+  asked about the same way.
 - A key that is made while another fails leaves that failure unnamed. Below API 33 the system
   names few of them.
 - An export outlives later changes on the device: its key for transfers opens it in any epoch. No

@@ -466,4 +466,7 @@ Nothing is published while the version is below 0.1.0.
 - A password under duress set to destroy destroys on every call that takes a password. The calls
   of the owner's own are among them.
 
+- A keystore failure the system does not name is asked about with a key of the keystore's own. One
+  that cannot be made reads as `Failure::Transient`, which below API 33 never came.
+
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main
