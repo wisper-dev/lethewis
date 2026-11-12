@@ -432,7 +432,7 @@ Nothing is published while the version is below 0.1.0.
 - The tests of lethewis-android build their slowest dependencies optimised. The core's tests do not:
   they measure the stack.
 - Kani builds a proof with its own crate and what that reaches, never the rest of the workspace.
-- A third way into a profile: the owner's password with two of three shares. Each way has its own
+- A third way into a profile: a password of it with two of three shares. Each way has its own
   place, and a change keeps the bytes of those it does not set.
 - `Profile::set_shares` and `Profile::clear_shares`, with the owner's password. Setting writes three
   shares to give to people the owner trusts.
@@ -445,8 +445,8 @@ Nothing is published while the version is below 0.1.0.
 - `Profile::change_password` takes new shares for a way in with shares, and refuses without them.
 - `Error::Locked`, `Error::SharesSet` and `Error::NoWayOut`. A password and two shares that open
   nothing read alike, whichever is wrong.
-- A fourth way into a profile, with the owner's password and a time lock of drand, under the
-  `timelock` feature. `Profile::set_time_lock` is the owner's check-in, which moves the round on.
+- A fourth way into a profile, with a password of it and a time lock of drand, under the
+  `timelock` feature. `Profile::set_time_lock` is the check-in, which moves the round on.
 - `Profile::unlock_with_round`, which spends the round. `Profile::clear_time_lock` and
   `Profile::time_lock_round`, which needs the chip alone, are built without the feature too.
 - `Error::TimeLockSet` refuses a new password while a time lock is set.
@@ -454,5 +454,16 @@ Nothing is published while the version is below 0.1.0.
 - `Keystore::unwatchable` with `Unwatchable`: what the device lacks for the key of the sign of the
   fingerprints. `Profile::watch_fingerprints` gives it in `Error::Unwatchable` where the system
   refuses the key, or `Error::Unexplained` where asking fails.
+- The ways with a second factor are locked under a key of the file. Every password of the profile
+  reaches it with the chip.
+- `Profile::set_duress` and `Profile::clear_duress` draw that key anew. They take the shares they
+  make again, and refuse while a time lock is set.
+- `Profile::unlock_with_shares` and `Profile::unlock_with_round` take either password of the
+  profile, so that a locked profile tells one from another no more.
+- The password that unlocks keeps its way, and the other reads as locked until it unlocks in turn.
+- `Profile::set_time_lock` takes either password of the profile. Both check in to the same round,
+  so a check-in under coercion tells one from another no more.
+- A password under duress set to destroy destroys on every call that takes a password. The calls
+  of the owner's own are among them.
 
 [Unreleased]: https://github.com/wisper-dev/lethewis/commits/main

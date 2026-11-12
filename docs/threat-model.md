@@ -83,16 +83,27 @@ A change of epoch moves a pointer in one step, then deletes the old root. What a
 left is erased only after the synced pointer and its root read strictly.
 
 On Android a profile has four ways in, each in its place. The owner's comes first, then one under
-duress, then the owner's with shares, then with a time lock.
+duress, then one with shares, then one with a time lock.
+
+Either password of the profile opens the last two, each with its second factor.
 
 Without the passwords and the chip they read alike. A change writes anew only the ways it sets, so
 two images of the file show which changed.
 
-After the ways lie the time lock, hidden under the chip, and a mark of a second factor set. Code
-that reaches the chip reads both, the round included.
+After the ways lie the time lock, hidden under the chip, and a mark of a second factor set. Then
+comes the key those ways are locked under, once under a pad of each password.
 
-A password under duress opens the profile as the owner's does. Set to destroy, it deletes the
-library's other keys in the keystore, then marks the other profiles destroyed.
+Code that reaches the chip reads the time lock and the mark, the round included. Reading that key
+takes a password of the profile as well.
+
+A password under duress opens the profile as the owner's does. It checks in to a time lock the
+same way.
+
+So a coercer who holds that password puts the deadline off as the owner would. A time lock
+protects against a missed check-in, not against coercion.
+
+Set to destroy, it deletes the library's other keys in the keystore, then marks the other
+profiles destroyed. It does so on every call that takes a password, the owner's own among them.
 
 For each sign the owner watches, a profile holds two tags. One is of the reading accepted, the
 other of what is to happen when a reading differs.
@@ -102,8 +113,8 @@ and writes nothing.
 
 It compares every action of every sign. Neither its time nor the file tells what any action is.
 
-The file is of one size and is tags alone, whatever is watched. Only the owner's password writes it
-through this library.
+The file is of one size and is tags alone, whatever is watched. Only a password of the profile
+writes it through this library.
 
 A tag the library cannot read is refused to the owner's calls. What was changed does not become a
 setting of the owner's own.
@@ -221,11 +232,20 @@ opens nothing.
 The application locks a profile with no password, when the verdict calls for it. Each password
 then reads as locked.
 
-The owner's password opens a locked profile only with two of three shares. It also opens with the
-signature of the round of its time lock, which the unlock spends.
+A password of the profile opens a locked one only with two of three shares. It also opens with
+the signature of the round of its time lock, which the unlock spends.
+
+An unlock writes the record of the password that opened the profile and empties the other. That
+other then reads as locked until it unlocks in turn, or is set anew.
+
+Where no way out is left, that emptied way reads as changed instead, which it was. Either password
+reads the other's alike.
 
 A changed sign set to lock calls for a lock, as does a file of the signs changed or gone. A lock
 needs the mark of a way in with shares.
+
+The owner's other calls refuse a password under duress. A coercer who asks for one of those
+tells it from the owner's; entering, checking in and unlocking do not.
 
 A sign locks only with a way in by shares, which stays while a sign locks. A password under duress
 set to destroy still destroys once the profile is locked.
@@ -266,10 +286,11 @@ library cannot tell a share given willingly from one taken.
 A lock overwrites the records of the passwords and does not erase them. A copy of the file from
 before, or its old bytes on the flash, open with the passwords of then.
 
-Two shares tell the owner's password from one under duress: only the owner's opens with them.
+A password of the profile that once opened it holds the key of the second factor from then on.
+Two shares or the round's signature then open the profile without that password again.
 
-After its round, the signature of a time lock tells them apart too, and it is public then. A
-check-in under the password under duress is refused.
+Setting, changing or removing a password draws that key anew, so a password removed opens nothing
+more.
 
 Who can write the app's files can make a lock fail, and a lock that fails leaves the profile open.
 The application is to enter a profile only once a lock it asked for succeeds.

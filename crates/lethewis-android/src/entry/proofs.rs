@@ -17,6 +17,7 @@ fn ways_in_are_read_as_written() {
     let tail = Tail {
         timed: kani::any(),
         mark: kani::any(),
+        copies: kani::any(),
     };
     kani::assert(
         parse_ways(&ways_bytes(&ways, &tail)) == Some((ways, tail)),
