@@ -54,6 +54,12 @@ password and the hardware secret at each unlock, and neither alone is enough.
   root. If that root survives or the hardware's keys leak, old records may still open.
 - A key derived from a password, twelve words or two shares comes back from them. Destroying it
   does not reach them; destroying the profile key it opens does.
+- A keystore failure the system does not name is asked about with a key of the keystore's own. One
+  that cannot be made says the keystore stopped for now.
+- The platform reads a keystore that failed as one without the key. A name that holds no key is
+  asked about the same way.
+- A key that is made while another fails leaves that failure unnamed. Below API 33 the system
+  names few of them.
 - An export outlives later changes on the device: its key for transfers opens it in any epoch. No
   export tells its age, so an older backup opens as a newer one does.
 - A lock record left behind opens until the next change of epoch. Against someone who held that
@@ -123,6 +129,10 @@ password and the hardware secret at each unlock, and neither alone is enough.
   Past four seconds of it, a device whose screen went off may sleep before the wipe.
 - An app the system freezes in the background keeps the keys of a call under way until it runs
   again.
+- Nothing destroys until the application sets it to. A password under duress destroys only where it
+  is set to, and so does a sign.
+- Where the owner is, destroying data of their own may itself be an offence. Warning them before
+  such a setting is turned on is the application's.
 - A password under duress opens its profile as the owner's does. Set to destroy, it deletes every
   other key of the library in the app's keystore.
 - A locked profile opens only with a password of it and two shares, or its round's signature.

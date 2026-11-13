@@ -105,6 +105,9 @@ protects against a missed check-in, not against coercion.
 Set to destroy, it deletes the library's other keys in the keystore, then marks the other
 profiles destroyed. It does so on every call that takes a password, the owner's own among them.
 
+A keystore that fails lists fewer keys, or none, and the destruction deletes what it listed. The
+password still opens the profile, so a coercer sees nothing of it.
+
 For each sign the owner watches, a profile holds two tags. One is of the reading accepted, the
 other of what is to happen when a reading differs.
 
@@ -199,6 +202,17 @@ On Android every challenge to the chip and its answer pass through the Java heap
 process. Their copies there are beyond wiping.
 
 Below API 33 the system names few failures: a damaged key then reads as unknown, not lost.
+
+A failure the system does not name is asked about with a key of the keystore's own. One that
+cannot be made says the keystore stopped for now; one that can leaves the failure unnamed.
+
+The platform reads a keystore that failed as one without the key, and throws nothing.
+
+A name that holds no key is asked about the same way. A keystore that stopped is then no sign
+watching nothing.
+
+Below API 31 a key of the user reads as missing until the keystore serves such keys. That is after
+the first unlock since boot, which only an application running before it reaches.
 
 From API 31 a key whose stored details lost their algorithm reads as lost: the system reports it
 alike.

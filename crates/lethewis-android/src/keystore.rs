@@ -9,11 +9,11 @@ pub trait Keystore {
     fn api_level(&self) -> u32;
 
     /// Whether a key is held under `alias`. The system reports a keystore that fails here as
-    /// holding no key.
+    /// holding no key, so an answer of `false` is one a key of the keystore's own confirmed.
     ///
     /// # Errors
     ///
-    /// The keystore's [`Failure`].
+    /// The keystore's [`Failure`], [`Failure::Transient`] where that key could not be made.
     fn contains(&mut self, alias: &str) -> Result<bool, Failure>;
 
     /// Creates an HMAC-SHA256 key under `alias`, in the secure element if `strong_box`, and usable
@@ -143,8 +143,10 @@ impl Level {
 /// works.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Failure {
-    /// From API 33, a failure the system marks as passing, or the keystore's internal error, a
-    /// service that died among them.
+    /// The keystore did not serve the call, and later it may: from API 33 a failure the system
+    /// marks as passing, or its internal error, a service that died among them. Also a keystore
+    /// that cannot make a key of its own, where the system named nothing. How long to keep trying,
+    /// and when to tell the owner instead, are the caller's.
     Transient,
     /// The device has to be unlocked first.
     Locked,
@@ -155,9 +157,9 @@ pub enum Failure {
     Corrupted,
     /// The secure element cannot hold the key.
     StrongBoxUnavailable,
-    /// The keystore, or the bridge to it, failed without saying whether it lasts. Below API 33 most
-    /// failures come as this, a damaged key among them; below API 31 so does a missing key while
-    /// the keystore cannot make one.
+    /// The keystore, or the bridge to it, failed without saying whether it lasts, while a key of
+    /// its own was made all the same. Below API 33 the system names few failures, so a damaged key
+    /// reads as this; below API 31 so does a missing key while the keystore cannot make one.
     Unknown,
 }
 
