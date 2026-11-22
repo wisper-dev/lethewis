@@ -692,6 +692,9 @@ jobs:
           cargo mutants "${scope[@]}" --list --json >listed.json
           # Taken in turn, so that the mutants of one file spread over the parts.
           cargo mutants "${scope[@]}" --shard "$PART/$PARTS" --sharding round-robin
+          # With fewer mutants than parts, a shard gets none and cargo-mutants writes no outcomes;
+          # there is then nothing to check.
+          [ -f mutants.out/outcomes.json ] || exit 0
           # A mutant whose build fails for any reason is unviable and goes untested. Only a compiler
           # that reported errors and exited with 1 marks one that does not build.
           crashed='internal compiler error|unexpectedly panicked|unexpectedly overflowed its stack|/rust(c|doc) .*\(signal:'
