@@ -21,7 +21,7 @@ Suggestions for functionality not listed here are accepted as issues.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 ![MSRV](https://img.shields.io/badge/rustc-1.99.0-orange.svg)
-![Readiness](https://img.shields.io/badge/readiness-86%25-green.svg)
+![Readiness](https://img.shields.io/badge/readiness-98%25-green.svg)
 
 ## How the keys relate
 
