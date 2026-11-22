@@ -51,6 +51,8 @@ extern "system" fn Java_com_alanwisper_lethewis_test_Tests_run(
     root: jstring,
     api: jint,
     test: jstring,
+    secure: jboolean,
+    watchable: jboolean,
 ) -> jstring {
     // SAFETY: the JVM calls a native method with the environment of the current thread, valid
     // until it returns.
@@ -58,7 +60,14 @@ extern "system" fn Java_com_alanwisper_lethewis_test_Tests_run(
         return ptr::null_mut();
     };
     let outcome = match (keystore.text(root), keystore.text(test), u32::try_from(api)) {
-        (Some(root), Some(test), Ok(api)) => run(Path::new(&root), &mut keystore, api, &test),
+        (Some(root), Some(test), Ok(api)) => run(
+            Path::new(&root),
+            &mut keystore,
+            api,
+            &test,
+            secure == jni_sys::JNI_TRUE,
+            watchable == jni_sys::JNI_TRUE,
+        ),
         _ => Err("the arguments are not as the runner passes them".to_owned()),
     };
     let report = match outcome {
@@ -165,7 +174,14 @@ fn check(holds: bool, what: &str) -> Result<(), String> {
 /// The tests `test`: `all` with the device unlocked, or one step of a profile kept across a lock,
 /// `before-lock`, `locked` and `after-lock`, or across a keystore that stops, `before-stop`,
 /// `stopping`, `stopped`, `restarted` and `after-stop`.
-fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Result<(), String> {
+fn run(
+    root: &Path,
+    keystore: &mut JniKeystore<'_>,
+    api: u32,
+    test: &str,
+    secure: bool,
+    watchable: bool,
+) -> Result<(), String> {
     check(
         keystore.api_level() == api,
         &format!("API level {} for {api}", keystore.api_level()),
@@ -241,7 +257,7 @@ fn run(root: &Path, keystore: &mut JniKeystore<'_>, api: u32, test: &str) -> Res
                 &format!("a keystore that started again verifies: {verified:?}"),
             )
         }
-        "context" => context(keystore),
+        "context" => context(keystore, secure, watchable),
         "after-lock" | "after-stop" => {
             let profile = kept(root)?;
             answers(&profile, keystore)?;
@@ -291,12 +307,24 @@ fn locked_device(root: &Path, keystore: &mut JniKeystore<'_>, api: u32) -> Resul
     )
 }
 
-/// The keystore asks the device through the context of `Wiper.start`, as in an app.
-fn context(keystore: &mut JniKeystore<'_>) -> Result<(), String> {
+/// The keystore asks the device through the context of `Wiper.start`, as in an app. A device that
+/// watches gives no obstacle; one with a secure lock screen but no strong biometric names the
+/// lack, and one without a secure lock screen names that.
+fn context(keystore: &mut JniKeystore<'_>, secure: bool, watchable: bool) -> Result<(), String> {
     let answer = keystore.unwatchable();
+    let expected = if watchable {
+        None
+    } else if secure {
+        Some(Unwatchable::NothingEnrolled)
+    } else {
+        Some(Unwatchable::NoLockScreen)
+    };
     check(
-        answer == Ok(Some(Unwatchable::NoLockScreen)),
-        &format!("the device asked through the watch's context: {answer:?}"),
+        answer == Ok(expected),
+        &format!(
+            "the device asked through the watch's context: {answer:?}, secure {secure}, \
+             watchable {watchable}"
+        ),
     )
 }
 
@@ -408,20 +436,39 @@ fn signs(home: &Path, keystore: &mut JniKeystore<'_>, pin: bool) -> Result<(), S
         agrees,
         &format!("the key of the sign: {armed:?}, with {watch:?}"),
     )?;
-    // Of a new profile only the sign armed above has a reading accepted; the three the application
-    // measures have none until the owner accepts them.
-    let verdict = profile
-        .judge(keystore, &[Some(watch.reading()), None, None, None])
+    // A fresh profile has no reading accepted, the fingerprint sign armed by the creation among
+    // them: every sign is unaccepted. Where the device holds the sign, the owner then accepts it,
+    // and only it reads as accepted; the three the application measures stay unaccepted.
+    let readings: Readings<'_> = [Some(watch.reading()), None, None, None];
+    let fresh = profile
+        .judge(keystore, &readings)
         .map_err(|error| format!("judging the signs: {error}"))?;
-    let told = if watch == Watch::Kept {
-        verdict.unaccepted == [false, true, true, true]
-    } else {
-        verdict.unaccepted == [true; 4]
-    };
     check(
-        told && verdict.changed == [false; 4] && !verdict.destroy,
-        &format!("the signs of a new profile: {verdict:?}"),
+        fresh.unaccepted == [true; 4] && fresh.changed == [false; 4] && !fresh.destroy,
+        &format!("the signs of a new profile: {fresh:?}"),
     )?;
+    if watch == Watch::Kept {
+        profile
+            .accept_signs(
+                &mut slots,
+                keystore,
+                &mut b"owner".to_vec(),
+                &readings,
+                &params,
+                &mut memory,
+                &mut source,
+            )
+            .map_err(|error| format!("accepting the sign: {error}"))?;
+        let accepted = profile
+            .judge(keystore, &readings)
+            .map_err(|error| format!("judging the accepted sign: {error}"))?;
+        check(
+            accepted.unaccepted == [false, true, true, true]
+                && accepted.changed == [false; 4]
+                && !accepted.destroy,
+            &format!("the sign after the owner accepts it: {accepted:?}"),
+        )?;
+    }
     let id = profile.id();
     let gone = profile
         .destroy(keystore)

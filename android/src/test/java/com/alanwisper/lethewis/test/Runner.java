@@ -81,6 +81,30 @@ public final class Runner extends Instrumentation {
             Tests.importKnownKey();
         }
         File root = new File(context.getNoBackupFilesDir(), "lethewis-tests");
-        return Tests.run(root.getPath(), Integer.parseInt(arguments.getString("api")), test);
+        // The tests take the device's state from the system, not from their own guess: whether a
+        // secure lock screen is set, and whether it can hold the sign of the fingerprints, which
+        // asks for a strong biometric too.
+        boolean secure = keyguard.isDeviceSecure();
+        boolean watchable = secure && strongEnrolled(context);
+        return Tests.run(
+                root.getPath(),
+                Integer.parseInt(arguments.getString("api")),
+                test,
+                secure,
+                watchable);
+    }
+
+    /** Whether the system reports a strong biometric enrolled and usable. */
+    private static boolean strongEnrolled(Context context) {
+        if (android.os.Build.VERSION.SDK_INT < 30) {
+            return false;
+        }
+        android.hardware.biometrics.BiometricManager manager =
+                context.getSystemService(android.hardware.biometrics.BiometricManager.class);
+        return manager != null
+                && manager.canAuthenticate(
+                                android.hardware.biometrics.BiometricManager.Authenticators
+                                        .BIOMETRIC_STRONG)
+                        == android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS;
     }
 }
