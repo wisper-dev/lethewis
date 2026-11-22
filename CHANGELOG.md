@@ -12,6 +12,7 @@ Nothing is published while the version is below 0.1.0.
 
 ### Added
 
+- `lethewis-core`: an ignored test that times a key derivation from a password on the device.
 - Workspace with the `lethewis-core` crate.
 - Documents: licence, security policy, contribution rules, code of conduct, threat model, proof
   register.
