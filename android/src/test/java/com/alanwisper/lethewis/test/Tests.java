@@ -30,7 +30,7 @@ final class Tests {
      * Runs the tests {@code test} under {@code root} on a system of API level {@code api}; returns
      * {@code passed}, or what failed.
      */
-    static native String run(String root, int api, String test);
+    static native String run(String root, int api, String test, boolean secure, boolean watchable);
 
     /** Breaks a rule of JNI, for which CheckJNI must stop the process. */
     static native void misuse();
